@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "corpus_id": "remin-zh-v1",
+  "generated_at": "2026-08-01",
+  "deterministic_facts": {
+    "project_id": "GH-2025-017",
+    "owner": "林晓岚",
+    "budget_cny": 286500,
+    "rrf_k": 60
+  },
+  "fixtures": [
+    {"path": "corpus/01-归航计划项目总结.docx", "kind": "docx", "expected": "readable"},
+    {"path": "corpus/02-归航计划会议纪要.pdf", "kind": "pdf", "expected": "readable"},
+    {"path": "corpus/03-扫描采购收据.pdf", "kind": "scanned_pdf", "expected": "ocr_required"},
+    {"path": "corpus/04-扫描采购收据.png", "kind": "image", "expected": "ocr_required"},
+    {"path": "corpus/05-项目说明.md", "kind": "markdown", "expected": "readable"},
+    {"path": "corpus/06-检索评估与项目台账.xlsx", "kind": "xlsx", "expected": "readable"},
+    {"path": "corpus/07-归航计划阶段汇报.pptx", "kind": "pptx", "expected": "readable"},
+    {"path": "corpus/08-资料清单.csv", "kind": "csv", "expected": "readable"},
+    {"path": "corpus/09-会议行动项.tsv", "kind": "tsv", "expected": "readable"},
+    {"path": "corpus/10-网页摘录.html", "kind": "html", "expected": "readable"},
+    {"path": "corpus/11-加密会议纪要.pdf", "kind": "encrypted_pdf", "expected": "password_required", "test_password": "remin-test-password"},
+    {"path": "corpus/12-损坏文档.pdf", "kind": "corrupt_pdf", "expected": "parse_failed"},
+    {"path": "corpus/13-完全重复-A.txt", "kind": "text", "expected": "exact_duplicate"},
+    {"path": "corpus/14-完全重复-B.txt", "kind": "text", "expected": "exact_duplicate"},
+    {"path": "corpus/15-归航计划-v1.txt", "kind": "text", "expected": "version_candidate"},
+    {"path": "corpus/16-归航计划-v2.txt", "kind": "text", "expected": "version_candidate"}
+  ],
+  "deferred_fixtures": [
+    {"formats": ["doc", "xls", "ppt"], "reason": "需要可再分发的LibreOffice离线兼容包或具有明确许可的旧格式样本，阶段2兼容链路实现前不得伪造扩展名"},
+    {"formats": ["docm", "xlsm", "pptm"], "reason": "宏格式需要明确的无执行解析验收样本，阶段2实现时补齐"}
+  ]
+}
+

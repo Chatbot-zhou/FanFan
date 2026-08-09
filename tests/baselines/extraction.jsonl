@@ -1,0 +1,4 @@
+{"case_id":"extract-001","source":"01-归航计划项目总结.docx","fields":{"project_id":{"value":"GH-2025-017","evidence_required":true},"owner":{"value":"林晓岚","evidence_required":true},"budget_cny":{"value":286500,"evidence_required":true}}}
+{"case_id":"extract-002","source":"02-归航计划会议纪要.pdf","fields":{"meeting_date":{"value":"2025-11-18T14:30:00+08:00","evidence_required":true},"next_review":{"value":"2025-12-02T10:00:00+08:00","evidence_required":true}}}
+{"case_id":"extract-003","source":"06-检索评估与项目台账.xlsx","fields":{"hybrid_recall_at_10":{"value":0.94,"locator":{"sheet_name":"评估结果","cell_range":"B7"}},"hybrid_p95_ms":{"value":2360,"locator":{"sheet_name":"评估结果","cell_range":"C7"}}}}
+

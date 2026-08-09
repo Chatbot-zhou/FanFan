@@ -1,0 +1,5 @@
+{"case_id":"search-001","query":"归航计划负责人","scope":"corpus","expected_any":[{"file":"01-归航计划项目总结.docx","text":"林晓岚"},{"file":"05-项目说明.md","text":"林晓岚"}],"must_not_return":["12-损坏文档.pdf"]}
+{"case_id":"search-002","query":"混合检索用什么参数","scope":"corpus","expected_any":[{"file":"02-归航计划会议纪要.pdf","text":"RRF融合，评测基线k=60"},{"file":"05-项目说明.md","text":"k=60"}],"must_not_return":[]}
+{"case_id":"search-003","query":"扫描采购凭证","scope":"corpus","expected_any":[{"file":"03-扫描采购收据.pdf","text":"收据"},{"file":"04-扫描采购收据.png","text":"收据"}],"requires_ocr":true,"must_not_return":[]}
+{"case_id":"search-004","query":"预算上限是多少","scope":"corpus","expected_any":[{"file":"01-归航计划项目总结.docx","text":"286,500"},{"file":"05-项目说明.md","text":"286,500"}],"must_not_return":[]}
+

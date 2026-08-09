@@ -1,0 +1,5 @@
+{"case_id":"qa-001","question":"归航计划的负责人是谁？","expected_answer_contains":["林晓岚"],"evidence_any":["01-归航计划项目总结.docx","05-项目说明.md"],"must_refuse":false}
+{"case_id":"qa-002","question":"混合检索基线参数是多少？","expected_answer_contains":["k=60"],"evidence_any":["01-归航计划项目总结.docx","02-归航计划会议纪要.pdf","05-项目说明.md"],"must_refuse":false}
+{"case_id":"qa-003","question":"归航计划最终上线日期是哪天？","expected_answer_contains":[],"evidence_any":[],"must_refuse":true,"refusal_reason":"测试资料没有最终上线日期"}
+{"case_id":"qa-004","question":"加密会议纪要写了什么？","expected_answer_contains":[],"evidence_any":[],"must_refuse":true,"refusal_reason":"没有用户提供的密码时不得读取"}
+

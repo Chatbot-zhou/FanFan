@@ -1,0 +1,32 @@
+{
+  "name": "remin",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@11.9.0",
+  "scripts": {
+    "dev": "corepack pnpm --filter @remin/desktop dev",
+    "build": "corepack pnpm --filter @remin/desktop build",
+    "tauri:dev": "corepack pnpm --filter @remin/desktop tauri:dev",
+    "tauri:build": "corepack pnpm --filter @remin/desktop tauri:build",
+    "typecheck": "corepack pnpm --filter @remin/desktop typecheck",
+    "test": "corepack pnpm --filter @remin/desktop test",
+    "check": "corepack pnpm typecheck && corepack pnpm test && corepack pnpm build",
+    "worker:test": "python -m unittest discover -s services/worker/tests -v",
+    "worker:corpus": "python scripts/validate_parsing_corpus.py",
+    "worker:build": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build_worker.ps1",
+    "worker:packaged-check": "python scripts/validate_packaged_worker.py",
+    "runtime:prepare": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/prepare_llama_runtime.ps1",
+    "runtime:check": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/validate_llama_runtime.ps1",
+    "semantic:performance": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/validate_semantic_performance.ps1",
+    "generation:smoke": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/validate_local_generation.ps1",
+    "installer:build": "corepack pnpm runtime:check && corepack pnpm worker:build && corepack pnpm worker:packaged-check && corepack pnpm --filter @remin/desktop tauri:build --bundles nsis",
+    "installer:smoke": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/validate_installer.ps1",
+    "release:manifest": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/generate_release_manifest.ps1",
+    "search:baseline": "cargo run -p remin-core --example evaluate_search --locked",
+    "contracts:check": "python scripts/validate_contracts.py",
+    "fixtures:check": "python scripts/validate_test_corpus.py",
+    "rust:check": "cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked",
+    "verify": "corepack pnpm contracts:check && corepack pnpm fixtures:check && corepack pnpm check && corepack pnpm worker:test && corepack pnpm worker:corpus && corepack pnpm rust:check && corepack pnpm search:baseline",
+    "verify:release": "corepack pnpm verify && corepack pnpm worker:build && corepack pnpm worker:packaged-check && corepack pnpm runtime:check && corepack pnpm semantic:performance && corepack pnpm generation:smoke"
+  }
+}

@@ -1,0 +1,4 @@
+{"case_id":"relation-001","files":["13-完全重复-A.txt","14-完全重复-B.txt"],"expected_relation":"exact_duplicate","confidence":1.0,"basis":"sha256"}
+{"case_id":"relation-002","files":["15-归航计划-v1.txt","16-归航计划-v2.txt"],"expected_relation":"version_candidate","must_not_auto_confirm":true,"shared_key":"GH-VERSION-001"}
+{"case_id":"relation-003","files":["03-扫描采购收据.pdf","04-扫描采购收据.png"],"expected_relation":"derived_or_embedded_candidate","must_not_auto_confirm":true}
+

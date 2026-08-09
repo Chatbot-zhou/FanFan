@@ -1,5 +1,6 @@
 # Node / frontend
 node_modules/
+.pnpm-store/
 dist/
 .vite/
 coverage/
@@ -54,3 +55,15 @@ Desktop.ini
 ~$*
 *.tmp
 *.temp
+
+# Local AI/editor collaboration artifacts
+.claude/
+.codex/
+.collab/
+
+# Local verification artifacts
+.artifacts/
+
+# Temporary helper scripts
+.git-commit-msg.txt
+push-to-rag.sh
