@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -6,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -23,6 +25,7 @@ struct GenerationProcess {
     port: u16,
     token: String,
     model_path: String,
+    mmproj_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -31,6 +34,7 @@ pub struct GenerationActivation {
     pub model_path: String,
     pub context_size: u32,
     pub self_test: String,
+    pub multimodal: bool,
 }
 
 impl LocalGenerationRuntime {
@@ -54,6 +58,41 @@ impl LocalGenerationRuntime {
     pub fn activate(
         &mut self,
         model_path: &str,
+        context_size: u32,
+        threads: u32,
+    ) -> Result<GenerationActivation, AppError> {
+        self.activate_internal(model_path, None, context_size, threads)
+    }
+
+    pub fn activate_multimodal(
+        &mut self,
+        model_path: &str,
+        mmproj_path: &str,
+        context_size: u32,
+        threads: u32,
+    ) -> Result<GenerationActivation, AppError> {
+        let projector = Path::new(mmproj_path);
+        if !projector.is_file()
+            || projector
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+                != Some("gguf")
+        {
+            return Err(AppError::new(
+                "VISION_PROJECTOR_INVALID",
+                "图片理解模型需要可读取且与主模型匹配的mmproj GGUF文件",
+                false,
+            ));
+        }
+        self.activate_internal(model_path, Some(mmproj_path), context_size, threads)
+    }
+
+    fn activate_internal(
+        &mut self,
+        model_path: &str,
+        mmproj_path: Option<&str>,
         context_size: u32,
         threads: u32,
     ) -> Result<GenerationActivation, AppError> {
@@ -113,6 +152,9 @@ impl LocalGenerationRuntime {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if let Some(mmproj_path) = mmproj_path {
+            command.args(["--mmproj", mmproj_path, "--no-mmproj-offload"]);
+        }
         hide_child_console(&mut command);
         let child = command.spawn().map_err(|error| {
             AppError::new("GENERATION_RUNTIME_START_FAILED", error.to_string(), true)
@@ -122,6 +164,7 @@ impl LocalGenerationRuntime {
             port,
             token,
             model_path: model_path.to_owned(),
+            mmproj_path: mmproj_path.map(str::to_owned),
         });
         let started = Instant::now();
         loop {
@@ -158,11 +201,21 @@ impl LocalGenerationRuntime {
                 }
             }
         }
-        let self_test = self.complete(
-            "你是本地运行状态检查器，不进行推理说明。",
-            "只回复：就绪",
-            64,
-        )?;
+        let self_test = if mmproj_path.is_some() {
+            self.complete_multimodal_data_url(
+                "你是本地多模态运行状态检查器，不进行推理说明。",
+                "只回复：就绪",
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+                64,
+                None,
+            )?
+        } else {
+            self.complete(
+                "你是本地运行状态检查器，不进行推理说明。",
+                "只回复：就绪",
+                64,
+            )?
+        };
         if self_test.trim().is_empty() {
             self.stop();
             return Err(AppError::new(
@@ -176,6 +229,7 @@ impl LocalGenerationRuntime {
             model_path: model_path.into(),
             context_size,
             self_test,
+            multimodal: mmproj_path.is_some(),
         })
     }
 
@@ -268,10 +322,128 @@ impl LocalGenerationRuntime {
             })
     }
 
+    pub fn describe_image_cancellable(
+        &mut self,
+        system: &str,
+        prompt: &str,
+        image_path: &Path,
+        mime_type: &str,
+        max_tokens: u32,
+        cancelled: &AtomicBool,
+    ) -> Result<String, AppError> {
+        if !matches!(
+            mime_type,
+            "image/jpeg" | "image/png" | "image/webp" | "image/bmp"
+        ) {
+            return Err(AppError::new(
+                "VISION_IMAGE_FORMAT_UNSUPPORTED",
+                "当前图片理解运行时只接受JPEG、PNG、WebP或BMP缓存",
+                false,
+            ));
+        }
+        let metadata = fs::metadata(image_path)
+            .map_err(|error| AppError::new("VISION_IMAGE_UNAVAILABLE", error.to_string(), true))?;
+        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 32 * 1024 * 1024 {
+            return Err(AppError::new(
+                "VISION_IMAGE_SIZE_UNSUPPORTED",
+                "图片理解缓存必须是1字节到32MB的普通文件",
+                false,
+            ));
+        }
+        let bytes = fs::read(image_path)
+            .map_err(|error| AppError::new("VISION_IMAGE_UNAVAILABLE", error.to_string(), true))?;
+        let data_url = format!("data:{mime_type};base64,{}", STANDARD.encode(bytes));
+        self.complete_multimodal_data_url(system, prompt, &data_url, max_tokens, Some(cancelled))
+    }
+
+    fn complete_multimodal_data_url(
+        &mut self,
+        system: &str,
+        prompt: &str,
+        data_url: &str,
+        max_tokens: u32,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<String, AppError> {
+        let process = self.process.as_mut().ok_or_else(|| {
+            AppError::new("VISION_RUNTIME_INACTIVE", "图片理解模型尚未启动", true)
+        })?;
+        if process.mmproj_path.is_none() {
+            return Err(AppError::new(
+                "VISION_RUNTIME_INACTIVE",
+                "当前本地模型进程没有加载多模态投影组件",
+                true,
+            ));
+        }
+        if process
+            .child
+            .try_wait()
+            .map_err(|error| AppError::new("VISION_RUNTIME_CHECK_FAILED", error.to_string(), true))?
+            .is_some()
+        {
+            self.process = None;
+            return Err(AppError::new(
+                "VISION_RUNTIME_EXITED",
+                "图片理解模型运行进程已经退出",
+                true,
+            ));
+        }
+        let payload = json!({
+            "model": "remin-local-vision",
+            "stream": false,
+            "temperature": 0.1,
+            "max_tokens": max_tokens.clamp(1, 2048),
+            "chat_template_kwargs": {"enable_thinking": false},
+            "messages": [
+                {"role":"system","content":system},
+                {"role":"user","content":[
+                    {"type":"text","text":prompt},
+                    {"type":"image_url","image_url":{"url":data_url}}
+                ]}
+            ]
+        });
+        let body = serde_json::to_vec(&payload)
+            .map_err(|error| AppError::new("VISION_REQUEST_INVALID", error.to_string(), false))?;
+        let (status, response) = http_request_internal(
+            process.port,
+            "POST",
+            "/v1/chat/completions",
+            Some(&process.token),
+            Some(&body),
+            cancelled,
+        )?;
+        if status != 200 {
+            return Err(AppError::new(
+                "VISION_REQUEST_FAILED",
+                format!("本地多模态模型返回{status}：{response}"),
+                status >= 500,
+            ));
+        }
+        let value: serde_json::Value = serde_json::from_str(&response)
+            .map_err(|error| AppError::new("VISION_RESPONSE_INVALID", error.to_string(), false))?;
+        value
+            .pointer("/choices/0/message/content")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                AppError::new(
+                    "VISION_RESPONSE_INVALID",
+                    "本地多模态模型响应缺少图片说明文本",
+                    false,
+                )
+            })
+    }
+
     pub fn active_model_path(&self) -> Option<&str> {
         self.process
             .as_ref()
             .map(|process| process.model_path.as_str())
+    }
+
+    pub fn active_mmproj_path(&self) -> Option<&str> {
+        self.process
+            .as_ref()
+            .and_then(|process| process.mmproj_path.as_deref())
     }
 
     pub fn stop(&mut self) {
@@ -499,6 +671,18 @@ mod tests {
     }
 
     #[test]
+    fn multimodal_activation_requires_projector_before_starting_runtime() {
+        let mut runtime = LocalGenerationRuntime::new(PathBuf::from("missing-llama-server.exe"));
+        assert_eq!(
+            runtime
+                .activate_multimodal("missing.gguf", "missing-mmproj.gguf", 4096, 2)
+                .unwrap_err()
+                .code,
+            "VISION_PROJECTOR_INVALID"
+        );
+    }
+
+    #[test]
     fn parses_content_length_and_chunked_local_responses() {
         let plain = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}";
         assert_eq!(
@@ -542,6 +726,36 @@ mod tests {
                 32,
             )
             .expect("generate local answer");
+        assert!(!answer.trim().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires pinned llama.cpp runtime, multimodal GGUF and matching mmproj"]
+    fn real_llama_cpp_runtime_understands_an_image_locally() {
+        let executable = std::env::var("REMIN_LLAMA_SERVER")
+            .map(PathBuf::from)
+            .expect("REMIN_LLAMA_SERVER is required");
+        let model =
+            std::env::var("REMIN_TEST_VISION_GGUF").expect("REMIN_TEST_VISION_GGUF is required");
+        let projector = std::env::var("REMIN_TEST_VISION_MMPROJ")
+            .expect("REMIN_TEST_VISION_MMPROJ is required");
+        let image = std::env::var("REMIN_TEST_IMAGE").expect("REMIN_TEST_IMAGE is required");
+        let mut runtime = LocalGenerationRuntime::new(executable);
+        let activation = runtime
+            .activate_multimodal(&model, &projector, 2048, 2)
+            .expect("activate pinned multimodal runtime");
+        assert!(activation.multimodal);
+        let answer = runtime
+            .describe_image_cancellable(
+                "只描述可见内容。",
+                "用一句中文描述图片。",
+                Path::new(&image),
+                "image/png",
+                128,
+                &AtomicBool::new(false),
+            )
+            .expect("understand local image");
         assert!(!answer.trim().is_empty());
     }
 }

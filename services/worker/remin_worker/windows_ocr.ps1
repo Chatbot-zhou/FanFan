@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory = $true)][ValidateSet('image', 'pdf')][string]$SourceKind,
     [int]$MaxPages = 50,
     [string]$LanguageTag = 'zh-Hans-CN',
-    [string]$PageNumbers = ''
+    [string]$PageNumbers = '',
+    [string]$AssetCacheDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,6 +43,7 @@ function Await-Action($Action) {
 [void][Windows.Storage.FileAccessMode, Windows.Storage, ContentType = WindowsRuntime]
 [void][Windows.Storage.Streams.IRandomAccessStream, Windows.Storage.Streams, ContentType = WindowsRuntime]
 [void][Windows.Storage.Streams.InMemoryRandomAccessStream, Windows.Storage.Streams, ContentType = WindowsRuntime]
+[void][Windows.Storage.Streams.DataReader, Windows.Storage.Streams, ContentType = WindowsRuntime]
 [void][Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType = WindowsRuntime]
 [void][Windows.Graphics.Imaging.SoftwareBitmap, Windows.Graphics.Imaging, ContentType = WindowsRuntime]
 [void][Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
@@ -88,6 +90,7 @@ function Read-Bitmap($Bitmap, [int]$PageNumber) {
 
 $file = Await-Operation ([Windows.Storage.StorageFile]::GetFileFromPathAsync($SourcePath)) ([Windows.Storage.StorageFile])
 $allLines = @()
+$renderedPages = @()
 $pageCount = 0
 if ($SourceKind -eq 'image') {
     $stream = Await-Operation ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
@@ -113,6 +116,24 @@ if ($SourceKind -eq 'image') {
             $width = [Math]::Min(2200, [Math]::Max(1200, [int]($page.Size.Width * 2)))
             $options.DestinationWidth = $width
             Await-Action ($page.RenderToStreamAsync($memory, $options))
+            if (-not [string]::IsNullOrWhiteSpace($AssetCacheDir)) {
+                $null = [IO.Directory]::CreateDirectory($AssetCacheDir)
+                if ($memory.Size -le 0 -or $memory.Size -gt 67108864) { throw 'Rendered PDF page exceeds the safe cache limit' }
+                $renderedPath = Join-Path $AssetCacheDir ("ocr-page-{0}-{1}.png" -f ($index + 1), [Guid]::NewGuid().ToString('N'))
+                $input = $memory.GetInputStreamAt(0)
+                $reader = [Windows.Storage.Streams.DataReader]::new($input)
+                try {
+                    $loaded = Await-Operation ($reader.LoadAsync([uint32]$memory.Size)) ([uint32])
+                    if ($loaded -ne [uint32]$memory.Size) { throw 'Rendered PDF page was not read completely' }
+                    $bytes = New-Object byte[] ([int]$loaded)
+                    $reader.ReadBytes($bytes)
+                    [IO.File]::WriteAllBytes($renderedPath, $bytes)
+                    $renderedPages += [ordered]@{ page_no = ($index + 1); path = $renderedPath; mime_type = 'image/png' }
+                } finally {
+                    $reader.Dispose()
+                    $input.Dispose()
+                }
+            }
             $memory.Seek(0)
             $decoder = Await-Operation ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($memory)) ([Windows.Graphics.Imaging.BitmapDecoder])
             $bitmap = Await-Operation ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
@@ -128,4 +149,5 @@ if ($SourceKind -eq 'image') {
     language = $language.LanguageTag
     page_count = $pageCount
     lines = $allLines
+    rendered_pages = $renderedPages
 } | ConvertTo-Json -Depth 8 -Compress

@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use chrono::{DateTime, Utc};
@@ -13,12 +13,14 @@ use crate::{
     AnswerResult, AppError, AppLogRecord, AskRequest, CandidateStatus, CatalogStore,
     CheckpointType, ChunkEmbeddingInput, CollectionRecord, CreateCollectionRequest,
     DegradationLevel, DegradationState, ExplorationCandidate, ExtractionRunRequest,
-    ExtractionRunResult, FilePreview, FileRecord, FileRelation, FileSystemEvent, InboxPage,
-    InboxQuery, InboxUpdateRequest, IndexActivityStats, IndexRebuildResult, JobRecord, JobStatus,
-    LogEventInput, LogPage, LogQuery, MaintenanceSnapshot, ParseResult, PendingEmbeddingChunk,
-    PlanSkillRequest, RelationPage, RelationQuery, RelationRefreshResult, RootRegistration,
-    ScanControl, ScanPolicy, SearchRequest, SearchSession, SemanticQuery, TaskExecutionResult,
-    file_identity_for_path, path_key, plan_skill, scan_root_with_control,
+    ExtractionRunResult, FilePreview, FileRecord, FileRelation, FileSystemEvent,
+    ImageUnderstandingResult, InboxPage, InboxQuery, InboxUpdateRequest, IndexActivityStats,
+    IndexRebuildResult, JobRecord, JobStatus, KnowledgeSpace, KnowledgeSpaceRequest, LogEventInput,
+    LogPage, LogQuery, MaintenanceSnapshot, ParseResult, PendingEmbeddingChunk,
+    PendingImageUnderstanding, PlanSkillRequest, RelationPage, RelationQuery,
+    RelationRefreshResult, RootRegistration, ScanControl, ScanPolicy, SearchRequest, SearchSession,
+    SemanticQuery, TaskExecutionResult, file_identity_for_path, path_key, plan_skill,
+    scan_root_with_control,
 };
 
 #[cfg(windows)]
@@ -326,7 +328,7 @@ pub struct CandidateActionOutcome {
 #[derive(Debug, Clone)]
 pub struct CatalogService {
     store: CatalogStore,
-    scan_policy: Arc<ScanPolicy>,
+    scan_policy: Arc<RwLock<ScanPolicy>>,
     scan_controls: Arc<Mutex<HashMap<Uuid, ScanControl>>>,
     scan_execution: Arc<Mutex<()>>,
 }
@@ -352,7 +354,9 @@ impl CatalogService {
         let exclusion_rules = store.list_exclusion_rules()?;
         Ok(Self {
             store,
-            scan_policy: Arc::new(ScanPolicy::new([data_directory]).with_rules(exclusion_rules)),
+            scan_policy: Arc::new(RwLock::new(
+                ScanPolicy::new([data_directory]).with_rules(exclusion_rules),
+            )),
             scan_controls: Arc::new(Mutex::new(HashMap::new())),
             scan_execution: Arc::new(Mutex::new(())),
         })
@@ -528,7 +532,12 @@ impl CatalogService {
                 false,
             ));
         }
-        if self.scan_policy.protects(&canonical) {
+        if self
+            .scan_policy
+            .read()
+            .map_err(|_| AppError::new("SCAN_POLICY_UNAVAILABLE", "扫描排除策略状态不可用", true))?
+            .protects(&canonical)
+        {
             return Err(AppError::new(
                 "ROOT_PROTECTED",
                 "拾忆的内部数据目录不能作为资料来源",
@@ -582,6 +591,33 @@ impl CatalogService {
 
     pub fn authorized_files_by_ids(&self, file_ids: &[Uuid]) -> Result<Vec<FileRecord>, AppError> {
         self.store.authorized_files_by_ids(file_ids)
+    }
+
+    pub fn list_exclusion_rules(&self) -> Result<Vec<crate::ExclusionRule>, AppError> {
+        self.store.list_exclusion_rules()
+    }
+
+    pub fn upsert_exclusion_rule(
+        &self,
+        input: &crate::ExclusionRuleInput,
+    ) -> Result<crate::ExclusionRule, AppError> {
+        let rule = self.store.upsert_exclusion_rule(input)?;
+        self.reload_exclusion_rules()?;
+        Ok(rule)
+    }
+
+    pub fn delete_exclusion_rule(&self, rule_id: &Uuid) -> Result<(), AppError> {
+        self.store.delete_exclusion_rule(rule_id)?;
+        self.reload_exclusion_rules()
+    }
+
+    fn reload_exclusion_rules(&self) -> Result<(), AppError> {
+        let rules = self.store.list_exclusion_rules()?;
+        let mut policy = self.scan_policy.write().map_err(|_| {
+            AppError::new("SCAN_POLICY_UNAVAILABLE", "扫描排除策略状态不可用", true)
+        })?;
+        *policy = policy.clone().with_rules(rules);
+        Ok(())
     }
 
     pub fn home_file_summary(&self, local_date: &str) -> Result<(u64, Vec<FileRecord>), AppError> {
@@ -868,6 +904,37 @@ impl CatalogService {
         self.store.update_inbox_item(request)
     }
 
+    pub fn list_knowledge_spaces(&self) -> Result<Vec<KnowledgeSpace>, AppError> {
+        self.store.list_knowledge_spaces()
+    }
+
+    pub fn create_knowledge_space(
+        &self,
+        request: &KnowledgeSpaceRequest,
+    ) -> Result<KnowledgeSpace, AppError> {
+        self.store.create_knowledge_space(request)
+    }
+
+    pub fn update_knowledge_space(
+        &self,
+        space_id: &Uuid,
+        request: &KnowledgeSpaceRequest,
+    ) -> Result<KnowledgeSpace, AppError> {
+        self.store.update_knowledge_space(space_id, request)
+    }
+
+    pub fn delete_knowledge_space(&self, space_id: &Uuid) -> Result<(), AppError> {
+        self.store.delete_knowledge_space(space_id)
+    }
+
+    pub fn storage_quota_override(&self) -> Result<Option<u64>, AppError> {
+        self.store.storage_quota_override()
+    }
+
+    pub fn set_storage_quota_override(&self, quota_bytes: u64) -> Result<u64, AppError> {
+        self.store.set_storage_quota_override(quota_bytes)
+    }
+
     pub fn list_collections(&self) -> Result<Vec<CollectionRecord>, AppError> {
         self.store.list_collections()
     }
@@ -928,6 +995,52 @@ impl CatalogService {
         self.store.query_collection_files(collection_id, request)
     }
 
+    pub fn refresh_collection_suggestions(
+        &self,
+        model_artifact_id: &str,
+        max_files: u32,
+    ) -> Result<crate::CollectionSuggestionRefreshResult, AppError> {
+        self.store
+            .refresh_collection_suggestions(model_artifact_id, max_files)
+    }
+
+    pub fn query_collection_suggestions(
+        &self,
+        request: &crate::CollectionSuggestionQuery,
+    ) -> Result<crate::CollectionSuggestionPage, AppError> {
+        self.store.query_collection_suggestions(request)
+    }
+
+    pub fn update_collection_suggestion(
+        &self,
+        suggestion_id: &Uuid,
+        request: &crate::CollectionSuggestionUpdateRequest,
+    ) -> Result<crate::CollectionSuggestion, AppError> {
+        self.store
+            .update_collection_suggestion(suggestion_id, request)
+    }
+
+    pub fn apply_collection_model_review(
+        &self,
+        suggestion_id: &Uuid,
+        review: &crate::CollectionModelReview,
+        model_version: &str,
+    ) -> Result<crate::CollectionSuggestion, AppError> {
+        self.store
+            .apply_collection_model_review(suggestion_id, review, model_version)
+    }
+
+    pub fn confirm_collection_suggestion(
+        &self,
+        suggestion_id: &Uuid,
+    ) -> Result<CollectionRecord, AppError> {
+        self.store.confirm_collection_suggestion(suggestion_id)
+    }
+
+    pub fn reject_collection_suggestion(&self, suggestion_id: &Uuid) -> Result<(), AppError> {
+        self.store.reject_collection_suggestion(suggestion_id)
+    }
+
     pub fn refresh_file_relations(
         &self,
         max_files: u32,
@@ -978,6 +1091,41 @@ impl CatalogService {
         self.store.commit_parse_result(file_id, result)
     }
 
+    pub fn recover_interrupted_image_understanding(&self) -> Result<u64, AppError> {
+        self.store.recover_interrupted_image_understanding()
+    }
+
+    pub fn claim_pending_image_understanding(
+        &self,
+        model_artifact_id: &str,
+    ) -> Result<Option<PendingImageUnderstanding>, AppError> {
+        self.store
+            .claim_pending_image_understanding(model_artifact_id)
+    }
+
+    pub fn commit_image_understanding(
+        &self,
+        result: &ImageUnderstandingResult,
+    ) -> Result<(), AppError> {
+        self.store.commit_image_understanding(result)
+    }
+
+    pub fn fail_image_understanding(
+        &self,
+        asset_id: &Uuid,
+        error: &AppError,
+    ) -> Result<(), AppError> {
+        self.store.fail_image_understanding(asset_id, error)
+    }
+
+    pub fn retry_image_understanding(&self, asset_id: &Uuid) -> Result<(), AppError> {
+        self.store.retry_image_understanding(asset_id)
+    }
+
+    pub fn image_understanding_stats(&self) -> Result<(u64, u64, u64), AppError> {
+        self.store.image_understanding_stats()
+    }
+
     pub fn search(&self, request: &SearchRequest) -> Result<SearchSession, AppError> {
         self.store.search(request)
     }
@@ -990,12 +1138,40 @@ impl CatalogService {
         self.store.search_with_semantic(request, semantic_query)
     }
 
+    pub fn semantic_index_coverage(
+        &self,
+        scope: &crate::ScopeFilter,
+        model_artifact_id: &str,
+    ) -> Result<(f64, f64), AppError> {
+        self.store.semantic_index_coverage(scope, model_artifact_id)
+    }
+
     pub fn answer_extractively(
         &self,
         request: &AskRequest,
         semantic_query: Option<SemanticQuery<'_>>,
     ) -> Result<AnswerResult, AppError> {
         self.store.answer_extractively(request, semantic_query)
+    }
+
+    pub fn load_ask_history(
+        &self,
+        session_id: &Uuid,
+        limit: usize,
+    ) -> Result<Vec<crate::AskMessage>, AppError> {
+        self.store.load_ask_history(session_id, limit)
+    }
+
+    pub fn record_ask_exchange(
+        &self,
+        request: &AskRequest,
+        result: &AnswerResult,
+    ) -> Result<(), AppError> {
+        self.store.record_ask_exchange(request, result)
+    }
+
+    pub fn validate_answer_evidence(&self, result: &AnswerResult) -> Result<(), AppError> {
+        self.store.validate_answer_evidence(result)
     }
 
     pub fn maintenance_snapshot(&self) -> Result<MaintenanceSnapshot, AppError> {
@@ -1057,6 +1233,22 @@ impl CatalogService {
             .commit_chunk_embeddings(model_artifact_id, dimension, embeddings)
     }
 
+    pub fn rebuild_vector_generation(
+        &self,
+        model_artifact_id: &str,
+        dimension: u32,
+    ) -> Result<crate::IndexGeneration, AppError> {
+        self.store
+            .rebuild_vector_generation(model_artifact_id, dimension)
+    }
+
+    pub fn active_vector_generation(
+        &self,
+        model_artifact_id: &str,
+    ) -> Result<Option<crate::IndexGeneration>, AppError> {
+        self.store.active_vector_generation(model_artifact_id)
+    }
+
     pub fn file_preview(&self, file_id: &Uuid, node_limit: usize) -> Result<FilePreview, AppError> {
         self.store.file_preview(file_id, node_limit)
     }
@@ -1074,6 +1266,13 @@ impl CatalogService {
 
     pub fn authorized_file_path(&self, file_id: &Uuid) -> Result<PathBuf, AppError> {
         self.store.authorized_file_path(file_id)
+    }
+
+    pub fn authorized_image_asset_path(
+        &self,
+        asset_id: &Uuid,
+    ) -> Result<(PathBuf, String, u64), AppError> {
+        self.store.authorized_image_asset_path(asset_id)
     }
 
     pub fn latest_active_scan_job(&self) -> Result<Option<JobRecord>, AppError> {
@@ -1221,7 +1420,12 @@ impl CatalogService {
             fields: &fields,
         });
         let root_path = PathBuf::from(root.canonical_path);
-        let result = match scan_root_with_control(&root_path, &self.scan_policy, &control) {
+        let policy = self
+            .scan_policy
+            .read()
+            .map_err(|_| AppError::new("SCAN_POLICY_UNAVAILABLE", "扫描排除策略状态不可用", true))?
+            .clone();
+        let result = match scan_root_with_control(&root_path, &policy, &control) {
             Ok(outcome) => self.store.commit_scan(&root_id, &job_id, &outcome),
             Err(error) if error.code == "SCAN_CANCELLED" => self.store.cancel_scan(&job_id),
             Err(error) => self.store.fail_scan(&root_id, &job_id, error),

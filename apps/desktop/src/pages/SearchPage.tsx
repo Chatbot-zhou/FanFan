@@ -1,9 +1,12 @@
 import { FileExcelOutlined, FilePdfOutlined, FileWordOutlined, SearchOutlined } from "@ant-design/icons";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { bridge, type CollectionRecord, type FilePreview, type SearchRequest, type SearchSession } from "../bridge";
+import { bridge, type CollectionRecord, type FilePreview, type KnowledgeSpace, type SearchRequest, type SearchSession } from "../bridge";
+import { PdfVisualPreview } from "../components/PdfVisualPreview";
+import { ImageAssetGallery } from "../components/ImageAssetGallery";
 import { useAppStore } from "../state/app-store";
 
 const emptyScope = {
+  knowledge_space_ids: [],
   root_ids: [],
   collection_ids: [],
   file_ids: [],
@@ -78,6 +81,8 @@ export function SearchPage() {
   const [sort, setSort] = useState<SearchRequest["sort"]>("relevance");
   const [collectionId, setCollectionId] = useState("");
   const [collections, setCollections] = useState<CollectionRecord[]>([]);
+  const [knowledgeSpaceId, setKnowledgeSpaceId] = useState("");
+  const [knowledgeSpaces, setKnowledgeSpaces] = useState<KnowledgeSpace[]>([]);
   const searchSerial = useRef(0);
   const lastSearchRequest = useRef<Omit<SearchRequest, "cursor"> | null>(null);
 
@@ -88,6 +93,11 @@ export function SearchPage() {
     }).catch(() => {
       if (active) setCollections([]);
     });
+    void bridge.knowledge_space_list().then((items) => {
+      if (active) setKnowledgeSpaces(items);
+    }).catch(() => {
+      if (active) setKnowledgeSpaces([]);
+    });
     return () => { active = false; };
   }, []);
 
@@ -97,11 +107,12 @@ export function SearchPage() {
       : new Date(Date.now() - Number(modifiedWindow) * 24 * 60 * 60 * 1000).toISOString();
     return {
       ...emptyScope,
+      knowledge_space_ids: knowledgeSpaceId ? [knowledgeSpaceId] : [],
       collection_ids: collectionId ? [collectionId] : [],
       extensions: extension ? [extension] : [],
       modified_from: modifiedFrom,
     };
-  }, [collectionId, extension, modifiedWindow]);
+  }, [collectionId, extension, knowledgeSpaceId, modifiedWindow]);
 
   const showPreview = async (fileId: string, offset = 0) => {
     setPreviewLoadingId(fileId);
@@ -222,8 +233,14 @@ export function SearchPage() {
           </select>
         </label>
         <label>范围
-          <select aria-label="搜索范围" value={collectionId} onChange={(event) => setCollectionId(event.target.value)}>
-            <option value="">全部资料</option>{collections.map((item) => <option key={item.collection_id} value={item.collection_id}>{item.name}</option>)}
+          <select aria-label="搜索范围" value={knowledgeSpaceId ? `space:${knowledgeSpaceId}` : collectionId ? `collection:${collectionId}` : ""} onChange={(event) => {
+            const [kind, id = ""] = event.target.value.split(":", 2);
+            setKnowledgeSpaceId(kind === "space" ? id : "");
+            setCollectionId(kind === "collection" ? id : "");
+          }}>
+            <option value="">全部资料</option>
+            {knowledgeSpaces.length > 0 && <optgroup label="知识空间">{knowledgeSpaces.map((item) => <option key={item.space_id} value={`space:${item.space_id}`}>{item.name}</option>)}</optgroup>}
+            <optgroup label="集合">{collections.map((item) => <option key={item.collection_id} value={`collection:${item.collection_id}`}>{item.name}</option>)}</optgroup>
           </select>
         </label>
         <label>类型
@@ -281,6 +298,8 @@ export function SearchPage() {
               </div>
               {preview?.file.file_id === result.file_id && (
                 <div className="search-result__preview" aria-label={`${result.name}内容预览`}>
+              {preview.file.extension.toLowerCase() === "pdf" && <PdfVisualPreview preview={preview} />}
+              <ImageAssetGallery assets={preview.image_assets} />
                   {preview.nodes.length === 0 ? <p>此文件当前只有名称和元数据，正文尚未就绪。</p> : preview.nodes.map((node) => (
                     <p key={node.node_id}>{node.text ?? (node.table_data ? JSON.stringify(node.table_data) : "")}</p>
                   ))}

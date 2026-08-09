@@ -22,8 +22,11 @@ pub struct MaintenanceSnapshot {
     pub failed_files: u64,
     pub active_jobs: u64,
     pub log_events: u64,
+    #[serde(skip_serializing)]
     pub degradation_level: String,
+    #[serde(skip_serializing)]
     pub degradation_reasons: Vec<String>,
+    pub background_notice: Option<String>,
     pub checks: Vec<HealthCheckItem>,
     pub checked_at: DateTime<Utc>,
 }

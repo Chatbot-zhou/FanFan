@@ -1,8 +1,10 @@
 import { FileSearchOutlined, SendOutlined } from "@ant-design/icons";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { bridge, type AnswerResult, type CollectionRecord, type FilePreview, type ModelRuntimeState } from "../bridge";
+import { bridge, type AnswerResult, type CollectionRecord, type FilePreview, type ImageDeepAnalysis, type KnowledgeSpace, type ModelRuntimeState, type RagReadiness } from "../bridge";
 import { displayPath } from "../utils/display-path";
+import { PdfVisualPreview } from "../components/PdfVisualPreview";
+import { ImageAssetGallery, imageAssetUrl } from "../components/ImageAssetGallery";
 
 const locatorLabel = (locator: AnswerResult["claims"][number]["citations"][number]["locator"]) => {
   if (locator.page_no) return `第 ${locator.page_no} 页`;
@@ -11,6 +13,21 @@ const locatorLabel = (locator: AnswerResult["claims"][number]["citations"][numbe
   if (locator.paragraph_no) return `第 ${locator.paragraph_no} 段`;
   if (locator.line_start) return `第 ${locator.line_start} 行`;
   return "正文位置";
+};
+
+const highlightQuestionTerms = (text: string, question: string) => {
+  const terms = (question.match(/[\p{L}\p{N}]{2,}/gu) ?? [])
+    .flatMap((value) => value.split(/(?:关于|有关|哪些|什么|如何|是否|请问|请|的|了|是|在|中|和|与)+/u))
+    .map((value) => value.trim())
+    .filter((value) => value.length >= 2)
+    .sort((left, right) => right.length - left.length);
+  const unique = [...new Set(terms)];
+  if (!unique.length) return text;
+  const expression = new RegExp(`(${unique.map((value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})`, "giu");
+  const normalized = new Set(unique.map((value) => value.toLocaleLowerCase("zh-CN")));
+  return text.split(expression).map((part, index) => normalized.has(part.toLocaleLowerCase("zh-CN"))
+    ? <strong className="answer-keyword" key={`${part}-${index}`}>{part}</strong>
+    : part);
 };
 
 export function AskPage({ model_state }: { model_state: ModelRuntimeState | null }) {
@@ -23,15 +40,34 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
   const activeOperationRef = useRef<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [collections, setCollections] = useState<CollectionRecord[]>([]);
+  const [knowledgeSpaces, setKnowledgeSpaces] = useState<KnowledgeSpace[]>([]);
   const [collectionId, setCollectionId] = useState("");
+  const [knowledgeSpaceId, setKnowledgeSpaceId] = useState("");
   const [preview, setPreview] = useState<FilePreview | null>(null);
   const [previewLoading, setPreviewLoading] = useState<string | null>(null);
-  const hasGeneration = model_state?.capabilities.generation === true;
-  const hasEmbedding = model_state?.capabilities.embedding === true;
+  const [readiness, setReadiness] = useState<RagReadiness | null>(null);
+  const [allowEvidenceExtracts, setAllowEvidenceExtracts] = useState(false);
+  const [phase, setPhase] = useState<string | null>(null);
+  const [deepAnalyses, setDeepAnalyses] = useState<Record<string, ImageDeepAnalysis>>({});
+  const [deepAnalysisLoading, setDeepAnalysisLoading] = useState<string | null>(null);
+  const hasGeneration = readiness?.generation_ready ?? model_state?.capabilities.generation === true;
+  const hasEmbedding = readiness?.embedding_ready ?? model_state?.capabilities.embedding === true;
+  const scope = useMemo(() => ({ knowledge_space_ids: knowledgeSpaceId ? [knowledgeSpaceId] : [], root_ids: [], collection_ids: collectionId ? [collectionId] : [], file_ids: [], extensions: [], modified_from: null, modified_to: null, availability: "present" as const }), [collectionId, knowledgeSpaceId]);
 
   useEffect(() => {
     void bridge.collection_list().then(setCollections).catch(() => setCollections([]));
+    void bridge.knowledge_space_list().then(setKnowledgeSpaces).catch(() => setKnowledgeSpaces([]));
   }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    void bridge.rag_readiness_get(scope).then((result) => {
+      if (!disposed) setReadiness(result);
+    }).catch(() => {
+      if (!disposed) setReadiness(null);
+    });
+    return () => { disposed = true; };
+  }, [scope]);
 
   useEffect(() => {
     if (!window.__TAURI_INTERNALS__) return undefined;
@@ -41,6 +77,9 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
       if (event.payload.operation_id === activeOperationRef.current) {
         setStreamedAnswer((current) => current + event.payload.token);
       }
+    }).then((unlisten) => disposed ? unlisten() : unlisteners.push(unlisten));
+    void listen<{ operation_id: string; phase: string }>("ask.phase", (event) => {
+      if (event.payload.operation_id === activeOperationRef.current) setPhase(event.payload.phase);
     }).then((unlisten) => disposed ? unlisten() : unlisteners.push(unlisten));
     return () => {
       disposed = true;
@@ -56,6 +95,10 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
   const submit = async () => {
     const trimmed = question.trim();
     if (!trimmed || loading) return;
+    if (readiness && !readiness.ready && !allowEvidenceExtracts) {
+      setError("完整 RAG 当前不可用。请先配置/完成索引，或明确选择下方的“证据摘录模式”。");
+      return;
+    }
     setLoading(true);
     setError(null);
     setPreview(null);
@@ -63,15 +106,18 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
       const result = await bridge.ask_start({
         question: trimmed,
         session_id: answer?.session_id ?? null,
-        scope: { root_ids: [], collection_ids: collectionId ? [collectionId] : [], file_ids: [], extensions: [], modified_from: null, modified_to: null, availability: "present" },
+        scope,
         answer_style: "concise",
         retrieval_limit: 12,
         max_source_files: 8,
         strict_evidence: true,
+        mode: readiness?.ready ? "rag" : "evidence_extracts",
+        allow_degraded_extractive: !readiness?.ready && allowEvidenceExtracts,
       });
       activeOperationRef.current = result.operation_id;
       setActiveOperationId(result.operation_id);
       setStreamedAnswer("");
+      setPhase("queued");
       while (activeOperationRef.current === result.operation_id) {
         const snapshot = await bridge.ask_operation_get(result.operation_id);
         if (snapshot.handle.status === "completed") {
@@ -94,6 +140,7 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
       activeOperationRef.current = null;
       setActiveOperationId(null);
       setLoading(false);
+      setPhase(null);
     }
   };
 
@@ -131,42 +178,83 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
     }
   };
 
+  const analyzeOriginalImage = async (assetId: string) => {
+    const currentQuestion = turns.at(-1)?.question ?? question.trim();
+    if (!currentQuestion || deepAnalysisLoading) return;
+    setDeepAnalysisLoading(assetId);
+    setError(null);
+    try {
+      const result = await bridge.image_deep_analyze(assetId, currentQuestion);
+      setDeepAnalyses((current) => ({ ...current, [assetId]: result }));
+    } catch (analysisError) {
+      setError(analysisError instanceof Error ? analysisError.message : String(analysisError));
+    } finally {
+      setDeepAnalysisLoading(null);
+    }
+  };
+
   return (
     <section className="page page--ask">
-      <header className="page-heading"><div><h1>问资料</h1><p>回答只使用你的本地资料，并在回答中标出来源。</p></div>{turns.length > 0 && !loading && <button type="button" className="text-button" onClick={() => { setTurns([]); setAnswer(null); setPreview(null); }}>新建会话</button>}</header>
+      <header className="page-heading"><div><h1>问资料</h1><p>回答只使用你的本地资料，并在回答中标出来源。</p></div>{turns.length > 0 && !loading && <button type="button" className="text-button" onClick={() => { setTurns([]); setAnswer(null); setPreview(null); setDeepAnalyses({}); }}>新建会话</button>}</header>
       <div className="scope-bar">
         <FileSearchOutlined /> 检索范围：
-        <select aria-label="问答范围" value={collectionId} onChange={(event) => setCollectionId(event.target.value)}>
-          <option value="">全部资料</option>{collections.map((item) => <option key={item.collection_id} value={item.collection_id}>{item.name}</option>)}
+        <select aria-label="问答范围" value={knowledgeSpaceId ? `space:${knowledgeSpaceId}` : collectionId ? `collection:${collectionId}` : ""} onChange={(event) => {
+          const [kind, id = ""] = event.target.value.split(":", 2);
+          setKnowledgeSpaceId(kind === "space" ? id : "");
+          setCollectionId(kind === "collection" ? id : "");
+        }}>
+          <option value="">全部资料</option>
+          {knowledgeSpaces.length > 0 && <optgroup label="知识空间">{knowledgeSpaces.map((item) => <option key={item.space_id} value={`space:${item.space_id}`}>{item.name}</option>)}</optgroup>}
+          <optgroup label="集合">{collections.map((item) => <option key={item.collection_id} value={`collection:${item.collection_id}`}>{item.name}</option>)}</optgroup>
         </select>
-        <span>{hasGeneration ? "本地生成回答" : hasEmbedding ? "语义检索 · 严格摘录" : "全文检索 · 严格摘录"}</span>
+        <span>{readiness?.ready ? `完整 RAG · 语义覆盖 ${Math.round(readiness.scope_index_coverage * 100)}%${readiness.pending_image_assets > 0 ? ` · 图片理解 ${Math.round(readiness.image_index_coverage * 100)}%` : ""}` : hasGeneration || hasEmbedding ? "完整 RAG 未就绪" : "仅证据摘录可用"}</span>
       </div>
+      {readiness && !readiness.ready && <div className="rag-readiness" role="status">
+        <div><strong>完整 RAG 暂不可用</strong><small>{readiness.blockers.map((blocker) => blocker.message).join("；")}</small></div>
+        <button type="button" className={allowEvidenceExtracts ? "active" : ""} onClick={() => setAllowEvidenceExtracts((value) => !value)}>{allowEvidenceExtracts ? "已选择证据摘录模式" : "明确使用证据摘录模式"}</button>
+      </div>}
       <div className={`conversation-area${answer ? " conversation-area--answered" : ""}`}>
         {!answer && <div className="conversation-empty">
           <div className="conversation-empty__mark">拾</div>
           <h2>从你的资料中寻找答案</h2>
-          <p>{hasGeneration ? "回答会附带原文引用；证据不足时，拾忆会明确说明。" : "未配置生成模型时，拾忆仍会给出可核对的原文依据，不会编造答案。"}</p>
+          <p>{readiness?.ready ? "使用会话历史理解追问，经混合召回、RRF 融合和逐句引文校验后显示回答。" : "不会静默退回关键词答案；只有你明确选择后才会进入证据摘录模式。"}</p>
         </div>}
-        {turns.slice(0, -1).map((turn, index) => <article className={`answer-card answer-card--${turn.answer.grounding_status}`} key={`${turn.answer.session_id}-${index}`}><header><span>你：{turn.question}</span><small>{turn.answer.elapsed_ms} ms</small></header><p className="answer-card__text">{turn.answer.answer}</p></article>)}
+        {turns.slice(0, -1).map((turn, index) => <article className={`answer-card answer-card--${turn.answer.grounding_status}`} key={`${turn.answer.session_id}-${index}`}><header><span>你：{turn.question}</span><small>{turn.answer.elapsed_ms} ms</small></header><p className="answer-card__text">{highlightQuestionTerms(turn.answer.answer, turn.question)}</p></article>)}
         {answer && <article className={`answer-card answer-card--${answer.grounding_status}`}>
           <header><span>{answer.answer_mode === "extractive" ? "严格证据摘录" : "本地模型回答"}</span><small>{answer.elapsed_ms} ms · {answer.used_file_ids.length} 个来源文件</small></header>
-          <p className="answer-card__text">{answer.answer}</p>
+          <p className="answer-card__text">{highlightQuestionTerms(answer.answer, turns.at(-1)?.question ?? question)}</p>
           {answer.claims.length > 0 && <div className="answer-claims">
             <h2>引用依据</h2>
             {answer.claims.map((claim, index) => <section key={claim.claim_id}>
-              <p>{claim.text}</p>
-              <div>{claim.citations.map((citation) => <button type="button" key={citation.evidence_id} onClick={() => void showPreview(citation.file_id, citation.node_id)}>
-                [{index + 1}] {sourceNames.get(citation.file_id) ?? "本地资料"} · {locatorLabel(citation.locator)}{previewLoading === citation.file_id ? " · 载入中" : ""}
-              </button>)}</div>
+              <p>{highlightQuestionTerms(claim.text, turns.at(-1)?.question ?? question)}</p>
+              <div>{claim.citations.map((citation) => {
+                const imageAssetId = citation.image_asset_id;
+                const deepAnalysis = imageAssetId ? deepAnalyses[imageAssetId] : undefined;
+                return <div className="answer-citation-group" key={citation.evidence_id}>
+                  <button type="button" className={imageAssetId ? "answer-citation answer-citation--image" : "answer-citation"} onClick={() => void showPreview(citation.file_id, citation.node_id)}>
+                    {imageAssetId && <img src={imageAssetUrl(imageAssetId)} alt="图片证据缩略图" loading="lazy" />}
+                    [{index + 1}] {sourceNames.get(citation.file_id) ?? "本地资料"} · {locatorLabel(citation.locator)}{previewLoading === citation.file_id ? " · 载入中" : ""}
+                  </button>
+                  {imageAssetId && <button type="button" className="image-deep-analysis-button" disabled={deepAnalysisLoading !== null} onClick={() => void analyzeOriginalImage(imageAssetId)}>{deepAnalysisLoading === imageAssetId ? "正在分析原图…" : "深度分析原图"}</button>}
+                  {deepAnalysis && <aside className="image-deep-analysis" aria-live="polite">
+                    <strong>针对当前问题的原图分析</strong>
+                    <p>{highlightQuestionTerms(deepAnalysis.answer, turns.at(-1)?.question ?? question)}</p>
+                    {deepAnalysis.observations.length > 0 && <ul>{deepAnalysis.observations.map((observation) => <li key={observation}>{observation}</li>)}</ul>}
+                    {deepAnalysis.uncertainties.length > 0 && <small>无法确认：{deepAnalysis.uncertainties.join("；")}</small>}
+                  </aside>}
+                </div>;
+              })}</div>
             </section>)}
           </div>}
           {preview && <div className="answer-preview" aria-label={`${preview.file.display_name}原文预览`}>
       <header><strong>{preview.file.display_name}</strong><small>{displayPath(preview.file.display_path)}</small></header>
-            {preview.nodes.map((node) => <p key={node.node_id} className={node.node_id === preview.anchor_node_id ? "preview-node--anchor" : undefined}><small>{locatorLabel(node.locator)}</small>{node.text ?? (node.table_data ? JSON.stringify(node.table_data) : "")}</p>)}
+            {preview.file.extension.toLowerCase() === "pdf" && <PdfVisualPreview preview={preview} />}
+            <ImageAssetGallery assets={preview.image_assets} />
+            {preview.nodes.map((node) => <p key={node.node_id} className={node.node_id === preview.anchor_node_id ? "preview-node--anchor" : undefined}><small>{locatorLabel(node.locator)}</small>{highlightQuestionTerms(node.text ?? (node.table_data ? JSON.stringify(node.table_data) : ""), turns.at(-1)?.question ?? question)}</p>)}
             {preview.next_offset !== null && <button type="button" className="text-button" disabled={previewLoading === preview.file.file_id} onClick={() => void showPreview(preview.file.file_id, null, preview.next_offset ?? 0)}>继续载入</button>}
           </div>}
         </article>}
-        {loading && streamedAnswer && <article className="answer-card answer-card--grounded" aria-live="polite"><header><span>正在生成已验证回答</span><small>本地处理</small></header><p className="answer-card__text">{streamedAnswer}</p></article>}
+        {loading && <article className="answer-card answer-card--grounded" aria-live="polite"><header><span>{({ queued: "正在排队", understanding: "正在理解问题", hybrid_retrieval: "正在执行混合检索", evidence_retrieval: "正在检索证据摘录", evidence_selection: "正在筛选证据", generating: "正在本地生成", citation_validation: "正在逐句校验引用", completed: "已完成" } as Record<string,string>)[phase ?? "queued"] ?? "正在处理"}</span><small>本地处理</small></header>{streamedAnswer && <p className="answer-card__text">{highlightQuestionTerms(streamedAnswer, question)}</p>}</article>}
       </div>
       {error && <p role="alert" className="inline-error">{error}</p>}
       <form className="ask-composer" onSubmit={(event) => { event.preventDefault(); void submit(); }}>

@@ -13,6 +13,10 @@ pub struct WelcomeState {
     pub welcome_version: String,
     pub welcome_completed: bool,
     pub welcome_completed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub root_authorization_completed: bool,
+    #[serde(default)]
+    pub root_authorization_completed_at: Option<DateTime<Utc>>,
 }
 
 impl WelcomeState {
@@ -21,6 +25,8 @@ impl WelcomeState {
             welcome_version: version.to_owned(),
             welcome_completed: false,
             welcome_completed_at: None,
+            root_authorization_completed: false,
+            root_authorization_completed_at: None,
         }
     }
 }
@@ -72,9 +78,28 @@ impl WelcomeService {
             welcome_version: requested_version.to_owned(),
             welcome_completed: true,
             welcome_completed_at: Some(Utc::now()),
+            root_authorization_completed: self
+                .get_state()
+                .map(|state| state.root_authorization_completed)
+                .unwrap_or(false),
+            root_authorization_completed_at: self
+                .get_state()
+                .ok()
+                .and_then(|state| state.root_authorization_completed_at),
         };
         self.atomic_write(&completed)?;
         Ok(completed)
+    }
+
+    pub fn complete_root_authorization(&self) -> Result<WelcomeState, AppError> {
+        let mut state = self.get_state()?;
+        if state.root_authorization_completed {
+            return Ok(state);
+        }
+        state.root_authorization_completed = true;
+        state.root_authorization_completed_at = Some(Utc::now());
+        self.atomic_write(&state)?;
+        Ok(state)
     }
 
     fn atomic_write(&self, state: &WelcomeState) -> Result<(), AppError> {

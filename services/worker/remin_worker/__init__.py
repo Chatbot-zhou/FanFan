@@ -1,7 +1,7 @@
 """拾忆本地文档处理 Worker。"""
 
 from .protocol import WorkerError, WorkerRequest, WorkerResponse
-from .parsing import DocumentNode, ParseRequest, ParseResult, ParseWarning, parse_document
+from .parsing import DocumentNode, ImageAsset, ParseRequest, ParseResult, ParseWarning, parse_document
 from .service import WorkerService
 from .execution import (
     CheckpointPolicy,
@@ -27,6 +27,7 @@ __all__ = [
     "WorkerRequest",
     "WorkerResponse",
     "DocumentNode",
+    "ImageAsset",
     "ParseRequest",
     "ParseResult",
     "ParseWarning",

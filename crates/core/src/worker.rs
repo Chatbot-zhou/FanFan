@@ -79,6 +79,23 @@ pub struct EmbeddingResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankRequest {
+    pub model_path: String,
+    pub tokenizer_path: Option<String>,
+    pub query: String,
+    pub documents: Vec<String>,
+    pub max_length: u32,
+    pub threads: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankResponse {
+    pub scores: Vec<f32>,
+    pub model_path: String,
+    pub tokenizer_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportTableRequest {
     pub target_path: String,
     pub format: String,
@@ -147,6 +164,10 @@ impl WorkerClient {
         request: &EmbeddingRequest,
     ) -> Result<EmbeddingResponse, AppError> {
         self.request_operation("embedding.encode", request)
+    }
+
+    pub fn rerank(&self, request: &RerankRequest) -> Result<RerankResponse, AppError> {
+        self.request_operation("rerank.score", request)
     }
 
     pub fn export_table(&self, request: &ExportTableRequest) -> Result<ExportResult, AppError> {
@@ -466,6 +487,7 @@ mod tests {
             ocr_policy: "auto".into(),
             language_hints: vec!["zh".into()],
             max_pages: None,
+            asset_cache_dir: None,
             parser_version: "0.1.0".into(),
         };
 
@@ -492,6 +514,7 @@ mod tests {
             ocr_policy: "auto".into(),
             language_hints: vec!["zh".into()],
             max_pages: None,
+            asset_cache_dir: None,
             parser_version: "0.1.0".into(),
         };
         let result = client

@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 import type { AppError, JobRecord } from "../bridge";
 
 const LIGHT_QUERY_KEYS = ["home-summary", "roots", "settings-roots", "maintenance"];
-const CATALOG_QUERY_KEYS = [...LIGHT_QUERY_KEYS, "files", "inbox", "collections", "collection-files", "file-relations"];
+const CATALOG_QUERY_KEYS = [...LIGHT_QUERY_KEYS, "files", "inbox", "collections", "collection-files", "collection-suggestions", "file-relations"];
 
 export function useBackendEvents() {
   const queryClient = useQueryClient();
@@ -33,11 +33,36 @@ export function useBackendEvents() {
         }),
         listen("catalog.changed", () => refresh(CATALOG_QUERY_KEYS)),
         listen("index.changed", () => refresh(["home-summary", "maintenance", "inbox"])),
-        listen("model.download_started", () => refresh()),
+        listen("collection.suggestions_changed", () => refresh(["collections", "collection-suggestions", "collection-files", "file-relations"])),
+        listen("model.download_started", () => {
+          refresh();
+          void queryClient.invalidateQueries({ queryKey: ["model-downloads"] });
+        }),
+        listen("model.download_state", () => {
+          void queryClient.invalidateQueries({ queryKey: ["model-downloads"] });
+        }),
+        listen<AppError>("model.download_failed", (event) => {
+          void queryClient.invalidateQueries({ queryKey: ["model-downloads"] });
+          setNotice(event.payload?.message || "模型下载失败，可在右上角打开详情后重试或切换来源。");
+        }),
         listen("model.download_completed", () => {
           refresh();
+          void queryClient.invalidateQueries({ queryKey: ["model-downloads"] });
           void queryClient.invalidateQueries({ queryKey: ["model-artifacts"] });
           void queryClient.invalidateQueries({ queryKey: ["model-runtime"] });
+        }),
+        listen("model.state", () => {
+          void queryClient.invalidateQueries({ queryKey: ["model-runtime"] });
+          void queryClient.invalidateQueries({ queryKey: ["model-role-configs"] });
+        }),
+        listen("embedding.index_phase", () => {
+          void queryClient.invalidateQueries({ queryKey: ["model-runtime"] });
+          void queryClient.invalidateQueries({ queryKey: ["model-downloads"] });
+        }),
+        listen<AppError>("embedding.failed", (event) => {
+          void queryClient.invalidateQueries({ queryKey: ["model-runtime"] });
+          void queryClient.invalidateQueries({ queryKey: ["model-downloads"] });
+          setNotice(event.payload?.message || "新语义索引构建失败，拾忆已保留原索引。可在模型配置中重试。");
         }),
         listen<AppError>("catalog.watch_degraded", (event) => {
           setNotice(event.payload?.message || "部分资料目录的实时监听暂时不可用，拾忆会保留已有索引。");

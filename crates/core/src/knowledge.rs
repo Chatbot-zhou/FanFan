@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
+use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -15,6 +16,14 @@ pub enum AnswerStyle {
     List,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AskMode {
+    #[default]
+    Rag,
+    EvidenceExtracts,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AskRequest {
     pub question: String,
@@ -24,6 +33,10 @@ pub struct AskRequest {
     pub retrieval_limit: u32,
     pub max_source_files: u32,
     pub strict_evidence: bool,
+    #[serde(default)]
+    pub mode: AskMode,
+    #[serde(default)]
+    pub allow_degraded_extractive: bool,
 }
 
 impl AskRequest {
@@ -102,6 +115,47 @@ pub struct AnswerResult {
     pub used_file_ids: Vec<Uuid>,
     pub elapsed_ms: u64,
     pub answer_mode: String,
+    #[serde(default)]
+    pub retrieval_channels: Vec<String>,
+    #[serde(default)]
+    pub index_coverage: f64,
+    #[serde(default)]
+    pub degradation_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RagReadiness {
+    pub ready: bool,
+    pub generation_ready: bool,
+    pub embedding_ready: bool,
+    pub vision_ready: bool,
+    pub semantic_index_coverage: f64,
+    pub scope_index_coverage: f64,
+    pub image_index_coverage: f64,
+    pub pending_image_assets: u64,
+    #[serde(skip_serializing)]
+    pub degradation_level: String,
+    pub background_notice: Option<String>,
+    pub blockers: Vec<AppError>,
+    pub checked_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AskSession {
+    pub session_id: Uuid,
+    pub scope: ScopeFilter,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AskMessage {
+    pub message_id: Uuid,
+    pub session_id: Uuid,
+    pub role: String,
+    pub content: String,
+    pub answer: Option<AnswerResult>,
+    pub created_at: DateTime<Utc>,
 }
 
 pub fn assemble_extractive_answer(
@@ -125,6 +179,9 @@ pub fn assemble_extractive_answer(
             used_file_ids: Vec::new(),
             elapsed_ms: started_at.elapsed().as_millis() as u64,
             answer_mode: "extractive".into(),
+            retrieval_channels: vec!["filename".into(), "fts".into()],
+            index_coverage: 0.0,
+            degradation_reason: None,
         };
     }
 
@@ -172,6 +229,9 @@ pub fn assemble_extractive_answer(
         claims,
         elapsed_ms: started_at.elapsed().as_millis() as u64 + session.elapsed_ms,
         answer_mode: "extractive".into(),
+        retrieval_channels: vec!["filename".into(), "fts".into()],
+        index_coverage: 0.0,
+        degradation_reason: None,
     }
 }
 
@@ -278,6 +338,7 @@ mod tests {
             question: "项目如何优化召回率？".into(),
             session_id: None,
             scope: ScopeFilter {
+                knowledge_space_ids: vec![],
                 root_ids: vec![],
                 collection_ids: vec![],
                 file_ids: vec![],
@@ -290,6 +351,8 @@ mod tests {
             retrieval_limit: 12,
             max_source_files: 8,
             strict_evidence: true,
+            mode: AskMode::Rag,
+            allow_degraded_extractive: false,
         }
     }
 
@@ -358,6 +421,7 @@ mod tests {
                 revision_id: Uuid::now_v7(),
                 node_id: Uuid::now_v7(),
                 chunk_id: Uuid::now_v7(),
+                image_asset_id: None,
                 quote: "采用混合召回".into(),
                 locator: Default::default(),
                 retrieval_score: 1.0,

@@ -2,7 +2,8 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$InstallerPath,
-    [string]$RepositoryRoot
+    [string]$RepositoryRoot,
+    [switch]$InstallerSmokePassed
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,6 +19,11 @@ if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
 
 $releaseRoot = Join-Path $RepositoryRoot '.artifacts\release'
 New-Item -ItemType Directory -Force -Path $releaseRoot | Out-Null
+$releaseInstaller = Join-Path $releaseRoot ([IO.Path]::GetFileName($installer))
+if (-not $installer.Equals($releaseInstaller, [StringComparison]::OrdinalIgnoreCase)) {
+    Copy-Item -LiteralPath $installer -Destination $releaseInstaller -Force
+    $installer = $releaseInstaller
+}
 $runtimeManifestPath = Join-Path $RepositoryRoot '.artifacts\runtime\llama\MANIFEST.json'
 $workerPath = Join-Path $RepositoryRoot '.artifacts\worker\remin-worker\remin-worker.exe'
 foreach ($required in @($runtimeManifestPath, $workerPath)) {
@@ -31,6 +37,17 @@ $signature = Get-AuthenticodeSignature -LiteralPath $installer
 $generatedAt = [DateTimeOffset]::UtcNow.ToString('o')
 $installerItem = Get-Item -LiteralPath $installer
 $productName = ([char]0x62FE).ToString() + ([char]0x5FC6).ToString()
+$verification = @(
+    'contract-catalog',
+    'frontend-typecheck-and-tests',
+    'rust-workspace-tests',
+    'python-worker-corpus',
+    'semantic-20000-file-gate',
+    'real-llama-generation'
+)
+if ($InstallerSmokePassed) {
+    $verification += 'isolated-installer-smoke'
+}
 $manifest = [ordered]@{
     schema_version = 1
     product = $productName
@@ -57,15 +74,7 @@ $manifest = [ordered]@{
         file_name = 'worker/remin-worker.exe'
         sha256 = (Get-FileHash -LiteralPath $workerPath -Algorithm SHA256).Hash.ToLowerInvariant()
     }
-    verification = @(
-        'contract-catalog',
-        'frontend-typecheck-and-tests',
-        'rust-workspace-tests',
-        'python-worker-corpus',
-        'semantic-20000-file-gate',
-        'real-llama-generation',
-        'isolated-installer-smoke'
-    )
+    verification = $verification
 }
 $manifestPath = Join-Path $releaseRoot 'release-manifest.json'
 $manifest | ConvertTo-Json -Depth 7 | Set-Content -LiteralPath $manifestPath -Encoding UTF8

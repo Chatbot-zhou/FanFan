@@ -21,6 +21,8 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 notify = "8.2"
 regex = "1"
 sha2 = "0.10"
+base64 = "0.22"
+usearch = { version = "2.26.0", default-features = false }
 windows = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Security",

@@ -77,6 +77,37 @@ pub struct ExclusionRule {
     pub overridable: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExclusionRuleInput {
+    pub rule_id: Option<Uuid>,
+    pub root_id: Option<Uuid>,
+    pub rule_type: ExclusionRuleType,
+    pub value: String,
+    pub enabled: bool,
+}
+
+impl ExclusionRuleInput {
+    pub fn validate(&self) -> Result<(), crate::AppError> {
+        let value = self.value.trim();
+        if value.is_empty()
+            || value.chars().count() > 260
+            || !matches!(
+                self.rule_type,
+                ExclusionRuleType::PathName
+                    | ExclusionRuleType::PathGlob
+                    | ExclusionRuleType::Extension
+            )
+        {
+            return Err(crate::AppError::new(
+                "EXCLUSION_RULE_INVALID",
+                "自定义排除规则只支持名称、通配路径或扩展名，且长度必须为1到260字",
+                false,
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuiltInExclusionRule {
     pub key: &'static str,

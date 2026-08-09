@@ -23,11 +23,14 @@ const eventLabels: Record<InboxItem["event_type"], string> = {
   restored: "资料已恢复",
   ocr_required: "等待 OCR",
   parse_failed: "处理失败",
+  relation_suggested: "发现资料关系",
+  collection_suggested: "发现智能集合建议",
 };
 
 export function InboxPage() {
   const initialStatus = useAppStore((state) => state.inbox_initial_status);
   const initialTodayOnly = useAppStore((state) => state.inbox_today_only);
+  const navigate = useAppStore((state) => state.navigate);
   const [status, setStatus] = useState<InboxTab>(initialStatus);
   const [todayOnly, setTodayOnly] = useState(initialTodayOnly);
   const queryClient = useQueryClient();
@@ -80,6 +83,8 @@ export function InboxPage() {
             </div>
             {item.triage_status === "new" || item.triage_status === "error" ? <div className="inbox-item__actions">
               {item.event_type === "ocr_required" && <button type="button" disabled={retryOcr.isPending} onClick={() => retryOcr.mutate(item.file_id)}><ReloadOutlined /> {retryOcr.isPending && retryOcr.variables === item.file_id ? "正在重试" : "重试 OCR"}</button>}
+              {item.event_type === "collection_suggested" && <button type="button" onClick={() => navigate("collections")}>审核集合建议</button>}
+              {item.event_type === "relation_suggested" && <button type="button" onClick={() => navigate("library")}>复核资料关系</button>}
               <button type="button" disabled={update.isPending} onClick={() => update.mutate({ inboxId: item.inbox_id, nextStatus: "reviewed" })}><CheckOutlined /> 已查看</button>
               <button type="button" disabled={update.isPending} onClick={() => update.mutate({ inboxId: item.inbox_id, nextStatus: "ignored" })}>忽略</button>
             </div> : <span className="inbox-item__state">{item.triage_status === "reviewed" ? "已查看" : "已忽略"}</span>}

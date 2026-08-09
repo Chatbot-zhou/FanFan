@@ -4,6 +4,62 @@ use uuid::Uuid;
 
 use crate::{AppError, FileRecord, ParseStatus};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KnowledgeSpaceRequest {
+    pub name: String,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub root_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub collection_ids: Vec<Uuid>,
+}
+
+impl KnowledgeSpaceRequest {
+    pub fn validate(&self) -> Result<(), AppError> {
+        let name_length = self.name.trim().chars().count();
+        if !(1..=40).contains(&name_length) {
+            return Err(AppError::new(
+                "KNOWLEDGE_SPACE_REQUEST_INVALID",
+                "知识空间名称长度必须在1到40个字符之间",
+                false,
+            ));
+        }
+        if self
+            .description
+            .as_ref()
+            .is_some_and(|value| value.chars().count() > 500)
+            || self.root_ids.len() > 128
+            || self.collection_ids.len() > 128
+        {
+            return Err(AppError::new(
+                "KNOWLEDGE_SPACE_REQUEST_INVALID",
+                "知识空间说明或成员数量超出限制",
+                false,
+            ));
+        }
+        if self.root_ids.is_empty() && self.collection_ids.is_empty() {
+            return Err(AppError::new(
+                "KNOWLEDGE_SPACE_SCOPE_REQUIRED",
+                "知识空间至少需要包含一个资料位置或集合",
+                false,
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KnowledgeSpace {
+    pub space_id: Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub root_ids: Vec<Uuid>,
+    pub collection_ids: Vec<Uuid>,
+    pub file_count: u64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InboxEventType {
@@ -14,6 +70,8 @@ pub enum InboxEventType {
     Restored,
     OcrRequired,
     ParseFailed,
+    RelationSuggested,
+    CollectionSuggested,
 }
 
 impl InboxEventType {
@@ -26,6 +84,8 @@ impl InboxEventType {
             Self::Restored => "restored",
             Self::OcrRequired => "ocr_required",
             Self::ParseFailed => "parse_failed",
+            Self::RelationSuggested => "relation_suggested",
+            Self::CollectionSuggested => "collection_suggested",
         }
     }
 
@@ -37,6 +97,8 @@ impl InboxEventType {
             "restored" => Self::Restored,
             "ocr_required" => Self::OcrRequired,
             "parse_failed" => Self::ParseFailed,
+            "relation_suggested" => Self::RelationSuggested,
+            "collection_suggested" => Self::CollectionSuggested,
             _ => Self::Discovered,
         }
     }
@@ -159,6 +221,7 @@ pub struct InboxUpdateRequest {
 pub enum CollectionKind {
     Manual,
     Rule,
+    Ai,
 }
 
 impl CollectionKind {
@@ -166,14 +229,15 @@ impl CollectionKind {
         match self {
             Self::Manual => "manual",
             Self::Rule => "rule",
+            Self::Ai => "ai",
         }
     }
 
     pub(crate) fn from_storage(value: &str) -> Self {
-        if value == "manual" {
-            Self::Manual
-        } else {
-            Self::Rule
+        match value {
+            "manual" => Self::Manual,
+            "ai" => Self::Ai,
+            _ => Self::Rule,
         }
     }
 }
@@ -199,6 +263,16 @@ pub struct CollectionRule {
     #[serde(default)]
     pub parse_statuses: Vec<ParseStatus>,
     pub modified_within_days: Option<u32>,
+    pub min_size_bytes: Option<u64>,
+    pub max_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub exclude_extensions: Vec<String>,
+    #[serde(default)]
+    pub exclude_filename_keywords: Vec<String>,
+    #[serde(default)]
+    pub exclude_path_keywords: Vec<String>,
+    #[serde(default)]
+    pub exclude_text_keywords: Vec<String>,
 }
 
 impl CollectionRule {
@@ -208,7 +282,13 @@ impl CollectionRule {
             || !self.path_keywords.is_empty()
             || !self.text_keywords.is_empty()
             || !self.parse_statuses.is_empty()
-            || self.modified_within_days.is_some();
+            || self.modified_within_days.is_some()
+            || self.min_size_bytes.is_some()
+            || self.max_size_bytes.is_some()
+            || !self.exclude_extensions.is_empty()
+            || !self.exclude_filename_keywords.is_empty()
+            || !self.exclude_path_keywords.is_empty()
+            || !self.exclude_text_keywords.is_empty();
         if !has_condition {
             return Err(AppError::new(
                 "COLLECTION_RULE_INVALID",
@@ -223,6 +303,29 @@ impl CollectionRule {
             return Err(AppError::new(
                 "COLLECTION_RULE_INVALID",
                 "最近修改天数必须在1到3650之间",
+                false,
+            ));
+        }
+        if self
+            .min_size_bytes
+            .zip(self.max_size_bytes)
+            .is_some_and(|(minimum, maximum)| minimum > maximum)
+        {
+            return Err(AppError::new(
+                "COLLECTION_RULE_INVALID",
+                "文件大小下限不能大于上限",
+                false,
+            ));
+        }
+        if self
+            .min_size_bytes
+            .into_iter()
+            .chain(self.max_size_bytes)
+            .any(|value| value > i64::MAX as u64)
+        {
+            return Err(AppError::new(
+                "COLLECTION_RULE_INVALID",
+                "文件大小条件超过本地索引支持范围",
                 false,
             ));
         }
@@ -260,13 +363,36 @@ impl CollectionRule {
         if let Some(days) = self.modified_within_days {
             checks.push(file.fs_modified_at >= now - Duration::days(i64::from(days)));
         }
-        if checks.is_empty() {
-            return true;
+        if self.min_size_bytes.is_some() || self.max_size_bytes.is_some() {
+            checks.push(
+                self.min_size_bytes
+                    .is_none_or(|minimum| file.size_bytes >= minimum)
+                    && self
+                        .max_size_bytes
+                        .is_none_or(|maximum| file.size_bytes <= maximum),
+            );
         }
-        match self.operator {
+        let included = match self.operator {
             RuleOperator::All => checks.into_iter().all(|value| value),
             RuleOperator::Any => checks.into_iter().any(|value| value),
-        }
+        };
+        included && !self.excludes_metadata(file)
+    }
+
+    pub(crate) fn excludes_metadata(&self, file: &FileRecord) -> bool {
+        self.exclude_extensions.iter().any(|value| {
+            value
+                .trim_start_matches('.')
+                .eq_ignore_ascii_case(&file.extension)
+        }) || self.exclude_filename_keywords.iter().any(|value| {
+            file.display_name
+                .to_lowercase()
+                .contains(&value.to_lowercase())
+        }) || self.exclude_path_keywords.iter().any(|value| {
+            file.canonical_path
+                .to_lowercase()
+                .contains(&value.to_lowercase())
+        })
     }
 }
 
@@ -297,12 +423,12 @@ impl CreateCollectionRequest {
                 "规则集合必须提供规则",
                 false,
             )),
-            (CollectionKind::Manual, Some(_)) => Err(AppError::new(
+            (CollectionKind::Manual | CollectionKind::Ai, Some(_)) => Err(AppError::new(
                 "COLLECTION_RULE_INVALID",
                 "手动集合不能包含自动规则",
                 false,
             )),
-            (CollectionKind::Manual, None) => Ok(()),
+            (CollectionKind::Manual | CollectionKind::Ai, None) => Ok(()),
         }
     }
 }
@@ -320,6 +446,96 @@ pub struct CollectionRecord {
     pub built_in: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionSuggestedMember {
+    pub file: FileRecord,
+    pub revision_id: Uuid,
+    pub confidence: f64,
+    pub rationale: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionSuggestion {
+    pub suggestion_id: Uuid,
+    pub suggested_name: String,
+    pub description: String,
+    pub confidence: f64,
+    pub status: String,
+    pub model_version: String,
+    pub algorithm_version: String,
+    pub members: Vec<CollectionSuggestedMember>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollectionSuggestionQuery {
+    pub cursor: Option<String>,
+    pub page_size: u32,
+    pub status: Option<String>,
+}
+
+impl CollectionSuggestionQuery {
+    pub fn validate(&self) -> Result<(), AppError> {
+        if !(1..=100).contains(&self.page_size) {
+            return Err(AppError::new(
+                "COLLECTION_SUGGESTION_QUERY_INVALID",
+                "建议每页数量必须在1到100之间",
+                false,
+            ));
+        }
+        self.offset().map(|_| ())
+    }
+
+    pub fn offset(&self) -> Result<u64, AppError> {
+        self.cursor.as_deref().unwrap_or("0").parse().map_err(|_| {
+            AppError::new(
+                "COLLECTION_SUGGESTION_QUERY_INVALID",
+                "建议分页游标无效",
+                false,
+            )
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionSuggestionPage {
+    pub items: Vec<CollectionSuggestion>,
+    pub next_cursor: Option<String>,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionSuggestionRefreshResult {
+    pub profiled_files: u64,
+    pub candidate_edges: u64,
+    pub created_suggestions: u64,
+    pub suggestion_ids: Vec<Uuid>,
+    pub algorithm_version: String,
+    pub model_version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionSuggestionUpdateRequest {
+    pub suggested_name: String,
+    pub description: String,
+    pub member_file_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionModelReviewMember {
+    pub file_id: Uuid,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionModelReview {
+    pub suggested_name: String,
+    pub description: String,
+    pub members: Vec<CollectionModelReviewMember>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -453,10 +669,41 @@ mod tests {
             text_keywords: vec![],
             parse_statuses: vec![ParseStatus::Parsed],
             modified_within_days: Some(7),
+            min_size_bytes: None,
+            max_size_bytes: None,
+            exclude_extensions: vec![],
+            exclude_filename_keywords: vec![],
+            exclude_path_keywords: vec![],
+            exclude_text_keywords: vec![],
         };
 
         assert!(rule.matches_metadata(&file("项目合同.pdf"), Utc::now()));
         assert!(!rule.matches_metadata(&file("项目合同.docx"), Utc::now()));
+    }
+
+    #[test]
+    fn rule_collection_applies_size_and_hard_exclusions() {
+        let mut rule = CollectionRule {
+            operator: RuleOperator::Any,
+            extensions: vec!["pdf".into()],
+            filename_keywords: vec!["合同".into()],
+            path_keywords: vec![],
+            text_keywords: vec![],
+            parse_statuses: vec![],
+            modified_within_days: None,
+            min_size_bytes: Some(50),
+            max_size_bytes: Some(200),
+            exclude_extensions: vec![],
+            exclude_filename_keywords: vec!["草稿".into()],
+            exclude_path_keywords: vec![],
+            exclude_text_keywords: vec![],
+        };
+
+        assert!(rule.matches_metadata(&file("项目合同.pdf"), Utc::now()));
+        assert!(!rule.matches_metadata(&file("项目合同草稿.pdf"), Utc::now()));
+        rule.min_size_bytes = Some(200);
+        rule.max_size_bytes = Some(100);
+        assert!(rule.validate().is_err());
     }
 
     #[test]

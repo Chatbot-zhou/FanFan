@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::{fs, fs::File, io::Read, path::PathBuf, time::Duration};
 
 use chrono::{DateTime, Utc};
@@ -8,23 +8,30 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    AnswerResult, AnswerSourceFile, AppError, AppLogRecord, AskRequest, AuthorizationSource,
-    BUILT_IN_EXCLUSION_RULES, CandidateRoot, CandidateRootStatus, CandidateRootType,
-    CheckpointStatus, CheckpointType, ChunkEmbeddingInput, CollectionKind, CollectionRecord,
-    CollectionRule, CreateCollectionRequest, DegradationLevel, DegradationState, DiscoveredFile,
-    DocumentNode, ExclusionRule, ExclusionRuleClass, ExclusionRuleType, ExplorationCandidate,
+    AnswerResult, AnswerSourceFile, AppError, AppLogRecord, AskMessage, AskRequest,
+    AuthorizationSource, BUILT_IN_EXCLUSION_RULES, CandidateRoot, CandidateRootStatus,
+    CandidateRootType, CheckpointStatus, CheckpointType, ChunkEmbeddingInput, CollectionKind,
+    CollectionModelReview, CollectionRecord, CollectionRule, CollectionSuggestedMember,
+    CollectionSuggestion, CollectionSuggestionPage, CollectionSuggestionQuery,
+    CollectionSuggestionRefreshResult, CollectionSuggestionUpdateRequest, CreateCollectionRequest,
+    DegradationLevel, DegradationState, DiscoveredFile, DocumentNode, ExclusionRule,
+    ExclusionRuleClass, ExclusionRuleInput, ExclusionRuleType, ExplorationCandidate,
     ExtractionChunk, ExtractionDocument, ExtractionRunRequest, ExtractionRunResult,
     ExtractionTable, FilePage, FileQuery, FileRecord, FileRelation, FileSystemEvent,
-    HealthCheckItem, InboxEventType, InboxItem, InboxPage, InboxQuery, InboxUpdateRequest,
-    IndexActivityStats, IndexRebuildResult, JobRecord, JobStatus, LogPage, LogQuery,
-    MaintenanceSnapshot, ParseOutcome, ParseResult, ParseStatus, PendingEmbeddingChunk, RankedHit,
+    HealthCheckItem, ImageAsset, ImageUnderstandingResult, InboxEventType, InboxItem, InboxPage,
+    InboxQuery, InboxUpdateRequest, IndexActivityStats, IndexRebuildResult, JobRecord, JobStatus,
+    KnowledgeSpace, KnowledgeSpaceRequest, LogPage, LogQuery, MaintenanceSnapshot, ParseOutcome,
+    ParseResult, ParseStatus, PendingEmbeddingChunk, PendingImageUnderstanding, RankedHit,
     RelationPage, RelationQuery, RelationRefreshResult, RelationType, RootKind, RootRecord,
     RootSource, RootStatus, ScanOutcome, ScopeFilter, SearchMode, SemanticQuery, SourceLocator,
     TaskPlan, TaskStep, TriageStatus, ValidationCheckpoint, VolumeType, WatchMode,
     chunks_from_nodes, fts_query, normalized_version_key,
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 6;
+pub const CURRENT_SCHEMA_VERSION: u32 = 14;
+
+type VectorSourceRow = (u64, String, String, String, Vec<f32>);
+type SemanticCandidate = (Uuid, (String, f32));
 
 struct Migration {
     version: u32,
@@ -401,11 +408,271 @@ const MIGRATIONS: &[Migration] = &[
                 ON chunk_embeddings(model_artifact_id, file_id, revision_id);
         "#,
     },
+    Migration {
+        version: 7,
+        name: "persistent_ask_sessions",
+        sql: r#"
+            CREATE TABLE ask_sessions (
+                session_id TEXT PRIMARY KEY,
+                scope_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE ask_messages (
+                message_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES ask_sessions(session_id) ON DELETE CASCADE,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                answer_json TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX idx_ask_messages_session_time
+                ON ask_messages(session_id, created_at, message_id);
+        "#,
+    },
+    Migration {
+        version: 8,
+        name: "ai_collection_suggestions",
+        sql: r#"
+            ALTER TABLE collection_memberships ADD COLUMN confidence REAL;
+            ALTER TABLE collection_memberships ADD COLUMN rationale TEXT;
+            ALTER TABLE collection_memberships ADD COLUMN state TEXT NOT NULL DEFAULT 'active';
+            ALTER TABLE collection_memberships ADD COLUMN evaluated_at TEXT;
+
+            CREATE TABLE document_profiles (
+                file_id TEXT PRIMARY KEY REFERENCES files(file_id) ON DELETE CASCADE,
+                revision_id TEXT NOT NULL REFERENCES file_revisions(revision_id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                keywords_json TEXT NOT NULL,
+                entities_json TEXT NOT NULL,
+                embedding_model_id TEXT NOT NULL,
+                dimension INTEGER NOT NULL,
+                vector_blob BLOB NOT NULL,
+                candidate_bucket TEXT NOT NULL,
+                algorithm_version TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE collection_suggestions (
+                suggestion_id TEXT PRIMARY KEY,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                suggested_name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'suggested',
+                model_version TEXT NOT NULL,
+                algorithm_version TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE collection_suggested_members (
+                suggestion_id TEXT NOT NULL REFERENCES collection_suggestions(suggestion_id) ON DELETE CASCADE,
+                file_id TEXT NOT NULL REFERENCES files(file_id) ON DELETE CASCADE,
+                revision_id TEXT NOT NULL REFERENCES file_revisions(revision_id) ON DELETE CASCADE,
+                confidence REAL NOT NULL,
+                rationale TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'suggested',
+                PRIMARY KEY (suggestion_id, file_id)
+            );
+
+            CREATE INDEX idx_document_profiles_bucket ON document_profiles(embedding_model_id, candidate_bucket);
+            CREATE INDEX idx_collection_suggestions_status ON collection_suggestions(status, updated_at DESC);
+            CREATE INDEX idx_collection_suggested_members_file ON collection_suggested_members(file_id);
+        "#,
+    },
+    Migration {
+        version: 9,
+        name: "usearch_index_generations",
+        sql: r#"
+            CREATE TABLE index_generations (
+                generation_id TEXT PRIMARY KEY,
+                model_artifact_id TEXT NOT NULL,
+                dimension INTEGER NOT NULL,
+                metric TEXT NOT NULL,
+                quantization TEXT NOT NULL,
+                index_path TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL,
+                item_count INTEGER NOT NULL DEFAULT 0,
+                coverage REAL NOT NULL DEFAULT 0,
+                error_code TEXT,
+                created_at TEXT NOT NULL,
+                activated_at TEXT
+            );
+
+            CREATE TABLE vector_index_keys (
+                generation_id TEXT NOT NULL REFERENCES index_generations(generation_id) ON DELETE CASCADE,
+                vector_key INTEGER NOT NULL CHECK (vector_key > 0),
+                chunk_id TEXT NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE,
+                file_id TEXT NOT NULL REFERENCES files(file_id) ON DELETE CASCADE,
+                revision_id TEXT NOT NULL REFERENCES file_revisions(revision_id) ON DELETE CASCADE,
+                PRIMARY KEY (generation_id, vector_key),
+                UNIQUE (generation_id, chunk_id)
+            );
+
+            CREATE UNIQUE INDEX idx_index_generations_active_model
+                ON index_generations(model_artifact_id)
+                WHERE status = 'active';
+            CREATE INDEX idx_vector_index_keys_chunk
+                ON vector_index_keys(chunk_id, generation_id);
+            CREATE INDEX idx_vector_index_keys_file
+                ON vector_index_keys(file_id, generation_id);
+        "#,
+    },
+    Migration {
+        version: 10,
+        name: "multimodal_image_assets",
+        sql: r#"
+            CREATE TABLE image_assets (
+                asset_id TEXT PRIMARY KEY,
+                file_id TEXT NOT NULL REFERENCES files(file_id) ON DELETE CASCADE,
+                revision_id TEXT NOT NULL REFERENCES file_revisions(revision_id) ON DELETE CASCADE,
+                asset_kind TEXT NOT NULL,
+                cache_path TEXT NOT NULL UNIQUE,
+                mime_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                locator_json TEXT NOT NULL,
+                ocr_text TEXT,
+                description TEXT,
+                vision_model_id TEXT,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX idx_image_assets_revision
+                ON image_assets(revision_id, status);
+            CREATE INDEX idx_image_assets_pending
+                ON image_assets(status, updated_at)
+                WHERE status IN ('pending_understanding', 'failed');
+
+            UPDATE file_revisions
+                SET parse_status = 'pending', completed_at = NULL, error_code = NULL
+                WHERE revision_id IN (
+                    SELECT f.current_revision_id FROM files f
+                    WHERE f.current_revision_id IS NOT NULL
+                      AND f.extension IN ('pdf','docx','docm','xlsx','xlsm','pptx','pptm','jpg','jpeg','png','tif','tiff','bmp','webp')
+                )
+                  AND COALESCE(index_version, 0) < 2;
+            UPDATE files
+                SET parse_status = 'pending'
+                WHERE current_revision_id IS NOT NULL
+                  AND extension IN ('pdf','docx','docm','xlsx','xlsm','pptx','pptm','jpg','jpeg','png','tif','tiff','bmp','webp')
+                  AND EXISTS (
+                      SELECT 1 FROM file_revisions r
+                      WHERE r.revision_id = files.current_revision_id
+                        AND COALESCE(r.index_version, 0) < 2
+                  );
+        "#,
+    },
+    Migration {
+        version: 11,
+        name: "metadata_only_file_policy",
+        sql: r#"
+            UPDATE file_revisions
+                SET parse_status = 'unsupported'
+                WHERE parse_status = 'pending'
+                  AND revision_id IN (
+                    SELECT current_revision_id FROM files
+                    WHERE current_revision_id IS NOT NULL
+                      AND extension NOT IN ('pdf','docx','docm','xlsx','xlsm','pptx','pptm','csv','tsv','md','txt','html','htm','jpg','jpeg','png','tif','tiff','bmp','webp','doc','xls','ppt','zip','rs','py','js','jsx','mjs','cjs','ts','tsx','java','kt','kts','go','c','cc','cpp','h','hpp','cs','rb','php','swift','scala','sh','ps1','sql','json','yaml','yml','toml','xml','css','scss','vue','svelte')
+                  );
+            UPDATE files
+                SET parse_status = 'unsupported'
+                WHERE parse_status = 'pending'
+                  AND extension NOT IN ('pdf','docx','docm','xlsx','xlsm','pptx','pptm','csv','tsv','md','txt','html','htm','jpg','jpeg','png','tif','tiff','bmp','webp','doc','xls','ppt','zip','rs','py','js','jsx','mjs','cjs','ts','tsx','java','kt','kts','go','c','cc','cpp','h','hpp','cs','rb','php','swift','scala','sh','ps1','sql','json','yaml','yml','toml','xml','css','scss','vue','svelte');
+        "#,
+    },
+    Migration {
+        version: 12,
+        name: "recoverable_image_understanding",
+        sql: r#"
+            ALTER TABLE document_nodes ADD COLUMN image_asset_id TEXT REFERENCES image_assets(asset_id) ON DELETE CASCADE;
+            ALTER TABLE image_assets ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE image_assets ADD COLUMN error_json TEXT;
+            ALTER TABLE image_assets ADD COLUMN idempotency_key TEXT;
+            ALTER TABLE image_assets ADD COLUMN started_at TEXT;
+            ALTER TABLE image_assets ADD COLUMN completed_at TEXT;
+
+            CREATE UNIQUE INDEX idx_document_nodes_image_asset
+                ON document_nodes(image_asset_id)
+                WHERE image_asset_id IS NOT NULL;
+            CREATE INDEX idx_image_assets_work_queue
+                ON image_assets(status, updated_at, asset_id)
+                WHERE status IN ('pending_understanding', 'processing', 'failed');
+
+            UPDATE image_assets
+                SET status = 'pending_understanding', started_at = NULL,
+                    error_json = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE status = 'processing';
+        "#,
+    },
+    Migration {
+        version: 13,
+        name: "knowledge_spaces",
+        sql: r#"
+            CREATE TABLE knowledge_spaces (
+                space_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE knowledge_space_roots (
+                space_id TEXT NOT NULL REFERENCES knowledge_spaces(space_id) ON DELETE CASCADE,
+                root_id TEXT NOT NULL REFERENCES roots(root_id) ON DELETE CASCADE,
+                PRIMARY KEY (space_id, root_id)
+            );
+
+            CREATE TABLE knowledge_space_collections (
+                space_id TEXT NOT NULL REFERENCES knowledge_spaces(space_id) ON DELETE CASCADE,
+                collection_id TEXT NOT NULL REFERENCES collections(collection_id) ON DELETE CASCADE,
+                PRIMARY KEY (space_id, collection_id)
+            );
+
+            CREATE INDEX idx_knowledge_space_roots_root
+                ON knowledge_space_roots(root_id, space_id);
+            CREATE INDEX idx_knowledge_space_collections_collection
+                ON knowledge_space_collections(collection_id, space_id);
+        "#,
+    },
+    Migration {
+        version: 14,
+        name: "application_settings",
+        sql: r#"
+            CREATE TABLE application_settings (
+                setting_key TEXT PRIMARY KEY,
+                value_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+        "#,
+    },
 ];
 
 #[derive(Debug, Clone)]
 pub struct CatalogStore {
     database_path: PathBuf,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct IndexGeneration {
+    pub generation_id: Uuid,
+    pub model_artifact_id: String,
+    pub dimension: u32,
+    pub metric: String,
+    pub quantization: String,
+    pub status: String,
+    pub item_count: u64,
+    pub coverage: f64,
+    pub error_code: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub activated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -447,6 +714,7 @@ impl CatalogStore {
         store.ensure_builtin_exclusion_rules()?;
         store.ensure_builtin_collections()?;
         store.backfill_inbox_events()?;
+        store.recover_interrupted_index_generations()?;
         Ok(store)
     }
 
@@ -460,6 +728,28 @@ impl CatalogStore {
             .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
             .map_err(|error| storage_error("DATABASE_CONFIG_FAILED", error, true))?;
         Ok(connection)
+    }
+
+    fn vector_index_directory(&self) -> Result<PathBuf, AppError> {
+        let parent = self.database_path.parent().ok_or_else(|| {
+            AppError::new(
+                "VECTOR_INDEX_PATH_INVALID",
+                "数据库路径没有可用的父目录",
+                false,
+            )
+        })?;
+        Ok(parent.join("vector-indexes"))
+    }
+
+    fn recover_interrupted_index_generations(&self) -> Result<(), AppError> {
+        let connection = self.connect()?;
+        connection
+            .execute(
+                "UPDATE index_generations SET status = 'failed', error_code = 'VECTOR_INDEX_BUILD_INTERRUPTED' WHERE status = 'building'",
+                [],
+            )
+            .map_err(|error| storage_error("VECTOR_INDEX_GENERATION_RECOVERY_FAILED", error, true))?;
+        Ok(())
     }
 
     fn migrate(&self, connection: &mut Connection) -> Result<(), AppError> {
@@ -544,6 +834,44 @@ impl CatalogStore {
             .map_err(|error| storage_error("DATABASE_MIGRATION_HISTORY_FAILED", error, false))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| storage_error("DATABASE_MIGRATION_HISTORY_FAILED", error, false))
+    }
+
+    pub fn storage_quota_override(&self) -> Result<Option<u64>, AppError> {
+        let connection = self.connect()?;
+        let value = connection
+            .query_row(
+                "SELECT value_json FROM application_settings WHERE setting_key = 'storage_soft_quota_bytes'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| storage_error("STORAGE_POLICY_READ_FAILED", error, true))?;
+        value
+            .map(|raw| {
+                serde_json::from_str::<u64>(&raw).map_err(|error| {
+                    AppError::new("STORAGE_POLICY_INVALID", error.to_string(), false)
+                })
+            })
+            .transpose()
+    }
+
+    pub fn set_storage_quota_override(&self, quota_bytes: u64) -> Result<u64, AppError> {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        if !(GIB..=2 * 1024 * GIB).contains(&quota_bytes) {
+            return Err(AppError::new(
+                "STORAGE_POLICY_INVALID",
+                "存储软配额需要在1GB到2TB之间",
+                false,
+            ));
+        }
+        let connection = self.connect()?;
+        connection
+            .execute(
+                "INSERT INTO application_settings (setting_key, value_json, updated_at) VALUES ('storage_soft_quota_bytes', ?1, ?2) ON CONFLICT(setting_key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+                params![serde_json::to_string(&quota_bytes).expect("u64 serializes"), Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| storage_error("STORAGE_POLICY_WRITE_FAILED", error, true))?;
+        Ok(quota_bytes)
     }
 
     fn ensure_builtin_exclusion_rules(&self) -> Result<(), AppError> {
@@ -700,6 +1028,56 @@ impl CatalogStore {
             .map_err(|error| storage_error("EXCLUSION_RULE_QUERY_FAILED", error, true))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| storage_error("EXCLUSION_RULE_QUERY_FAILED", error, true))
+    }
+
+    pub fn upsert_exclusion_rule(
+        &self,
+        input: &ExclusionRuleInput,
+    ) -> Result<ExclusionRule, AppError> {
+        input.validate()?;
+        let connection = self.connect()?;
+        let rule_id = input.rule_id.unwrap_or_else(Uuid::now_v7);
+        if input.rule_id.is_some() {
+            let built_in_key = connection
+                .query_row(
+                    "SELECT built_in_key FROM exclusion_rules WHERE rule_id = ?1",
+                    [rule_id.to_string()],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(|error| storage_error("EXCLUSION_RULE_MUTATION_FAILED", error, true))?
+                .ok_or_else(|| {
+                    AppError::new("EXCLUSION_RULE_NOT_FOUND", "排除规则不存在", false)
+                })?;
+            if built_in_key.is_some() {
+                connection.execute("UPDATE exclusion_rules SET enabled = ?1 WHERE rule_id = ?2 AND overridable = 1", params![i64::from(input.enabled), rule_id.to_string()])
+                    .map_err(|error| storage_error("EXCLUSION_RULE_MUTATION_FAILED", error, true))?;
+            } else {
+                connection.execute("UPDATE exclusion_rules SET root_id = ?1, rule_type = ?2, value_json = ?3, enabled = ?4 WHERE rule_id = ?5 AND overridable = 1", params![input.root_id.map(|value| value.to_string()), input.rule_type.as_str(), serde_json::to_string(input.value.trim()).expect("string serializes"), i64::from(input.enabled), rule_id.to_string()])
+                    .map_err(|error| storage_error("EXCLUSION_RULE_MUTATION_FAILED", error, true))?;
+            }
+        } else {
+            connection.execute("INSERT INTO exclusion_rules (rule_id, built_in_key, root_id, rule_class, rule_type, value_json, enabled, overridable, created_at) VALUES (?1, NULL, ?2, 'default', ?3, ?4, ?5, 1, ?6)", params![rule_id.to_string(), input.root_id.map(|value| value.to_string()), input.rule_type.as_str(), serde_json::to_string(input.value.trim()).expect("string serializes"), i64::from(input.enabled), Utc::now().to_rfc3339()])
+                .map_err(|error| storage_error("EXCLUSION_RULE_MUTATION_FAILED", error, true))?;
+        }
+        self.list_exclusion_rules()?
+            .into_iter()
+            .find(|rule| rule.rule_id == rule_id)
+            .ok_or_else(|| AppError::new("EXCLUSION_RULE_NOT_FOUND", "排除规则不存在", false))
+    }
+
+    pub fn delete_exclusion_rule(&self, rule_id: &Uuid) -> Result<(), AppError> {
+        let connection = self.connect()?;
+        let changed = connection.execute("DELETE FROM exclusion_rules WHERE rule_id = ?1 AND built_in_key IS NULL AND overridable = 1", [rule_id.to_string()])
+            .map_err(|error| storage_error("EXCLUSION_RULE_MUTATION_FAILED", error, true))?;
+        if changed == 0 {
+            return Err(AppError::new(
+                "EXCLUSION_RULE_READONLY",
+                "内置或硬排除规则不能删除",
+                false,
+            ));
+        }
+        Ok(())
     }
 
     pub fn upsert_candidate_root(
@@ -1674,19 +2052,78 @@ impl CatalogStore {
     }
 
     pub fn query_files(&self, request: &FileQuery) -> Result<FilePage, AppError> {
+        request.validate_filters()?;
         let connection = self.connect()?;
         let offset = request.offset()?;
         let page_size = u64::from(request.validated_page_size());
+        let mut predicates = vec![AUTHORIZED_FILE_SQL.to_owned()];
+        let mut values = Vec::<SqlValue>::new();
+        if let Some(query) = request
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            predicates.push("f.display_name LIKE ? ESCAPE '\\'".into());
+            values.push(SqlValue::Text(format!("%{}%", escape_like(query))));
+        }
+        if !request.extensions.is_empty() {
+            let extensions = request
+                .extensions
+                .iter()
+                .map(|value| value.trim().trim_start_matches('.').to_ascii_lowercase())
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>();
+            if !extensions.is_empty() {
+                predicates.push(format!(
+                    "lower(f.extension) IN ({})",
+                    vec!["?"; extensions.len()].join(",")
+                ));
+                values.extend(extensions.into_iter().map(SqlValue::Text));
+            }
+        }
+        if !request.parse_statuses.is_empty() {
+            let statuses = request
+                .parse_statuses
+                .iter()
+                .filter(|value| {
+                    matches!(
+                        value.as_str(),
+                        "pending" | "parsing" | "parsed" | "ocr_pending" | "failed"
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !statuses.is_empty() {
+                predicates.push(format!(
+                    "f.parse_status IN ({})",
+                    vec!["?"; statuses.len()].join(",")
+                ));
+                values.extend(statuses.into_iter().map(SqlValue::Text));
+            }
+        }
+        if let Some(availability) = request.availability {
+            predicates.push("f.availability = ?".into());
+            values.push(SqlValue::Text(availability.as_str().into()));
+        }
+        let predicate = predicates.join(" AND ");
+        let count_sql = format!("SELECT COUNT(*) FROM files f WHERE {predicate}");
         let total = connection
-            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, u64>(0))
+            .query_row(&count_sql, params_from_iter(values.iter()), |row| {
+                row.get::<_, u64>(0)
+            })
             .map_err(|error| storage_error("FILE_QUERY_FAILED", error, true))?;
+        let sql = format!(
+            "{FILE_SELECT_WITH_ALIAS} WHERE {predicate} ORDER BY f.last_seen_at DESC, f.file_id DESC LIMIT ? OFFSET ?"
+        );
+        let mut page_values = values;
+        page_values.push(SqlValue::Integer(page_size as i64));
+        page_values.push(SqlValue::Integer(offset as i64));
         let mut statement = connection
-            .prepare(
-                "SELECT file_id, volume_id, canonical_path, display_name, extension, mime_type, size_bytes, fs_created_at, modified_at, windows_file_id, content_sha256, availability, current_revision_id, parse_status, first_seen_at, last_seen_at FROM files ORDER BY last_seen_at DESC, file_id DESC LIMIT ?1 OFFSET ?2",
-            )
+            .prepare(&sql)
             .map_err(|error| storage_error("FILE_QUERY_FAILED", error, true))?;
         let items = statement
-            .query_map(params![page_size, offset], file_from_row)
+            .query_map(params_from_iter(page_values.iter()), file_from_row)
             .map_err(|error| storage_error("FILE_QUERY_FAILED", error, true))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| storage_error("FILE_QUERY_FAILED", error, true))?;
@@ -1953,6 +2390,131 @@ impl CatalogStore {
             .ok_or_else(|| AppError::new("INBOX_ITEM_NOT_FOUND", "收件箱项目不可访问", false))
     }
 
+    pub fn list_knowledge_spaces(&self) -> Result<Vec<KnowledgeSpace>, AppError> {
+        let connection = self.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT space_id, name, description, created_at, updated_at FROM knowledge_spaces ORDER BY updated_at DESC, space_id DESC",
+            )
+            .map_err(|error| storage_error("KNOWLEDGE_SPACE_QUERY_FAILED", error, true))?;
+        let rows = statement
+            .query_map([], |row| {
+                let space_id = row.get::<_, String>(0)?;
+                let created_at = row.get::<_, String>(3)?;
+                let updated_at = row.get::<_, String>(4)?;
+                Ok((
+                    parse_uuid_column(&space_id, 0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    parse_datetime_column(&created_at, 3)?,
+                    parse_datetime_column(&updated_at, 4)?,
+                ))
+            })
+            .map_err(|error| storage_error("KNOWLEDGE_SPACE_QUERY_FAILED", error, true))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| storage_error("KNOWLEDGE_SPACE_QUERY_FAILED", error, true))?;
+        drop(statement);
+
+        rows.into_iter()
+            .map(|(space_id, name, description, created_at, updated_at)| {
+                let (root_ids, collection_ids) = knowledge_space_members(&connection, &space_id)?;
+                let file_count =
+                    knowledge_space_file_count(&connection, &root_ids, &collection_ids)?;
+                Ok(KnowledgeSpace {
+                    space_id,
+                    name,
+                    description,
+                    root_ids,
+                    collection_ids,
+                    file_count,
+                    created_at,
+                    updated_at,
+                })
+            })
+            .collect()
+    }
+
+    pub fn create_knowledge_space(
+        &self,
+        request: &KnowledgeSpaceRequest,
+    ) -> Result<KnowledgeSpace, AppError> {
+        request.validate()?;
+        let space_id = Uuid::now_v7();
+        let now = Utc::now();
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| storage_error("DATABASE_TRANSACTION_FAILED", error, true))?;
+        validate_knowledge_space_references(&transaction, request)?;
+        transaction
+            .execute(
+                "INSERT INTO knowledge_spaces (space_id, name, description, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)",
+                params![space_id.to_string(), request.name.trim(), request.description.as_ref().map(|value| value.trim()).filter(|value| !value.is_empty()), now.to_rfc3339()],
+            )
+            .map_err(|error| storage_error("KNOWLEDGE_SPACE_CREATE_FAILED", error, true))?;
+        replace_knowledge_space_members(&transaction, &space_id, request)?;
+        transaction
+            .commit()
+            .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))?;
+        self.knowledge_space_by_id(&space_id)
+    }
+
+    pub fn update_knowledge_space(
+        &self,
+        space_id: &Uuid,
+        request: &KnowledgeSpaceRequest,
+    ) -> Result<KnowledgeSpace, AppError> {
+        request.validate()?;
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| storage_error("DATABASE_TRANSACTION_FAILED", error, true))?;
+        validate_knowledge_space_references(&transaction, request)?;
+        let updated = transaction
+            .execute(
+                "UPDATE knowledge_spaces SET name = ?2, description = ?3, updated_at = ?4 WHERE space_id = ?1",
+                params![space_id.to_string(), request.name.trim(), request.description.as_ref().map(|value| value.trim()).filter(|value| !value.is_empty()), Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| storage_error("KNOWLEDGE_SPACE_UPDATE_FAILED", error, true))?;
+        if updated == 0 {
+            return Err(AppError::new(
+                "KNOWLEDGE_SPACE_NOT_FOUND",
+                "知识空间不存在",
+                false,
+            ));
+        }
+        replace_knowledge_space_members(&transaction, space_id, request)?;
+        transaction
+            .commit()
+            .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))?;
+        self.knowledge_space_by_id(space_id)
+    }
+
+    pub fn delete_knowledge_space(&self, space_id: &Uuid) -> Result<(), AppError> {
+        let connection = self.connect()?;
+        let deleted = connection
+            .execute(
+                "DELETE FROM knowledge_spaces WHERE space_id = ?1",
+                [space_id.to_string()],
+            )
+            .map_err(|error| storage_error("KNOWLEDGE_SPACE_DELETE_FAILED", error, true))?;
+        if deleted == 0 {
+            return Err(AppError::new(
+                "KNOWLEDGE_SPACE_NOT_FOUND",
+                "知识空间不存在",
+                false,
+            ));
+        }
+        Ok(())
+    }
+
+    fn knowledge_space_by_id(&self, space_id: &Uuid) -> Result<KnowledgeSpace, AppError> {
+        self.list_knowledge_spaces()?
+            .into_iter()
+            .find(|space| space.space_id == *space_id)
+            .ok_or_else(|| AppError::new("KNOWLEDGE_SPACE_NOT_FOUND", "知识空间不存在", false))
+    }
+
     pub fn list_collections(&self) -> Result<Vec<CollectionRecord>, AppError> {
         let connection = self.connect()?;
         collection_rows(&connection)
@@ -2048,7 +2610,7 @@ impl CatalogStore {
     ) -> Result<(), AppError> {
         let connection = self.connect()?;
         let collection = collection_by_id(&connection, collection_id)?;
-        if collection.kind != CollectionKind::Manual {
+        if collection.kind == CollectionKind::Rule {
             return Err(AppError::new(
                 "COLLECTION_MEMBERSHIP_INVALID",
                 "规则集合由规则自动维护，不能手动添加资料",
@@ -2058,7 +2620,7 @@ impl CatalogStore {
         authorized_file_by_id(&connection, file_id)?;
         connection
             .execute(
-                "INSERT OR IGNORE INTO collection_memberships (collection_id, file_id, source, created_at) VALUES (?1, ?2, 'manual', ?3)",
+                "INSERT INTO collection_memberships (collection_id, file_id, source, created_at, confidence, rationale, state, evaluated_at) VALUES (?1, ?2, 'manual', ?3, 1.0, '用户手动添加', 'active', ?3) ON CONFLICT(collection_id, file_id) DO UPDATE SET source = 'manual', confidence = 1.0, rationale = '用户手动添加', state = 'active', evaluated_at = excluded.evaluated_at",
                 params![collection_id.to_string(), file_id.to_string(), Utc::now().to_rfc3339()],
             )
             .map_err(|error| storage_error("COLLECTION_MEMBERSHIP_FAILED", error, true))?;
@@ -2072,19 +2634,25 @@ impl CatalogStore {
     ) -> Result<(), AppError> {
         let connection = self.connect()?;
         let collection = collection_by_id(&connection, collection_id)?;
-        if collection.kind != CollectionKind::Manual {
+        if collection.kind == CollectionKind::Rule {
             return Err(AppError::new(
                 "COLLECTION_MEMBERSHIP_INVALID",
                 "规则集合由规则自动维护，不能手动移除资料",
                 false,
             ));
         }
-        connection
-            .execute(
+        let changed = if collection.kind == CollectionKind::Ai {
+            connection.execute(
+                "UPDATE collection_memberships SET state = 'excluded', rationale = '用户人工排除', evaluated_at = ?3 WHERE collection_id = ?1 AND file_id = ?2",
+                params![collection_id.to_string(), file_id.to_string(), Utc::now().to_rfc3339()],
+            )
+        } else {
+            connection.execute(
                 "DELETE FROM collection_memberships WHERE collection_id = ?1 AND file_id = ?2",
                 params![collection_id.to_string(), file_id.to_string()],
             )
-            .map_err(|error| storage_error("COLLECTION_MEMBERSHIP_FAILED", error, true))?;
+        };
+        changed.map_err(|error| storage_error("COLLECTION_MEMBERSHIP_FAILED", error, true))?;
         Ok(())
     }
 
@@ -2103,12 +2671,12 @@ impl CatalogStore {
         let collection = collection_by_id(&connection, collection_id)?;
         let files = list_files_with_connection(&connection)?;
         match collection.kind {
-            CollectionKind::Manual => Ok(files
+            CollectionKind::Manual | CollectionKind::Ai => Ok(files
                 .into_iter()
                 .filter(|file| {
                     connection
                         .query_row(
-                            "SELECT EXISTS(SELECT 1 FROM collection_memberships WHERE collection_id = ?1 AND file_id = ?2)",
+                            "SELECT EXISTS(SELECT 1 FROM collection_memberships WHERE collection_id = ?1 AND file_id = ?2 AND state = 'active')",
                             params![collection_id.to_string(), file.file_id.to_string()],
                             |row| row.get::<_, i64>(0),
                         )
@@ -2143,7 +2711,7 @@ impl CatalogStore {
         let offset = request.offset()?;
         let page_size = request.validated_page_size();
         let (total, items) = match collection.kind {
-            CollectionKind::Manual => (
+            CollectionKind::Manual | CollectionKind::Ai => (
                 count_manual_collection_files(&connection, collection_id)?,
                 query_manual_collection_files(&connection, collection_id, offset, page_size)?,
             ),
@@ -2162,6 +2730,559 @@ impl CatalogStore {
             items,
             next_cursor: (consumed < total).then(|| consumed.to_string()),
             total,
+        })
+    }
+
+    pub fn refresh_collection_suggestions(
+        &self,
+        model_artifact_id: &str,
+        max_files: u32,
+    ) -> Result<CollectionSuggestionRefreshResult, AppError> {
+        if model_artifact_id.trim().is_empty() || !(1..=2_000).contains(&max_files) {
+            return Err(AppError::new(
+                "COLLECTION_SUGGESTION_REFRESH_INVALID",
+                "AI集合刷新需要有效的Embedding模型，且单批文件数必须在1到2000之间",
+                false,
+            ));
+        }
+        const ALGORITHM_VERSION: &str = "semantic_lsh_v1";
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| storage_error("COLLECTION_SUGGESTION_REFRESH_FAILED", error, true))?;
+        let sql = format!(
+            "WITH targets AS (SELECT f.file_id, f.current_revision_id, f.display_name FROM files f LEFT JOIN document_profiles p ON p.file_id = f.file_id WHERE f.current_revision_id IS NOT NULL AND f.parse_status = 'parsed' AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL} AND EXISTS (SELECT 1 FROM chunk_embeddings ce WHERE ce.file_id = f.file_id AND ce.revision_id = f.current_revision_id AND ce.model_artifact_id = ?1) AND (p.file_id IS NULL OR p.revision_id <> f.current_revision_id OR p.embedding_model_id <> ?1 OR p.algorithm_version <> ?2) ORDER BY f.last_seen_at DESC LIMIT ?3) SELECT t.file_id, t.current_revision_id, t.display_name, c.text, e.dimension, e.vector_blob FROM targets t JOIN chunks c ON c.file_id = t.file_id AND c.revision_id = t.current_revision_id JOIN chunk_embeddings e ON e.chunk_id = c.chunk_id AND e.model_artifact_id = ?1 ORDER BY t.file_id, c.ordinal"
+        );
+        let rows = {
+            let mut statement = transaction
+                .prepare(&sql)
+                .map_err(|error| storage_error("COLLECTION_PROFILE_QUERY_FAILED", error, true))?;
+            statement
+                .query_map(
+                    params![model_artifact_id, ALGORITHM_VERSION, i64::from(max_files)],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, u32>(4)?,
+                            row.get::<_, Vec<u8>>(5)?,
+                        ))
+                    },
+                )
+                .map_err(|error| storage_error("COLLECTION_PROFILE_QUERY_FAILED", error, true))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| storage_error("COLLECTION_PROFILE_QUERY_FAILED", error, true))?
+        };
+        let mut grouped: BTreeMap<String, ProfileAggregate> = BTreeMap::new();
+        for (file_id, revision_id, title, text, dimension, bytes) in rows {
+            let vector = decode_vector(&bytes, dimension)?;
+            let entry = grouped
+                .entry(file_id)
+                .or_insert_with(|| (revision_id, title, Vec::new(), Vec::new()));
+            if entry.2.len() < 3 {
+                entry.2.push(text);
+                entry.3.push(vector);
+            }
+        }
+        let now = Utc::now().to_rfc3339();
+        let mut profiles = Vec::new();
+        for (file_id, (revision_id, title, texts, vectors)) in grouped {
+            let vector = mean_normalized_vector(&vectors)?;
+            let bucket = semantic_bucket(&vector);
+            let summary = texts
+                .first()
+                .map(|text| compact_profile_text(text, 260))
+                .unwrap_or_default();
+            let keywords = profile_keywords(&title);
+            transaction
+                .execute(
+                    "INSERT INTO document_profiles (file_id, revision_id, title, summary, keywords_json, entities_json, embedding_model_id, dimension, vector_blob, candidate_bucket, algorithm_version, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, '[]', ?6, ?7, ?8, ?9, ?10, ?11, ?11) ON CONFLICT(file_id) DO UPDATE SET revision_id = excluded.revision_id, title = excluded.title, summary = excluded.summary, keywords_json = excluded.keywords_json, entities_json = excluded.entities_json, embedding_model_id = excluded.embedding_model_id, dimension = excluded.dimension, vector_blob = excluded.vector_blob, candidate_bucket = excluded.candidate_bucket, algorithm_version = excluded.algorithm_version, updated_at = excluded.updated_at",
+                    params![file_id, revision_id, title, summary, serde_json::to_string(&keywords).unwrap_or_else(|_| "[]".into()), model_artifact_id, vector.len() as u32, encode_vector(&vector), bucket, ALGORITHM_VERSION, now],
+                )
+                .map_err(|error| storage_error("COLLECTION_PROFILE_WRITE_FAILED", error, true))?;
+            profiles.push(ProfileCandidate {
+                file_id: parse_uuid_value(&file_id)?,
+                revision_id: parse_uuid_value(&revision_id)?,
+                title,
+                vector,
+                bucket,
+            });
+        }
+        let mut candidate_edges = 0_u64;
+        for profile in &profiles {
+            let candidates = {
+                let mut statement = transaction
+                    .prepare("SELECT file_id, revision_id, title, dimension, vector_blob FROM document_profiles WHERE embedding_model_id = ?1 AND candidate_bucket = ?2 AND file_id <> ?3 ORDER BY updated_at DESC LIMIT 96")
+                    .map_err(|error| storage_error("COLLECTION_CANDIDATE_QUERY_FAILED", error, true))?;
+                statement
+                    .query_map(
+                        params![
+                            model_artifact_id,
+                            profile.bucket,
+                            profile.file_id.to_string()
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, u32>(3)?,
+                                row.get::<_, Vec<u8>>(4)?,
+                            ))
+                        },
+                    )
+                    .map_err(|error| {
+                        storage_error("COLLECTION_CANDIDATE_QUERY_FAILED", error, true)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        storage_error("COLLECTION_CANDIDATE_QUERY_FAILED", error, true)
+                    })?
+            };
+            for (other_file_id, _other_revision, other_title, dimension, bytes) in candidates {
+                let other_file_id = parse_uuid_value(&other_file_id)?;
+                let other_vector = decode_vector(&bytes, dimension)?;
+                if other_vector.len() != profile.vector.len() {
+                    continue;
+                }
+                let similarity = profile
+                    .vector
+                    .iter()
+                    .zip(&other_vector)
+                    .map(|(left, right)| left * right)
+                    .sum::<f32>();
+                if similarity < 0.78 {
+                    continue;
+                }
+                let (left, right) = if profile.file_id < other_file_id {
+                    (profile.file_id, other_file_id)
+                } else {
+                    (other_file_id, profile.file_id)
+                };
+                let reasons = serde_json::to_string(&vec![
+                    format!("文档语义画像相似度 {:.0}%", similarity * 100.0),
+                    format!(
+                        "候选桶 {}，对比《{}》与《{}》",
+                        profile.bucket, profile.title, other_title
+                    ),
+                ])
+                .map_err(|error| {
+                    AppError::new("COLLECTION_REASON_INVALID", error.to_string(), false)
+                })?;
+                transaction
+                    .execute(
+                        "INSERT INTO file_relations (relation_id, left_file_id, right_file_id, relation_type, confidence, reasons_json, review_status, created_at, updated_at) VALUES (?1, ?2, ?3, 'related', ?4, ?5, 'suggested', ?6, ?6) ON CONFLICT(left_file_id, right_file_id, relation_type) DO UPDATE SET confidence = excluded.confidence, reasons_json = excluded.reasons_json, updated_at = excluded.updated_at",
+                        params![Uuid::now_v7().to_string(), left.to_string(), right.to_string(), f64::from(similarity), reasons, now],
+                    )
+                    .map_err(|error| storage_error("COLLECTION_CANDIDATE_WRITE_FAILED", error, true))?;
+                candidate_edges += 1;
+            }
+        }
+        let mut created_suggestions = 0_u64;
+        let mut suggestion_ids = Vec::new();
+        let mut consumed = HashSet::new();
+        for profile in &profiles {
+            if suggestion_ids.len() >= 24 {
+                break;
+            }
+            if consumed.contains(&profile.file_id) {
+                continue;
+            }
+            let related = {
+                let mut statement = transaction
+                    .prepare("SELECT CASE WHEN left_file_id = ?1 THEN right_file_id ELSE left_file_id END, confidence FROM file_relations WHERE relation_type = 'related' AND review_status <> 'rejected' AND confidence >= 0.78 AND (left_file_id = ?1 OR right_file_id = ?1) ORDER BY confidence DESC LIMIT 11")
+                    .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?;
+                statement
+                    .query_map([profile.file_id.to_string()], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                    })
+                    .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?
+            };
+            if related.is_empty() {
+                continue;
+            }
+            let mut members = vec![(
+                profile.file_id,
+                profile.revision_id,
+                1.0_f64,
+                "该文档是本组语义质心候选".to_owned(),
+            )];
+            for (file_id, confidence) in related {
+                let file_id = parse_uuid_value(&file_id)?;
+                let revision_id = transaction
+                    .query_row(
+                        "SELECT revision_id FROM document_profiles WHERE file_id = ?1",
+                        [file_id.to_string()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?;
+                if let Some(revision_id) = revision_id {
+                    members.push((
+                        file_id,
+                        parse_uuid_value(&revision_id)?,
+                        confidence,
+                        format!("与组内核心文档的语义相似度为 {:.0}%", confidence * 100.0),
+                    ));
+                }
+            }
+            members.sort_by_key(|member| member.0);
+            members.dedup_by_key(|member| member.0);
+            if members.len() < 2 {
+                continue;
+            }
+            let mut digest = Sha256::new();
+            digest.update(ALGORITHM_VERSION.as_bytes());
+            digest.update(model_artifact_id.as_bytes());
+            for (file_id, revision_id, _, _) in &members {
+                digest.update(file_id.as_bytes());
+                digest.update(revision_id.as_bytes());
+            }
+            let idempotency_key = format!("{:x}", digest.finalize());
+            let suggestion_id = Uuid::now_v7();
+            let confidence = members.iter().skip(1).map(|member| member.2).sum::<f64>()
+                / (members.len() - 1) as f64;
+            let name = format!("{} · 相关资料", collection_name_stem(&profile.title));
+            let changed = transaction
+                .execute(
+                    "INSERT OR IGNORE INTO collection_suggestions (suggestion_id, idempotency_key, suggested_name, description, confidence, status, model_version, algorithm_version, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'suggested', ?6, ?7, ?8, ?8)",
+                    params![suggestion_id.to_string(), idempotency_key, name, "基于文档级Embedding与内容关系形成的虚拟分组；不会改变任何原文件位置。", confidence, model_artifact_id, ALGORITHM_VERSION, now],
+                )
+                .map_err(|error| storage_error("COLLECTION_SUGGESTION_WRITE_FAILED", error, true))?;
+            if changed == 0 {
+                continue;
+            }
+            for (file_id, revision_id, member_confidence, rationale) in &members {
+                transaction
+                    .execute(
+                        "INSERT INTO collection_suggested_members (suggestion_id, file_id, revision_id, confidence, rationale, state) VALUES (?1, ?2, ?3, ?4, ?5, 'suggested')",
+                        params![suggestion_id.to_string(), file_id.to_string(), revision_id.to_string(), member_confidence, rationale],
+                    )
+                    .map_err(|error| storage_error("COLLECTION_SUGGESTION_WRITE_FAILED", error, true))?;
+                insert_inbox_event(
+                    &transaction,
+                    file_id,
+                    InboxEventType::CollectionSuggested,
+                    Utc::now(),
+                    None,
+                    TriageStatus::New,
+                    Some("AI发现这份资料与其他文档存在主题联系，等待审核虚拟集合建议"),
+                    None,
+                    &format!("collection_suggestion:{suggestion_id}:{file_id}"),
+                )?;
+                consumed.insert(*file_id);
+            }
+            created_suggestions += 1;
+            suggestion_ids.push(suggestion_id);
+        }
+        transaction
+            .commit()
+            .map_err(|error| storage_error("COLLECTION_SUGGESTION_REFRESH_FAILED", error, true))?;
+        Ok(CollectionSuggestionRefreshResult {
+            profiled_files: profiles.len() as u64,
+            candidate_edges,
+            created_suggestions,
+            suggestion_ids,
+            algorithm_version: ALGORITHM_VERSION.into(),
+            model_version: model_artifact_id.into(),
+        })
+    }
+
+    pub fn query_collection_suggestions(
+        &self,
+        request: &CollectionSuggestionQuery,
+    ) -> Result<CollectionSuggestionPage, AppError> {
+        request.validate()?;
+        let connection = self.connect()?;
+        let offset = request.offset()?;
+        let status = request.status.as_deref().unwrap_or("suggested");
+        let total = connection
+            .query_row(
+                "SELECT COUNT(*) FROM collection_suggestions WHERE status = ?1",
+                [status],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(|error| storage_error("COLLECTION_SUGGESTION_QUERY_FAILED", error, true))?;
+        let raw = {
+            let mut statement = connection
+                .prepare("SELECT suggestion_id, suggested_name, description, confidence, status, model_version, algorithm_version, created_at, updated_at FROM collection_suggestions WHERE status = ?1 ORDER BY updated_at DESC LIMIT ?2 OFFSET ?3")
+                .map_err(|error| storage_error("COLLECTION_SUGGESTION_QUERY_FAILED", error, true))?;
+            statement
+                .query_map(
+                    params![status, i64::from(request.page_size), offset as i64],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, f64>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, String>(7)?,
+                            row.get::<_, String>(8)?,
+                        ))
+                    },
+                )
+                .map_err(|error| storage_error("COLLECTION_SUGGESTION_QUERY_FAILED", error, true))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| storage_error("COLLECTION_SUGGESTION_QUERY_FAILED", error, true))?
+        };
+        let mut items = Vec::new();
+        for (
+            suggestion_id,
+            suggested_name,
+            description,
+            confidence,
+            status,
+            model_version,
+            algorithm_version,
+            created_at,
+            updated_at,
+        ) in raw
+        {
+            let suggestion_id = parse_uuid_value(&suggestion_id)?;
+            let members = query_suggestion_members(&connection, &suggestion_id)?;
+            items.push(CollectionSuggestion {
+                suggestion_id,
+                suggested_name,
+                description,
+                confidence,
+                status,
+                model_version,
+                algorithm_version,
+                members,
+                created_at: parse_datetime_value(&created_at)?,
+                updated_at: parse_datetime_value(&updated_at)?,
+            });
+        }
+        let consumed = offset + items.len() as u64;
+        Ok(CollectionSuggestionPage {
+            items,
+            next_cursor: (consumed < total).then(|| consumed.to_string()),
+            total,
+        })
+    }
+
+    pub fn update_collection_suggestion(
+        &self,
+        suggestion_id: &Uuid,
+        request: &CollectionSuggestionUpdateRequest,
+    ) -> Result<CollectionSuggestion, AppError> {
+        self.update_collection_suggestion_internal(suggestion_id, request, None)
+    }
+
+    pub fn apply_collection_model_review(
+        &self,
+        suggestion_id: &Uuid,
+        review: &CollectionModelReview,
+        model_version: &str,
+    ) -> Result<CollectionSuggestion, AppError> {
+        if model_version.trim().is_empty()
+            || review.suggested_name.trim().is_empty()
+            || review.suggested_name.chars().count() > 40
+            || review.description.chars().count() > 400
+            || !(2..=50).contains(&review.members.len())
+            || review.members.iter().any(|member| {
+                member.rationale.trim().is_empty() || member.rationale.chars().count() > 400
+            })
+            || review
+                .members
+                .iter()
+                .map(|member| member.file_id)
+                .collect::<HashSet<_>>()
+                .len()
+                != review.members.len()
+        {
+            return Err(AppError::new(
+                "COLLECTION_MODEL_REVIEW_INVALID",
+                "AI集合复核的名称、说明、成员或理由无效",
+                false,
+            ));
+        }
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| storage_error("COLLECTION_MODEL_REVIEW_FAILED", error, true))?;
+        ensure_suggestion_status(&transaction, suggestion_id, "suggested")?;
+        let existing = query_suggestion_members(&transaction, suggestion_id)?
+            .into_iter()
+            .map(|member| (member.file.file_id, member))
+            .collect::<HashMap<_, _>>();
+        if review
+            .members
+            .iter()
+            .any(|member| !existing.contains_key(&member.file_id))
+        {
+            return Err(AppError::new(
+                "COLLECTION_MODEL_REVIEW_INVALID",
+                "AI集合复核加入了候选组之外的资料",
+                false,
+            ));
+        }
+        let now = Utc::now().to_rfc3339();
+        transaction.execute("UPDATE collection_suggestions SET suggested_name = ?1, description = ?2, model_version = ?3, updated_at = ?4 WHERE suggestion_id = ?5", params![review.suggested_name.trim(), review.description.trim(), model_version, now, suggestion_id.to_string()])
+            .map_err(|error| storage_error("COLLECTION_MODEL_REVIEW_FAILED", error, true))?;
+        transaction
+            .execute(
+                "DELETE FROM collection_suggested_members WHERE suggestion_id = ?1",
+                [suggestion_id.to_string()],
+            )
+            .map_err(|error| storage_error("COLLECTION_MODEL_REVIEW_FAILED", error, true))?;
+        for reviewed_member in &review.members {
+            let existing_member = existing
+                .get(&reviewed_member.file_id)
+                .expect("reviewed member was checked");
+            transaction.execute("INSERT INTO collection_suggested_members (suggestion_id, file_id, revision_id, confidence, rationale, state) VALUES (?1, ?2, ?3, ?4, ?5, 'suggested')", params![suggestion_id.to_string(), reviewed_member.file_id.to_string(), existing_member.revision_id.to_string(), existing_member.confidence, reviewed_member.rationale.trim()])
+                .map_err(|error| storage_error("COLLECTION_MODEL_REVIEW_FAILED", error, true))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| storage_error("COLLECTION_MODEL_REVIEW_FAILED", error, true))?;
+        self.collection_suggestion_by_id(suggestion_id)
+    }
+
+    fn update_collection_suggestion_internal(
+        &self,
+        suggestion_id: &Uuid,
+        request: &CollectionSuggestionUpdateRequest,
+        model_version: Option<&str>,
+    ) -> Result<CollectionSuggestion, AppError> {
+        if request.suggested_name.trim().is_empty()
+            || request.suggested_name.chars().count() > 40
+            || request.description.chars().count() > 400
+            || request.member_file_ids.len() < 2
+            || request.member_file_ids.len() > 50
+        {
+            return Err(AppError::new(
+                "COLLECTION_SUGGESTION_UPDATE_INVALID",
+                "建议名称需为1到40字，且成员数量需为2到50个",
+                false,
+            ));
+        }
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| storage_error("COLLECTION_SUGGESTION_UPDATE_FAILED", error, true))?;
+        ensure_suggestion_status(&transaction, suggestion_id, "suggested")?;
+        transaction.execute("UPDATE collection_suggestions SET suggested_name = ?1, description = ?2, model_version = COALESCE(?3, model_version), updated_at = ?4 WHERE suggestion_id = ?5", params![request.suggested_name.trim(), request.description.trim(), model_version, Utc::now().to_rfc3339(), suggestion_id.to_string()])
+            .map_err(|error| storage_error("COLLECTION_SUGGESTION_UPDATE_FAILED", error, true))?;
+        let existing = query_suggestion_members(&transaction, suggestion_id)?
+            .into_iter()
+            .map(|member| (member.file.file_id, member))
+            .collect::<HashMap<_, _>>();
+        transaction
+            .execute(
+                "DELETE FROM collection_suggested_members WHERE suggestion_id = ?1",
+                [suggestion_id.to_string()],
+            )
+            .map_err(|error| storage_error("COLLECTION_SUGGESTION_UPDATE_FAILED", error, true))?;
+        for file_id in &request.member_file_ids {
+            let file = authorized_file_by_id(&transaction, file_id)?;
+            let revision_id = file.current_revision_id.ok_or_else(|| {
+                AppError::new(
+                    "COLLECTION_SUGGESTION_MEMBER_INVALID",
+                    "建议成员没有当前修订",
+                    true,
+                )
+            })?;
+            let (confidence, rationale, state) = existing
+                .get(file_id)
+                .map(|member| {
+                    (
+                        member.confidence,
+                        member.rationale.clone(),
+                        member.state.clone(),
+                    )
+                })
+                .unwrap_or((1.0, "用户补充到AI建议组".into(), "manual_override".into()));
+            transaction.execute("INSERT INTO collection_suggested_members (suggestion_id, file_id, revision_id, confidence, rationale, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![suggestion_id.to_string(), file_id.to_string(), revision_id.to_string(), confidence, rationale, state])
+                .map_err(|error| storage_error("COLLECTION_SUGGESTION_UPDATE_FAILED", error, true))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| storage_error("COLLECTION_SUGGESTION_UPDATE_FAILED", error, true))?;
+        self.collection_suggestion_by_id(suggestion_id)
+    }
+
+    pub fn confirm_collection_suggestion(
+        &self,
+        suggestion_id: &Uuid,
+    ) -> Result<CollectionRecord, AppError> {
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| storage_error("COLLECTION_SUGGESTION_CONFIRM_FAILED", error, true))?;
+        ensure_suggestion_status(&transaction, suggestion_id, "suggested")?;
+        let (name, description) = transaction.query_row("SELECT suggested_name, description FROM collection_suggestions WHERE suggestion_id = ?1", [suggestion_id.to_string()], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|error| storage_error("COLLECTION_SUGGESTION_CONFIRM_FAILED", error, true))?;
+        let collection_id = Uuid::now_v7();
+        let now = Utc::now().to_rfc3339();
+        transaction.execute("INSERT INTO collections (collection_id, name, description, icon, color, kind, rule_json, built_in, created_at, updated_at) VALUES (?1, ?2, ?3, 'sparkles', '#8c7cf0', 'ai', NULL, 0, ?4, ?4)", params![collection_id.to_string(), name, description, now])
+            .map_err(|error| storage_error("COLLECTION_SUGGESTION_CONFIRM_FAILED", error, false))?;
+        let members = query_suggestion_members(&transaction, suggestion_id)?;
+        for member in members {
+            transaction.execute("INSERT INTO collection_memberships (collection_id, file_id, source, created_at, confidence, rationale, state, evaluated_at) VALUES (?1, ?2, 'model', ?3, ?4, ?5, 'active', ?3)", params![collection_id.to_string(), member.file.file_id.to_string(), now, member.confidence, member.rationale])
+                .map_err(|error| storage_error("COLLECTION_SUGGESTION_CONFIRM_FAILED", error, true))?;
+        }
+        transaction.execute("UPDATE collection_suggestions SET status = 'confirmed', updated_at = ?1 WHERE suggestion_id = ?2", params![now, suggestion_id.to_string()])
+            .map_err(|error| storage_error("COLLECTION_SUGGESTION_CONFIRM_FAILED", error, true))?;
+        transaction
+            .execute(
+                "UPDATE inbox_events SET triage_status = 'reviewed', processed_at = ?1 WHERE dedupe_key LIKE ?2 AND triage_status IN ('new','error')",
+                params![now, format!("collection_suggestion:{suggestion_id}:%")],
+            )
+            .map_err(|error| storage_error("COLLECTION_SUGGESTION_CONFIRM_FAILED", error, true))?;
+        transaction
+            .commit()
+            .map_err(|error| storage_error("COLLECTION_SUGGESTION_CONFIRM_FAILED", error, true))?;
+        let connection = self.connect()?;
+        collection_by_id(&connection, &collection_id)
+    }
+
+    pub fn reject_collection_suggestion(&self, suggestion_id: &Uuid) -> Result<(), AppError> {
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| storage_error("COLLECTION_SUGGESTION_REJECT_FAILED", error, true))?;
+        ensure_suggestion_status(&transaction, suggestion_id, "suggested")?;
+        let now = Utc::now().to_rfc3339();
+        transaction.execute("UPDATE collection_suggestions SET status = 'rejected', updated_at = ?1 WHERE suggestion_id = ?2", params![now, suggestion_id.to_string()])
+            .map_err(|error| storage_error("COLLECTION_SUGGESTION_REJECT_FAILED", error, true))?;
+        transaction
+            .execute(
+                "UPDATE inbox_events SET triage_status = 'reviewed', processed_at = ?1 WHERE dedupe_key LIKE ?2 AND triage_status IN ('new','error')",
+                params![now, format!("collection_suggestion:{suggestion_id}:%")],
+            )
+            .map_err(|error| storage_error("COLLECTION_SUGGESTION_REJECT_FAILED", error, true))?;
+        transaction
+            .commit()
+            .map_err(|error| storage_error("COLLECTION_SUGGESTION_REJECT_FAILED", error, true))
+    }
+
+    fn collection_suggestion_by_id(
+        &self,
+        suggestion_id: &Uuid,
+    ) -> Result<CollectionSuggestion, AppError> {
+        let connection = self.connect()?;
+        let raw = connection.query_row("SELECT suggested_name, description, confidence, status, model_version, algorithm_version, created_at, updated_at FROM collection_suggestions WHERE suggestion_id = ?1", [suggestion_id.to_string()], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, f64>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?, row.get::<_, String>(7)?)))
+            .optional().map_err(|error| storage_error("COLLECTION_SUGGESTION_QUERY_FAILED", error, true))?
+            .ok_or_else(|| AppError::new("COLLECTION_SUGGESTION_NOT_FOUND", "AI集合建议不存在", false))?;
+        Ok(CollectionSuggestion {
+            suggestion_id: *suggestion_id,
+            suggested_name: raw.0,
+            description: raw.1,
+            confidence: raw.2,
+            status: raw.3,
+            model_version: raw.4,
+            algorithm_version: raw.5,
+            members: query_suggestion_members(&connection, suggestion_id)?,
+            created_at: parse_datetime_value(&raw.6)?,
+            updated_at: parse_datetime_value(&raw.7)?,
         })
     }
 
@@ -2236,6 +3357,7 @@ impl CatalogStore {
             .map_err(|error| storage_error("RELATION_REFRESH_FAILED", error, true))?;
 
         let mut exact_duplicate_pairs = 0_u64;
+        let mut relation_file_ids = HashSet::new();
         for group in hashes.values().filter(|group| group.len() > 1) {
             for left_index in 0..group.len() {
                 for right_index in (left_index + 1)..group.len() {
@@ -2247,6 +3369,8 @@ impl CatalogStore {
                         1.0,
                         &["文件字节SHA-256完全相同".to_owned()],
                     )?;
+                    relation_file_ids.insert(group[left_index]);
+                    relation_file_ids.insert(group[right_index]);
                     exact_duplicate_pairs += 1;
                 }
             }
@@ -2274,9 +3398,30 @@ impl CatalogStore {
                         0.78,
                         &["文件名去除版本与副本后缀后相同".to_owned()],
                     )?;
+                    relation_file_ids.insert(group[left_index]);
+                    relation_file_ids.insert(group[right_index]);
                     version_candidate_pairs += 1;
                 }
             }
+        }
+        for file_id in relation_file_ids {
+            let revision_key = files
+                .iter()
+                .find(|file| file.file_id == file_id)
+                .and_then(|file| file.current_revision_id)
+                .map(|revision| revision.to_string())
+                .unwrap_or_else(|| "no-revision".into());
+            insert_inbox_event(
+                &transaction,
+                &file_id,
+                InboxEventType::RelationSuggested,
+                Utc::now(),
+                None,
+                TriageStatus::New,
+                Some("关系分析发现重复项或可能的文档版本，等待人工复核"),
+                None,
+                &format!("relation_suggestion:{file_id}:{revision_key}"),
+            )?;
         }
         transaction
             .commit()
@@ -2514,7 +3659,7 @@ impl CatalogStore {
         let connection = self.connect()?;
         let mut statement = connection
             .prepare(
-                "SELECT file_id, volume_id, canonical_path, display_name, extension, mime_type, size_bytes, fs_created_at, modified_at, windows_file_id, content_sha256, availability, current_revision_id, parse_status, first_seen_at, last_seen_at FROM files WHERE availability = 'present' AND current_revision_id IS NOT NULL AND parse_status = 'pending' AND extension IN ('pdf', 'docx', 'docm', 'xlsx', 'xlsm', 'pptx', 'pptm', 'csv', 'tsv', 'md', 'txt', 'html', 'htm', 'jpg', 'jpeg', 'png', 'tif', 'tiff', 'bmp', 'webp', 'doc', 'xls', 'ppt') ORDER BY last_seen_at LIMIT ?1",
+                "SELECT file_id, volume_id, canonical_path, display_name, extension, mime_type, size_bytes, fs_created_at, modified_at, windows_file_id, content_sha256, availability, current_revision_id, parse_status, first_seen_at, last_seen_at FROM files WHERE availability = 'present' AND current_revision_id IS NOT NULL AND parse_status = 'pending' AND extension IN ('pdf', 'docx', 'docm', 'xlsx', 'xlsm', 'pptx', 'pptm', 'csv', 'tsv', 'md', 'txt', 'html', 'htm', 'jpg', 'jpeg', 'png', 'tif', 'tiff', 'bmp', 'webp', 'doc', 'xls', 'ppt', 'zip', 'rs', 'py', 'js', 'jsx', 'mjs', 'cjs', 'ts', 'tsx', 'java', 'kt', 'kts', 'go', 'c', 'cc', 'cpp', 'h', 'hpp', 'cs', 'rb', 'php', 'swift', 'scala', 'sh', 'ps1', 'sql', 'json', 'yaml', 'yml', 'toml', 'xml', 'css', 'scss', 'vue', 'svelte') ORDER BY last_seen_at LIMIT ?1",
             )
             .map_err(|error| storage_error("FILE_QUERY_FAILED", error, true))?;
         statement
@@ -2636,6 +3781,217 @@ impl CatalogStore {
         Ok(committed)
     }
 
+    pub fn active_vector_generation(
+        &self,
+        model_artifact_id: &str,
+    ) -> Result<Option<IndexGeneration>, AppError> {
+        let connection = self.connect()?;
+        let row = connection
+            .query_row(
+                "SELECT generation_id, model_artifact_id, dimension, metric, quantization, status, item_count, coverage, error_code, created_at, activated_at FROM index_generations WHERE model_artifact_id = ?1 AND status = 'active' LIMIT 1",
+                [model_artifact_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u32>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, u64>(6)?,
+                        row.get::<_, f64>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| storage_error("VECTOR_INDEX_GENERATION_QUERY_FAILED", error, true))?;
+        let Some((
+            generation_id,
+            model_artifact_id,
+            dimension,
+            metric,
+            quantization,
+            status,
+            item_count,
+            coverage,
+            error_code,
+            created_at,
+            activated_at,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        Ok(Some(IndexGeneration {
+            generation_id: parse_uuid_value(&generation_id)?,
+            model_artifact_id,
+            dimension,
+            metric,
+            quantization,
+            status,
+            item_count,
+            coverage,
+            error_code,
+            created_at: parse_datetime_value(&created_at)?,
+            activated_at: activated_at
+                .as_deref()
+                .map(parse_datetime_value)
+                .transpose()?,
+        }))
+    }
+
+    pub fn rebuild_vector_generation(
+        &self,
+        model_artifact_id: &str,
+        dimension: u32,
+    ) -> Result<IndexGeneration, AppError> {
+        if model_artifact_id.trim().is_empty() || dimension == 0 {
+            return Err(AppError::new(
+                "VECTOR_INDEX_GENERATION_INVALID",
+                "向量索引代际需要有效的模型标识和维度",
+                false,
+            ));
+        }
+        let generation_id = Uuid::now_v7();
+        let index_path = self
+            .vector_index_directory()?
+            .join(format!("{generation_id}.usearch"));
+        let created_at = Utc::now();
+        let mut connection = self.connect()?;
+        connection
+            .execute(
+                "INSERT INTO index_generations (generation_id, model_artifact_id, dimension, metric, quantization, index_path, status, item_count, coverage, created_at) VALUES (?1, ?2, ?3, 'cosine', 'bf16', ?4, 'building', 0, 0, ?5)",
+                params![generation_id.to_string(), model_artifact_id, dimension, index_path.to_string_lossy(), created_at.to_rfc3339()],
+            )
+            .map_err(|error| storage_error("VECTOR_INDEX_GENERATION_WRITE_FAILED", error, true))?;
+
+        let loaded = (|| -> Result<Vec<VectorSourceRow>, AppError> {
+            let sql = format!(
+                "SELECT e.chunk_id, e.file_id, e.revision_id, e.vector_blob FROM chunk_embeddings e JOIN files f ON f.file_id = e.file_id WHERE e.model_artifact_id = ?1 AND e.dimension = ?2 AND f.current_revision_id = e.revision_id AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL} ORDER BY e.chunk_id"
+            );
+            let mut statement = connection
+                .prepare(&sql)
+                .map_err(|error| storage_error("VECTOR_INDEX_SOURCE_QUERY_FAILED", error, true))?;
+            let rows = statement
+                .query_map(params![model_artifact_id, dimension], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                })
+                .map_err(|error| storage_error("VECTOR_INDEX_SOURCE_QUERY_FAILED", error, true))?;
+            let mut loaded = Vec::new();
+            for (index, row) in rows.enumerate() {
+                let (chunk_id, file_id, revision_id, bytes) = row.map_err(|error| {
+                    storage_error("VECTOR_INDEX_SOURCE_QUERY_FAILED", error, true)
+                })?;
+                let key = u64::try_from(index + 1).map_err(|_| {
+                    AppError::new("VECTOR_INDEX_CAPACITY_EXCEEDED", "向量键空间不足", false)
+                })?;
+                loaded.push((
+                    key,
+                    chunk_id,
+                    file_id,
+                    revision_id,
+                    decode_vector(&bytes, dimension)?,
+                ));
+            }
+            Ok(loaded)
+        })();
+        let loaded = match loaded {
+            Ok(loaded) if !loaded.is_empty() => loaded,
+            Ok(_) => {
+                let error = AppError::new(
+                    "VECTOR_INDEX_EMPTY",
+                    "当前模型还没有可建立索引的有效向量",
+                    true,
+                );
+                let _ = connection.execute(
+                    "UPDATE index_generations SET status = 'failed', error_code = ?2 WHERE generation_id = ?1",
+                    params![generation_id.to_string(), error.code.clone()],
+                );
+                return Err(error);
+            }
+            Err(error) => {
+                let _ = connection.execute(
+                    "UPDATE index_generations SET status = 'failed', error_code = ?2 WHERE generation_id = ?1",
+                    params![generation_id.to_string(), error.code.clone()],
+                );
+                return Err(error);
+            }
+        };
+        let entries = loaded
+            .iter()
+            .map(|(key, _, _, _, vector)| (*key, vector.as_slice()))
+            .collect::<Vec<_>>();
+        if let Err(error) = crate::build_index_refs(&index_path, dimension as usize, &entries) {
+            let _ = connection.execute(
+                "UPDATE index_generations SET status = 'failed', error_code = ?2 WHERE generation_id = ?1",
+                params![generation_id.to_string(), error.code.clone()],
+            );
+            return Err(error);
+        }
+
+        let total_chunks = count_query(
+            &connection,
+            &format!(
+                "SELECT COUNT(*) FROM chunks c JOIN files f ON f.file_id = c.file_id WHERE f.current_revision_id = c.revision_id AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL}"
+            ),
+        )?;
+        let coverage = coverage_ratio(loaded.len() as u64, total_chunks);
+        let activated_at = Utc::now();
+        let transaction = connection
+            .transaction()
+            .map_err(|error| storage_error("DATABASE_TRANSACTION_FAILED", error, true))?;
+        for (key, chunk_id, file_id, revision_id, _) in &loaded {
+            let key = i64::try_from(*key).map_err(|_| {
+                AppError::new(
+                    "VECTOR_INDEX_CAPACITY_EXCEEDED",
+                    "向量键超出数据库范围",
+                    false,
+                )
+            })?;
+            transaction
+                .execute(
+                    "INSERT INTO vector_index_keys (generation_id, vector_key, chunk_id, file_id, revision_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![generation_id.to_string(), key, chunk_id, file_id, revision_id],
+                )
+                .map_err(|error| storage_error("VECTOR_INDEX_KEY_WRITE_FAILED", error, true))?;
+        }
+        transaction
+            .execute(
+                "UPDATE index_generations SET status = 'retired' WHERE model_artifact_id = ?1 AND status = 'active'",
+                [model_artifact_id],
+            )
+            .map_err(|error| storage_error("VECTOR_INDEX_GENERATION_WRITE_FAILED", error, true))?;
+        transaction
+            .execute(
+                "UPDATE index_generations SET status = 'active', item_count = ?2, coverage = ?3, activated_at = ?4, error_code = NULL WHERE generation_id = ?1 AND status = 'building'",
+                params![generation_id.to_string(), loaded.len() as u64, coverage, activated_at.to_rfc3339()],
+            )
+            .map_err(|error| storage_error("VECTOR_INDEX_GENERATION_WRITE_FAILED", error, true))?;
+        transaction
+            .commit()
+            .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))?;
+        Ok(IndexGeneration {
+            generation_id,
+            model_artifact_id: model_artifact_id.to_owned(),
+            dimension,
+            metric: "cosine".into(),
+            quantization: "bf16".into(),
+            status: "active".into(),
+            item_count: loaded.len() as u64,
+            coverage,
+            error_code: None,
+            created_at,
+            activated_at: Some(activated_at),
+        })
+    }
+
     pub fn mark_file_parsing(&self, file_id: &Uuid, revision_id: &Uuid) -> Result<(), AppError> {
         let mut connection = self.connect()?;
         let transaction = connection
@@ -2694,6 +4050,34 @@ impl CatalogStore {
         result: &ParseResult,
     ) -> Result<(), AppError> {
         let chunks = chunks_from_nodes(result);
+        for asset in &result.image_assets {
+            let cache_path = PathBuf::from(&asset.cache_path);
+            let path_is_managed = cache_path.components().any(|component| {
+                component
+                    .as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case("image-assets")
+            });
+            let metadata = fs::metadata(&cache_path).map_err(|error| {
+                AppError::new("IMAGE_ASSET_CACHE_UNAVAILABLE", error.to_string(), true)
+            })?;
+            if asset.revision_id != result.revision_id
+                || !path_is_managed
+                || !metadata.is_file()
+                || metadata.len() != asset.size_bytes
+                || !matches!(
+                    asset.status.as_str(),
+                    "pending_understanding" | "ready" | "failed"
+                )
+                || hash_file_sha256(&cache_path)? != asset.sha256
+            {
+                return Err(AppError::new(
+                    "IMAGE_ASSET_INVALID",
+                    "图片缓存的修订、路径、大小、哈希或状态无效",
+                    false,
+                ));
+            }
+        }
         let mut connection = self.connect()?;
         let transaction = connection
             .transaction()
@@ -2727,6 +4111,12 @@ impl CatalogStore {
                 [result.revision_id.to_string()],
             )
             .map_err(|error| storage_error("INDEX_WRITE_FAILED", error, true))?;
+        transaction
+            .execute(
+                "DELETE FROM image_assets WHERE revision_id = ?1",
+                [result.revision_id.to_string()],
+            )
+            .map_err(|error| storage_error("IMAGE_ASSET_WRITE_FAILED", error, true))?;
 
         for node in &result.nodes {
             insert_document_node(&transaction, &result.revision_id, node)?;
@@ -2747,6 +4137,17 @@ impl CatalogStore {
                     params![chunk.chunk_id.to_string(), file_id.to_string(), chunk.revision_id.to_string(), chunk.normalized_text],
                 )
                 .map_err(|error| storage_error("INDEX_WRITE_FAILED", error, true))?;
+        }
+        for asset in &result.image_assets {
+            let locator_json = serde_json::to_string(&asset.locator)
+                .map_err(|error| AppError::new("IMAGE_ASSET_INVALID", error.to_string(), false))?;
+            let now = Utc::now().to_rfc3339();
+            transaction
+                .execute(
+                    "INSERT INTO image_assets (asset_id, file_id, revision_id, asset_kind, cache_path, mime_type, size_bytes, sha256, locator_json, ocr_text, description, vision_model_id, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+                    params![asset.asset_id.to_string(), file_id.to_string(), asset.revision_id.to_string(), asset.asset_kind, asset.cache_path, asset.mime_type, asset.size_bytes, asset.sha256, locator_json, asset.ocr_text, asset.description, asset.vision_model_id, asset.status, now],
+                )
+                .map_err(|error| storage_error("IMAGE_ASSET_WRITE_FAILED", error, true))?;
         }
 
         let parse_status = match result.status {
@@ -2831,8 +4232,425 @@ impl CatalogStore {
             .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))
     }
 
+    pub fn recover_interrupted_image_understanding(&self) -> Result<u64, AppError> {
+        let connection = self.connect()?;
+        connection
+            .execute(
+                "UPDATE image_assets SET status = 'pending_understanding', started_at = NULL, updated_at = ?1, error_json = ?2 WHERE status = 'processing'",
+                params![Utc::now().to_rfc3339(), serde_json::to_string(&AppError::new("VISION_JOB_INTERRUPTED", "应用上次退出时图片理解尚未完成，已从检查点恢复", true)).expect("serialize static error")],
+            )
+            .map(|changed| changed as u64)
+            .map_err(|error| storage_error("IMAGE_UNDERSTANDING_RECOVERY_FAILED", error, true))
+    }
+
+    pub fn claim_pending_image_understanding(
+        &self,
+        model_artifact_id: &str,
+    ) -> Result<Option<PendingImageUnderstanding>, AppError> {
+        if model_artifact_id.trim().is_empty() {
+            return Err(AppError::new(
+                "VISION_MODEL_INVALID",
+                "图片理解任务缺少模型标识",
+                false,
+            ));
+        }
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| storage_error("IMAGE_UNDERSTANDING_CLAIM_FAILED", error, true))?;
+        let sql = format!(
+            "SELECT ia.asset_id, ia.file_id, ia.revision_id, ia.cache_path, ia.mime_type, ia.size_bytes, ia.sha256, ia.locator_json, ia.ocr_text, ia.attempt_count FROM image_assets ia JOIN files f ON f.file_id = ia.file_id WHERE ia.status = 'pending_understanding' AND f.current_revision_id = ia.revision_id AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL} ORDER BY ia.updated_at, ia.asset_id LIMIT 1"
+        );
+        let row = transaction
+            .query_row(&sql, [], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, u64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, u32>(9)?,
+                ))
+            })
+            .optional()
+            .map_err(|error| storage_error("IMAGE_UNDERSTANDING_CLAIM_FAILED", error, true))?;
+        let Some((
+            asset_id,
+            file_id,
+            revision_id,
+            cache_path,
+            mime_type,
+            size_bytes,
+            sha256,
+            locator_json,
+            ocr_text,
+            attempt_count,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let asset_id = parse_uuid_value(&asset_id)?;
+        let file_id = parse_uuid_value(&file_id)?;
+        let revision_id = parse_uuid_value(&revision_id)?;
+        let locator = serde_json::from_str::<SourceLocator>(&locator_json)
+            .map_err(|error| AppError::new("IMAGE_ASSET_INVALID", error.to_string(), false))?;
+        let path = PathBuf::from(&cache_path);
+        let metadata = fs::metadata(&path)
+            .map_err(|error| AppError::new("IMAGE_ASSET_UNAVAILABLE", error.to_string(), true))?;
+        if !metadata.is_file() || metadata.len() != size_bytes || hash_file_sha256(&path)? != sha256
+        {
+            transaction
+                .execute(
+                    "UPDATE image_assets SET status = 'failed', error_json = ?1, updated_at = ?2 WHERE asset_id = ?3",
+                    params![serde_json::to_string(&AppError::new("IMAGE_ASSET_CACHE_INVALID", "图片缓存大小或哈希已经变化，需要重新解析源文件", false)).expect("serialize static error"), Utc::now().to_rfc3339(), asset_id.to_string()],
+                )
+                .map_err(|error| storage_error("IMAGE_UNDERSTANDING_CLAIM_FAILED", error, true))?;
+            transaction
+                .commit()
+                .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))?;
+            return Ok(None);
+        }
+        let idempotency_key = format!("vision:v1:{model_artifact_id}:{sha256}");
+        let now = Utc::now().to_rfc3339();
+        let changed = transaction
+            .execute(
+                "UPDATE image_assets SET status = 'processing', attempt_count = attempt_count + 1, error_json = NULL, idempotency_key = ?1, started_at = ?2, completed_at = NULL, updated_at = ?2 WHERE asset_id = ?3 AND status = 'pending_understanding'",
+                params![idempotency_key, now, asset_id.to_string()],
+            )
+            .map_err(|error| storage_error("IMAGE_UNDERSTANDING_CLAIM_FAILED", error, true))?;
+        if changed != 1 {
+            return Err(AppError::new(
+                "IMAGE_UNDERSTANDING_ALREADY_CLAIMED",
+                "图片理解任务已由另一个后台执行器领取",
+                true,
+            ));
+        }
+        transaction
+            .commit()
+            .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))?;
+        Ok(Some(PendingImageUnderstanding {
+            asset_id,
+            file_id,
+            revision_id,
+            cache_path,
+            mime_type,
+            size_bytes,
+            sha256,
+            locator,
+            ocr_text,
+            attempt_count: attempt_count.saturating_add(1),
+            idempotency_key,
+        }))
+    }
+
+    pub fn fail_image_understanding(
+        &self,
+        asset_id: &Uuid,
+        error: &AppError,
+    ) -> Result<(), AppError> {
+        let connection = self.connect()?;
+        let attempts = connection
+            .query_row(
+                "SELECT attempt_count FROM image_assets WHERE asset_id = ?1",
+                [asset_id.to_string()],
+                |row| row.get::<_, u32>(0),
+            )
+            .optional()
+            .map_err(|query_error| {
+                storage_error("IMAGE_UNDERSTANDING_FAIL_FAILED", query_error, true)
+            })?
+            .ok_or_else(|| AppError::new("IMAGE_ASSET_NOT_FOUND", "图片理解任务不存在", false))?;
+        let status = if error.retryable && attempts < 2 {
+            "pending_understanding"
+        } else {
+            "failed"
+        };
+        connection
+            .execute(
+                "UPDATE image_assets SET status = ?1, error_json = ?2, started_at = NULL, updated_at = ?3 WHERE asset_id = ?4 AND status = 'processing'",
+                params![status, serde_json::to_string(error).map_err(|serialize_error| AppError::new("IMAGE_UNDERSTANDING_ERROR_INVALID", serialize_error.to_string(), false))?, Utc::now().to_rfc3339(), asset_id.to_string()],
+            )
+            .map_err(|write_error| storage_error("IMAGE_UNDERSTANDING_FAIL_FAILED", write_error, true))?;
+        Ok(())
+    }
+
+    pub fn retry_image_understanding(&self, asset_id: &Uuid) -> Result<(), AppError> {
+        let connection = self.connect()?;
+        let sql = format!(
+            "UPDATE image_assets SET status = 'pending_understanding', attempt_count = 0, error_json = NULL, started_at = NULL, completed_at = NULL, updated_at = ?1 WHERE asset_id = ?2 AND status = 'failed' AND EXISTS (SELECT 1 FROM files f WHERE f.file_id = image_assets.file_id AND f.current_revision_id = image_assets.revision_id AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL})"
+        );
+        let changed = connection
+            .execute(&sql, params![Utc::now().to_rfc3339(), asset_id.to_string()])
+            .map_err(|error| storage_error("IMAGE_UNDERSTANDING_RETRY_FAILED", error, true))?;
+        if changed == 0 {
+            return Err(AppError::new(
+                "IMAGE_UNDERSTANDING_RETRY_INVALID",
+                "只有失败的图片理解任务可以重试",
+                false,
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn commit_image_understanding(
+        &self,
+        result: &ImageUnderstandingResult,
+    ) -> Result<(), AppError> {
+        let summary = result.summary.trim();
+        if summary.is_empty()
+            || summary.chars().count() > 12_000
+            || result.keywords.len() > 64
+            || result.entities.len() > 64
+            || result.idempotency_key.trim().is_empty()
+        {
+            return Err(AppError::new(
+                "IMAGE_UNDERSTANDING_RESULT_INVALID",
+                "图片理解结果为空或超出安全长度",
+                false,
+            ));
+        }
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| storage_error("IMAGE_UNDERSTANDING_COMMIT_FAILED", error, true))?;
+        let sql = format!(
+            "SELECT ia.file_id, ia.revision_id, ia.locator_json, ia.ocr_text, ia.status, ia.idempotency_key FROM image_assets ia JOIN files f ON f.file_id = ia.file_id WHERE ia.asset_id = ?1 AND f.current_revision_id = ia.revision_id AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL} LIMIT 1"
+        );
+        let row = transaction
+            .query_row(&sql, [result.asset_id.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })
+            .optional()
+            .map_err(|error| storage_error("IMAGE_UNDERSTANDING_COMMIT_FAILED", error, true))?
+            .ok_or_else(|| {
+                AppError::new(
+                    "IMAGE_UNDERSTANDING_STALE_REVISION",
+                    "图片所属文件已经变化、离线或超出授权范围，结果未写入",
+                    false,
+                )
+            })?;
+        let (file_id, revision_id, locator_json, existing_ocr, status, stored_key) = row;
+        let revision_id = parse_uuid_value(&revision_id)?;
+        if revision_id != result.revision_id {
+            return Err(AppError::new(
+                "IMAGE_UNDERSTANDING_STALE_REVISION",
+                "图片理解结果不属于当前文件修订",
+                false,
+            ));
+        }
+        if status == "ready" && stored_key.as_deref() == Some(result.idempotency_key.as_str()) {
+            return Ok(());
+        }
+        if status != "processing" || stored_key.as_deref() != Some(result.idempotency_key.as_str())
+        {
+            return Err(AppError::new(
+                "IMAGE_UNDERSTANDING_CHECKPOINT_MISMATCH",
+                "图片理解任务检查点已经变化，结果未写入",
+                true,
+            ));
+        }
+        let file_id = parse_uuid_value(&file_id)?;
+        let locator = serde_json::from_str::<SourceLocator>(&locator_json)
+            .map_err(|error| AppError::new("IMAGE_ASSET_INVALID", error.to_string(), false))?;
+        let visible_text = result
+            .visible_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or(existing_ocr
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()));
+        let mut sections = vec![format!("图片内容：{summary}")];
+        if let Some(value) = visible_text {
+            sections.push(format!("图片文字：{value}"));
+        }
+        if let Some(value) = result
+            .chart_summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            sections.push(format!("图表信息：{value}"));
+        }
+        if !result.keywords.is_empty() {
+            sections.push(format!("关键词：{}", result.keywords.join("、")));
+        }
+        if !result.entities.is_empty() {
+            sections.push(format!("实体：{}", result.entities.join("、")));
+        }
+        let node_id = result.asset_id;
+        transaction
+            .execute(
+                "DELETE FROM chunks_fts WHERE chunk_id IN (SELECT chunk_id FROM chunks WHERE node_id IN (SELECT node_id FROM document_nodes WHERE image_asset_id = ?1))",
+                [result.asset_id.to_string()],
+            )
+            .map_err(|error| storage_error("IMAGE_UNDERSTANDING_COMMIT_FAILED", error, true))?;
+        transaction
+            .execute(
+                "DELETE FROM document_nodes WHERE image_asset_id = ?1",
+                [result.asset_id.to_string()],
+            )
+            .map_err(|error| storage_error("IMAGE_UNDERSTANDING_COMMIT_FAILED", error, true))?;
+        let node_ordinal = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM document_nodes WHERE revision_id = ?1",
+                [revision_id.to_string()],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(|error| storage_error("IMAGE_UNDERSTANDING_COMMIT_FAILED", error, true))?;
+        let node = DocumentNode {
+            node_id,
+            parent_id: None,
+            ordinal: node_ordinal,
+            node_type: "image_description".into(),
+            text: Some(sections.join("\n")),
+            table_data: None,
+            locator: locator.clone(),
+            heading_path: vec!["图片理解".into()],
+        };
+        let parse_result = ParseResult {
+            revision_id,
+            status: ParseOutcome::Parsed,
+            parser_name: "vision".into(),
+            parser_version: "1".into(),
+            nodes: vec![node.clone()],
+            image_assets: vec![],
+            warnings: vec![],
+            metrics: crate::ParseMetrics {
+                page_count: 0,
+                node_count: 1,
+                character_count: node
+                    .text
+                    .as_ref()
+                    .map_or(0, |text| text.chars().count() as u64),
+                ocr_page_count: 0,
+                elapsed_ms: 0,
+            },
+            error: None,
+        };
+        let mut chunks = chunks_from_nodes(&parse_result);
+        let chunk_ordinal = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(ordinal), 0) FROM chunks WHERE revision_id = ?1",
+                [revision_id.to_string()],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(|error| storage_error("IMAGE_UNDERSTANDING_COMMIT_FAILED", error, true))?;
+        transaction
+            .execute(
+                "INSERT INTO document_nodes (node_id, revision_id, parent_id, ordinal, node_type, locator_json, heading_path_json, text, table_json, image_asset_id) VALUES (?1, ?2, NULL, ?3, 'image_description', ?4, ?5, ?6, NULL, ?1)",
+                params![node_id.to_string(), revision_id.to_string(), node_ordinal, locator_json, serde_json::to_string(&node.heading_path).expect("serialize static heading"), node.text],
+            )
+            .map_err(|error| storage_error("IMAGE_UNDERSTANDING_COMMIT_FAILED", error, true))?;
+        for chunk in &mut chunks {
+            chunk.ordinal += chunk_ordinal;
+            let chunk_locator = serde_json::to_string(&chunk.locator).map_err(|error| {
+                AppError::new("INDEX_SERIALIZE_FAILED", error.to_string(), false)
+            })?;
+            transaction
+                .execute(
+                    "INSERT INTO chunks (chunk_id, file_id, revision_id, node_id, ordinal, text, normalized_text, token_count, content_hash, language, locator_json, embedding_model_id, embedding_status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, 'pending')",
+                    params![chunk.chunk_id.to_string(), file_id.to_string(), revision_id.to_string(), node_id.to_string(), chunk.ordinal, chunk.text, chunk.normalized_text, chunk.token_count, chunk.content_hash, chunk.language, chunk_locator],
+                )
+                .map_err(|error| storage_error("IMAGE_UNDERSTANDING_COMMIT_FAILED", error, true))?;
+            transaction
+                .execute(
+                    "INSERT INTO chunks_fts (chunk_id, file_id, revision_id, normalized_text) VALUES (?1, ?2, ?3, ?4)",
+                    params![chunk.chunk_id.to_string(), file_id.to_string(), revision_id.to_string(), chunk.normalized_text],
+                )
+                .map_err(|error| storage_error("IMAGE_UNDERSTANDING_COMMIT_FAILED", error, true))?;
+        }
+        let completed_at = Utc::now().to_rfc3339();
+        let changed = transaction
+            .execute(
+                "UPDATE image_assets SET description = ?1, ocr_text = COALESCE(?2, ocr_text), vision_model_id = ?3, status = 'ready', error_json = NULL, completed_at = ?4, updated_at = ?4 WHERE asset_id = ?5 AND revision_id = ?6 AND status = 'processing' AND idempotency_key = ?7",
+                params![summary, result.visible_text, result.model_artifact_id, completed_at, result.asset_id.to_string(), revision_id.to_string(), result.idempotency_key],
+            )
+            .map_err(|error| storage_error("IMAGE_UNDERSTANDING_COMMIT_FAILED", error, true))?;
+        if changed != 1 {
+            return Err(AppError::new(
+                "IMAGE_UNDERSTANDING_CHECKPOINT_MISMATCH",
+                "图片理解任务在提交时已经变化",
+                true,
+            ));
+        }
+        transaction
+            .commit()
+            .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))
+    }
+
+    pub fn image_understanding_stats(&self) -> Result<(u64, u64, u64), AppError> {
+        let connection = self.connect()?;
+        let sql = format!(
+            "SELECT COUNT(*), SUM(CASE WHEN ia.status = 'ready' THEN 1 ELSE 0 END), SUM(CASE WHEN ia.status IN ('pending_understanding','processing') THEN 1 ELSE 0 END) FROM image_assets ia JOIN files f ON f.file_id = ia.file_id WHERE f.current_revision_id = ia.revision_id AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL}"
+        );
+        connection
+            .query_row(&sql, [], |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, Option<u64>>(1)?.unwrap_or(0),
+                    row.get::<_, Option<u64>>(2)?.unwrap_or(0),
+                ))
+            })
+            .map_err(|error| storage_error("IMAGE_UNDERSTANDING_STATS_FAILED", error, true))
+    }
+
     pub fn search(&self, request: &crate::SearchRequest) -> Result<crate::SearchSession, AppError> {
         self.search_with_semantic(request, None)
+    }
+
+    pub fn semantic_index_coverage(
+        &self,
+        scope: &ScopeFilter,
+        model_artifact_id: &str,
+    ) -> Result<(f64, f64), AppError> {
+        if model_artifact_id.trim().is_empty() {
+            return Ok((0.0, 0.0));
+        }
+        let connection = self.connect()?;
+        let files = list_files_with_connection(&connection)?;
+        let scoped_file_ids = collect_scoped_file_ids(&connection, &files, scope)?;
+        let sql = format!(
+            "SELECT c.file_id, EXISTS (SELECT 1 FROM chunk_embeddings e WHERE e.chunk_id = c.chunk_id AND e.model_artifact_id = ?1 AND e.revision_id = c.revision_id) FROM chunks c JOIN files f ON f.file_id = c.file_id WHERE f.current_revision_id = c.revision_id AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL}"
+        );
+        let mut statement = connection
+            .prepare(&sql)
+            .map_err(|error| storage_error("RAG_COVERAGE_QUERY_FAILED", error, true))?;
+        let rows = statement
+            .query_map([model_artifact_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })
+            .map_err(|error| storage_error("RAG_COVERAGE_QUERY_FAILED", error, true))?;
+        let mut total = 0_u64;
+        let mut indexed = 0_u64;
+        let mut scoped_total = 0_u64;
+        let mut scoped_indexed = 0_u64;
+        for row in rows {
+            let (file_id, has_embedding) =
+                row.map_err(|error| storage_error("RAG_COVERAGE_QUERY_FAILED", error, true))?;
+            total += 1;
+            indexed += u64::from(has_embedding);
+            if Uuid::parse_str(&file_id).is_ok_and(|file_id| scoped_file_ids.contains(&file_id)) {
+                scoped_total += 1;
+                scoped_indexed += u64::from(has_embedding);
+            }
+        }
+        Ok((
+            coverage_ratio(indexed, total),
+            coverage_ratio(scoped_indexed, scoped_total),
+        ))
     }
 
     pub fn search_with_semantic(
@@ -2994,13 +4812,13 @@ impl CatalogStore {
             };
             let row = connection
                 .query_row(
-                    "SELECT chunk_id, node_id, text, locator_json FROM chunks WHERE file_id = ?1 AND revision_id = ?2 AND text = ?3 LIMIT 1",
+                    "SELECT c.chunk_id, c.node_id, c.text, c.locator_json, n.image_asset_id FROM chunks c JOIN document_nodes n ON n.node_id = c.node_id WHERE c.file_id = ?1 AND c.revision_id = ?2 AND c.text = ?3 LIMIT 1",
                     params![result.file_id.to_string(), revision_id.to_string(), result.snippet],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, Option<String>>(4)?)),
                 )
                 .optional()
                 .map_err(|error| storage_error("ASK_EVIDENCE_QUERY_FAILED", error, true))?;
-            let Some((chunk_id, node_id, quote, locator_json)) = row else {
+            let Some((chunk_id, node_id, quote, locator_json, image_asset_id)) = row else {
                 continue;
             };
             let locator = serde_json::from_str::<SourceLocator>(&locator_json)
@@ -3012,6 +4830,10 @@ impl CatalogStore {
                     revision_id,
                     node_id: parse_uuid_value(&node_id)?,
                     chunk_id: parse_uuid_value(&chunk_id)?,
+                    image_asset_id: image_asset_id
+                        .as_deref()
+                        .map(parse_uuid_value)
+                        .transpose()?,
                     quote,
                     locator,
                     retrieval_score: result.scores.fused,
@@ -3026,6 +4848,114 @@ impl CatalogStore {
         Ok(crate::assemble_extractive_answer(
             request, &session, evidence, started_at,
         ))
+    }
+
+    pub fn load_ask_history(
+        &self,
+        session_id: &Uuid,
+        limit: usize,
+    ) -> Result<Vec<AskMessage>, AppError> {
+        let connection = self.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT message_id, role, content, answer_json, created_at FROM ask_messages WHERE session_id = ?1 ORDER BY created_at DESC, message_id DESC LIMIT ?2",
+            )
+            .map_err(|error| storage_error("ASK_HISTORY_QUERY_FAILED", error, true))?;
+        let rows = statement
+            .query_map(
+                params![session_id.to_string(), limit.clamp(1, 20) as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .map_err(|error| storage_error("ASK_HISTORY_QUERY_FAILED", error, true))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| storage_error("ASK_HISTORY_QUERY_FAILED", error, true))?;
+        let mut messages = rows
+            .into_iter()
+            .map(|(message_id, role, content, answer_json, created_at)| {
+                Ok(AskMessage {
+                    message_id: parse_uuid_value(&message_id)?,
+                    session_id: *session_id,
+                    role,
+                    content,
+                    answer: answer_json
+                        .map(|value| {
+                            serde_json::from_str(&value).map_err(|error| {
+                                AppError::new("ASK_HISTORY_INVALID", error.to_string(), false)
+                            })
+                        })
+                        .transpose()?,
+                    created_at: parse_datetime_value(&created_at)?,
+                })
+            })
+            .collect::<Result<Vec<_>, AppError>>()?;
+        messages.reverse();
+        Ok(messages)
+    }
+
+    pub fn record_ask_exchange(
+        &self,
+        request: &AskRequest,
+        result: &AnswerResult,
+    ) -> Result<(), AppError> {
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| storage_error("ASK_HISTORY_WRITE_FAILED", error, true))?;
+        let now = Utc::now();
+        let scope_json = serde_json::to_string(&request.scope)
+            .map_err(|error| AppError::new("ASK_SCOPE_INVALID", error.to_string(), false))?;
+        transaction
+            .execute(
+                "INSERT INTO ask_sessions (session_id, scope_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?3) ON CONFLICT(session_id) DO UPDATE SET scope_json = excluded.scope_json, updated_at = excluded.updated_at",
+                params![result.session_id.to_string(), scope_json, now.to_rfc3339()],
+            )
+            .map_err(|error| storage_error("ASK_HISTORY_WRITE_FAILED", error, true))?;
+        transaction
+            .execute(
+                "INSERT INTO ask_messages (message_id, session_id, role, content, answer_json, created_at) VALUES (?1, ?2, 'user', ?3, NULL, ?4)",
+                params![Uuid::now_v7().to_string(), result.session_id.to_string(), request.question.trim(), now.to_rfc3339()],
+            )
+            .map_err(|error| storage_error("ASK_HISTORY_WRITE_FAILED", error, true))?;
+        let answer_json = serde_json::to_string(result)
+            .map_err(|error| AppError::new("ASK_RESULT_INVALID", error.to_string(), false))?;
+        transaction
+            .execute(
+                "INSERT INTO ask_messages (message_id, session_id, role, content, answer_json, created_at) VALUES (?1, ?2, 'assistant', ?3, ?4, ?5)",
+                params![result.message_id.to_string(), result.session_id.to_string(), result.answer, answer_json, Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| storage_error("ASK_HISTORY_WRITE_FAILED", error, true))?;
+        transaction
+            .commit()
+            .map_err(|error| storage_error("ASK_HISTORY_WRITE_FAILED", error, true))
+    }
+
+    pub fn validate_answer_evidence(&self, answer: &AnswerResult) -> Result<(), AppError> {
+        let connection = self.connect()?;
+        for citation in answer.claims.iter().flat_map(|claim| &claim.citations) {
+            let valid: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM chunks c JOIN document_nodes n ON n.node_id = c.node_id JOIN files f ON f.file_id = c.file_id JOIN file_root_memberships m ON m.file_id = f.file_id JOIN roots r ON r.root_id = m.root_id WHERE c.chunk_id = ?1 AND c.node_id = ?2 AND c.file_id = ?3 AND c.revision_id = ?4 AND c.text = ?5 AND (?6 IS NULL OR n.image_asset_id = ?6) AND f.current_revision_id = ?4 AND f.availability = 'present' AND r.enabled = 1)",
+                    params![citation.chunk_id.to_string(), citation.node_id.to_string(), citation.file_id.to_string(), citation.revision_id.to_string(), citation.quote, citation.image_asset_id.map(|value| value.to_string())],
+                    |row| row.get(0),
+                )
+                .map_err(|error| storage_error("ASK_CITATION_VALIDATE_FAILED", error, true))?;
+            if !valid {
+                return Err(AppError::new(
+                    "ASK_CITATION_STALE_OR_UNAUTHORIZED",
+                    "回答引用的资料已变化、离线或不再位于授权范围，已停止显示回答",
+                    true,
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn file_preview(
@@ -3057,6 +4987,7 @@ impl CatalogStore {
                 file,
                 revision_id: None,
                 nodes: vec![],
+                image_assets: vec![],
                 offset: 0,
                 next_offset: None,
                 anchor_node_id: None,
@@ -3109,11 +5040,13 @@ impl CatalogStore {
             .map_err(|error| storage_error("PREVIEW_QUERY_FAILED", error, true))?;
         let truncated = nodes.len() > node_limit;
         nodes.truncate(node_limit);
+        let image_assets = image_assets_for_revision(&connection, &revision_id)?;
         let next_offset = truncated.then_some((effective_offset + nodes.len()) as u32);
         Ok(crate::FilePreview {
             file,
             revision_id: Some(revision_id),
             nodes,
+            image_assets,
             offset: effective_offset as u32,
             next_offset,
             anchor_node_id: anchor_node_id.copied(),
@@ -3132,6 +5065,58 @@ impl CatalogStore {
             ));
         }
         Ok(PathBuf::from(file.canonical_path))
+    }
+
+    pub fn authorized_image_asset_path(
+        &self,
+        asset_id: &Uuid,
+    ) -> Result<(PathBuf, String, u64), AppError> {
+        let connection = self.connect()?;
+        let sql = format!(
+            "SELECT ia.cache_path, ia.mime_type, ia.size_bytes, ia.sha256 FROM image_assets ia JOIN files f ON f.file_id = ia.file_id WHERE ia.asset_id = ?1 AND f.current_revision_id = ia.revision_id AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL} LIMIT 1"
+        );
+        let (cache_path, mime_type, size_bytes, sha256) = connection
+            .query_row(&sql, [asset_id.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .optional()
+            .map_err(|error| storage_error("IMAGE_ASSET_QUERY_FAILED", error, true))?
+            .ok_or_else(|| {
+                AppError::new(
+                    "IMAGE_ASSET_NOT_FOUND",
+                    "图片资产不存在、已经失效或超出授权范围",
+                    false,
+                )
+            })?;
+        if !matches!(
+            mime_type.as_str(),
+            "image/jpeg" | "image/png" | "image/tiff" | "image/bmp" | "image/webp"
+        ) || size_bytes == 0
+            || size_bytes > 64 * 1024 * 1024
+        {
+            return Err(AppError::new(
+                "IMAGE_ASSET_UNSAFE",
+                "图片资产类型或大小不允许在预览中加载",
+                false,
+            ));
+        }
+        let path = PathBuf::from(cache_path);
+        let metadata = fs::metadata(&path)
+            .map_err(|error| AppError::new("IMAGE_ASSET_UNAVAILABLE", error.to_string(), true))?;
+        if !metadata.is_file() || metadata.len() != size_bytes || hash_file_sha256(&path)? != sha256
+        {
+            return Err(AppError::new(
+                "IMAGE_ASSET_UNAVAILABLE",
+                "图片资产缓存已经失效，需要重新建立索引",
+                true,
+            ));
+        }
+        Ok((path, mime_type, size_bytes))
     }
 
     pub fn append_log(&self, event: &LogEventInput<'_>) -> Result<(), AppError> {
@@ -3336,6 +5321,11 @@ impl CatalogStore {
             DegradationLevel::Core => "core",
         }
         .to_owned();
+        let background_notice = degradation
+            .triggers
+            .first()
+            .cloned()
+            .or_else(|| (active_jobs > 0).then(|| format!("{active_jobs}个后台任务正在处理")));
         Ok(MaintenanceSnapshot {
             schema_version: CURRENT_SCHEMA_VERSION,
             database_size_bytes,
@@ -3348,6 +5338,7 @@ impl CatalogStore {
             log_events,
             degradation_level,
             degradation_reasons: degradation.triggers,
+            background_notice,
             checks,
             checked_at: Utc::now(),
         })
@@ -3462,9 +5453,12 @@ impl CatalogStore {
                     level,
                     component,
                     event_name,
-                    fields: serde_json::from_str(&fields_json).map_err(|error| {
-                        AppError::new("LOG_DATA_INVALID", error.to_string(), false)
-                    })?,
+                    fields: sanitize_log_value(
+                        &serde_json::from_str(&fields_json).map_err(|error| {
+                            AppError::new("LOG_DATA_INVALID", error.to_string(), false)
+                        })?,
+                        None,
+                    ),
                     created_at: DateTime::parse_from_rfc3339(&created_at)
                         .map_err(|error| {
                             AppError::new("LOG_DATA_INVALID", error.to_string(), false)
@@ -3604,6 +5598,11 @@ fn sanitize_log_value(value: &serde_json::Value, field_name: Option<&str>) -> se
     }
     match value {
         serde_json::Value::String(text)
+            if matches!(text.as_str(), "full" | "balanced" | "core") =>
+        {
+            serde_json::Value::String("background_adjusted".to_owned())
+        }
+        serde_json::Value::String(text)
             if text.starts_with("\\\\")
                 || text
                     .as_bytes()
@@ -3621,6 +5620,14 @@ fn sanitize_log_value(value: &serde_json::Value, field_name: Option<&str>) -> se
         serde_json::Value::Object(fields) => serde_json::Value::Object(
             fields
                 .iter()
+                .filter(|(key, _)| {
+                    let key = key.to_ascii_lowercase();
+                    !key.contains("degradation")
+                        && !key.contains("resource_mode")
+                        && !key.contains("runtime_mode")
+                        && key != "triggers"
+                        && key != "disabled_features"
+                })
                 .map(|(key, value)| (key.clone(), sanitize_log_value(value, Some(key))))
                 .collect(),
         ),
@@ -3715,7 +5722,12 @@ fn collection_rule_matches(
         || !rule.filename_keywords.is_empty()
         || !rule.path_keywords.is_empty()
         || !rule.parse_statuses.is_empty()
-        || rule.modified_within_days.is_some();
+        || rule.modified_within_days.is_some()
+        || rule.min_size_bytes.is_some()
+        || rule.max_size_bytes.is_some();
+    if rule.excludes_metadata(file) {
+        return Ok(false);
+    }
     let metadata_matches = has_metadata_conditions && rule.matches_metadata(file, Utc::now());
     let has_text_conditions = !rule.text_keywords.is_empty();
     let mut text_matches = false;
@@ -3733,6 +5745,24 @@ fn collection_rule_matches(
             if found {
                 text_matches = true;
                 break;
+            }
+        }
+    }
+    if !rule.exclude_text_keywords.is_empty()
+        && let Some(revision_id) = file.current_revision_id
+    {
+        for keyword in &rule.exclude_text_keywords {
+            let pattern = format!("%{}%", keyword.trim().to_lowercase());
+            let found = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM chunks WHERE revision_id = ?1 AND lower(text) LIKE ?2)",
+                    params![revision_id.to_string(), pattern],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| storage_error("COLLECTION_QUERY_FAILED", error, true))?
+                != 0;
+            if found {
+                return Ok(false);
             }
         }
     }
@@ -3794,9 +5824,9 @@ fn collection_rows(connection: &Connection) -> Result<Vec<CollectionRecord>, App
             .transpose()
             .map_err(|error| AppError::new("COLLECTION_RULE_INVALID", error.to_string(), false))?;
         let file_count = match kind {
-            CollectionKind::Manual => connection
+            CollectionKind::Manual | CollectionKind::Ai => connection
                 .query_row(
-                    "SELECT COUNT(*) FROM collection_memberships m WHERE m.collection_id = ?1 AND EXISTS (SELECT 1 FROM file_root_memberships fm JOIN roots r ON r.root_id = fm.root_id WHERE fm.file_id = m.file_id AND r.enabled = 1)",
+                    "SELECT COUNT(*) FROM collection_memberships m WHERE m.collection_id = ?1 AND m.state = 'active' AND EXISTS (SELECT 1 FROM file_root_memberships fm JOIN roots r ON r.root_id = fm.root_id WHERE fm.file_id = m.file_id AND r.enabled = 1)",
                     [collection_id.to_string()],
                     |row| row.get::<_, u64>(0),
                 )
@@ -3843,7 +5873,7 @@ fn count_manual_collection_files(
     connection
         .query_row(
             &format!(
-                "SELECT COUNT(*) FROM files f JOIN collection_memberships cm ON cm.file_id = f.file_id WHERE cm.collection_id = ?1 AND {AUTHORIZED_FILE_SQL}"
+                "SELECT COUNT(*) FROM files f JOIN collection_memberships cm ON cm.file_id = f.file_id WHERE cm.collection_id = ?1 AND cm.state = 'active' AND {AUTHORIZED_FILE_SQL}"
             ),
             [collection_id.to_string()],
             |row| row.get(0),
@@ -3858,7 +5888,7 @@ fn query_manual_collection_files(
     page_size: u32,
 ) -> Result<Vec<FileRecord>, AppError> {
     let sql = format!(
-        "{FILE_SELECT_WITH_ALIAS} JOIN collection_memberships cm ON cm.file_id = f.file_id WHERE cm.collection_id = ?1 AND {AUTHORIZED_FILE_SQL} ORDER BY f.last_seen_at DESC LIMIT ?2 OFFSET ?3"
+        "{FILE_SELECT_WITH_ALIAS} JOIN collection_memberships cm ON cm.file_id = f.file_id WHERE cm.collection_id = ?1 AND cm.state = 'active' AND {AUTHORIZED_FILE_SQL} ORDER BY f.last_seen_at DESC LIMIT ?2 OFFSET ?3"
     );
     let mut statement = connection
         .prepare(&sql)
@@ -3875,6 +5905,193 @@ fn query_manual_collection_files(
         .map_err(|error| storage_error("COLLECTION_QUERY_FAILED", error, true))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| storage_error("COLLECTION_QUERY_FAILED", error, true))
+}
+
+#[derive(Debug, Clone)]
+struct ProfileCandidate {
+    file_id: Uuid,
+    revision_id: Uuid,
+    title: String,
+    vector: Vec<f32>,
+    bucket: String,
+}
+
+type ProfileAggregate = (String, String, Vec<String>, Vec<Vec<f32>>);
+
+fn query_suggestion_members(
+    connection: &Connection,
+    suggestion_id: &Uuid,
+) -> Result<Vec<CollectionSuggestedMember>, AppError> {
+    let sql = format!(
+        "SELECT f.file_id, f.volume_id, f.canonical_path, f.display_name, f.extension, f.mime_type, f.size_bytes, f.fs_created_at, f.modified_at, f.windows_file_id, f.content_sha256, f.availability, f.current_revision_id, f.parse_status, f.first_seen_at, f.last_seen_at, sm.revision_id, sm.confidence, sm.rationale, sm.state FROM files f JOIN collection_suggested_members sm ON sm.file_id = f.file_id WHERE sm.suggestion_id = ?1 AND {AUTHORIZED_FILE_SQL} ORDER BY sm.confidence DESC, f.display_name LIMIT 50"
+    );
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| storage_error("COLLECTION_SUGGESTION_QUERY_FAILED", error, true))?;
+    statement
+        .query_map([suggestion_id.to_string()], |row| {
+            let file = file_from_row(row)?;
+            Ok((
+                file,
+                (
+                    row.get::<_, String>(16)?,
+                    row.get::<_, f64>(17)?,
+                    row.get::<_, String>(18)?,
+                    row.get::<_, String>(19)?,
+                ),
+            ))
+        })
+        .map_err(|error| storage_error("COLLECTION_SUGGESTION_QUERY_FAILED", error, true))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| storage_error("COLLECTION_SUGGESTION_QUERY_FAILED", error, true))?
+        .into_iter()
+        .map(|(file, (revision_id, confidence, rationale, state))| {
+            Ok(CollectionSuggestedMember {
+                file,
+                revision_id: parse_uuid_value(&revision_id)?,
+                confidence,
+                rationale,
+                state,
+            })
+        })
+        .collect()
+}
+
+fn coverage_ratio(indexed: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        (indexed as f64 / total as f64).clamp(0.0, 1.0)
+    }
+}
+
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn ensure_suggestion_status(
+    connection: &Connection,
+    suggestion_id: &Uuid,
+    expected: &str,
+) -> Result<(), AppError> {
+    let status = connection
+        .query_row(
+            "SELECT status FROM collection_suggestions WHERE suggestion_id = ?1",
+            [suggestion_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| storage_error("COLLECTION_SUGGESTION_QUERY_FAILED", error, true))?
+        .ok_or_else(|| {
+            AppError::new("COLLECTION_SUGGESTION_NOT_FOUND", "AI集合建议不存在", false)
+        })?;
+    if status != expected {
+        return Err(AppError::new(
+            "COLLECTION_SUGGESTION_STATE_INVALID",
+            format!("AI集合建议当前状态为{status}，不能执行此操作"),
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn decode_vector(bytes: &[u8], dimension: u32) -> Result<Vec<f32>, AppError> {
+    if bytes.len() != dimension as usize * 4 {
+        return Err(AppError::new(
+            "EMBEDDING_VECTOR_INVALID",
+            "向量字节长度与维度不一致",
+            false,
+        ));
+    }
+    let vector = bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect::<Vec<_>>();
+    if vector.iter().any(|value| !value.is_finite()) {
+        return Err(AppError::new(
+            "EMBEDDING_VECTOR_INVALID",
+            "向量包含无效数值",
+            false,
+        ));
+    }
+    Ok(vector)
+}
+
+fn mean_normalized_vector(vectors: &[Vec<f32>]) -> Result<Vec<f32>, AppError> {
+    let dimension = vectors.first().map(Vec::len).unwrap_or_default();
+    if dimension == 0 || vectors.iter().any(|vector| vector.len() != dimension) {
+        return Err(AppError::new(
+            "COLLECTION_PROFILE_VECTOR_INVALID",
+            "文档向量维度不一致",
+            false,
+        ));
+    }
+    let mut mean = vec![0.0_f32; dimension];
+    for vector in vectors {
+        for (target, value) in mean.iter_mut().zip(vector) {
+            *target += *value;
+        }
+    }
+    let norm = mean.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if !norm.is_finite() || norm <= f32::EPSILON {
+        return Err(AppError::new(
+            "COLLECTION_PROFILE_VECTOR_INVALID",
+            "文档向量无法归一化",
+            false,
+        ));
+    }
+    mean.iter_mut().for_each(|value| *value /= norm);
+    Ok(mean)
+}
+
+fn semantic_bucket(vector: &[f32]) -> String {
+    let bits = vector
+        .iter()
+        .take(6)
+        .enumerate()
+        .fold(0_u8, |value, (index, item)| {
+            value | (u8::from(*item >= 0.0) << index)
+        });
+    format!("{bits:02x}")
+}
+
+fn compact_profile_text(value: &str, limit: usize) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(limit)
+        .collect()
+}
+
+fn collection_name_stem(value: &str) -> String {
+    let stem = value
+        .rsplit_once('.')
+        .map_or(value, |(stem, _)| stem)
+        .trim();
+    let compact = compact_profile_text(stem, 24);
+    if compact.is_empty() {
+        "相关主题".into()
+    } else {
+        compact
+    }
+}
+
+fn profile_keywords(value: &str) -> Vec<String> {
+    let stem = collection_name_stem(value);
+    let chars = stem.chars().collect::<Vec<_>>();
+    let mut keywords = Vec::new();
+    for window in chars.windows(2).take(8) {
+        let keyword = window.iter().collect::<String>();
+        if !keywords.contains(&keyword) {
+            keywords.push(keyword);
+        }
+    }
+    keywords
 }
 
 fn collection_rule_predicate(rule: &CollectionRule) -> (String, Vec<SqlValue>) {
@@ -3930,6 +6147,18 @@ fn collection_rule_predicate(rule: &CollectionRule) -> (String, Vec<SqlValue>) {
             (Utc::now() - chrono::Duration::days(i64::from(days))).to_rfc3339(),
         ));
     }
+    if rule.min_size_bytes.is_some() || rule.max_size_bytes.is_some() {
+        let mut size_conditions = Vec::new();
+        if let Some(minimum) = rule.min_size_bytes {
+            size_conditions.push("f.size_bytes >= ?");
+            values.push(SqlValue::Integer(minimum.min(i64::MAX as u64) as i64));
+        }
+        if let Some(maximum) = rule.max_size_bytes {
+            size_conditions.push("f.size_bytes <= ?");
+            values.push(SqlValue::Integer(maximum.min(i64::MAX as u64) as i64));
+        }
+        conditions.push(format!("({})", size_conditions.join(" AND ")));
+    }
     if !rule.text_keywords.is_empty() {
         conditions.push(format!(
             "EXISTS (SELECT 1 FROM chunks rc WHERE rc.revision_id = f.current_revision_id AND ({}))",
@@ -3945,7 +6174,60 @@ fn collection_rule_predicate(rule: &CollectionRule) -> (String, Vec<SqlValue>) {
         crate::RuleOperator::All => " AND ",
         crate::RuleOperator::Any => " OR ",
     };
-    (conditions.join(separator), values)
+    let mut predicate = if conditions.is_empty() {
+        "1 = 1".to_owned()
+    } else {
+        format!("({})", conditions.join(separator))
+    };
+    let mut exclusions = Vec::new();
+    if !rule.exclude_extensions.is_empty() {
+        exclusions.push(format!(
+            "lower(f.extension) IN ({})",
+            vec!["?"; rule.exclude_extensions.len()].join(",")
+        ));
+        values.extend(
+            rule.exclude_extensions
+                .iter()
+                .map(|value| SqlValue::Text(value.trim_start_matches('.').to_lowercase())),
+        );
+    }
+    if !rule.exclude_filename_keywords.is_empty() {
+        exclusions.push(format!(
+            "({})",
+            vec!["lower(f.display_name) LIKE ?"; rule.exclude_filename_keywords.len()].join(" OR ")
+        ));
+        values.extend(
+            rule.exclude_filename_keywords
+                .iter()
+                .map(|value| SqlValue::Text(format!("%{}%", value.to_lowercase()))),
+        );
+    }
+    if !rule.exclude_path_keywords.is_empty() {
+        exclusions.push(format!(
+            "({})",
+            vec!["lower(f.canonical_path) LIKE ?"; rule.exclude_path_keywords.len()].join(" OR ")
+        ));
+        values.extend(
+            rule.exclude_path_keywords
+                .iter()
+                .map(|value| SqlValue::Text(format!("%{}%", value.to_lowercase()))),
+        );
+    }
+    if !rule.exclude_text_keywords.is_empty() {
+        exclusions.push(format!(
+            "EXISTS (SELECT 1 FROM chunks rc WHERE rc.revision_id = f.current_revision_id AND ({}))",
+            vec!["lower(rc.text) LIKE ?"; rule.exclude_text_keywords.len()].join(" OR ")
+        ));
+        values.extend(
+            rule.exclude_text_keywords
+                .iter()
+                .map(|value| SqlValue::Text(format!("%{}%", value.to_lowercase()))),
+        );
+    }
+    if !exclusions.is_empty() {
+        predicate.push_str(&format!(" AND NOT ({})", exclusions.join(" OR ")));
+    }
+    (predicate, values)
 }
 
 fn count_files_for_rule(connection: &Connection, rule: &CollectionRule) -> Result<u64, AppError> {
@@ -4068,6 +6350,44 @@ fn document_node_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DocumentN
     })
 }
 
+fn image_assets_for_revision(
+    connection: &Connection,
+    revision_id: &Uuid,
+) -> Result<Vec<ImageAsset>, AppError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT asset_id, revision_id, asset_kind, cache_path, mime_type, size_bytes, sha256, locator_json, ocr_text, description, vision_model_id, status, error_json FROM image_assets WHERE revision_id = ?1 ORDER BY created_at, asset_id LIMIT 512",
+        )
+        .map_err(|error| storage_error("IMAGE_ASSET_QUERY_FAILED", error, true))?;
+    statement
+        .query_map([revision_id.to_string()], |row| {
+            let asset_id = row.get::<_, String>(0)?;
+            let revision_id = row.get::<_, String>(1)?;
+            let locator_json = row.get::<_, String>(7)?;
+            Ok(ImageAsset {
+                asset_id: parse_uuid_column(&asset_id, 0)?,
+                revision_id: parse_uuid_column(&revision_id, 1)?,
+                asset_kind: row.get(2)?,
+                cache_path: row.get(3)?,
+                mime_type: row.get(4)?,
+                size_bytes: row.get(5)?,
+                sha256: row.get(6)?,
+                locator: parse_json_column(7, &locator_json)?,
+                ocr_text: row.get(8)?,
+                description: row.get(9)?,
+                vision_model_id: row.get(10)?,
+                status: row.get(11)?,
+                error: row
+                    .get::<_, Option<String>>(12)?
+                    .map(|value| parse_json_column(12, &value))
+                    .transpose()?,
+            })
+        })
+        .map_err(|error| storage_error("IMAGE_ASSET_QUERY_FAILED", error, true))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| storage_error("IMAGE_ASSET_QUERY_FAILED", error, true))
+}
+
 fn parse_json_column<T: serde::de::DeserializeOwned>(
     index: usize,
     value: &str,
@@ -4081,12 +6401,212 @@ fn parse_json_column<T: serde::de::DeserializeOwned>(
     })
 }
 
+fn validate_knowledge_space_references(
+    transaction: &Transaction<'_>,
+    request: &KnowledgeSpaceRequest,
+) -> Result<(), AppError> {
+    for root_id in request.root_ids.iter().collect::<HashSet<_>>() {
+        let exists = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM roots WHERE root_id = ?1 AND enabled = 1)",
+                [root_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| storage_error("KNOWLEDGE_SPACE_REFERENCE_FAILED", error, true))?
+            != 0;
+        if !exists {
+            return Err(AppError::new(
+                "KNOWLEDGE_SPACE_ROOT_INVALID",
+                "知识空间包含不存在或已停用的资料位置",
+                false,
+            ));
+        }
+    }
+    for collection_id in request.collection_ids.iter().collect::<HashSet<_>>() {
+        let exists = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM collections WHERE collection_id = ?1)",
+                [collection_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| storage_error("KNOWLEDGE_SPACE_REFERENCE_FAILED", error, true))?
+            != 0;
+        if !exists {
+            return Err(AppError::new(
+                "KNOWLEDGE_SPACE_COLLECTION_INVALID",
+                "知识空间包含不存在的集合",
+                false,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn replace_knowledge_space_members(
+    transaction: &Transaction<'_>,
+    space_id: &Uuid,
+    request: &KnowledgeSpaceRequest,
+) -> Result<(), AppError> {
+    transaction
+        .execute(
+            "DELETE FROM knowledge_space_roots WHERE space_id = ?1",
+            [space_id.to_string()],
+        )
+        .map_err(|error| storage_error("KNOWLEDGE_SPACE_UPDATE_FAILED", error, true))?;
+    transaction
+        .execute(
+            "DELETE FROM knowledge_space_collections WHERE space_id = ?1",
+            [space_id.to_string()],
+        )
+        .map_err(|error| storage_error("KNOWLEDGE_SPACE_UPDATE_FAILED", error, true))?;
+    for root_id in request.root_ids.iter().collect::<HashSet<_>>() {
+        transaction
+            .execute(
+                "INSERT INTO knowledge_space_roots (space_id, root_id) VALUES (?1, ?2)",
+                params![space_id.to_string(), root_id.to_string()],
+            )
+            .map_err(|error| storage_error("KNOWLEDGE_SPACE_UPDATE_FAILED", error, true))?;
+    }
+    for collection_id in request.collection_ids.iter().collect::<HashSet<_>>() {
+        transaction
+            .execute(
+                "INSERT INTO knowledge_space_collections (space_id, collection_id) VALUES (?1, ?2)",
+                params![space_id.to_string(), collection_id.to_string()],
+            )
+            .map_err(|error| storage_error("KNOWLEDGE_SPACE_UPDATE_FAILED", error, true))?;
+    }
+    Ok(())
+}
+
+fn knowledge_space_members(
+    connection: &Connection,
+    space_id: &Uuid,
+) -> Result<(Vec<Uuid>, Vec<Uuid>), AppError> {
+    let load_ids = |query: &str, code: &'static str| -> Result<Vec<Uuid>, AppError> {
+        let mut statement = connection
+            .prepare(query)
+            .map_err(|error| storage_error(code, error, true))?;
+        statement
+            .query_map([space_id.to_string()], |row| {
+                let value = row.get::<_, String>(0)?;
+                parse_uuid_column(&value, 0)
+            })
+            .map_err(|error| storage_error(code, error, true))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| storage_error(code, error, true))
+    };
+    Ok((
+        load_ids(
+            "SELECT root_id FROM knowledge_space_roots WHERE space_id = ?1 ORDER BY root_id",
+            "KNOWLEDGE_SPACE_ROOT_QUERY_FAILED",
+        )?,
+        load_ids(
+            "SELECT collection_id FROM knowledge_space_collections WHERE space_id = ?1 ORDER BY collection_id",
+            "KNOWLEDGE_SPACE_COLLECTION_QUERY_FAILED",
+        )?,
+    ))
+}
+
+fn file_matches_any_root(
+    connection: &Connection,
+    file_id: &Uuid,
+    root_ids: &[Uuid],
+) -> Result<bool, AppError> {
+    if root_ids.is_empty() {
+        return Ok(false);
+    }
+    let allowed = root_ids.iter().map(Uuid::to_string).collect::<HashSet<_>>();
+    let mut statement = connection
+        .prepare(
+            "SELECT m.root_id FROM file_root_memberships m JOIN roots r ON r.root_id = m.root_id WHERE m.file_id = ?1 AND r.enabled = 1",
+        )
+        .map_err(|error| storage_error("KNOWLEDGE_SPACE_SCOPE_FAILED", error, true))?;
+    let roots = statement
+        .query_map([file_id.to_string()], |row| row.get::<_, String>(0))
+        .map_err(|error| storage_error("KNOWLEDGE_SPACE_SCOPE_FAILED", error, true))?;
+    for root in roots {
+        if allowed.contains(
+            &root.map_err(|error| storage_error("KNOWLEDGE_SPACE_SCOPE_FAILED", error, true))?,
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn knowledge_space_contains_file(
+    connection: &Connection,
+    file: &FileRecord,
+    space_id: &Uuid,
+) -> Result<bool, AppError> {
+    let exists = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM knowledge_spaces WHERE space_id = ?1)",
+            [space_id.to_string()],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| storage_error("KNOWLEDGE_SPACE_SCOPE_FAILED", error, true))?
+        != 0;
+    if !exists {
+        return Err(AppError::new(
+            "KNOWLEDGE_SPACE_NOT_FOUND",
+            "检索范围中的知识空间不存在",
+            false,
+        ));
+    }
+    let (root_ids, collection_ids) = knowledge_space_members(connection, space_id)?;
+    Ok(file_matches_any_root(connection, &file.file_id, &root_ids)?
+        || (!collection_ids.is_empty()
+            && file_matches_collection_scope(connection, file, &collection_ids)?))
+}
+
+fn file_matches_knowledge_space_scope(
+    connection: &Connection,
+    file: &FileRecord,
+    space_ids: &[Uuid],
+) -> Result<bool, AppError> {
+    for space_id in space_ids {
+        if knowledge_space_contains_file(connection, file, space_id)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn knowledge_space_file_count(
+    connection: &Connection,
+    root_ids: &[Uuid],
+    collection_ids: &[Uuid],
+) -> Result<u64, AppError> {
+    let files = list_files_with_connection(connection)?;
+    let mut count = 0_u64;
+    for file in files {
+        if !file_is_authorized(connection, &file.file_id)?
+            || file.availability != crate::Availability::Present
+        {
+            continue;
+        }
+        if file_matches_any_root(connection, &file.file_id, root_ids)?
+            || (!collection_ids.is_empty()
+                && file_matches_collection_scope(connection, &file, collection_ids)?)
+        {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 fn file_matches_scope(
     connection: &Connection,
     file: &FileRecord,
     scope: &ScopeFilter,
 ) -> Result<bool, AppError> {
     if !file_is_authorized(connection, &file.file_id)? {
+        return Ok(false);
+    }
+    if !scope.knowledge_space_ids.is_empty()
+        && !file_matches_knowledge_space_scope(connection, file, &scope.knowledge_space_ids)?
+    {
         return Ok(false);
     }
     if !scope.collection_ids.is_empty()
@@ -4174,6 +6694,12 @@ fn collect_scoped_file_ids(
     let mut scoped = HashSet::new();
     for file in files {
         if !authorized.contains(&file.file_id)
+            || (!scope.knowledge_space_ids.is_empty()
+                && !file_matches_knowledge_space_scope(
+                    connection,
+                    file,
+                    &scope.knowledge_space_ids,
+                )?)
             || (!scope.file_ids.is_empty() && !scope.file_ids.contains(&file.file_id))
             || (!scope.extensions.is_empty()
                 && !scope.extensions.iter().any(|extension| {
@@ -4250,10 +6776,10 @@ fn file_matches_collection_scope(
         let Some((kind, rule_json)) = raw else {
             continue;
         };
-        if kind == "manual" {
+        if kind != "rule" {
             let member = connection
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM collection_memberships WHERE collection_id = ?1 AND file_id = ?2)",
+                    "SELECT EXISTS(SELECT 1 FROM collection_memberships WHERE collection_id = ?1 AND file_id = ?2 AND state = 'active')",
                     params![collection_id.to_string(), file.file_id.to_string()],
                     |row| row.get::<_, i64>(0),
                 )
@@ -4347,6 +6873,52 @@ fn search_semantic(
             false,
         ));
     }
+    let candidates =
+        search_semantic_usearch_candidates(connection, query, scoped_file_ids)?.unwrap_or(
+            search_semantic_exact_candidates(connection, query, scoped_file_ids)?,
+        );
+
+    let mut details = connection
+        .prepare(
+            "SELECT f.file_id, f.volume_id, f.canonical_path, f.display_name, f.extension, f.mime_type, f.size_bytes, f.fs_created_at, f.modified_at, f.windows_file_id, f.content_sha256, f.availability, f.current_revision_id, f.parse_status, f.first_seen_at, f.last_seen_at, c.revision_id, c.text, c.locator_json FROM chunks c JOIN files f ON f.file_id = c.file_id WHERE c.chunk_id = ?1 AND f.current_revision_id = c.revision_id",
+        )
+        .map_err(|error| storage_error("EMBEDDING_QUERY_FAILED", error, true))?;
+    let mut hits = Vec::with_capacity(candidates.len());
+    for (_file_id, (chunk_id, score)) in candidates {
+        let detail = details
+            .query_row([chunk_id], |row| {
+                let file = file_from_row(row)?;
+                Ok((
+                    file,
+                    row.get::<_, String>(16)?,
+                    row.get::<_, String>(17)?,
+                    row.get::<_, String>(18)?,
+                ))
+            })
+            .optional()
+            .map_err(|error| storage_error("EMBEDDING_QUERY_FAILED", error, true))?;
+        let Some((file, revision_id, text, locator_json)) = detail else {
+            continue;
+        };
+        let locator = serde_json::from_str::<SourceLocator>(&locator_json)
+            .map_err(|error| AppError::new("EMBEDDING_VECTOR_INVALID", error.to_string(), false))?;
+        hits.push(RankedHit {
+            file,
+            revision_id: Some(parse_uuid_value(&revision_id)?),
+            snippet: text,
+            locator: Some(locator),
+            reason: "semantic",
+            channel_score: score,
+        });
+    }
+    Ok(hits)
+}
+
+fn search_semantic_exact_candidates(
+    connection: &Connection,
+    query: &SemanticQuery<'_>,
+    scoped_file_ids: &HashSet<Uuid>,
+) -> Result<Vec<SemanticCandidate>, AppError> {
     let mut statement = connection
         .prepare(
             "SELECT e.chunk_id, e.file_id, e.dimension, e.vector_blob FROM chunk_embeddings e JOIN files f ON f.file_id = e.file_id WHERE e.model_artifact_id = ?1 AND f.current_revision_id = e.revision_id AND f.availability = 'present'",
@@ -4385,41 +6957,120 @@ fn search_semantic(
     let mut candidates = best_by_file.into_iter().collect::<Vec<_>>();
     candidates.sort_by(|left, right| right.1.1.total_cmp(&left.1.1));
     candidates.truncate(500);
+    Ok(candidates)
+}
 
-    let mut details = connection
-        .prepare(
-            "SELECT f.file_id, f.volume_id, f.canonical_path, f.display_name, f.extension, f.mime_type, f.size_bytes, f.fs_created_at, f.modified_at, f.windows_file_id, f.content_sha256, f.availability, f.current_revision_id, f.parse_status, f.first_seen_at, f.last_seen_at, c.revision_id, c.text, c.locator_json FROM chunks c JOIN files f ON f.file_id = c.file_id WHERE c.chunk_id = ?1 AND f.current_revision_id = c.revision_id",
-        )
-        .map_err(|error| storage_error("EMBEDDING_QUERY_FAILED", error, true))?;
-    let mut hits = Vec::with_capacity(candidates.len());
-    for (_file_id, (chunk_id, score)) in candidates {
-        let detail = details
-            .query_row([chunk_id], |row| {
-                let file = file_from_row(row)?;
+fn search_semantic_usearch_candidates(
+    connection: &Connection,
+    query: &SemanticQuery<'_>,
+    scoped_file_ids: &HashSet<Uuid>,
+) -> Result<Option<Vec<SemanticCandidate>>, AppError> {
+    let active = connection
+        .query_row(
+            "SELECT generation_id, dimension, index_path, item_count FROM index_generations WHERE model_artifact_id = ?1 AND status = 'active' LIMIT 1",
+            [query.model_artifact_id],
+            |row| {
                 Ok((
-                    file,
-                    row.get::<_, String>(16)?,
-                    row.get::<_, String>(17)?,
-                    row.get::<_, String>(18)?,
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, usize>(3)?,
                 ))
-            })
-            .optional()
-            .map_err(|error| storage_error("EMBEDDING_QUERY_FAILED", error, true))?;
-        let Some((file, revision_id, text, locator_json)) = detail else {
+            },
+        )
+        .optional()
+        .map_err(|error| storage_error("VECTOR_INDEX_GENERATION_QUERY_FAILED", error, true))?;
+    let Some((generation_id, dimension, index_path, item_count)) = active else {
+        return Ok(None);
+    };
+    if dimension as usize != query.vector.len() || item_count == 0 {
+        return Ok(None);
+    }
+    let indexed_files: u64 = connection
+        .query_row(
+            "SELECT COUNT(DISTINCT file_id) FROM vector_index_keys WHERE generation_id = ?1",
+            [&generation_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| storage_error("VECTOR_INDEX_KEY_QUERY_FAILED", error, true))?;
+    if scoped_file_ids.len() < indexed_files as usize {
+        return Ok(None);
+    }
+    let candidate_count = item_count.clamp(1, 5_000);
+    let matches = match crate::search_index(
+        std::path::Path::new(&index_path),
+        query.vector,
+        candidate_count,
+    ) {
+        Ok(matches) => matches,
+        Err(_) => return Ok(None),
+    };
+    if matches.is_empty() {
+        return Ok(None);
+    }
+    let score_by_key = matches
+        .iter()
+        .map(|item| (item.key, (1.0 - item.distance / 2.0).clamp(0.0, 1.0)))
+        .collect::<HashMap<_, _>>();
+    let placeholders = std::iter::repeat_n("?", score_by_key.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT vector_key, chunk_id, file_id FROM vector_index_keys WHERE generation_id = ? AND vector_key IN ({placeholders})"
+    );
+    let mut values = Vec::<SqlValue>::with_capacity(score_by_key.len() + 1);
+    values.push(SqlValue::Text(generation_id));
+    for key in score_by_key.keys() {
+        let key = i64::try_from(*key).map_err(|_| {
+            AppError::new(
+                "VECTOR_INDEX_CAPACITY_EXCEEDED",
+                "向量键超出数据库范围",
+                false,
+            )
+        })?;
+        values.push(SqlValue::Integer(key));
+    }
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| storage_error("VECTOR_INDEX_KEY_QUERY_FAILED", error, true))?;
+    let rows = statement
+        .query_map(params_from_iter(values), |row| {
+            Ok((
+                row.get::<_, u64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| storage_error("VECTOR_INDEX_KEY_QUERY_FAILED", error, true))?;
+    let mut best_by_file = HashMap::<Uuid, (String, f32)>::new();
+    for row in rows {
+        let (key, chunk_id, file_id) =
+            row.map_err(|error| storage_error("VECTOR_INDEX_KEY_QUERY_FAILED", error, true))?;
+        let file_id = parse_uuid_value(&file_id)?;
+        if !scoped_file_ids.contains(&file_id) {
+            continue;
+        }
+        let Some(score) = score_by_key.get(&key).copied() else {
             continue;
         };
-        let locator = serde_json::from_str::<SourceLocator>(&locator_json)
-            .map_err(|error| AppError::new("EMBEDDING_VECTOR_INVALID", error.to_string(), false))?;
-        hits.push(RankedHit {
-            file,
-            revision_id: Some(parse_uuid_value(&revision_id)?),
-            snippet: text,
-            locator: Some(locator),
-            reason: "semantic",
-            channel_score: score,
-        });
+        if score < 0.2 {
+            continue;
+        }
+        if best_by_file
+            .get(&file_id)
+            .is_none_or(|current| score > current.1)
+        {
+            best_by_file.insert(file_id, (chunk_id, score));
+        }
     }
-    Ok(hits)
+    let mut candidates = best_by_file.into_iter().collect::<Vec<_>>();
+    candidates.sort_by(|left, right| right.1.1.total_cmp(&left.1.1));
+    candidates.truncate(500);
+    if candidates.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(candidates))
+    }
 }
 
 fn dot_product_with_le_f32(query: &[f32], bytes: &[u8], dimension: u32) -> Result<f32, AppError> {
@@ -4466,6 +7117,18 @@ fn active_scan_job_with(
         )
         .optional()
         .map_err(|error| storage_error("JOB_QUERY_FAILED", error, true))
+}
+
+fn initial_parse_status(extension: &str) -> &'static str {
+    match extension.to_ascii_lowercase().as_str() {
+        "pdf" | "docx" | "docm" | "xlsx" | "xlsm" | "pptx" | "pptm" | "csv" | "tsv" | "md"
+        | "txt" | "html" | "htm" | "jpg" | "jpeg" | "png" | "tif" | "tiff" | "bmp" | "webp"
+        | "doc" | "xls" | "ppt" | "zip" | "rs" | "py" | "js" | "jsx" | "mjs" | "cjs" | "ts"
+        | "tsx" | "java" | "kt" | "kts" | "go" | "c" | "cc" | "cpp" | "h" | "hpp" | "cs" | "rb"
+        | "php" | "swift" | "scala" | "sh" | "ps1" | "sql" | "json" | "yaml" | "yml" | "toml"
+        | "xml" | "css" | "scss" | "vue" | "svelte" => "pending",
+        _ => "unsupported",
+    }
 }
 
 fn upsert_file(
@@ -4532,6 +7195,7 @@ fn upsert_file(
         .map_err(|error| storage_error("FILE_QUERY_FAILED", error, true))?;
     let now = Utc::now();
     let fingerprint = format!("{}:{}", file.size_bytes, file.modified_at.to_rfc3339());
+    let initial_parse_status = initial_parse_status(&file.extension);
     let existing_fingerprint: Option<String> = transaction
         .query_row(
             "SELECT r.metadata_fingerprint FROM files f LEFT JOIN file_revisions r ON r.revision_id = f.current_revision_id WHERE f.file_id = ?1",
@@ -4545,15 +7209,15 @@ fn upsert_file(
     let revision_id = if revision_changed {
         transaction
             .execute(
-                "INSERT OR IGNORE INTO files (file_id, canonical_path, path_key, name, extension, size_bytes, modified_at, discovered_at, availability, volume_id, display_name, mime_type, fs_created_at, windows_file_id, parse_status, first_seen_at, last_seen_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'present', ?9, ?4, ?10, ?11, ?12, 'pending', ?8, ?8)",
-                params![file_id.to_string(), file.canonical_path, file.path_key, file.name, file.extension, file.size_bytes, file.modified_at.to_rfc3339(), now.to_rfc3339(), file.volume_id, file.mime_type, file.created_at.map(|value| value.to_rfc3339()), file.windows_file_id],
+                "INSERT OR IGNORE INTO files (file_id, canonical_path, path_key, name, extension, size_bytes, modified_at, discovered_at, availability, volume_id, display_name, mime_type, fs_created_at, windows_file_id, parse_status, first_seen_at, last_seen_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'present', ?9, ?4, ?10, ?11, ?12, ?13, ?8, ?8)",
+                params![file_id.to_string(), file.canonical_path, file.path_key, file.name, file.extension, file.size_bytes, file.modified_at.to_rfc3339(), now.to_rfc3339(), file.volume_id, file.mime_type, file.created_at.map(|value| value.to_rfc3339()), file.windows_file_id, initial_parse_status],
             )
             .map_err(|error| storage_error("FILE_UPSERT_FAILED", error, true))?;
         let revision_id = Uuid::now_v7();
         transaction
             .execute(
-                "INSERT INTO file_revisions (revision_id, file_id, size_bytes, fs_modified_at, content_sha256, metadata_fingerprint, created_at) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
-                params![revision_id.to_string(), file_id.to_string(), file.size_bytes, file.modified_at.to_rfc3339(), fingerprint, now.to_rfc3339()],
+                "INSERT INTO file_revisions (revision_id, file_id, size_bytes, fs_modified_at, content_sha256, metadata_fingerprint, created_at, parse_status) VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7)",
+                params![revision_id.to_string(), file_id.to_string(), file.size_bytes, file.modified_at.to_rfc3339(), fingerprint, now.to_rfc3339(), initial_parse_status],
             )
             .map_err(|error| storage_error("REVISION_INSERT_FAILED", error, true))?;
         revision_id
@@ -4569,7 +7233,7 @@ fn upsert_file(
     };
     transaction
         .execute(
-            "INSERT INTO files (file_id, canonical_path, path_key, name, extension, size_bytes, modified_at, discovered_at, availability, volume_id, display_name, mime_type, fs_created_at, windows_file_id, current_revision_id, parse_status, first_seen_at, last_seen_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'present', ?9, ?4, ?10, ?11, ?12, ?13, 'pending', ?8, ?8) ON CONFLICT(file_id) DO UPDATE SET canonical_path = excluded.canonical_path, path_key = excluded.path_key, name = excluded.name, display_name = excluded.display_name, extension = excluded.extension, mime_type = excluded.mime_type, size_bytes = excluded.size_bytes, fs_created_at = excluded.fs_created_at, modified_at = excluded.modified_at, windows_file_id = excluded.windows_file_id, volume_id = excluded.volume_id, content_sha256 = CASE WHEN files.current_revision_id <> excluded.current_revision_id THEN NULL ELSE files.content_sha256 END, current_revision_id = excluded.current_revision_id, parse_status = CASE WHEN files.current_revision_id <> excluded.current_revision_id THEN 'pending' ELSE files.parse_status END, availability = 'present', last_seen_at = excluded.last_seen_at",
+            "INSERT INTO files (file_id, canonical_path, path_key, name, extension, size_bytes, modified_at, discovered_at, availability, volume_id, display_name, mime_type, fs_created_at, windows_file_id, current_revision_id, parse_status, first_seen_at, last_seen_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'present', ?9, ?4, ?10, ?11, ?12, ?13, ?14, ?8, ?8) ON CONFLICT(file_id) DO UPDATE SET canonical_path = excluded.canonical_path, path_key = excluded.path_key, name = excluded.name, display_name = excluded.display_name, extension = excluded.extension, mime_type = excluded.mime_type, size_bytes = excluded.size_bytes, fs_created_at = excluded.fs_created_at, modified_at = excluded.modified_at, windows_file_id = excluded.windows_file_id, volume_id = excluded.volume_id, content_sha256 = CASE WHEN files.current_revision_id <> excluded.current_revision_id THEN NULL ELSE files.content_sha256 END, current_revision_id = excluded.current_revision_id, parse_status = CASE WHEN files.current_revision_id <> excluded.current_revision_id THEN excluded.parse_status ELSE files.parse_status END, availability = 'present', last_seen_at = excluded.last_seen_at",
             params![
                 file_id.to_string(),
                 file.canonical_path,
@@ -4584,6 +7248,7 @@ fn upsert_file(
                 file.created_at.map(|value| value.to_rfc3339()),
                 file.windows_file_id,
                 revision_id.to_string(),
+                initial_parse_status,
             ],
         )
         .map_err(|error| storage_error("FILE_UPSERT_FAILED", error, true))?;
@@ -4991,6 +7656,16 @@ impl JobStatus {
 mod tests {
     use super::*;
 
+    #[test]
+    fn metadata_only_formats_never_enter_the_content_parser_queue() {
+        for extension in ["exe", "dll", "msi", "mp4", "mp3", "7z", "unknown"] {
+            assert_eq!(initial_parse_status(extension), "unsupported");
+        }
+        for extension in ["pdf", "docx", "png", "zip", "rs", "py", "tsx"] {
+            assert_eq!(initial_parse_status(extension), "pending");
+        }
+    }
+
     fn test_root_registration() -> RootRegistration {
         RootRegistration {
             label: "文档".to_owned(),
@@ -5377,6 +8052,14 @@ mod tests {
                 (4, "document_index_foundation".to_owned()),
                 (5, "inbox_collections_and_relations".to_owned()),
                 (6, "local_vector_index".to_owned()),
+                (7, "persistent_ask_sessions".to_owned()),
+                (8, "ai_collection_suggestions".to_owned()),
+                (9, "usearch_index_generations".to_owned()),
+                (10, "multimodal_image_assets".to_owned()),
+                (11, "metadata_only_file_policy".to_owned()),
+                (12, "recoverable_image_understanding".to_owned()),
+                (13, "knowledge_spaces".to_owned()),
+                (14, "application_settings".to_owned()),
             ]
         );
         let rules = store.list_exclusion_rules().expect("list exclusion rules");
@@ -5386,6 +8069,20 @@ mod tests {
                 .iter()
                 .filter(|rule| rule.rule_class == ExclusionRuleClass::Hard)
                 .all(|rule| !rule.overridable)
+        );
+        assert_eq!(store.storage_quota_override().expect("default quota"), None);
+        let quota = 12 * 1024 * 1024 * 1024;
+        assert_eq!(
+            store.set_storage_quota_override(quota).expect("set quota"),
+            quota
+        );
+        assert_eq!(
+            store.storage_quota_override().expect("saved quota"),
+            Some(quota)
+        );
+        assert_eq!(
+            store.set_storage_quota_override(0).unwrap_err().code,
+            "STORAGE_POLICY_INVALID"
         );
     }
 
@@ -5408,7 +8105,10 @@ mod tests {
             store.schema_version().expect("schema version"),
             CURRENT_SCHEMA_VERSION
         );
-        assert_eq!(store.migration_history().expect("history").len(), 6);
+        assert_eq!(
+            store.migration_history().expect("history").len(),
+            CURRENT_SCHEMA_VERSION as usize
+        );
     }
 
     #[test]
@@ -5732,6 +8432,77 @@ mod tests {
                 .len(),
             1
         );
+        let space = store
+            .create_knowledge_space(&KnowledgeSpaceRequest {
+                name: "归航知识空间".into(),
+                description: Some("只在拾忆中组合资料范围".into()),
+                root_ids: vec![],
+                collection_ids: vec![manual.collection_id],
+            })
+            .expect("create knowledge space");
+        assert_eq!(space.file_count, 1);
+        let scoped = store
+            .search(&crate::SearchRequest {
+                query: inbox.items[0].display_name.clone(),
+                scope: ScopeFilter {
+                    knowledge_space_ids: vec![space.space_id],
+                    root_ids: vec![],
+                    collection_ids: vec![],
+                    file_ids: vec![],
+                    extensions: vec![],
+                    modified_from: None,
+                    modified_to: None,
+                    availability: crate::Availability::Present,
+                },
+                mode: SearchMode::Filename,
+                sort: crate::SearchSort::Relevance,
+                page_size: 20,
+                cursor: None,
+            })
+            .expect("search knowledge space");
+        assert_eq!(scoped.results.len(), 1);
+        let updated_space = store
+            .update_knowledge_space(
+                &space.space_id,
+                &KnowledgeSpaceRequest {
+                    name: "全部归航资料".into(),
+                    description: None,
+                    root_ids: vec![root.root_id],
+                    collection_ids: vec![],
+                },
+            )
+            .expect("update knowledge space");
+        assert_eq!(updated_space.file_count, 2);
+        assert_eq!(store.list_knowledge_spaces().expect("list spaces").len(), 1);
+        let filtered = store
+            .create_collection(&CreateCollectionRequest {
+                name: "有效归航文本".into(),
+                description: Some("验证大小和硬排除条件".into()),
+                icon: "sparkles".into(),
+                color: "#71a7ca".into(),
+                kind: CollectionKind::Rule,
+                rule: Some(CollectionRule {
+                    operator: crate::RuleOperator::All,
+                    extensions: vec!["txt".into()],
+                    filename_keywords: vec![],
+                    path_keywords: vec![],
+                    text_keywords: vec![],
+                    parse_statuses: vec![],
+                    modified_within_days: None,
+                    min_size_bytes: Some(1),
+                    max_size_bytes: Some(1024),
+                    exclude_extensions: vec![],
+                    exclude_filename_keywords: vec!["v2".into()],
+                    exclude_path_keywords: vec![],
+                    exclude_text_keywords: vec![],
+                }),
+            })
+            .expect("create filtered rule collection");
+        let filtered_files = store
+            .collection_files(&filtered.collection_id)
+            .expect("query filtered collection");
+        assert_eq!(filtered_files.len(), 1);
+        assert_eq!(filtered_files[0].display_name, "归航计划-最终版.txt");
 
         let refresh = store
             .refresh_file_relations(100)
@@ -5739,6 +8510,18 @@ mod tests {
         assert_eq!(refresh.hashed_files, 2);
         assert_eq!(refresh.exact_duplicate_pairs, 1);
         assert_eq!(refresh.version_candidate_pairs, 1);
+        let relation_inbox = store
+            .query_inbox(&InboxQuery {
+                status: TriageStatus::New,
+                event_types: vec![InboxEventType::RelationSuggested],
+                root_ids: vec![root.root_id],
+                date_from: None,
+                date_to: None,
+                cursor: None,
+                page_size: 20,
+            })
+            .expect("query relation inbox events");
+        assert_eq!(relation_inbox.items.len(), 2);
         let relations = store.list_file_relations(20).expect("list relations");
         assert!(
             relations
@@ -5767,6 +8550,15 @@ mod tests {
         assert_eq!(
             fs::read_to_string(first_path).expect("read source after analysis"),
             "离线资料内容一致"
+        );
+        store
+            .delete_knowledge_space(&space.space_id)
+            .expect("delete knowledge space");
+        assert!(
+            store
+                .list_knowledge_spaces()
+                .expect("empty spaces")
+                .is_empty()
         );
     }
 
@@ -5820,6 +8612,15 @@ mod tests {
             .mark_file_parsing(&file_id, &revision_id)
             .expect("restart parsing");
 
+        let asset_id = Uuid::now_v7();
+        let asset_directory = directory
+            .path()
+            .join("image-assets")
+            .join(revision_id.to_string());
+        fs::create_dir_all(&asset_directory).expect("create asset cache");
+        let asset_path = asset_directory.join(format!("{asset_id}.png"));
+        fs::write(&asset_path, b"read-only-derived-image").expect("write derived image");
+        let asset_hash = hash_file_sha256(&asset_path).expect("hash derived image");
         let parse_result = ParseResult {
             revision_id,
             status: ParseOutcome::Parsed,
@@ -5839,6 +8640,25 @@ mod tests {
                     ..SourceLocator::default()
                 },
                 heading_path: vec!["检索评估".into()],
+            }],
+            image_assets: vec![ImageAsset {
+                asset_id,
+                revision_id,
+                asset_kind: "embedded_image".into(),
+                cache_path: asset_path.to_string_lossy().into_owned(),
+                mime_type: "image/png".into(),
+                size_bytes: b"read-only-derived-image".len() as u64,
+                sha256: asset_hash,
+                locator: SourceLocator {
+                    kind: crate::SourceKind::Docx,
+                    paragraph_no: Some(3),
+                    ..SourceLocator::default()
+                },
+                ocr_text: None,
+                description: None,
+                vision_model_id: None,
+                status: "pending_understanding".into(),
+                error: None,
             }],
             warnings: vec![],
             metrics: crate::ParseMetrics {
@@ -5868,18 +8688,67 @@ mod tests {
                 }],
             )
             .expect("commit embedding");
+        let generation = store
+            .rebuild_vector_generation("embedding-test", 2)
+            .expect("build USearch generation");
+        assert_eq!(generation.status, "active");
+        assert_eq!(generation.item_count, 1);
+        assert_eq!(generation.coverage, 1.0);
+        assert_eq!(
+            store
+                .active_vector_generation("embedding-test")
+                .expect("read active generation")
+                .map(|item| item.generation_id),
+            Some(generation.generation_id)
+        );
+        let semantic_scope = ScopeFilter {
+            knowledge_space_ids: vec![],
+            root_ids: vec![root.root_id],
+            collection_ids: vec![],
+            file_ids: vec![],
+            extensions: vec![],
+            modified_from: None,
+            modified_to: None,
+            availability: crate::Availability::Present,
+        };
+        assert_eq!(
+            store
+                .semantic_index_coverage(&semantic_scope, "embedding-test")
+                .expect("old model coverage"),
+            (1.0, 1.0)
+        );
+        assert_eq!(
+            store
+                .semantic_index_coverage(&semantic_scope, "embedding-next")
+                .expect("new model must not inherit old coverage"),
+            (0.0, 0.0)
+        );
+        store
+            .commit_chunk_embeddings(
+                "embedding-next",
+                3,
+                &[ChunkEmbeddingInput {
+                    chunk_id: pending_embeddings[0].chunk_id,
+                    vector: vec![0.0, 1.0, 0.0],
+                }],
+            )
+            .expect("commit next embedding generation");
+        let next_generation = store
+            .rebuild_vector_generation("embedding-next", 3)
+            .expect("build next USearch generation");
+        assert_eq!(next_generation.status, "active");
+        assert_eq!(next_generation.dimension, 3);
+        assert_eq!(
+            store
+                .active_vector_generation("embedding-test")
+                .expect("old generation still queryable")
+                .map(|item| item.generation_id),
+            Some(generation.generation_id)
+        );
 
         let request = crate::SearchRequest {
             query: "混合召回".into(),
-            scope: ScopeFilter {
-                root_ids: vec![root.root_id],
-                collection_ids: vec![],
-                file_ids: vec![],
-                extensions: vec![],
-                modified_from: None,
-                modified_to: None,
-                availability: crate::Availability::Present,
-            },
+            scope: semantic_scope,
             mode: SearchMode::Hybrid,
             sort: crate::SearchSort::Relevance,
             page_size: 10,
@@ -5936,8 +8805,118 @@ mod tests {
         assert_eq!(semantic.results[0].scores.semantic, Some(1.0));
         let preview = store.file_preview(&file_id, 10).expect("preview file");
         assert_eq!(preview.nodes.len(), 1);
+        assert_eq!(preview.image_assets.len(), 1);
+        assert_eq!(preview.image_assets[0].asset_id, asset_id);
+        assert!(
+            !serde_json::to_value(&preview.image_assets[0])
+                .expect("serialize public image asset")
+                .as_object()
+                .expect("image asset object")
+                .contains_key("cache_path")
+        );
         assert_eq!(preview.nodes[0].locator.line_start, Some(8));
         assert!(!preview.truncated);
+        let (authorized_asset_path, authorized_asset_mime, authorized_asset_size) = store
+            .authorized_image_asset_path(&asset_id)
+            .expect("authorized image asset");
+        assert_eq!(authorized_asset_path, asset_path);
+        assert_eq!(authorized_asset_mime, "image/png");
+        assert_eq!(
+            authorized_asset_size,
+            b"read-only-derived-image".len() as u64
+        );
+        assert_eq!(
+            store
+                .image_understanding_stats()
+                .expect("image understanding stats"),
+            (1, 0, 1)
+        );
+        let first_claim = store
+            .claim_pending_image_understanding("vision-test")
+            .expect("claim image understanding")
+            .expect("pending image");
+        assert_eq!(first_claim.asset_id, asset_id);
+        assert_eq!(first_claim.attempt_count, 1);
+        assert_eq!(
+            store
+                .recover_interrupted_image_understanding()
+                .expect("recover image understanding"),
+            1
+        );
+        let recovered_claim = store
+            .claim_pending_image_understanding("vision-test")
+            .expect("claim recovered image understanding")
+            .expect("recovered pending image");
+        assert_eq!(recovered_claim.asset_id, asset_id);
+        assert_eq!(recovered_claim.attempt_count, 2);
+        let image_result = ImageUnderstandingResult {
+            asset_id,
+            revision_id,
+            model_artifact_id: "vision-test".into(),
+            summary: "柱状图显示第二季度收入明显增长。".into(),
+            visible_text: Some("第二季度 收入 128 万元".into()),
+            keywords: vec!["季度收入".into(), "增长".into()],
+            entities: vec!["第二季度".into()],
+            chart_summary: Some("第二季度柱高于第一季度。".into()),
+            idempotency_key: recovered_claim.idempotency_key,
+        };
+        store
+            .commit_image_understanding(&image_result)
+            .expect("commit image understanding");
+        store
+            .commit_image_understanding(&image_result)
+            .expect("idempotent image understanding commit");
+        assert_eq!(
+            store
+                .image_understanding_stats()
+                .expect("completed image understanding stats"),
+            (1, 1, 0)
+        );
+        let image_preview = store
+            .file_preview(&file_id, 10)
+            .expect("preview image description");
+        assert_eq!(image_preview.nodes.len(), 2);
+        assert_eq!(image_preview.image_assets[0].status, "ready");
+        assert_eq!(
+            image_preview.image_assets[0].description.as_deref(),
+            Some("柱状图显示第二季度收入明显增长。")
+        );
+        let ask = AskRequest {
+            question: "第二季度收入".into(),
+            session_id: None,
+            scope: request.scope.clone(),
+            answer_style: crate::AnswerStyle::Concise,
+            retrieval_limit: 12,
+            max_source_files: 8,
+            strict_evidence: true,
+            mode: crate::AskMode::EvidenceExtracts,
+            allow_degraded_extractive: true,
+        };
+        let image_answer = store
+            .answer_extractively(&ask, None)
+            .expect("retrieve image description");
+        assert_eq!(
+            image_answer.claims[0].citations[0].image_asset_id,
+            Some(asset_id)
+        );
+        store
+            .validate_answer_evidence(&image_answer)
+            .expect("validate image evidence");
+        assert_eq!(
+            store
+                .list_pending_embedding_chunks("embedding-test", 20)
+                .expect("image description embedding work")
+                .len(),
+            1
+        );
+        fs::write(&asset_path, b"tampered-derived-image!").expect("tamper derived cache");
+        assert_eq!(
+            store
+                .authorized_image_asset_path(&asset_id)
+                .expect_err("tampered image cache must not be served")
+                .code,
+            "IMAGE_ASSET_UNAVAILABLE"
+        );
         assert_eq!(
             store
                 .authorized_file_path(&file_id)
@@ -5957,6 +8936,13 @@ mod tests {
                 .expect_err("disabled roots cannot open files")
                 .code,
             "FILE_NOT_FOUND"
+        );
+        assert_eq!(
+            store
+                .authorized_image_asset_path(&asset_id)
+                .expect_err("disabled roots cannot preview derived images")
+                .code,
+            "IMAGE_ASSET_NOT_FOUND"
         );
     }
 
@@ -5991,6 +8977,7 @@ mod tests {
         let mut request = crate::SearchRequest {
             query: "分页资料".into(),
             scope: ScopeFilter {
+                knowledge_space_ids: vec![],
                 root_ids: vec![root.root_id],
                 collection_ids: vec![],
                 file_ids: vec![],
@@ -6096,6 +9083,7 @@ mod tests {
         let request = crate::SearchRequest {
             query: "不存在的检索词".into(),
             scope: ScopeFilter {
+                knowledge_space_ids: vec![],
                 root_ids: vec![root.root_id],
                 collection_ids: vec![],
                 file_ids: vec![],

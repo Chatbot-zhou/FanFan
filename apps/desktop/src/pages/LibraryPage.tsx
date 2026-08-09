@@ -2,7 +2,8 @@ import { ApartmentOutlined, FolderAddOutlined, MoreOutlined, ReloadOutlined, Saf
 import { isTauri } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
+import { useRef, useState } from "react";
 import { bridge, type ExportResult, type ExtractionRunResult, type SkillDefinition, type TaskExecutionResult, type TaskPlan } from "../bridge";
 import { useAppStore } from "../state/app-store";
 import { displayPath } from "../utils/display-path";
@@ -59,6 +60,13 @@ export function LibraryPage() {
   const [exportFormat, setExportFormat] = useState<ExportResult["format"]>("xlsx");
   const [exporting, setExporting] = useState(false);
   const [exportResult, setExportResult] = useState<ExportResult | null>(null);
+  const fileListRef = useRef<HTMLDivElement>(null);
+  const fileVirtualizer = useVirtualizer({
+    count: fileItems.length,
+    getScrollElement: () => fileListRef.current,
+    estimateSize: () => 58,
+    overscan: 10,
+  });
 
   const addRoot = async () => {
     setError(null);
@@ -146,11 +154,14 @@ export function LibraryPage() {
         <header><div><h2>资料文件</h2><p>选择已完成索引的文件后，通过上下文操作栏进入批量处理。</p></div><span>{selected.size > 0 ? `已选择 ${selected.size} 项` : `共 ${fileTotal} 项`}</span></header>
         {files.isLoading && <p>正在读取资料目录…</p>}
         {files.isError && <p role="alert" className="inline-error">{files.error instanceof Error ? files.error.message : String(files.error)}</p>}
-        <div className="file-select-table">
-          {fileItems.map((file) => {
+        <div ref={fileListRef} className="file-select-table file-select-table--virtual">
+          <div style={{ height: `${fileVirtualizer.getTotalSize()}px`, position: "relative" }}>
+          {fileVirtualizer.getVirtualItems().map((virtualRow) => {
+            const file = fileItems[virtualRow.index]!;
             const ready = file.parse_status === "parsed" && Boolean(file.current_revision_id);
-            return <label key={file.file_id} className={!ready ? "is-disabled" : ""}><input type="checkbox" disabled={!ready} checked={selected.has(file.file_id)} onChange={() => toggleFile(file.file_id)} /><span><strong>{file.display_name}</strong><small>{displayPath(file.display_path)}</small></span><em>{ready ? "可处理" : file.parse_status === "ocr_pending" ? "等待OCR" : "尚未索引"}</em></label>;
+            return <label key={file.file_id} className={!ready ? "is-disabled" : ""} style={{ position: "absolute", transform: `translateY(${virtualRow.start}px)`, width: "100%", height: `${virtualRow.size}px` }}><input type="checkbox" disabled={!ready} checked={selected.has(file.file_id)} onChange={() => toggleFile(file.file_id)} /><span><strong>{file.display_name}</strong><small>{displayPath(file.display_path)}</small></span><em>{ready ? "可处理" : file.parse_status === "ocr_pending" ? "等待OCR" : "尚未索引"}</em></label>;
           })}
+          </div>
           {!files.isLoading && fileTotal === 0 && <div className="relation-empty"><p>扫描到的资料会显示在这里。</p></div>}
         </div>
         {files.hasNextPage && <button type="button" className="load-more-button" disabled={files.isFetchingNextPage} onClick={() => void files.fetchNextPage()}>{files.isFetchingNextPage ? "正在加载" : `加载更多（还剩 ${Math.max(0, fileTotal - fileItems.length)} 项）`}</button>}

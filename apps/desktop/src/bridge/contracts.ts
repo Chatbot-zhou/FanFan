@@ -13,6 +13,7 @@ export type AppRoute =
 export type Availability = "present" | "missing" | "unreadable";
 
 export interface ScopeFilter {
+  knowledge_space_ids: string[];
   root_ids: string[];
   collection_ids: string[];
   file_ids: string[];
@@ -23,7 +24,7 @@ export interface ScopeFilter {
 }
 
 export interface SourceLocator {
-  kind: "pdf" | "docx" | "spreadsheet" | "presentation" | "text" | "image";
+  kind: "pdf" | "docx" | "spreadsheet" | "presentation" | "text" | "code" | "archive" | "image";
   page_no: number | null;
   slide_no: number | null;
   sheet_name: string | null;
@@ -42,6 +43,7 @@ export interface EvidenceRef {
   revision_id: string;
   node_id: string;
   chunk_id: string;
+  image_asset_id: string | null;
   quote: string;
   locator: SourceLocator;
   retrieval_score: number;
@@ -139,19 +141,21 @@ export interface ExplorationCandidate {
   rejection_reasons: string[];
 }
 
-export interface DegradationState {
-  level: "full" | "balanced" | "core";
-  triggers: string[];
-  disabled_features: string[];
-  entered_at: UtcDateTime | null;
-  recover_after: UtcDateTime | null;
-  manual_override: boolean;
-}
-
 export interface WelcomeState {
   welcome_version: string;
   welcome_completed: boolean;
   welcome_completed_at: UtcDateTime | null;
+  root_authorization_completed: boolean;
+  root_authorization_completed_at: UtcDateTime | null;
+}
+
+export type ThemePreference = "system" | "day_gradient" | "night_dark";
+export type EffectiveTheme = "day_gradient" | "night_dark";
+
+export interface ThemeState {
+  preference: ThemePreference;
+  effective_theme: EffectiveTheme;
+  updated_at: UtcDateTime | null;
 }
 
 export interface StartupState {
@@ -159,17 +163,14 @@ export interface StartupState {
   ready: boolean;
   progress: number;
   pending_files: number;
-  degradation_level: "full" | "balanced" | "core";
   blocker: AppError | null;
   recovery_actions: Array<"open_settings" | "retry_startup">;
 }
 
-export type RuntimeMode = "full" | "balanced" | "core" | "basic";
 export type ModelStatus = "checking" | "unconfigured" | "ready" | "unavailable";
 
 export interface ModelRuntimeState {
   status: ModelStatus;
-  runtime_mode: RuntimeMode;
   active_profile_id: string | null;
   active_profile_name: string | null;
   runtime_backend: "gpu" | "cpu" | null;
@@ -178,12 +179,20 @@ export interface ModelRuntimeState {
   capabilities: {
     generation: boolean;
     embedding: boolean;
+    vision: boolean;
     reranker: boolean;
     ocr: boolean;
   };
+  rag_complete: boolean;
+  semantic_index_coverage: number;
+  embedding_migration: {
+    artifact_id: string;
+    status: "indexing" | "paused" | "cancelled" | "failed";
+    error: AppError | null;
+  } | null;
 }
 
-export type ModelRole = "generation" | "embedding" | "reranker" | "ocr";
+export type ModelRole = "generation" | "embedding" | "vision" | "reranker" | "ocr";
 export type ModelFormat = "gguf" | "onnx";
 
 export interface ImportCandidate {
@@ -213,9 +222,19 @@ export interface ModelArtifact {
   quantization: string | null;
   context_length: number | null;
   embedding_dimension: number | null;
+  query_prefix: string | null;
+  max_length: number | null;
   license_name: string | null;
   status: string;
   imported_at: UtcDateTime;
+}
+
+export interface ModelRoleConfig {
+  role: Exclude<ModelRole, "ocr">;
+  active_artifact_id: string | null;
+  required_for: string;
+  optional: boolean;
+  load_policy: "on_demand" | "background_index" | "serial_on_demand";
 }
 
 export interface ModelEdition {
@@ -225,7 +244,7 @@ export interface ModelEdition {
   recommended_memory_gb: number;
   download_size_bytes: number;
   capabilities: string[];
-  artifact: {
+  artifacts: Array<{
     model_id: string;
     role: ModelRole;
     format: ModelFormat;
@@ -236,8 +255,50 @@ export interface ModelEdition {
     url: string;
     sha256: string;
     size_bytes: number;
+    companion_files: Array<{
+      file_name: string;
+      remote_path: string;
+      url: string;
+      sha256: string;
+      size_bytes: number;
+    }>;
     license_name: string;
-  };
+    query_prefix: string | null;
+    max_length: number | null;
+  }>;
+}
+
+export type ModelDownloadStatus = "queued" | "running" | "paused" | "completed" | "failed" | "cancelled";
+export type ModelDownloadPhase = "queued" | "downloading" | "verifying" | "installing" | "self_testing" | "activating" | "indexing" | "paused" | "completed" | "failed" | "cancelled";
+
+export interface ModelDownloadFileProgress {
+  role: ModelRole;
+  file_name: string;
+  downloaded_bytes: number;
+  total_bytes: number;
+  status: string;
+}
+
+export interface ModelDownloadJob {
+  job_id: string;
+  edition_id: ModelEdition["edition_id"];
+  edition_name: string;
+  source: "huggingface" | "modelscope";
+  status: ModelDownloadStatus;
+  phase: ModelDownloadPhase;
+  downloaded_bytes: number;
+  total_bytes: number;
+  progress: number;
+  bytes_per_second: number;
+  eta_seconds: number | null;
+  retry_count: number;
+  current_file: string | null;
+  files: ModelDownloadFileProgress[];
+  installed_artifact_ids: string[];
+  profile_id: string | null;
+  error: AppError | null;
+  created_at: UtcDateTime;
+  updated_at: UtcDateTime;
 }
 
 export interface EnvironmentCheck {
@@ -370,6 +431,22 @@ export interface AskRequest {
   retrieval_limit: number;
   max_source_files: number;
   strict_evidence: true;
+  mode: "rag" | "evidence_extracts";
+  allow_degraded_extractive: boolean;
+}
+
+export interface RagReadiness {
+  ready: boolean;
+  generation_ready: boolean;
+  embedding_ready: boolean;
+  vision_ready: boolean;
+  semantic_index_coverage: number;
+  scope_index_coverage: number;
+  image_index_coverage: number;
+  pending_image_assets: number;
+  background_notice: string | null;
+  blockers: AppError[];
+  checked_at: UtcDateTime;
 }
 
 export interface AnswerClaim {
@@ -395,7 +472,10 @@ export interface AnswerResult {
   source_files: AnswerSourceFile[];
   used_file_ids: string[];
   elapsed_ms: number;
-  answer_mode: "extractive" | "generated";
+  answer_mode: "extractive" | "generated" | "rag_refusal";
+  retrieval_channels: string[];
+  index_coverage: number;
+  degradation_reason: string | null;
 }
 
 export interface OperationHandle {
@@ -416,7 +496,7 @@ export interface InboxItem {
   file_id: string;
   display_name: string;
   display_path: string;
-  event_type: "discovered" | "modified" | "renamed" | "missing" | "restored" | "ocr_required" | "parse_failed";
+  event_type: "discovered" | "modified" | "renamed" | "missing" | "restored" | "ocr_required" | "parse_failed" | "relation_suggested" | "collection_suggested";
   observed_at: UtcDateTime;
   previous_display_path: string | null;
   triage_status: "new" | "reviewed" | "ignored" | "error";
@@ -442,7 +522,7 @@ export interface InboxPage {
 }
 
 export type TriageStatus = InboxItem["triage_status"];
-export type CollectionKind = "manual" | "rule";
+export type CollectionKind = "manual" | "rule" | "ai";
 export type RuleOperator = "all" | "any";
 
 export interface CollectionRule {
@@ -453,6 +533,12 @@ export interface CollectionRule {
   text_keywords: string[];
   parse_statuses: FileRecord["parse_status"][];
   modified_within_days: number | null;
+  min_size_bytes: number | null;
+  max_size_bytes: number | null;
+  exclude_extensions: string[];
+  exclude_filename_keywords: string[];
+  exclude_path_keywords: string[];
+  exclude_text_keywords: string[];
 }
 
 export interface CreateCollectionRequest {
@@ -462,6 +548,20 @@ export interface CreateCollectionRequest {
   color: string;
   kind: CollectionKind;
   rule: CollectionRule | null;
+}
+
+export interface KnowledgeSpaceRequest {
+  name: string;
+  description: string | null;
+  root_ids: string[];
+  collection_ids: string[];
+}
+
+export interface KnowledgeSpace extends KnowledgeSpaceRequest {
+  space_id: string;
+  file_count: number;
+  created_at: UtcDateTime;
+  updated_at: UtcDateTime;
 }
 
 export interface CollectionRecord {
@@ -476,6 +576,48 @@ export interface CollectionRecord {
   built_in: boolean;
   created_at: UtcDateTime;
   updated_at: UtcDateTime;
+}
+
+export interface CollectionSuggestedMember {
+  file: FileRecord;
+  revision_id: string;
+  confidence: number;
+  rationale: string;
+  state: "suggested" | "manual_override" | string;
+}
+
+export interface CollectionSuggestion {
+  suggestion_id: string;
+  suggested_name: string;
+  description: string;
+  confidence: number;
+  status: "suggested" | "confirmed" | "rejected";
+  model_version: string;
+  algorithm_version: string;
+  members: CollectionSuggestedMember[];
+  created_at: UtcDateTime;
+  updated_at: UtcDateTime;
+}
+
+export interface CollectionSuggestionPage {
+  items: CollectionSuggestion[];
+  next_cursor: string | null;
+  total: number;
+}
+
+export interface CollectionSuggestionRefreshResult {
+  profiled_files: number;
+  candidate_edges: number;
+  created_suggestions: number;
+  suggestion_ids: string[];
+  algorithm_version: string;
+  model_version: string;
+}
+
+export interface CollectionSuggestionUpdateRequest {
+  suggested_name: string;
+  description: string;
+  member_file_ids: string[];
 }
 
 export type RelationType = "exact_duplicate" | "version_candidate" | "related";
@@ -563,12 +705,36 @@ export interface FileRecord {
 export interface FileQuery {
   cursor: string | null;
   page_size: number;
+  query?: string | null;
+  extensions?: string[];
+  parse_statuses?: string[];
+  availability?: Availability | null;
 }
 
 export interface FilePage {
   items: FileRecord[];
   next_cursor: string | null;
   total: number;
+}
+
+export type ExclusionRuleType = "exact_path" | "path_name" | "path_glob" | "extension" | "hidden" | "system" | "reparse_point" | "cloud_placeholder";
+
+export interface ExclusionRule {
+  rule_id: string;
+  root_id: string | null;
+  rule_class: "hard" | "default";
+  rule_type: ExclusionRuleType;
+  value: unknown;
+  enabled: boolean;
+  overridable: boolean;
+}
+
+export interface ExclusionRuleInput {
+  rule_id: string | null;
+  root_id: string | null;
+  rule_type: "path_name" | "path_glob" | "extension";
+  value: string;
+  enabled: boolean;
 }
 
 export interface DocumentNode {
@@ -582,10 +748,36 @@ export interface DocumentNode {
   heading_path: string[];
 }
 
+export interface ImageAsset {
+  asset_id: string;
+  revision_id: string;
+  asset_kind: "standalone_image" | "embedded_image" | "pdf_embedded_image" | string;
+  mime_type: string;
+  size_bytes: number;
+  sha256: string;
+  locator: SourceLocator;
+  ocr_text: string | null;
+  description: string | null;
+  vision_model_id: string | null;
+  status: "pending_understanding" | "processing" | "ready" | "failed";
+  error: AppError | null;
+}
+
+export interface ImageDeepAnalysis {
+  asset_id: string;
+  question: string;
+  answer: string;
+  observations: string[];
+  uncertainties: string[];
+  model_artifact_id: string;
+  analyzed_at: UtcDateTime;
+}
+
 export interface FilePreview {
   file: FileRecord;
   revision_id: string | null;
   nodes: DocumentNode[];
+  image_assets: ImageAsset[];
   offset: number;
   next_offset: number | null;
   anchor_node_id: string | null;
@@ -654,8 +846,7 @@ export interface MaintenanceSnapshot {
   failed_files: number;
   active_jobs: number;
   log_events: number;
-  degradation_level: "full" | "balanced" | "core";
-  degradation_reasons: string[];
+  background_notice: string | null;
   checks: HealthCheckItem[];
   checked_at: UtcDateTime;
 }
@@ -665,6 +856,34 @@ export interface MaintenanceCheckResult {
   database_result: string;
   elapsed_ms: number;
   source_files_modified: false;
+}
+
+export interface StorageUsageCategory {
+  key: "database" | "vector_indexes" | "installed_models" | "resumable_downloads" | "temporary_cache" | "failed_downloads";
+  label: string;
+  size_bytes: number;
+  clearable: boolean;
+  detail: string;
+}
+
+export interface StorageUsageSnapshot {
+  categories: StorageUsageCategory[];
+  total_bytes: number;
+  data_directory: string;
+  disk_capacity_bytes: number | null;
+  disk_available_bytes: number | null;
+  soft_quota_bytes: number;
+  soft_quota_is_custom: boolean;
+  over_soft_quota: boolean;
+  background_tasks_paused: boolean;
+  notice: string | null;
+  measured_at: UtcDateTime;
+}
+
+export interface CacheClearResult {
+  category: "temporary_cache" | "failed_downloads";
+  removed_entries: number;
+  freed_bytes: number;
 }
 
 export interface AppLogRecord {
@@ -741,18 +960,28 @@ export interface ReminBridge {
   startup_get_state(): Promise<StartupState>;
   welcome_get_state(): Promise<WelcomeState>;
   welcome_complete(welcome_version: string): Promise<WelcomeState>;
+  welcome_authorization_complete(): Promise<WelcomeState>;
+  theme_get_state(system_dark: boolean): Promise<ThemeState>;
+  theme_set_preference(preference: ThemePreference, system_dark: boolean): Promise<ThemeState>;
   environment_get_latest(): Promise<EnvironmentCheck | null>;
   environment_detect(): Promise<EnvironmentCheck>;
   model_state_get(): Promise<ModelRuntimeState>;
   model_import_scan(paths: string[]): Promise<ImportCandidate[]>;
   model_import_confirm(selections: Array<{ source_path: string; role: ModelRole }>): Promise<ModelArtifact[]>;
   model_artifact_list(): Promise<ModelArtifact[]>;
+  model_role_config_list(): Promise<ModelRoleConfig[]>;
   model_catalog_list(): Promise<ModelEdition[]>;
-  model_download_install(edition_id: ModelEdition["edition_id"], source: "huggingface" | "modelscope", confirmed: true): Promise<ModelArtifact>;
+  model_download_start(edition_id: ModelEdition["edition_id"], source: "huggingface" | "modelscope", confirmed: true): Promise<ModelDownloadJob>;
+  model_download_list(): Promise<ModelDownloadJob[]>;
+  model_download_get(job_id: string): Promise<ModelDownloadJob>;
+  model_download_pause(job_id: string): Promise<ModelDownloadJob>;
+  model_download_cancel(job_id: string): Promise<ModelDownloadJob>;
+  model_download_retry(job_id: string, source?: "huggingface" | "modelscope"): Promise<ModelDownloadJob>;
   model_artifact_activate(artifact_id: string): Promise<ModelRuntimeState>;
   home_get_summary(local_date: string): Promise<HomeSummary>;
   candidate_root_action(candidate_id: string, action: "add" | "ignore"): Promise<CandidateRoot>;
   search_start(request: SearchRequest): Promise<SearchSession>;
+  rag_readiness_get(scope: ScopeFilter): Promise<RagReadiness>;
   ask_start(request: AskRequest): Promise<OperationHandle>;
   ask_operation_get(operation_id: string): Promise<AskOperationSnapshot>;
   ask_cancel(operation_id: string): Promise<AskOperationSnapshot>;
@@ -762,6 +991,12 @@ export interface ReminBridge {
   inbox_query(request: InboxQuery): Promise<InboxPage>;
   inbox_update(inbox_id: string, triage_status: TriageStatus): Promise<InboxItem>;
   ocr_retry(file_id: string): Promise<boolean>;
+  image_understanding_retry(asset_id: string): Promise<boolean>;
+  image_deep_analyze(asset_id: string, question: string): Promise<ImageDeepAnalysis>;
+  knowledge_space_list(): Promise<KnowledgeSpace[]>;
+  knowledge_space_create(request: KnowledgeSpaceRequest): Promise<KnowledgeSpace>;
+  knowledge_space_update(space_id: string, request: KnowledgeSpaceRequest): Promise<KnowledgeSpace>;
+  knowledge_space_delete(space_id: string): Promise<void>;
   collection_list(): Promise<CollectionRecord[]>;
   collection_create(request: CreateCollectionRequest): Promise<CollectionRecord>;
   collection_update(collection_id: string, request: CreateCollectionRequest): Promise<CollectionRecord>;
@@ -770,10 +1005,18 @@ export interface ReminBridge {
   collection_file_query(collection_id: string, request: FileQuery): Promise<FilePage>;
   collection_add_file(collection_id: string, file_id: string): Promise<void>;
   collection_remove_file(collection_id: string, file_id: string): Promise<void>;
+  collection_suggestion_refresh(max_files?: number): Promise<CollectionSuggestionRefreshResult>;
+  collection_suggestion_query(cursor: string | null, page_size: number, status?: "suggested" | "confirmed" | "rejected"): Promise<CollectionSuggestionPage>;
+  collection_suggestion_update(suggestion_id: string, suggestion: CollectionSuggestionUpdateRequest): Promise<CollectionSuggestion>;
+  collection_suggestion_confirm(suggestion_id: string): Promise<CollectionRecord>;
+  collection_suggestion_reject(suggestion_id: string): Promise<void>;
   relation_refresh(max_files: number): Promise<RelationRefreshResult>;
   relation_query(request: RelationQuery): Promise<RelationPage>;
   relation_review(relation_id: string, action: "accepted" | "rejected"): Promise<void>;
   file_query(request: FileQuery): Promise<FilePage>;
+  exclusion_rule_list(): Promise<ExclusionRule[]>;
+  exclusion_rule_upsert(request: ExclusionRuleInput): Promise<ExclusionRule>;
+  exclusion_rule_delete(rule_id: string): Promise<void>;
   extraction_preset_list(): Promise<ExtractionPreset[]>;
   extraction_run(file_ids: string[], preset_id: string): Promise<ExtractionRunResult>;
   skill_list(): Promise<SkillDefinition[]>;
@@ -784,11 +1027,14 @@ export interface ReminBridge {
   extraction_export(run: ExtractionRunResult, format: ExportResult["format"], target_path: string): Promise<ExportResult>;
   maintenance_get(): Promise<MaintenanceSnapshot>;
   maintenance_check(level: "quick" | "full"): Promise<MaintenanceCheckResult>;
+  storage_usage_get(): Promise<StorageUsageSnapshot>;
+  storage_policy_set(quota_bytes: number, confirmation: "SET_STORAGE_QUOTA"): Promise<StorageUsageSnapshot>;
+  cache_clear(category: "temporary_cache" | "failed_downloads", confirmation: "CLEAR_CACHE"): Promise<CacheClearResult>;
+  app_data_reset_schedule(confirmation: "RESET_APPLICATION_DATA"): Promise<void>;
   maintenance_log_query(request: LogQuery): Promise<LogPage>;
   maintenance_logs_clear(): Promise<number>;
   diagnostic_export(target_path: string, confirmed: true): Promise<ExportResult>;
   index_rebuild(confirmation: "REBUILD_INDEX"): Promise<IndexRebuildResult>;
-  root_discover_defaults(): Promise<RootDiscoveryResult>;
   root_list(): Promise<RootRecord[]>;
   root_add(request: AddRootRequest): Promise<RootRecord>;
   root_disable(root_id: string): Promise<void>;

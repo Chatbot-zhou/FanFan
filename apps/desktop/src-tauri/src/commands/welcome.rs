@@ -33,3 +33,14 @@ pub fn welcome_complete(
         .map_err(|_| AppError::local_config("欢迎状态锁不可用", true))?
         .complete(&request.welcome_version)
 }
+
+#[tauri::command(async)]
+pub fn welcome_authorization_complete(
+    service: State<'_, WelcomeServiceState>,
+) -> Result<remin_core::welcome::WelcomeState, AppError> {
+    service
+        .0
+        .lock()
+        .map_err(|_| AppError::local_config("欢迎状态锁不可用", true))?
+        .complete_root_authorization()
+}

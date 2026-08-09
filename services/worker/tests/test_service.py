@@ -49,6 +49,17 @@ class WorkerServiceTests(unittest.TestCase):
         self.assertFalse(response.ok)
         self.assertEqual(response.error.code, "FILE_NOT_FOUND")
 
+    def test_rerank_requires_a_local_onnx_model(self) -> None:
+        response = self.service.handle(WorkerRequest(REQUEST_IDS[2], "rerank.score", {
+            "model_path": "Z:/missing/reranker.onnx",
+            "query": "检索问题",
+            "documents": ["候选证据"],
+            "max_length": 512,
+            "threads": 2,
+        }))
+        self.assertFalse(response.ok)
+        self.assertEqual(response.error.code, "RERANK_MODEL_UNAVAILABLE")
+
     def test_request_id_must_be_uuid_v7(self) -> None:
         with self.assertRaisesRegex(ValueError, "UUIDv7"):
             WorkerRequest("r1", "health.check")

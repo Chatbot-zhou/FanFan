@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{AppError, FileRecord, ScopeFilter, SourceLocator};
 
-pub const INDEX_VERSION: u32 = 1;
+pub const INDEX_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParseRequest {
@@ -21,6 +21,8 @@ pub struct ParseRequest {
     pub ocr_policy: String,
     pub language_hints: Vec<String>,
     pub max_pages: Option<u32>,
+    #[serde(default)]
+    pub asset_cache_dir: Option<String>,
     pub parser_version: String,
 }
 
@@ -63,12 +65,66 @@ pub struct DocumentNode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ImageAsset {
+    pub asset_id: Uuid,
+    pub revision_id: Uuid,
+    pub asset_kind: String,
+    #[serde(default, skip_serializing)]
+    pub cache_path: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub locator: SourceLocator,
+    pub ocr_text: Option<String>,
+    pub description: Option<String>,
+    pub vision_model_id: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub error: Option<AppError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PendingImageUnderstanding {
+    pub asset_id: Uuid,
+    pub file_id: Uuid,
+    pub revision_id: Uuid,
+    #[serde(skip_serializing)]
+    pub cache_path: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub locator: SourceLocator,
+    pub ocr_text: Option<String>,
+    pub attempt_count: u32,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ImageUnderstandingResult {
+    pub asset_id: Uuid,
+    pub revision_id: Uuid,
+    pub model_artifact_id: String,
+    pub summary: String,
+    #[serde(default)]
+    pub visible_text: Option<String>,
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    #[serde(default)]
+    pub entities: Vec<String>,
+    #[serde(default)]
+    pub chart_summary: Option<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ParseResult {
     pub revision_id: Uuid,
     pub status: ParseOutcome,
     pub parser_name: String,
     pub parser_version: String,
     pub nodes: Vec<DocumentNode>,
+    #[serde(default)]
+    pub image_assets: Vec<ImageAsset>,
     pub warnings: Vec<ParseWarning>,
     pub metrics: ParseMetrics,
     pub error: Option<AppError>,
@@ -89,6 +145,8 @@ pub struct ChunkRecord {
     pub embedding_model_id: Option<String>,
     pub embedding_status: String,
 }
+
+pub type ContentChunk = ChunkRecord;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -235,6 +293,8 @@ pub struct FilePreview {
     pub file: FileRecord,
     pub revision_id: Option<Uuid>,
     pub nodes: Vec<DocumentNode>,
+    #[serde(default)]
+    pub image_assets: Vec<ImageAsset>,
     pub offset: u32,
     pub next_offset: Option<u32>,
     pub anchor_node_id: Option<Uuid>,
@@ -389,7 +449,7 @@ pub fn chunks_from_nodes(result: &ParseResult) -> Vec<ChunkRecord> {
         let Some(source_text) = source_text.filter(|value| !value.trim().is_empty()) else {
             continue;
         };
-        for text in split_text(&source_text, 450, 50) {
+        for text in split_text(&source_text, 384, 480, 64) {
             ordinal += 1;
             let normalized_text = normalize_for_fts(&text);
             chunks.push(ChunkRecord {
@@ -397,7 +457,7 @@ pub fn chunks_from_nodes(result: &ParseResult) -> Vec<ChunkRecord> {
                 revision_id: result.revision_id,
                 node_id: node.node_id,
                 ordinal,
-                token_count: normalized_text.split_whitespace().count() as u64,
+                token_count: estimated_token_count(&text),
                 content_hash: stable_content_hash(&text),
                 language: detect_language(&text).to_owned(),
                 text,
@@ -411,15 +471,35 @@ pub fn chunks_from_nodes(result: &ParseResult) -> Vec<ChunkRecord> {
     chunks
 }
 
-fn split_text(text: &str, target_chars: usize, overlap_chars: usize) -> Vec<String> {
+fn split_text(
+    text: &str,
+    target_tokens: usize,
+    max_tokens: usize,
+    overlap_tokens: usize,
+) -> Vec<String> {
     let characters = text.chars().collect::<Vec<_>>();
-    if characters.len() <= target_chars {
+    if estimated_token_count(text) <= max_tokens as u64 {
         return vec![text.trim().to_owned()];
     }
     let mut chunks = Vec::new();
     let mut start = 0;
     while start < characters.len() {
-        let end = (start + target_chars).min(characters.len());
+        let mut end = start;
+        let mut weight = 0.0_f32;
+        let mut preferred_end = None;
+        while end < characters.len() && weight.ceil() < max_tokens as f32 {
+            let next_weight = weight + token_weight(characters[end]);
+            if next_weight.ceil() > max_tokens as f32 && end > start {
+                break;
+            }
+            weight = next_weight;
+            end += 1;
+            if weight.ceil() >= target_tokens as f32 && is_chunk_boundary(characters[end - 1]) {
+                preferred_end = Some(end);
+                break;
+            }
+        }
+        let end = preferred_end.unwrap_or(end).max(start + 1);
         let chunk = characters[start..end]
             .iter()
             .collect::<String>()
@@ -431,9 +511,36 @@ fn split_text(text: &str, target_chars: usize, overlap_chars: usize) -> Vec<Stri
         if end == characters.len() {
             break;
         }
-        start = end.saturating_sub(overlap_chars);
+        let mut next_start = end;
+        let mut overlap = 0.0_f32;
+        while next_start > start && overlap.ceil() < overlap_tokens as f32 {
+            next_start -= 1;
+            overlap += token_weight(characters[next_start]);
+        }
+        start = next_start.max(start + 1);
     }
     chunks
+}
+
+fn estimated_token_count(text: &str) -> u64 {
+    text.chars().map(token_weight).sum::<f32>().ceil().max(1.0) as u64
+}
+
+fn token_weight(value: char) -> f32 {
+    if value.is_whitespace() {
+        0.0
+    } else if value.is_ascii_alphanumeric() {
+        0.25
+    } else {
+        1.0
+    }
+}
+
+fn is_chunk_boundary(value: char) -> bool {
+    matches!(
+        value,
+        '\n' | '\r' | '。' | '！' | '？' | '；' | '.' | '!' | '?' | ';'
+    )
 }
 
 pub fn normalize_for_fts(text: &str) -> String {
@@ -564,6 +671,7 @@ mod tests {
                 },
                 heading_path: vec!["检索".into()],
             }],
+            image_assets: vec![],
             warnings: vec![],
             metrics: ParseMetrics {
                 page_count: 0,
@@ -576,6 +684,7 @@ mod tests {
         };
         let chunks = chunks_from_nodes(&result);
         assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|chunk| chunk.token_count <= 480));
         assert!(
             chunks
                 .iter()

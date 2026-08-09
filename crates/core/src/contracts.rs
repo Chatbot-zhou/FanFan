@@ -47,6 +47,8 @@ impl std::error::Error for AppError {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ScopeFilter {
+    #[serde(default)]
+    pub knowledge_space_ids: Vec<Uuid>,
     pub root_ids: Vec<Uuid>,
     pub collection_ids: Vec<Uuid>,
     pub file_ids: Vec<Uuid>,
@@ -183,10 +185,18 @@ where
         .serialize(serializer)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileQuery {
     pub cursor: Option<String>,
     pub page_size: u32,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    #[serde(default)]
+    pub parse_statuses: Vec<String>,
+    #[serde(default)]
+    pub availability: Option<Availability>,
 }
 
 impl FileQuery {
@@ -200,6 +210,23 @@ impl FileQuery {
             .unwrap_or("0")
             .parse::<u64>()
             .map_err(|_| AppError::new("FILE_CURSOR_INVALID", "资料分页游标无效", false))
+    }
+
+    pub fn validate_filters(&self) -> Result<(), AppError> {
+        if self
+            .query
+            .as_ref()
+            .is_some_and(|query| query.chars().count() > 200)
+            || self.extensions.len() > 32
+            || self.parse_statuses.len() > 8
+        {
+            return Err(AppError::new(
+                "FILE_FILTER_INVALID",
+                "资料过滤条件过长或数量超出限制",
+                false,
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -277,6 +304,8 @@ pub enum SourceKind {
     Spreadsheet,
     Presentation,
     Text,
+    Code,
+    Archive,
     Image,
 }
 
@@ -287,6 +316,8 @@ pub struct EvidenceRef {
     pub revision_id: Uuid,
     pub node_id: Uuid,
     pub chunk_id: Uuid,
+    #[serde(default)]
+    pub image_asset_id: Option<Uuid>,
     pub quote: String,
     pub locator: SourceLocator,
     pub retrieval_score: f32,

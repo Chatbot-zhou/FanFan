@@ -10,7 +10,6 @@ pub struct StartupState {
     pub ready: bool,
     pub progress: f64,
     pub pending_files: u64,
-    pub degradation_level: &'static str,
     pub blocker: Option<AppError>,
     pub recovery_actions: Vec<&'static str>,
 }
@@ -22,7 +21,6 @@ impl Default for StartupState {
             ready: false,
             progress: 0.1,
             pending_files: 0,
-            degradation_level: "full",
             blocker: None,
             recovery_actions: Vec::new(),
         }
@@ -48,7 +46,6 @@ impl StartupServiceState {
                 ready: true,
                 progress: 1.0,
                 pending_files: 0,
-                degradation_level: "core",
                 blocker: Some(error),
                 recovery_actions: vec!["open_settings", "retry_startup"],
             },
@@ -67,7 +64,6 @@ pub fn startup_get_state(startup: State<'_, StartupServiceState>) -> StartupStat
             ready: true,
             progress: 1.0,
             pending_files: 0,
-            degradation_level: "core",
             blocker: Some(AppError::new(
                 "STARTUP_STATE_UNAVAILABLE",
                 "启动状态暂时无法读取，基础功能仍可继续使用",

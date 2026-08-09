@@ -25,13 +25,27 @@ class WorkerError:
 @dataclass(frozen=True, slots=True)
 class WorkerRequest:
     request_id: str
-    operation: Literal["health.check", "document.probe", "document.parse", "embedding.encode", "export.write"]
+    operation: Literal[
+        "health.check",
+        "document.probe",
+        "document.parse",
+        "embedding.encode",
+        "rerank.score",
+        "export.write",
+    ]
     payload: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not is_uuid_v7(self.request_id):
             raise ValueError("request_id必须使用UUIDv7")
-        if self.operation not in {"health.check", "document.probe", "document.parse", "embedding.encode", "export.write"}:
+        if self.operation not in {
+            "health.check",
+            "document.probe",
+            "document.parse",
+            "embedding.encode",
+            "rerank.score",
+            "export.write",
+        }:
             raise ValueError("operation不受支持")
         if not isinstance(self.payload, dict):
             raise ValueError("payload必须是对象")
@@ -43,7 +57,14 @@ class WorkerRequest:
         payload = value.get("payload", {})
         if not isinstance(request_id, str) or not is_uuid_v7(request_id):
             raise ValueError("request_id必须使用UUIDv7")
-        if operation not in {"health.check", "document.probe", "document.parse", "embedding.encode", "export.write"}:
+        if operation not in {
+            "health.check",
+            "document.probe",
+            "document.parse",
+            "embedding.encode",
+            "rerank.score",
+            "export.write",
+        }:
             raise ValueError("operation 不受支持")
         if not isinstance(payload, dict):
             raise ValueError("payload 必须是对象")

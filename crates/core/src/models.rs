@@ -3,6 +3,7 @@ use std::{
     fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 use chrono::{DateTime, Utc};
@@ -12,7 +13,8 @@ use uuid::Uuid;
 
 use crate::AppError;
 
-const REGISTRY_VERSION: u32 = 1;
+const REGISTRY_VERSION: u32 = 3;
+const DOWNLOAD_REGISTRY_VERSION: u32 = 1;
 const MAX_IMPORT_FILES: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,6 +22,7 @@ const MAX_IMPORT_FILES: usize = 512;
 pub enum ModelRole {
     Generation,
     Embedding,
+    Vision,
     Reranker,
     Ocr,
 }
@@ -29,6 +32,7 @@ impl ModelRole {
         match self {
             Self::Generation => "generation",
             Self::Embedding => "embedding",
+            Self::Vision => "vision",
             Self::Reranker => "reranker",
             Self::Ocr => "ocr",
         }
@@ -75,6 +79,9 @@ pub struct DownloadedModelMetadata {
     pub repository_id: String,
     pub revision: String,
     pub license_name: String,
+    pub model_id: Option<String>,
+    pub query_prefix: Option<String>,
+    pub max_length: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +100,10 @@ pub struct ModelArtifact {
     pub quantization: Option<String>,
     pub context_length: Option<u32>,
     pub embedding_dimension: Option<u32>,
+    #[serde(default)]
+    pub query_prefix: Option<String>,
+    #[serde(default)]
+    pub max_length: Option<u32>,
     pub license_name: Option<String>,
     pub status: String,
     pub imported_at: DateTime<Utc>,
@@ -103,7 +114,98 @@ pub struct ModelRegistryState {
     pub registry_version: u32,
     pub artifacts: Vec<ModelArtifact>,
     pub active_artifacts: BTreeMap<String, Uuid>,
+    #[serde(default)]
+    pub profiles: Vec<ModelProfile>,
+    #[serde(default)]
+    pub active_profile_id: Option<Uuid>,
+    #[serde(default)]
+    pub pending_embedding_activation: Option<PendingEmbeddingActivation>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PendingEmbeddingActivation {
+    pub artifact_id: Uuid,
+    pub dimension: u32,
+    pub profile_id: Option<Uuid>,
+    pub download_job_id: Option<Uuid>,
+    pub status: String,
+    pub error: Option<AppError>,
+    pub requested_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelProfile {
+    pub profile_id: Uuid,
+    pub edition: String,
+    pub name: String,
+    pub generation_artifact_id: Uuid,
+    pub embedding_artifact_id: Uuid,
+    #[serde(default)]
+    pub vision_artifact_id: Option<Uuid>,
+    pub ocr_artifact_id: Option<Uuid>,
+    pub reranker_artifact_id: Option<Uuid>,
+    pub status: String,
+    pub activated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelRoleConfig {
+    pub role: ModelRole,
+    pub active_artifact_id: Option<Uuid>,
+    pub required_for: String,
+    pub optional: bool,
+    pub load_policy: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelDownloadFileProgress {
+    pub role: ModelRole,
+    pub file_name: String,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelDownloadJob {
+    pub job_id: Uuid,
+    pub edition_id: String,
+    pub edition_name: String,
+    pub source: ModelSource,
+    pub status: String,
+    pub phase: String,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub progress: f64,
+    pub bytes_per_second: u64,
+    pub eta_seconds: Option<u64>,
+    pub retry_count: u32,
+    pub current_file: Option<String>,
+    pub files: Vec<ModelDownloadFileProgress>,
+    pub installed_artifact_ids: Vec<Uuid>,
+    pub profile_id: Option<Uuid>,
+    pub error: Option<AppError>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ModelDownloadRegistryState {
+    registry_version: u32,
+    jobs: Vec<ModelDownloadJob>,
+    updated_at: DateTime<Utc>,
+}
+
+impl Default for ModelDownloadRegistryState {
+    fn default() -> Self {
+        Self {
+            registry_version: DOWNLOAD_REGISTRY_VERSION,
+            jobs: Vec::new(),
+            updated_at: Utc::now(),
+        }
+    }
 }
 
 impl Default for ModelRegistryState {
@@ -112,6 +214,9 @@ impl Default for ModelRegistryState {
             registry_version: REGISTRY_VERSION,
             artifacts: Vec::new(),
             active_artifacts: BTreeMap::new(),
+            profiles: Vec::new(),
+            active_profile_id: None,
+            pending_embedding_activation: None,
             updated_at: Utc::now(),
         }
     }
@@ -121,6 +226,9 @@ impl Default for ModelRegistryState {
 pub struct ModelManager {
     model_root: PathBuf,
     registry_path: PathBuf,
+    downloads_path: PathBuf,
+    download_lock: Arc<Mutex<()>>,
+    registry_lock: Arc<Mutex<()>>,
 }
 
 impl ModelManager {
@@ -131,9 +239,14 @@ impl ModelManager {
         })?;
         let manager = Self {
             registry_path: model_root.join("registry.json"),
+            downloads_path: model_root.join("downloads.json"),
             model_root,
+            download_lock: Arc::new(Mutex::new(())),
+            registry_lock: Arc::new(Mutex::new(())),
         };
         manager.load_registry()?;
+        manager.recover_interrupted_downloads()?;
+        manager.recover_interrupted_embedding_activation()?;
         Ok(manager)
     }
 
@@ -245,6 +358,7 @@ impl ModelManager {
                 false,
             ));
         }
+        let _registry_guard = self.lock_registry()?;
         let mut registry = self.load_registry()?;
         let mut imported = Vec::new();
         let mut installation_guards = Vec::new();
@@ -252,7 +366,27 @@ impl ModelManager {
             let source = fs::canonicalize(&selection.source_path).map_err(|error| {
                 AppError::new("MODEL_SOURCE_UNAVAILABLE", error.to_string(), true)
             })?;
-            let candidate = import_candidate(&source)?;
+            let mut candidate = import_candidate(&source)?;
+            if selection.role == ModelRole::Vision
+                && candidate.format == ModelFormat::Gguf
+                && candidate.companion_files.is_empty()
+            {
+                candidate.companion_files = discover_gguf_vision_companions(&source)?;
+            }
+            if selection.role == ModelRole::Vision
+                && candidate.format == ModelFormat::Gguf
+                && source.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .to_ascii_lowercase()
+                        .contains("mmproj")
+                })
+            {
+                return Err(AppError::new(
+                    "VISION_MODEL_MAIN_REQUIRED",
+                    "请选择视觉语言模型主GGUF文件；mmproj只能作为同目录配套文件导入",
+                    false,
+                ));
+            }
             if let Some(existing) = registry
                 .artifacts
                 .iter()
@@ -328,11 +462,15 @@ impl ModelManager {
                 artifact_id,
                 role: selection.role,
                 format: candidate.format,
-                model_id: source
-                    .file_stem()
-                    .map(|value| value.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| candidate.display_name.clone()),
-                model_version: None,
+                model_id: metadata
+                    .and_then(|value| value.model_id.clone())
+                    .unwrap_or_else(|| {
+                        source
+                            .file_stem()
+                            .map(|value| value.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| candidate.display_name.clone())
+                    }),
+                model_version: metadata.map(|value| value.revision.clone()),
                 source: metadata
                     .map(|value| value.source)
                     .unwrap_or(ModelSource::LocalImport),
@@ -344,6 +482,8 @@ impl ModelManager {
                 quantization: infer_quantization(&candidate.display_name),
                 context_length: None,
                 embedding_dimension: None,
+                query_prefix: metadata.and_then(|value| value.query_prefix.clone()),
+                max_length: metadata.and_then(|value| value.max_length),
                 license_name: metadata.map(|value| value.license_name.clone()),
                 status: "ready".into(),
                 imported_at: Utc::now(),
@@ -387,11 +527,409 @@ impl ModelManager {
             .find(|artifact| artifact.artifact_id == *artifact_id))
     }
 
+    pub fn active_profile(&self) -> Result<Option<ModelProfile>, AppError> {
+        let registry = self.load_registry()?;
+        let Some(profile_id) = registry.active_profile_id else {
+            return Ok(None);
+        };
+        Ok(registry
+            .profiles
+            .into_iter()
+            .find(|profile| profile.profile_id == profile_id))
+    }
+
+    pub fn role_configs(&self) -> Result<Vec<ModelRoleConfig>, AppError> {
+        let registry = self.load_registry()?;
+        let active = |role: ModelRole| {
+            registry
+                .active_artifacts
+                .get(role.directory_name())
+                .copied()
+        };
+        Ok(vec![
+            ModelRoleConfig {
+                role: ModelRole::Generation,
+                active_artifact_id: active(ModelRole::Generation),
+                required_for: "严格证据问答与回答组织".into(),
+                optional: false,
+                load_policy: "on_demand".into(),
+            },
+            ModelRoleConfig {
+                role: ModelRole::Embedding,
+                active_artifact_id: active(ModelRole::Embedding),
+                required_for: "语义检索与文档关系".into(),
+                optional: false,
+                load_policy: "background_index".into(),
+            },
+            ModelRoleConfig {
+                role: ModelRole::Vision,
+                active_artifact_id: active(ModelRole::Vision),
+                required_for: "图片、图表与扫描页理解".into(),
+                optional: false,
+                load_policy: "serial_on_demand".into(),
+            },
+            ModelRoleConfig {
+                role: ModelRole::Reranker,
+                active_artifact_id: active(ModelRole::Reranker),
+                required_for: "候选证据精排".into(),
+                optional: true,
+                load_policy: "on_demand".into(),
+            },
+        ])
+    }
+
+    pub fn activate_profile(
+        &self,
+        edition: &str,
+        edition_name: &str,
+        generation_artifact_id: &Uuid,
+        embedding_artifact_id: &Uuid,
+        embedding_dimension: u32,
+        download_job_id: Option<Uuid>,
+    ) -> Result<ModelProfile, AppError> {
+        if embedding_dimension == 0 {
+            return Err(AppError::new(
+                "MODEL_ACTIVATION_INVALID",
+                "完整RAG配置缺少有效的向量维度",
+                false,
+            ));
+        }
+        let _registry_guard = self.lock_registry()?;
+        let mut registry = self.load_registry()?;
+        let generation = registry
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_id == *generation_artifact_id)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::new("MODEL_ARTIFACT_NOT_FOUND", "生成模型组件不存在", false)
+            })?;
+        let embedding = registry
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_id == *embedding_artifact_id)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::new("MODEL_ARTIFACT_NOT_FOUND", "语义模型组件不存在", false)
+            })?;
+        if generation.role != ModelRole::Generation
+            || generation.format != ModelFormat::Gguf
+            || embedding.role != ModelRole::Embedding
+            || embedding.format != ModelFormat::Onnx
+        {
+            return Err(AppError::new(
+                "MODEL_ACTIVATION_INVALID",
+                "完整RAG配置的模型角色或格式不匹配",
+                false,
+            ));
+        }
+        if !Path::new(&generation.local_path).is_file()
+            || !Path::new(&embedding.local_path).is_file()
+        {
+            return Err(AppError::new(
+                "MODEL_SOURCE_UNAVAILABLE",
+                "完整RAG配置包含不可用的本地模型文件",
+                false,
+            ));
+        }
+        if let Some(artifact) = registry
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.artifact_id == *embedding_artifact_id)
+        {
+            artifact.embedding_dimension = Some(embedding_dimension);
+        }
+        let embedding_already_active = registry
+            .active_artifacts
+            .get(ModelRole::Embedding.directory_name())
+            .is_some_and(|active| *active == *embedding_artifact_id);
+        let now = Utc::now();
+        let profile = ModelProfile {
+            profile_id: Uuid::now_v7(),
+            edition: edition.to_owned(),
+            name: edition_name.to_owned(),
+            generation_artifact_id: *generation_artifact_id,
+            embedding_artifact_id: *embedding_artifact_id,
+            vision_artifact_id: None,
+            ocr_artifact_id: None,
+            reranker_artifact_id: None,
+            status: if embedding_already_active {
+                "ready".into()
+            } else {
+                "indexing".into()
+            },
+            activated_at: now,
+        };
+        supersede_pending_profile(&mut registry);
+        registry.profiles.push(profile.clone());
+        if embedding_already_active {
+            registry.active_artifacts.insert(
+                ModelRole::Generation.directory_name().into(),
+                *generation_artifact_id,
+            );
+            registry.active_artifacts.insert(
+                ModelRole::Embedding.directory_name().into(),
+                *embedding_artifact_id,
+            );
+            registry.active_profile_id = Some(profile.profile_id);
+            registry.pending_embedding_activation = None;
+        } else {
+            registry.pending_embedding_activation = Some(PendingEmbeddingActivation {
+                artifact_id: *embedding_artifact_id,
+                dimension: embedding_dimension,
+                profile_id: Some(profile.profile_id),
+                download_job_id,
+                status: "indexing".into(),
+                error: None,
+                requested_at: now,
+                updated_at: now,
+            });
+        }
+        registry.registry_version = REGISTRY_VERSION;
+        registry.updated_at = now;
+        self.save_registry(&registry)?;
+        Ok(profile)
+    }
+
+    pub fn begin_embedding_activation(
+        &self,
+        artifact_id: &Uuid,
+        embedding_dimension: u32,
+    ) -> Result<Option<PendingEmbeddingActivation>, AppError> {
+        if embedding_dimension == 0 {
+            return Err(AppError::new(
+                "MODEL_ACTIVATION_INVALID",
+                "Embedding 模型自检没有返回有效的向量维度",
+                false,
+            ));
+        }
+        let _registry_guard = self.lock_registry()?;
+        let mut registry = self.load_registry()?;
+        let artifact = registry
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.artifact_id == *artifact_id)
+            .ok_or_else(|| AppError::new("MODEL_ARTIFACT_NOT_FOUND", "模型组件不存在", false))?;
+        if artifact.role != ModelRole::Embedding || artifact.format != ModelFormat::Onnx {
+            return Err(AppError::new(
+                "MODEL_ACTIVATION_INVALID",
+                "只有通过自检的 ONNX Embedding 组件可以建立语义索引",
+                false,
+            ));
+        }
+        if !Path::new(&artifact.local_path).is_file() {
+            return Err(AppError::new(
+                "MODEL_SOURCE_UNAVAILABLE",
+                "模型组件文件已经离开拾忆管理目录",
+                false,
+            ));
+        }
+        artifact.embedding_dimension = Some(embedding_dimension);
+        let already_active = registry
+            .active_artifacts
+            .get(ModelRole::Embedding.directory_name())
+            .is_some_and(|active| *active == *artifact_id);
+        supersede_pending_profile(&mut registry);
+        let pending = if already_active {
+            registry.pending_embedding_activation = None;
+            None
+        } else {
+            let now = Utc::now();
+            let pending = PendingEmbeddingActivation {
+                artifact_id: *artifact_id,
+                dimension: embedding_dimension,
+                profile_id: None,
+                download_job_id: None,
+                status: "indexing".into(),
+                error: None,
+                requested_at: now,
+                updated_at: now,
+            };
+            registry.pending_embedding_activation = Some(pending.clone());
+            Some(pending)
+        };
+        registry.updated_at = Utc::now();
+        self.save_registry(&registry)?;
+        Ok(pending)
+    }
+
+    pub fn pending_embedding_activation(
+        &self,
+    ) -> Result<Option<PendingEmbeddingActivation>, AppError> {
+        Ok(self.load_registry()?.pending_embedding_activation)
+    }
+
+    pub fn complete_embedding_activation(
+        &self,
+        artifact_id: &Uuid,
+        dimension: u32,
+    ) -> Result<PendingEmbeddingActivation, AppError> {
+        let _registry_guard = self.lock_registry()?;
+        let mut registry = self.load_registry()?;
+        let pending = registry
+            .pending_embedding_activation
+            .clone()
+            .filter(|pending| {
+                pending.artifact_id == *artifact_id
+                    && pending.dimension == dimension
+                    && pending.status == "indexing"
+            })
+            .ok_or_else(|| {
+                AppError::new(
+                    "MODEL_ACTIVATION_INVALID",
+                    "Embedding 索引完成结果与当前待切换模型不一致",
+                    false,
+                )
+            })?;
+        let artifact = registry
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.artifact_id == *artifact_id)
+            .ok_or_else(|| AppError::new("MODEL_ARTIFACT_NOT_FOUND", "模型组件不存在", false))?;
+        if artifact.role != ModelRole::Embedding || artifact.format != ModelFormat::Onnx {
+            return Err(AppError::new(
+                "MODEL_ACTIVATION_INVALID",
+                "待切换组件不是有效的 ONNX Embedding 模型",
+                false,
+            ));
+        }
+        artifact.embedding_dimension = Some(dimension);
+        registry
+            .active_artifacts
+            .insert(ModelRole::Embedding.directory_name().into(), *artifact_id);
+        if let Some(profile_id) = pending.profile_id {
+            let profile = registry
+                .profiles
+                .iter_mut()
+                .find(|profile| profile.profile_id == profile_id)
+                .ok_or_else(|| {
+                    AppError::new(
+                        "MODEL_ACTIVATION_INVALID",
+                        "待切换模型配置已经不存在",
+                        false,
+                    )
+                })?;
+            profile.status = "ready".into();
+            profile.activated_at = Utc::now();
+            registry.active_artifacts.insert(
+                ModelRole::Generation.directory_name().into(),
+                profile.generation_artifact_id,
+            );
+            registry.active_profile_id = Some(profile_id);
+        } else if registry.active_profile_id.is_some_and(|profile_id| {
+            registry.profiles.iter().any(|profile| {
+                profile.profile_id == profile_id && profile.embedding_artifact_id != *artifact_id
+            })
+        }) {
+            registry.active_profile_id = None;
+        }
+        registry.pending_embedding_activation = None;
+        registry.updated_at = Utc::now();
+        self.save_registry(&registry)?;
+        Ok(pending)
+    }
+
+    pub fn fail_embedding_activation(
+        &self,
+        artifact_id: &Uuid,
+        error: &AppError,
+    ) -> Result<PendingEmbeddingActivation, AppError> {
+        self.update_pending_embedding_activation(artifact_id, None, "failed", Some(error.clone()))
+    }
+
+    pub fn pause_embedding_activation(
+        &self,
+        download_job_id: &Uuid,
+    ) -> Result<PendingEmbeddingActivation, AppError> {
+        self.update_pending_embedding_activation_for_job(download_job_id, "paused", None)
+    }
+
+    pub fn cancel_embedding_activation(
+        &self,
+        download_job_id: &Uuid,
+    ) -> Result<PendingEmbeddingActivation, AppError> {
+        self.update_pending_embedding_activation_for_job(download_job_id, "cancelled", None)
+    }
+
+    pub fn resume_embedding_activation(
+        &self,
+        download_job_id: &Uuid,
+    ) -> Result<PendingEmbeddingActivation, AppError> {
+        self.update_pending_embedding_activation_for_job(download_job_id, "indexing", None)
+    }
+
+    fn update_pending_embedding_activation_for_job(
+        &self,
+        download_job_id: &Uuid,
+        status: &str,
+        error: Option<AppError>,
+    ) -> Result<PendingEmbeddingActivation, AppError> {
+        let pending = self
+            .pending_embedding_activation()?
+            .filter(|pending| pending.download_job_id == Some(*download_job_id))
+            .ok_or_else(|| {
+                AppError::new(
+                    "MODEL_DOWNLOAD_CONTROL_INVALID",
+                    "当前下载任务没有可控制的索引切换阶段",
+                    false,
+                )
+            })?;
+        self.update_pending_embedding_activation(
+            &pending.artifact_id,
+            Some(*download_job_id),
+            status,
+            error,
+        )
+    }
+
+    fn update_pending_embedding_activation(
+        &self,
+        artifact_id: &Uuid,
+        download_job_id: Option<Uuid>,
+        status: &str,
+        error: Option<AppError>,
+    ) -> Result<PendingEmbeddingActivation, AppError> {
+        let _registry_guard = self.lock_registry()?;
+        let mut registry = self.load_registry()?;
+        let pending = registry
+            .pending_embedding_activation
+            .as_mut()
+            .filter(|pending| {
+                pending.artifact_id == *artifact_id
+                    && download_job_id
+                        .map(|job_id| pending.download_job_id == Some(job_id))
+                        .unwrap_or(true)
+            })
+            .ok_or_else(|| {
+                AppError::new(
+                    "MODEL_ACTIVATION_INVALID",
+                    "待切换的 Embedding 模型已经变化",
+                    false,
+                )
+            })?;
+        pending.status = status.to_owned();
+        pending.error = error;
+        pending.updated_at = Utc::now();
+        let updated = pending.clone();
+        if let Some(profile_id) = pending.profile_id
+            && let Some(profile) = registry
+                .profiles
+                .iter_mut()
+                .find(|profile| profile.profile_id == profile_id)
+        {
+            profile.status = status.to_owned();
+        }
+        registry.updated_at = Utc::now();
+        self.save_registry(&registry)?;
+        Ok(updated)
+    }
+
     pub fn activate_artifact(
         &self,
         artifact_id: &Uuid,
         embedding_dimension: Option<u32>,
     ) -> Result<ModelArtifact, AppError> {
+        let _registry_guard = self.lock_registry()?;
         let mut registry = self.load_registry()?;
         let artifact = registry
             .artifacts
@@ -425,6 +963,358 @@ impl ModelManager {
         Ok(activated)
     }
 
+    pub fn vision_projector_path(&self, artifact: &ModelArtifact) -> Result<PathBuf, AppError> {
+        if artifact.role != ModelRole::Vision || artifact.format != ModelFormat::Gguf {
+            return Err(AppError::new(
+                "VISION_MODEL_INVALID",
+                "图片理解模型必须是带mmproj配套文件的GGUF视觉语言模型",
+                false,
+            ));
+        }
+        let directory = Path::new(&artifact.local_path)
+            .parent()
+            .ok_or_else(|| AppError::new("VISION_MODEL_INVALID", "图片理解模型目录无效", false))?;
+        let mut projectors = fs::read_dir(directory)
+            .map_err(|error| {
+                AppError::new("VISION_PROJECTOR_UNAVAILABLE", error.to_string(), true)
+            })?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .extension()
+                        .is_some_and(|value| value.eq_ignore_ascii_case("gguf"))
+                    && path.file_name().is_some_and(|value| {
+                        value
+                            .to_string_lossy()
+                            .to_ascii_lowercase()
+                            .contains("mmproj")
+                    })
+            })
+            .collect::<Vec<_>>();
+        projectors.sort();
+        match projectors.as_slice() {
+            [path] => Ok(path.clone()),
+            [] => Err(AppError::new(
+                "VISION_PROJECTOR_MISSING",
+                "视觉模型目录缺少与主模型匹配的mmproj文件",
+                false,
+            )),
+            _ => Err(AppError::new(
+                "VISION_PROJECTOR_AMBIGUOUS",
+                "视觉模型目录包含多个mmproj文件，请只保留与主模型匹配的一个",
+                false,
+            )),
+        }
+    }
+
+    pub fn create_download_job(
+        &self,
+        edition_id: &str,
+        edition_name: &str,
+        source: ModelSource,
+        files: Vec<ModelDownloadFileProgress>,
+    ) -> Result<ModelDownloadJob, AppError> {
+        let _guard = self.download_lock.lock().map_err(|_| {
+            AppError::new(
+                "MODEL_DOWNLOAD_STATE_UNAVAILABLE",
+                "模型下载状态暂时不可用",
+                true,
+            )
+        })?;
+        let mut registry = self.load_download_registry()?;
+        if let Some(existing) = registry.jobs.iter().find(|job| {
+            job.edition_id == edition_id
+                && job.source == source
+                && matches!(job.status.as_str(), "queued" | "running" | "paused")
+        }) {
+            return Ok(existing.clone());
+        }
+        let total_bytes = files.iter().map(|file| file.total_bytes).sum();
+        let now = Utc::now();
+        let job = ModelDownloadJob {
+            job_id: Uuid::now_v7(),
+            edition_id: edition_id.to_owned(),
+            edition_name: edition_name.to_owned(),
+            source,
+            status: "queued".into(),
+            phase: "queued".into(),
+            downloaded_bytes: files.iter().map(|file| file.downloaded_bytes).sum(),
+            total_bytes,
+            progress: 0.0,
+            bytes_per_second: 0,
+            eta_seconds: None,
+            retry_count: 0,
+            current_file: None,
+            files,
+            installed_artifact_ids: Vec::new(),
+            profile_id: None,
+            error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        registry.jobs.push(job.clone());
+        registry.updated_at = now;
+        self.save_download_registry(&registry)?;
+        Ok(job)
+    }
+
+    pub fn list_download_jobs(&self) -> Result<Vec<ModelDownloadJob>, AppError> {
+        let _guard = self.download_lock.lock().map_err(|_| {
+            AppError::new(
+                "MODEL_DOWNLOAD_STATE_UNAVAILABLE",
+                "模型下载状态暂时不可用",
+                true,
+            )
+        })?;
+        let mut jobs = self.load_download_registry()?.jobs;
+        jobs.sort_by_key(|job| std::cmp::Reverse(job.updated_at));
+        Ok(jobs)
+    }
+
+    pub fn download_job(&self, job_id: &Uuid) -> Result<ModelDownloadJob, AppError> {
+        self.list_download_jobs()?
+            .into_iter()
+            .find(|job| job.job_id == *job_id)
+            .ok_or_else(|| {
+                AppError::new("MODEL_DOWNLOAD_JOB_NOT_FOUND", "模型下载任务不存在", false)
+            })
+    }
+
+    pub fn update_download_job(
+        &self,
+        job: &ModelDownloadJob,
+    ) -> Result<ModelDownloadJob, AppError> {
+        let _guard = self.download_lock.lock().map_err(|_| {
+            AppError::new(
+                "MODEL_DOWNLOAD_STATE_UNAVAILABLE",
+                "模型下载状态暂时不可用",
+                true,
+            )
+        })?;
+        let mut registry = self.load_download_registry()?;
+        let current = registry
+            .jobs
+            .iter_mut()
+            .find(|current| current.job_id == job.job_id)
+            .ok_or_else(|| {
+                AppError::new("MODEL_DOWNLOAD_JOB_NOT_FOUND", "模型下载任务不存在", false)
+            })?;
+        let mut next = job.clone();
+        next.downloaded_bytes = next.files.iter().map(|file| file.downloaded_bytes).sum();
+        next.total_bytes = next.files.iter().map(|file| file.total_bytes).sum();
+        next.progress = if next.total_bytes == 0 {
+            0.0
+        } else {
+            (next.downloaded_bytes as f64 / next.total_bytes as f64).clamp(0.0, 1.0)
+        };
+        next.updated_at = Utc::now();
+        *current = next.clone();
+        registry.updated_at = next.updated_at;
+        self.save_download_registry(&registry)?;
+        Ok(next)
+    }
+
+    pub fn download_artifact_staging_directory(
+        &self,
+        source: ModelSource,
+        edition_id: &str,
+        role: ModelRole,
+    ) -> Result<PathBuf, AppError> {
+        let source = match source {
+            ModelSource::Huggingface => "huggingface",
+            ModelSource::Modelscope => "modelscope",
+            ModelSource::LocalImport => {
+                return Err(AppError::new(
+                    "MODEL_DOWNLOAD_SOURCE_UNAVAILABLE",
+                    "本地导入不能使用下载暂存目录",
+                    false,
+                ));
+            }
+        };
+        let directory = self
+            .download_staging_directory()?
+            .join(source)
+            .join(edition_id)
+            .join(role.directory_name());
+        fs::create_dir_all(&directory).map_err(|error| {
+            AppError::new("MODEL_DIRECTORY_CREATE_FAILED", error.to_string(), true)
+        })?;
+        Ok(directory)
+    }
+
+    fn recover_interrupted_downloads(&self) -> Result<(), AppError> {
+        let _guard = self.download_lock.lock().map_err(|_| {
+            AppError::new(
+                "MODEL_DOWNLOAD_STATE_UNAVAILABLE",
+                "模型下载状态暂时不可用",
+                true,
+            )
+        })?;
+        let mut registry = self.load_download_registry()?;
+        let mut changed = false;
+        for job in &mut registry.jobs {
+            if matches!(job.status.as_str(), "queued" | "running") {
+                job.status = "paused".into();
+                job.phase = "paused".into();
+                job.bytes_per_second = 0;
+                job.eta_seconds = None;
+                job.current_file = None;
+                job.error = Some(AppError::new(
+                    "MODEL_DOWNLOAD_INTERRUPTED",
+                    "应用上次退出时模型尚未下载完成，可以继续下载",
+                    true,
+                ));
+                job.updated_at = Utc::now();
+                changed = true;
+            }
+        }
+        let legacy_root = self.model_root.join(".downloads");
+        if legacy_root.is_dir() {
+            let entries = fs::read_dir(&legacy_root).map_err(|error| {
+                AppError::new("MODEL_DOWNLOAD_STATE_READ_FAILED", error.to_string(), true)
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    AppError::new("MODEL_DOWNLOAD_STATE_READ_FAILED", error.to_string(), true)
+                })?;
+                let path = entry.path();
+                let metadata = match entry.metadata() {
+                    Ok(metadata) if metadata.is_file() => metadata,
+                    _ => continue,
+                };
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let Some((edition_id, edition_name, role, total_bytes)) =
+                    legacy_download_spec(&name)
+                else {
+                    continue;
+                };
+                let quarantine = legacy_root.join("quarantine");
+                fs::create_dir_all(&quarantine).map_err(|error| {
+                    AppError::new("MODEL_DOWNLOAD_QUARANTINE_FAILED", error.to_string(), true)
+                })?;
+                let quarantined_name =
+                    format!("{}.invalid-{}", name, Utc::now().timestamp_millis());
+                fs::rename(&path, quarantine.join(quarantined_name)).map_err(|error| {
+                    AppError::new("MODEL_DOWNLOAD_QUARANTINE_FAILED", error.to_string(), true)
+                })?;
+                let now = Utc::now();
+                registry.jobs.push(ModelDownloadJob {
+                    job_id: Uuid::now_v7(),
+                    edition_id: edition_id.into(),
+                    edition_name: edition_name.into(),
+                    source: ModelSource::Huggingface,
+                    status: "failed".into(),
+                    phase: "failed".into(),
+                    downloaded_bytes: metadata.len().min(total_bytes),
+                    total_bytes,
+                    progress: if total_bytes == 0 {
+                        0.0
+                    } else {
+                        (metadata.len() as f64 / total_bytes as f64).clamp(0.0, 1.0)
+                    },
+                    bytes_per_second: 0,
+                    eta_seconds: None,
+                    retry_count: 0,
+                    current_file: Some(name.clone()),
+                    files: vec![ModelDownloadFileProgress {
+                        role,
+                        file_name: name.trim_end_matches(".part").into(),
+                        downloaded_bytes: metadata.len().min(total_bytes),
+                        total_bytes,
+                        status: "failed".into(),
+                    }],
+                    installed_artifact_ids: Vec::new(),
+                    profile_id: None,
+                    error: Some(AppError::new(
+                        "MODEL_DOWNLOAD_LEGACY_PARTIAL_INVALID",
+                        format!(
+                            "发现旧版未标记来源的断点文件，已隔离以避免跨来源续传（实际{}字节，预期{}字节）",
+                            metadata.len(),
+                            total_bytes
+                        ),
+                        true,
+                    )),
+                    created_at: now,
+                    updated_at: now,
+                });
+                changed = true;
+            }
+        }
+        if changed {
+            registry.updated_at = Utc::now();
+            self.save_download_registry(&registry)?;
+        }
+        Ok(())
+    }
+
+    fn recover_interrupted_embedding_activation(&self) -> Result<(), AppError> {
+        let _registry_guard = self.lock_registry()?;
+        let mut registry = self.load_registry()?;
+        let Some(pending) = registry.pending_embedding_activation.as_mut() else {
+            return Ok(());
+        };
+        if pending.status != "indexing" || pending.download_job_id.is_none() {
+            return Ok(());
+        }
+        pending.status = "paused".into();
+        pending.error = None;
+        pending.updated_at = Utc::now();
+        if let Some(profile_id) = pending.profile_id
+            && let Some(profile) = registry
+                .profiles
+                .iter_mut()
+                .find(|profile| profile.profile_id == profile_id)
+        {
+            profile.status = "paused".into();
+        }
+        registry.updated_at = Utc::now();
+        self.save_registry(&registry)
+    }
+
+    fn load_download_registry(&self) -> Result<ModelDownloadRegistryState, AppError> {
+        if !self.downloads_path.exists() {
+            return Ok(ModelDownloadRegistryState::default());
+        }
+        let bytes = fs::read(&self.downloads_path).map_err(|error| {
+            AppError::new("MODEL_DOWNLOAD_STATE_READ_FAILED", error.to_string(), true)
+        })?;
+        let registry =
+            serde_json::from_slice::<ModelDownloadRegistryState>(&bytes).map_err(|error| {
+                AppError::new("MODEL_DOWNLOAD_STATE_INVALID", error.to_string(), false)
+            })?;
+        if registry.registry_version > DOWNLOAD_REGISTRY_VERSION {
+            return Err(AppError::new(
+                "MODEL_DOWNLOAD_STATE_TOO_NEW",
+                "模型下载状态来自更高版本的拾忆",
+                false,
+            ));
+        }
+        Ok(registry)
+    }
+
+    fn save_download_registry(
+        &self,
+        registry: &ModelDownloadRegistryState,
+    ) -> Result<(), AppError> {
+        let bytes = serde_json::to_vec_pretty(registry).map_err(|error| {
+            AppError::new("MODEL_DOWNLOAD_STATE_INVALID", error.to_string(), false)
+        })?;
+        let temporary_path = self.downloads_path.with_extension("json.tmp");
+        let mut file = File::create(&temporary_path).map_err(|error| {
+            AppError::new("MODEL_DOWNLOAD_STATE_WRITE_FAILED", error.to_string(), true)
+        })?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|error| {
+                AppError::new("MODEL_DOWNLOAD_STATE_WRITE_FAILED", error.to_string(), true)
+            })?;
+        atomic_replace_file(&temporary_path, &self.downloads_path).map_err(|error| {
+            AppError::new("MODEL_DOWNLOAD_STATE_WRITE_FAILED", error.to_string(), true)
+        })
+    }
+
     fn load_registry(&self) -> Result<ModelRegistryState, AppError> {
         if !self.registry_path.exists() {
             return Ok(ModelRegistryState::default());
@@ -444,8 +1334,20 @@ impl ModelManager {
         Ok(registry)
     }
 
+    fn lock_registry(&self) -> Result<std::sync::MutexGuard<'_, ()>, AppError> {
+        self.registry_lock.lock().map_err(|_| {
+            AppError::new(
+                "MODEL_REGISTRY_LOCK_FAILED",
+                "模型注册表状态已损坏，请重启拾忆后重试",
+                true,
+            )
+        })
+    }
+
     fn save_registry(&self, registry: &ModelRegistryState) -> Result<(), AppError> {
-        let bytes = serde_json::to_vec_pretty(registry)
+        let mut registry = registry.clone();
+        registry.registry_version = REGISTRY_VERSION;
+        let bytes = serde_json::to_vec_pretty(&registry)
             .map_err(|error| AppError::new("MODEL_REGISTRY_INVALID", error.to_string(), false))?;
         let temporary_path = self.registry_path.with_extension("json.tmp");
         let mut file = File::create(&temporary_path).map_err(|error| {
@@ -458,6 +1360,20 @@ impl ModelManager {
             })?;
         atomic_replace_file(&temporary_path, &self.registry_path)
             .map_err(|error| AppError::new("MODEL_REGISTRY_WRITE_FAILED", error.to_string(), true))
+    }
+}
+
+fn supersede_pending_profile(registry: &mut ModelRegistryState) {
+    if let Some(profile_id) = registry
+        .pending_embedding_activation
+        .as_ref()
+        .and_then(|pending| pending.profile_id)
+        && let Some(profile) = registry
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.profile_id == profile_id)
+    {
+        profile.status = "superseded".into();
     }
 }
 
@@ -489,6 +1405,18 @@ impl Drop for InstallationGuard {
         if !self.committed {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+}
+
+fn legacy_download_spec(name: &str) -> Option<(&'static str, &'static str, ModelRole, u64)> {
+    match name {
+        "Qwen3-0.6B-Q8_0.gguf.part" => {
+            Some(("light", "轻量版", ModelRole::Generation, 639_446_688))
+        }
+        "Qwen3-4B-Q4_K_M.gguf.part" => {
+            Some(("standard", "标准版", ModelRole::Generation, 2_497_280_256))
+        }
+        _ => None,
     }
 }
 
@@ -566,6 +1494,8 @@ fn import_candidate(path: &Path) -> Result<ImportCandidate, AppError> {
     let suggested_role = infer_role(path, format);
     let companion_files = if format == ModelFormat::Onnx {
         discover_companion_files(path)?
+    } else if suggested_role == Some(ModelRole::Vision) {
+        discover_gguf_vision_companions(path)?
     } else {
         Vec::new()
     };
@@ -580,6 +1510,17 @@ fn import_candidate(path: &Path) -> Result<ImportCandidate, AppError> {
             .any(|value| value.ends_with("tokenizer.json"))
     {
         warnings.push("向量模型目录缺少tokenizer.json，运行自检可能失败".into());
+    }
+    if format == ModelFormat::Gguf
+        && suggested_role == Some(ModelRole::Vision)
+        && !path.file_name().is_some_and(|name| {
+            name.to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("mmproj")
+        })
+        && companion_files.is_empty()
+    {
+        warnings.push("视觉模型目录缺少匹配的mmproj GGUF文件，无法启用图片理解".into());
     }
     Ok(ImportCandidate {
         candidate_id: Uuid::now_v7(),
@@ -611,6 +1552,13 @@ fn infer_role(path: &Path, format: ModelFormat) -> Option<ModelRole> {
     let value = path.to_string_lossy().to_ascii_lowercase();
     if value.contains("ocr") || value.contains("det_model") || value.contains("rec_model") {
         Some(ModelRole::Ocr)
+    } else if value.contains("vision")
+        || value.contains("vl-")
+        || value.contains("-vl")
+        || value.contains("multimodal")
+        || value.contains("mmproj")
+    {
+        Some(ModelRole::Vision)
     } else if value.contains("rerank") || value.contains("cross-encoder") {
         Some(ModelRole::Reranker)
     } else if value.contains("embed") || value.contains("bge-") || value.contains("gte-") {
@@ -626,7 +1574,16 @@ fn discover_companion_files(path: &Path) -> Result<Vec<String>, AppError> {
     let parent = path
         .parent()
         .ok_or_else(|| AppError::new("MODEL_SOURCE_UNAVAILABLE", "ONNX模型缺少父目录", false))?;
-    let allowed = ["json", "txt", "model", "vocab", "merges", "yaml", "yml"];
+    let allowed = [
+        "json",
+        "txt",
+        "model",
+        "vocab",
+        "merges",
+        "yaml",
+        "yml",
+        "onnx_data",
+    ];
     let mut files = Vec::new();
     for entry in fs::read_dir(parent)
         .map_err(|error| AppError::new("MODEL_SOURCE_UNAVAILABLE", error.to_string(), true))?
@@ -650,6 +1607,33 @@ fn discover_companion_files(path: &Path) -> Result<Vec<String>, AppError> {
             files.push(entry.path().to_string_lossy().into_owned());
         }
     }
+    files.sort();
+    Ok(files)
+}
+
+fn discover_gguf_vision_companions(path: &Path) -> Result<Vec<String>, AppError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::new("MODEL_SOURCE_UNAVAILABLE", "GGUF模型缺少父目录", false))?;
+    let mut files = fs::read_dir(parent)
+        .map_err(|error| AppError::new("MODEL_SOURCE_UNAVAILABLE", error.to_string(), true))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|candidate| {
+            candidate != path
+                && candidate.is_file()
+                && candidate
+                    .extension()
+                    .is_some_and(|value| value.eq_ignore_ascii_case("gguf"))
+                && candidate.file_name().is_some_and(|value| {
+                    value
+                        .to_string_lossy()
+                        .to_ascii_lowercase()
+                        .contains("mmproj")
+                })
+        })
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
     files.sort();
     Ok(files)
 }
@@ -682,6 +1666,33 @@ fn infer_quantization(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn import_fake_model(
+        manager: &ModelManager,
+        source_root: &Path,
+        name: &str,
+        role: ModelRole,
+    ) -> ModelArtifact {
+        let directory = source_root.join(name);
+        fs::create_dir_all(&directory).expect("create model source");
+        let extension = if role == ModelRole::Embedding {
+            "onnx"
+        } else {
+            "gguf"
+        };
+        let model = directory.join(format!("{name}.{extension}"));
+        fs::write(&model, format!("fake {name} model bytes")).expect("write fake model");
+        if role == ModelRole::Embedding {
+            fs::write(directory.join("tokenizer.json"), b"{}").expect("write tokenizer");
+        }
+        manager
+            .import_artifacts(&[ModelImportSelection {
+                source_path: model.to_string_lossy().into_owned(),
+                role,
+            }])
+            .expect("import fake model")
+            .remove(0)
+    }
 
     #[test]
     fn local_import_is_hash_verified_and_keeps_source_read_only() {
@@ -730,6 +1741,144 @@ mod tests {
     }
 
     #[test]
+    fn embedding_profile_switch_keeps_old_model_until_new_index_is_verified() {
+        let data = tempfile::tempdir().expect("data tempdir");
+        let source = tempfile::tempdir().expect("source tempdir");
+        let manager = ModelManager::open(data.path()).expect("open manager");
+        let generation =
+            import_fake_model(&manager, source.path(), "generation", ModelRole::Generation);
+        let old_embedding = import_fake_model(
+            &manager,
+            source.path(),
+            "embedding-old",
+            ModelRole::Embedding,
+        );
+        let new_embedding = import_fake_model(
+            &manager,
+            source.path(),
+            "embedding-new",
+            ModelRole::Embedding,
+        );
+        manager
+            .activate_artifact(&old_embedding.artifact_id, Some(2))
+            .expect("activate existing embedding baseline");
+        let old_profile = manager
+            .activate_profile(
+                "old",
+                "旧配置",
+                &generation.artifact_id,
+                &old_embedding.artifact_id,
+                2,
+                None,
+            )
+            .expect("activate old profile");
+        assert_eq!(old_profile.status, "ready");
+
+        let job_id = Uuid::now_v7();
+        let staged = manager
+            .activate_profile(
+                "new",
+                "新配置",
+                &generation.artifact_id,
+                &new_embedding.artifact_id,
+                3,
+                Some(job_id),
+            )
+            .expect("stage new profile");
+        assert_eq!(staged.status, "indexing");
+        assert_eq!(
+            manager
+                .active_artifact(ModelRole::Embedding)
+                .expect("read old active embedding")
+                .expect("old embedding remains active")
+                .artifact_id,
+            old_embedding.artifact_id
+        );
+        assert_eq!(
+            manager
+                .active_profile()
+                .expect("read old active profile")
+                .expect("old profile remains active")
+                .profile_id,
+            old_profile.profile_id
+        );
+        let pending = manager
+            .pending_embedding_activation()
+            .expect("read pending migration")
+            .expect("pending migration");
+        assert_eq!(pending.artifact_id, new_embedding.artifact_id);
+        assert_eq!(pending.download_job_id, Some(job_id));
+
+        drop(manager);
+        let manager = ModelManager::open(data.path()).expect("reopen manager after interruption");
+        assert_eq!(
+            manager
+                .pending_embedding_activation()
+                .expect("read recovered migration")
+                .expect("recovered migration")
+                .status,
+            "paused"
+        );
+        assert_eq!(
+            manager
+                .active_artifact(ModelRole::Embedding)
+                .expect("read active after restart")
+                .expect("old embedding preserved after restart")
+                .artifact_id,
+            old_embedding.artifact_id
+        );
+        manager
+            .resume_embedding_activation(&job_id)
+            .expect("resume migration after restart");
+
+        let failure = AppError::new(
+            "VECTOR_INDEX_INCOMPLETE",
+            "synthetic incomplete index",
+            true,
+        );
+        manager
+            .fail_embedding_activation(&new_embedding.artifact_id, &failure)
+            .expect("persist failed migration");
+        assert_eq!(
+            manager
+                .active_artifact(ModelRole::Embedding)
+                .expect("read active after failure")
+                .expect("old embedding preserved after failure")
+                .artifact_id,
+            old_embedding.artifact_id
+        );
+        manager
+            .resume_embedding_activation(&job_id)
+            .expect("resume persisted migration");
+        let completed = manager
+            .complete_embedding_activation(&new_embedding.artifact_id, 3)
+            .expect("complete verified migration");
+        assert_eq!(completed.download_job_id, Some(job_id));
+        assert!(
+            manager
+                .pending_embedding_activation()
+                .expect("read completed migration")
+                .is_none()
+        );
+        assert_eq!(
+            manager
+                .active_artifact(ModelRole::Embedding)
+                .expect("read new active embedding")
+                .expect("new embedding active")
+                .artifact_id,
+            new_embedding.artifact_id
+        );
+        assert_eq!(
+            manager
+                .active_profile()
+                .expect("read new active profile")
+                .expect("new profile active")
+                .profile_id,
+            staged.profile_id
+        );
+    }
+
+    #[test]
     fn scripts_are_not_discovered_as_model_components() {
         let data = tempfile::tempdir().expect("data tempdir");
         let source = tempfile::tempdir().expect("source tempdir");
@@ -739,5 +1888,67 @@ mod tests {
             .scan_import_paths(&[source.path().to_string_lossy().into_owned()])
             .expect_err("scripts cannot be imported");
         assert_eq!(error.code, "MODEL_FORMAT_UNSUPPORTED");
+    }
+
+    #[test]
+    fn legacy_partial_download_is_quarantined_and_reported_as_failed() {
+        let data = tempfile::tempdir().expect("data tempdir");
+        let downloads = data.path().join("models").join(".downloads");
+        fs::create_dir_all(&downloads).expect("create legacy downloads");
+        let partial = downloads.join("Qwen3-0.6B-Q8_0.gguf.part");
+        fs::write(&partial, b"invalid interrupted model bytes").expect("write partial");
+
+        let manager = ModelManager::open(data.path()).expect("open manager");
+        let jobs = manager.list_download_jobs().expect("list recovered jobs");
+
+        assert!(!partial.exists());
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, "failed");
+        assert_eq!(jobs[0].phase, "failed");
+        assert_eq!(
+            jobs[0].error.as_ref().map(|error| error.code.as_str()),
+            Some("MODEL_DOWNLOAD_LEGACY_PARTIAL_INVALID")
+        );
+        assert!(
+            downloads
+                .join("quarantine")
+                .read_dir()
+                .expect("quarantine")
+                .next()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn vision_import_copies_matching_mmproj_and_rejects_projector_as_main() {
+        let data = tempfile::tempdir().expect("data tempdir");
+        let source = tempfile::tempdir().expect("source tempdir");
+        let model = source.path().join("Qwen3-VL-2B-Q4_K_M.gguf");
+        let projector = source.path().join("mmproj-Qwen3-VL-2B-F16.gguf");
+        fs::write(&model, b"vision-main").expect("write vision model");
+        fs::write(&projector, b"vision-projector").expect("write projector");
+        let manager = ModelManager::open(data.path()).expect("open manager");
+
+        let imported = manager
+            .import_artifacts(&[ModelImportSelection {
+                source_path: model.to_string_lossy().into_owned(),
+                role: ModelRole::Vision,
+            }])
+            .expect("import vision model");
+        let copied_projector = manager
+            .vision_projector_path(&imported[0])
+            .expect("resolve copied projector");
+        assert_eq!(
+            fs::read(copied_projector).expect("read copied projector"),
+            b"vision-projector"
+        );
+
+        let error = manager
+            .import_artifacts(&[ModelImportSelection {
+                source_path: projector.to_string_lossy().into_owned(),
+                role: ModelRole::Vision,
+            }])
+            .expect_err("projector cannot be imported as main model");
+        assert_eq!(error.code, "VISION_MODEL_MAIN_REQUIRED");
     }
 }

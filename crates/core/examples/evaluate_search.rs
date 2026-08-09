@@ -54,6 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ocr_policy: "auto".into(),
                 language_hints: vec!["zh".into()],
                 max_pages: None,
+                asset_cache_dir: None,
                 parser_version: "0.1.0".into(),
             };
             let result = worker
@@ -64,6 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     parser_name: "none".into(),
                     parser_version: request.parser_version,
                     nodes: vec![],
+                    image_assets: vec![],
                     warnings: vec![],
                     metrics: ParseMetrics {
                         page_count: 0,
@@ -90,6 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let session = catalog.search(&SearchRequest {
             query: case.query.clone(),
             scope: ScopeFilter {
+                knowledge_space_ids: vec![],
                 root_ids: vec![root.root_id],
                 collection_ids: vec![],
                 file_ids: vec![],

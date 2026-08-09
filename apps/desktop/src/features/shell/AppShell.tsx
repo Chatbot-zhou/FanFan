@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { bridge } from "../../bridge";
 import { useAppStore } from "../../state/app-store";
@@ -14,6 +14,7 @@ import { Sidebar } from "./Sidebar";
 import { StatusBar } from "./StatusBar";
 import { TitleBar } from "./TitleBar";
 import { useBackendEvents } from "../../hooks/useBackendEvents";
+import { RootAuthorizationPage } from "../onboarding/RootAuthorizationPage";
 
 interface AppShellProps {
   startup_notice: string | null;
@@ -24,13 +25,12 @@ const STARTUP_PHASE_LABELS: Record<string, string> = {
   recovering_jobs: "正在恢复上次未完成的任务",
   scheduling_background_work: "正在安排后台索引任务",
   ready: "后台服务已就绪",
-  degraded: "后台服务已进入核心模式",
+  degraded: "部分后台服务暂时不可用",
 };
 
 export function AppShell({ startup_notice }: AppShellProps) {
   const eventNotice = useBackendEvents();
   const queryClient = useQueryClient();
-  const discoveryStarted = useRef(false);
   const route = useAppStore((state) => state.route);
   const startup = useQuery({
     queryKey: ["startup-state"],
@@ -44,6 +44,12 @@ export function AppShell({ startup_notice }: AppShellProps) {
     enabled: backendReady,
   });
   const currentModelState = model.data ?? null;
+  const modelDownloads = useQuery({
+    queryKey: ["model-downloads"],
+    queryFn: () => bridge.model_download_list(),
+    refetchInterval: (query) => query.state.data?.some((job) => job.status === "queued" || job.status === "running") ? 500 : false,
+    enabled: backendReady,
+  });
   const home = useQuery({
     queryKey: ["home-summary", new Date().toLocaleDateString("sv-SE")],
     queryFn: () => bridge.home_get_summary(new Date().toLocaleDateString("sv-SE")),
@@ -52,6 +58,11 @@ export function AppShell({ startup_notice }: AppShellProps) {
   const roots = useQuery({
     queryKey: ["roots"],
     queryFn: () => bridge.root_list(),
+    enabled: backendReady,
+  });
+  const welcome = useQuery({
+    queryKey: ["welcome-state"],
+    queryFn: () => bridge.welcome_get_state(),
     enabled: backendReady,
   });
   const environment = useQuery({
@@ -67,16 +78,40 @@ export function AppShell({ startup_notice }: AppShellProps) {
   });
 
   useEffect(() => {
-    if (!backendReady || discoveryStarted.current) return;
-    discoveryStarted.current = true;
-    void bridge.root_discover_defaults().then(() => {
-      void queryClient.invalidateQueries({ queryKey: ["roots"] });
-      void queryClient.invalidateQueries({ queryKey: ["home-summary"] });
-    }).catch(() => undefined);
+    if (!backendReady) return;
     void bridge.environment_detect().then(() => {
       void queryClient.invalidateQueries({ queryKey: ["environment"] });
     }).catch(() => undefined);
   }, [backendReady, queryClient]);
+
+  useEffect(() => {
+    if (!backendReady || welcome.data?.root_authorization_completed || !roots.data?.length) return;
+    void bridge.welcome_authorization_complete().then(() => {
+      void queryClient.invalidateQueries({ queryKey: ["welcome-state"] });
+    }).catch(() => undefined);
+  }, [backendReady, queryClient, roots.data?.length, welcome.data?.root_authorization_completed]);
+
+  const completeAuthorization = async () => {
+    await bridge.welcome_authorization_complete();
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["welcome-state"] }),
+      queryClient.invalidateQueries({ queryKey: ["roots"] }),
+      queryClient.invalidateQueries({ queryKey: ["home-summary"] }),
+    ]);
+  };
+
+  const authorizationRequired = backendReady
+    && welcome.data?.root_authorization_completed === false
+    && roots.data?.length === 0;
+
+  if (authorizationRequired) {
+    return (
+      <div className="app-window">
+        <TitleBar model_state={currentModelState} model_download={modelDownloads.data?.[0] ?? null} />
+        <RootAuthorizationPage onCompleted={completeAuthorization} />
+      </div>
+    );
+  }
 
   const page = {
     home: <HomePage summary={home.data ?? null} loading={home.isLoading} />,
@@ -91,7 +126,7 @@ export function AppShell({ startup_notice }: AppShellProps) {
 
   return (
     <div className="app-window">
-      <TitleBar model_state={currentModelState} />
+      <TitleBar model_state={currentModelState} model_download={modelDownloads.data?.[0] ?? null} />
       <div className="app-window__body">
         <Sidebar />
         <main className="workspace">

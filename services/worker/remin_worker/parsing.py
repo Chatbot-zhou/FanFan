@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import csv
 import html.parser
+import hashlib
 import io
+import mimetypes
 import os
 import re
 import secrets
@@ -23,6 +25,11 @@ from .ocr import recognize_with_windows
 
 PARSER_VERSION = "0.1.0"
 SUPPORTED_TEXT = {"txt", "md", "csv", "tsv", "html", "htm"}
+SUPPORTED_CODE = {
+    "rs", "py", "js", "jsx", "mjs", "cjs", "ts", "tsx", "java", "kt", "kts", "go",
+    "c", "cc", "cpp", "h", "hpp", "cs", "rb", "php", "swift", "scala", "sh", "ps1",
+    "sql", "json", "yaml", "yml", "toml", "xml", "css", "scss", "vue", "svelte",
+}
 SUPPORTED_OPEN_XML = {"docx", "docm", "xlsx", "xlsm", "pptx", "pptm"}
 IMAGE_FORMATS = {"jpg", "jpeg", "png", "tif", "tiff", "bmp", "webp"}
 LEGACY_OFFICE = {"doc", "xls", "ppt"}
@@ -49,6 +56,7 @@ class ParseRequest:
     ocr_policy: Literal["auto", "force", "disabled"] = "auto"
     language_hints: tuple[str, ...] = ("zh",)
     max_pages: int | None = None
+    asset_cache_dir: str | None = None
     parser_version: str = PARSER_VERSION
 
     @classmethod
@@ -71,6 +79,9 @@ class ParseRequest:
         max_pages = value.get("max_pages")
         if max_pages is not None and (not isinstance(max_pages, int) or max_pages < 1):
             raise ValueError("max_pages必须是正整数或null")
+        asset_cache_dir = value.get("asset_cache_dir")
+        if asset_cache_dir is not None and (not isinstance(asset_cache_dir, str) or not asset_cache_dir.strip()):
+            raise ValueError("asset_cache_dir必须是非空字符串或null")
         return cls(
             job_id=required_ids[0],
             file_id=required_ids[1],
@@ -80,6 +91,7 @@ class ParseRequest:
             ocr_policy=ocr_policy,
             language_hints=tuple(hints),
             max_pages=max_pages,
+            asset_cache_dir=asset_cache_dir,
             parser_version=str(value.get("parser_version") or PARSER_VERSION),
         )
 
@@ -104,12 +116,29 @@ class DocumentNode:
 
 
 @dataclass(frozen=True, slots=True)
+class ImageAsset:
+    asset_id: str
+    revision_id: str
+    asset_kind: str
+    cache_path: str
+    mime_type: str
+    size_bytes: int
+    sha256: str
+    locator: dict[str, Any]
+    ocr_text: str | None = None
+    description: str | None = None
+    vision_model_id: str | None = None
+    status: str = "pending_understanding"
+
+
+@dataclass(frozen=True, slots=True)
 class ParseResult:
     revision_id: str
     status: Literal["parsed", "partial", "encrypted", "unsupported", "failed"]
     parser_name: str
     parser_version: str
     nodes: tuple[DocumentNode, ...]
+    image_assets: tuple[ImageAsset, ...]
     warnings: tuple[ParseWarning, ...]
     metrics: dict[str, int]
     error: WorkerError | None = None
@@ -134,6 +163,105 @@ def locator(kind: str, **overrides: Any) -> dict[str, Any]:
     }
     value.update(overrides)
     return value
+
+
+def _cache_image_asset(
+    request: ParseRequest,
+    content: bytes,
+    suffix: str,
+    asset_kind: str,
+    source_locator: dict[str, Any],
+    ocr_text: str | None = None,
+) -> ImageAsset | None:
+    if not request.asset_cache_dir or not content:
+        return None
+    cache_directory = Path(request.asset_cache_dir)
+    cache_directory.mkdir(parents=True, exist_ok=True)
+    asset_id = uuid7()
+    clean_suffix = re.sub(r"[^a-zA-Z0-9]", "", suffix.lower().lstrip(".")) or "bin"
+    target = cache_directory / f"{asset_id}.{clean_suffix}"
+    temporary = cache_directory / f".{asset_id}.part"
+    with temporary.open("xb") as stream:
+        stream.write(content)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, target)
+    return ImageAsset(
+        asset_id=asset_id,
+        revision_id=request.revision_id,
+        asset_kind=asset_kind,
+        cache_path=str(target),
+        mime_type=mimetypes.guess_type(target.name)[0] or "application/octet-stream",
+        size_bytes=len(content),
+        sha256=hashlib.sha256(content).hexdigest(),
+        locator=source_locator,
+        ocr_text=ocr_text,
+    )
+
+
+def _relationship_targets(package: zipfile.ZipFile, relationship_path: str) -> dict[str, str]:
+    if relationship_path not in package.namelist():
+        return {}
+    root = ElementTree.fromstring(package.read(relationship_path))
+    return {
+        relation.attrib.get("Id", ""): relation.attrib.get("Target", "").replace("\\", "/")
+        for relation in root.iter()
+        if relation.tag.endswith("Relationship")
+    }
+
+
+def _openxml_image_assets(request: ParseRequest, path: Path, source_format: str) -> list[ImageAsset]:
+    prefixes = {
+        "docx": ("word/media/", "docx"),
+        "docm": ("word/media/", "docx"),
+        "xlsx": ("xl/media/", "spreadsheet"),
+        "xlsm": ("xl/media/", "spreadsheet"),
+        "pptx": ("ppt/media/", "presentation"),
+        "pptm": ("ppt/media/", "presentation"),
+    }
+    prefix, locator_kind = prefixes[source_format]
+    assets: list[ImageAsset] = []
+    with zipfile.ZipFile(path) as package:
+        media_paths = [name for name in package.namelist() if name.startswith(prefix) and not name.endswith("/")]
+        locations: dict[str, dict[str, Any]] = {}
+        if source_format in {"pptx", "pptm"}:
+            slide_paths = sorted(
+                (name for name in package.namelist() if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)),
+                key=lambda name: int(re.search(r"\d+", Path(name).stem).group()),
+            )
+            for slide_number, slide_path in enumerate(slide_paths, 1):
+                relationships = _relationship_targets(package, f"ppt/slides/_rels/{Path(slide_path).name}.rels")
+                root = ElementTree.fromstring(package.read(slide_path))
+                shape_number = 0
+                for element in root.iter():
+                    relation_id = next((value for key, value in element.attrib.items() if key.endswith("}embed")), None)
+                    if relation_id and relation_id in relationships:
+                        shape_number += 1
+                        target = relationships[relation_id].removeprefix("../")
+                        media_path = target if target.startswith("ppt/") else f"ppt/{target}"
+                        locations[media_path] = locator("presentation", slide_no=slide_number, shape_no=shape_number)
+        elif source_format in {"docx", "docm"}:
+            relationships = _relationship_targets(package, "word/_rels/document.xml.rels")
+            if "word/document.xml" in package.namelist():
+                root = ElementTree.fromstring(package.read("word/document.xml"))
+                for paragraph_number, paragraph in enumerate((item for item in root.iter() if item.tag.endswith("}p")), 1):
+                    for element in paragraph.iter():
+                        relation_id = next((value for key, value in element.attrib.items() if key.endswith("}embed")), None)
+                        if relation_id and relation_id in relationships:
+                            target = relationships[relation_id].removeprefix("../")
+                            media_path = target if target.startswith("word/") else f"word/{target}"
+                            locations[media_path] = locator("docx", paragraph_no=paragraph_number)
+        total_bytes = 0
+        for media_path in media_paths[:512]:
+            content = package.read(media_path)
+            total_bytes += len(content)
+            if total_bytes > 256 * 1024 * 1024:
+                break
+            source_locator = locations.get(media_path, locator(locator_kind))
+            asset = _cache_image_asset(request, content, Path(media_path).suffix, "embedded_image", source_locator)
+            if asset is not None:
+                assets.append(asset)
+    return assets
 
 
 class _VisibleHtmlParser(html.parser.HTMLParser):
@@ -184,6 +312,79 @@ def _text_nodes(path: Path, source_format: str) -> list[DocumentNode]:
                 DocumentNode(uuid7(), None, ordinal, "paragraph", line, None, locator("text", line_start=ordinal, line_end=ordinal))
             )
     return nodes
+
+
+_CODE_SYMBOL_PATTERNS = (
+    re.compile(r"^\s*(?:(?:pub|public|private|protected|internal|static|export|default|abstract|final|open)\s+)*(?:async\s+)?(?:def|class|fn|func|function|interface|struct|enum|trait|impl|record|module)\s+([A-Za-z_$][\w$]*)"),
+    re.compile(r"^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=.*(?:=>|function\b)"),
+    re.compile(r"^\s*(?:function\s+)?([A-Za-z_][\w]*)\s*\(\s*\)\s*\{"),
+)
+
+
+def _code_symbol(line: str) -> str | None:
+    for pattern in _CODE_SYMBOL_PATTERNS:
+        match = pattern.match(line)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _code_nodes(path: Path, source_format: str) -> list[DocumentNode]:
+    lines = _decode_text(path).splitlines()
+    if not lines:
+        return []
+    starts = [(index, symbol) for index, line in enumerate(lines) if (symbol := _code_symbol(line))]
+    ranges: list[tuple[int, int, str | None]] = []
+    if starts:
+        first_start = starts[0][0]
+        if first_start > 0 and any(line.strip() for line in lines[:first_start]):
+            ranges.append((0, first_start, None))
+        for position, (start, symbol) in enumerate(starts):
+            end = starts[position + 1][0] if position + 1 < len(starts) else len(lines)
+            ranges.append((start, end, symbol))
+    else:
+        ranges.extend((start, min(start + 120, len(lines)), None) for start in range(0, len(lines), 120))
+    nodes: list[DocumentNode] = []
+    for start, end, symbol in ranges:
+        text = "\n".join(lines[start:end]).strip()
+        if not text:
+            continue
+        heading_path = (source_format, symbol) if symbol else (source_format,)
+        nodes.append(DocumentNode(
+            uuid7(),
+            None,
+            len(nodes) + 1,
+            "code_symbol" if symbol else "code_block",
+            text,
+            None,
+            locator("code", line_start=start + 1, line_end=end, heading_path=list(heading_path)),
+            heading_path,
+        ))
+    return nodes
+
+
+def _zip_manifest_nodes(path: Path) -> tuple[list[DocumentNode], list[ParseWarning]]:
+    nodes: list[DocumentNode] = []
+    warnings: list[ParseWarning] = []
+    with zipfile.ZipFile(path) as package:
+        members = package.infolist()
+        if len(members) > 10_000:
+            warnings.append(ParseWarning("ARCHIVE_MANIFEST_TRUNCATED", "压缩包条目超过10000项，仅索引前10000项清单"))
+            members = members[:10_000]
+        for offset in range(0, len(members), 200):
+            batch = members[offset:offset + 200]
+            rows = [[item.filename, str(item.file_size), "目录" if item.is_dir() else "文件"] for item in batch]
+            nodes.append(DocumentNode(
+                uuid7(),
+                None,
+                len(nodes) + 1,
+                "archive_manifest",
+                None,
+                {"columns": ["路径", "大小（字节）", "类型"], "rows": rows},
+                locator("archive", line_start=offset + 1, line_end=offset + len(batch)),
+                ("zip", "清单"),
+            ))
+    return nodes, warnings
 
 
 def _xml_text(element: ElementTree.Element) -> str:
@@ -304,6 +505,7 @@ def _pdf_result(request: ParseRequest, path: Path, started_at: float) -> ParseRe
         if reader.is_encrypted:
             return _result(request, "encrypted", "pypdf", [], [ParseWarning("PDF_ENCRYPTED", "PDF已加密，请提供未加密副本")], 0)
         nodes: list[DocumentNode] = []
+        image_assets: list[ImageAsset] = []
         warnings: list[ParseWarning] = []
         ocr_pages: list[int] = []
         pages = reader.pages[: request.max_pages] if request.max_pages else reader.pages
@@ -314,32 +516,85 @@ def _pdf_result(request: ParseRequest, path: Path, started_at: float) -> ParseRe
             if len(text) < 30 and request.ocr_policy == "disabled":
                 warnings.append(ParseWarning("OCR_REQUIRED", "该页可提取文字少于30个字符", locator("pdf", page_no=page_number)))
             nodes.append(DocumentNode(uuid7(), None, page_number, "page", text or None, None, locator("pdf", page_no=page_number)))
+            try:
+                for image in page.images:
+                    image_name = str(getattr(image, "name", "image.bin"))
+                    image_data = bytes(getattr(image, "data", b""))
+                    asset = _cache_image_asset(
+                        request,
+                        image_data,
+                        Path(image_name).suffix,
+                        "pdf_embedded_image",
+                        locator("pdf", page_no=page_number),
+                    )
+                    if asset is not None:
+                        image_assets.append(asset)
+            except (AttributeError, OSError, ValueError) as error:
+                warnings.append(ParseWarning("PDF_IMAGE_EXTRACT_FAILED", str(error), locator("pdf", page_no=page_number)))
         ocr_page_count = 0
         parser_name = "pypdf"
         if ocr_pages:
-            ocr_result, ocr_error = recognize_with_windows(path, "pdf", request.max_pages, request.language_hints, ocr_pages)
-            if ocr_error:
-                for page_number in ocr_pages:
-                    warnings.append(ParseWarning(ocr_error.code, ocr_error.message, locator("pdf", page_no=page_number)))
-                    warnings.append(ParseWarning("OCR_REQUIRED", "该页尚未完成OCR", locator("pdf", page_no=page_number)))
-            elif ocr_result is not None:
-                recognized = _ocr_nodes(ocr_result, "pdf", len(nodes))
-                recognized_pages = {node.locator["page_no"] for node in recognized}
-                if recognized:
-                    nodes = [node for node in nodes if node.locator.get("page_no") not in recognized_pages] + recognized
-                    nodes.sort(key=lambda node: (node.locator.get("page_no") or 0, node.ordinal))
-                    nodes = [
-                        DocumentNode(node.node_id, node.parent_id, ordinal, node.node_type, node.text, node.table_data, node.locator, node.heading_path)
-                        for ordinal, node in enumerate(nodes, 1)
-                    ]
-                    ocr_page_count = len(recognized_pages)
-                    parser_name = "pypdf+windows-ocr"
-                for page_number in ocr_pages:
-                    if page_number not in recognized_pages:
-                        warnings.append(ParseWarning("OCR_NO_TEXT", "该页OCR后没有识别到文字", locator("pdf", page_no=page_number)))
-                        warnings.append(ParseWarning("OCR_REQUIRED", "该页尚未获得可索引文字", locator("pdf", page_no=page_number)))
+            render_directory: Path | None = None
+            if request.asset_cache_dir:
+                render_directory = Path(request.asset_cache_dir) / f".ocr-render-{uuid7()}"
+            try:
+                ocr_result, ocr_error = recognize_with_windows(
+                    path,
+                    "pdf",
+                    request.max_pages,
+                    request.language_hints,
+                    ocr_pages,
+                    render_directory,
+                )
+                if ocr_error:
+                    for page_number in ocr_pages:
+                        warnings.append(ParseWarning(ocr_error.code, ocr_error.message, locator("pdf", page_no=page_number)))
+                        warnings.append(ParseWarning("OCR_REQUIRED", "该页尚未完成OCR", locator("pdf", page_no=page_number)))
+                elif ocr_result is not None:
+                    recognized = _ocr_nodes(ocr_result, "pdf", len(nodes))
+                    recognized_pages = {node.locator["page_no"] for node in recognized}
+                    if recognized:
+                        nodes = [node for node in nodes if node.locator.get("page_no") not in recognized_pages] + recognized
+                        nodes.sort(key=lambda node: (node.locator.get("page_no") or 0, node.ordinal))
+                        nodes = [
+                            DocumentNode(node.node_id, node.parent_id, ordinal, node.node_type, node.text, node.table_data, node.locator, node.heading_path)
+                            for ordinal, node in enumerate(nodes, 1)
+                        ]
+                        ocr_page_count = len(recognized_pages)
+                        parser_name = "pypdf+windows-ocr"
+                    ocr_text_by_page: dict[int, str] = {}
+                    for page_number in ocr_pages:
+                        page_text = "\n".join(
+                            node.text or ""
+                            for node in recognized
+                            if node.locator.get("page_no") == page_number
+                        ).strip()
+                        if page_text:
+                            ocr_text_by_page[page_number] = page_text
+                        if page_number not in recognized_pages:
+                            warnings.append(ParseWarning("OCR_NO_TEXT", "该页OCR后没有识别到文字", locator("pdf", page_no=page_number)))
+                            warnings.append(ParseWarning("OCR_REQUIRED", "该页尚未获得可索引文字", locator("pdf", page_no=page_number)))
+                    for rendered in ocr_result.get("rendered_pages", []):
+                        try:
+                            page_number = int(rendered["page_no"])
+                            rendered_path = Path(str(rendered["path"]))
+                            asset = _cache_image_asset(
+                                request,
+                                rendered_path.read_bytes(),
+                                ".png",
+                                "pdf_scanned_page",
+                                locator("pdf", page_no=page_number),
+                                ocr_text_by_page.get(page_number),
+                            )
+                            if asset is not None:
+                                image_assets.append(asset)
+                        except (KeyError, OSError, TypeError, ValueError) as error:
+                            warnings.append(ParseWarning("PDF_IMAGE_EXTRACT_FAILED", str(error)))
+            finally:
+                if render_directory is not None:
+                    shutil.rmtree(render_directory, ignore_errors=True)
         status: Literal["parsed", "partial"] = "partial" if warnings else "parsed"
-        return _result(request, status, parser_name, nodes, warnings, len(pages), started_at, ocr_page_count)
+        return _result(request, status, parser_name, nodes, warnings, len(pages), started_at, ocr_page_count, image_assets)
     except (PdfReadError, OSError, ValueError) as error:
         return _failure(request, "PDF_PARSE_FAILED", str(error), False)
 
@@ -353,6 +608,7 @@ def _result(
     page_count: int,
     started_at: float | None = None,
     ocr_page_count: int = 0,
+    image_assets: list[ImageAsset] | None = None,
 ) -> ParseResult:
     return ParseResult(
         revision_id=request.revision_id,
@@ -360,6 +616,7 @@ def _result(
         parser_name=parser_name,
         parser_version=request.parser_version,
         nodes=tuple(nodes),
+        image_assets=tuple(image_assets or ()),
         warnings=tuple(warnings),
         metrics={
             "page_count": page_count,
@@ -378,6 +635,7 @@ def _failure(request: ParseRequest, code: str, message: str, retryable: bool) ->
         parser_name="none",
         parser_version=request.parser_version,
         nodes=(),
+        image_assets=(),
         warnings=(),
         metrics={"page_count": 0, "node_count": 0, "character_count": 0, "ocr_page_count": 0, "elapsed_ms": 0},
         error=WorkerError(code, message, retryable),
@@ -457,27 +715,51 @@ def parse_document(request: ParseRequest) -> ParseResult:
         if source_format in SUPPORTED_TEXT:
             nodes = _text_nodes(path, source_format)
             return _result(request, "parsed", "stdlib-text", nodes, [], 0, started_at)
+        if source_format in SUPPORTED_CODE:
+            nodes = _code_nodes(path, source_format)
+            return _result(request, "parsed", "stdlib-code-structure", nodes, [], 0, started_at)
+        if source_format == "zip":
+            nodes, warnings = _zip_manifest_nodes(path)
+            return _result(request, "parsed", "stdlib-zip-manifest", nodes, warnings, 0, started_at)
         if source_format in {"docx", "docm"}:
             nodes = _docx_nodes(path)
-            return _result(request, "parsed", "openxml-docx", nodes, [], 0, started_at)
+            image_assets = _openxml_image_assets(request, path, source_format)
+            return _result(request, "parsed", "openxml-docx", nodes, [], 0, started_at, image_assets=image_assets)
         if source_format in {"xlsx", "xlsm"}:
             nodes = _xlsx_nodes(path)
-            return _result(request, "parsed", "openxml-xlsx", nodes, [], 0, started_at)
+            image_assets = _openxml_image_assets(request, path, source_format)
+            return _result(request, "parsed", "openxml-xlsx", nodes, [], 0, started_at, image_assets=image_assets)
         if source_format in {"pptx", "pptm"}:
             nodes = _pptx_nodes(path)
-            return _result(request, "parsed", "openxml-pptx", nodes, [], len(nodes), started_at)
+            image_assets = _openxml_image_assets(request, path, source_format)
+            return _result(request, "parsed", "openxml-pptx", nodes, [], len(nodes), started_at, image_assets=image_assets)
         if source_format == "pdf":
             return _pdf_result(request, path, started_at)
         if source_format in IMAGE_FORMATS:
+            standalone_asset = _cache_image_asset(request, path.read_bytes(), path.suffix, "standalone_image", locator("image", page_no=1))
+            image_assets = [standalone_asset] if standalone_asset is not None else []
             if request.ocr_policy == "disabled":
-                return _result(request, "partial", "image-metadata", [], [ParseWarning("OCR_REQUIRED", "图片需要OCR后才能建立全文索引")], 1, started_at)
+                return _result(request, "partial", "image-metadata", [], [ParseWarning("OCR_REQUIRED", "图片需要OCR后才能建立全文索引")], 1, started_at, image_assets=image_assets)
             ocr_result, ocr_error = recognize_with_windows(path, "image", 1, request.language_hints)
             if ocr_error:
-                return _result(request, "partial", "image-metadata", [], [ParseWarning(ocr_error.code, ocr_error.message), ParseWarning("OCR_REQUIRED", "图片尚未完成OCR")], 1, started_at)
+                return _result(request, "partial", "image-metadata", [], [ParseWarning(ocr_error.code, ocr_error.message), ParseWarning("OCR_REQUIRED", "图片尚未完成OCR")], 1, started_at, image_assets=image_assets)
             nodes = _ocr_nodes(ocr_result or {}, "image")
+            ocr_text = "\n".join(node.text or "" for node in nodes).strip() or None
+            if standalone_asset is not None:
+                image_assets = [ImageAsset(
+                    standalone_asset.asset_id,
+                    standalone_asset.revision_id,
+                    standalone_asset.asset_kind,
+                    standalone_asset.cache_path,
+                    standalone_asset.mime_type,
+                    standalone_asset.size_bytes,
+                    standalone_asset.sha256,
+                    standalone_asset.locator,
+                    ocr_text,
+                )]
             if not nodes:
-                return _result(request, "partial", "windows-ocr", [], [ParseWarning("OCR_NO_TEXT", "图片OCR后没有识别到文字"), ParseWarning("OCR_REQUIRED", "图片尚未获得可索引文字")], 1, started_at)
-            return _result(request, "parsed", "windows-ocr", nodes, [], 1, started_at, 1)
+                return _result(request, "partial", "windows-ocr", [], [ParseWarning("OCR_NO_TEXT", "图片OCR后没有识别到文字"), ParseWarning("OCR_REQUIRED", "图片尚未获得可索引文字")], 1, started_at, image_assets=image_assets)
+            return _result(request, "parsed", "windows-ocr", nodes, [], 1, started_at, 1, image_assets)
         if source_format in LEGACY_OFFICE:
             return _legacy_office_result(request, path, source_format, started_at)
         return _result(request, "unsupported", "none", [], [ParseWarning("FORMAT_UNSUPPORTED", f"暂不支持{source_format}格式")], 0, started_at)

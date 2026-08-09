@@ -1,30 +1,35 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::Utc;
 use remin_core::{
-    AddRootRequest, AnswerResult, AppError, AskRequest, CandidateRoot, CatalogService,
-    ChunkEmbeddingInput, CollectionRecord, CollectionRule, CreateCollectionRequest,
-    DegradationLevel, DownloadedModelMetadata, EmbeddingRequest, ExportResult, ExportTableRequest,
-    ExtractionPreset, ExtractionRunRequest, ExtractionRunResult, FilePage, FilePreview, FileQuery,
-    FileRecord, ImportCandidate, InboxItem, InboxPage, InboxQuery, InboxUpdateRequest,
-    IncrementalWatchManager, IndexRebuildResult, JobRecord, LocalGenerationRuntime, LogPage,
-    LogQuery, MaintenanceSnapshot, ModelArtifact, ModelEdition, ModelFormat, ModelImportSelection,
-    ModelManager, ModelRole, ParseMetrics, ParseOutcome, ParseRequest, ParseResult,
-    PlanSkillRequest, RelationPage, RelationQuery, RelationRefreshResult, RelationType,
-    RootDiscoveryResult, RootRecord, SearchMode, SearchRequest, SearchSession, SemanticQuery,
-    SkillDefinition, TaskExecutionResult, TaskPlan, TriageStatus, WorkerClient,
+    AddRootRequest, AnswerResult, AppError, AskMode, AskRequest, CandidateRoot, CatalogService,
+    ChunkEmbeddingInput, CollectionModelReview, CollectionRecord, CollectionRule,
+    CollectionSuggestion, CollectionSuggestionPage, CollectionSuggestionQuery,
+    CollectionSuggestionRefreshResult, CollectionSuggestionUpdateRequest, CreateCollectionRequest,
+    DegradationLevel, DownloadFile, DownloadedModelMetadata, EmbeddingRequest, ExclusionRule,
+    ExclusionRuleInput, ExportResult, ExportTableRequest, ExtractionPreset, ExtractionRunRequest,
+    ExtractionRunResult, FilePage, FilePreview, FileQuery, FileRecord, ImageUnderstandingResult,
+    ImportCandidate, InboxItem, InboxPage, InboxQuery, InboxUpdateRequest, IncrementalWatchManager,
+    IndexRebuildResult, JobRecord, KnowledgeSpace, KnowledgeSpaceRequest, LocalGenerationRuntime,
+    LogPage, LogQuery, MaintenanceSnapshot, ModelArtifact, ModelDownloadFileProgress,
+    ModelDownloadJob, ModelEdition, ModelFormat, ModelImportSelection, ModelManager, ModelRole,
+    ModelRoleConfig, ModelSource, ParseMetrics, ParseOutcome, ParseRequest, ParseResult,
+    PendingEmbeddingActivation, PlanSkillRequest, RagReadiness, RelationPage, RelationQuery,
+    RelationRefreshResult, RelationType, RerankRequest, RootRecord, ScopeFilter, SearchMode,
+    SearchRequest, SearchSession, SemanticQuery, SkillDefinition, TaskExecutionResult, TaskPlan,
+    TriageStatus, WorkerClient,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -64,6 +69,12 @@ impl CatalogServiceState {
 #[derive(Default)]
 pub struct WatcherServiceState(pub Mutex<Option<IncrementalWatchManager>>);
 
+#[derive(Default)]
+pub struct ScanCoordinatorState {
+    queue: Mutex<VecDeque<(Uuid, Uuid)>>,
+    running: AtomicBool,
+}
+
 impl WatcherServiceState {
     pub fn install(&self, watcher: IncrementalWatchManager) -> Result<(), AppError> {
         let mut current = self.0.lock().map_err(|_| {
@@ -95,9 +106,81 @@ pub struct WorkerServiceState {
     pub client: WorkerClient,
     pub running: AtomicBool,
     pub embedding_running: AtomicBool,
+    pub embedding_reschedule: AtomicBool,
+    pub vision_running: AtomicBool,
 }
 
 pub struct GenerationServiceState(pub Arc<Mutex<LocalGenerationRuntime>>);
+
+const DOWNLOAD_ACTION_RUN: u8 = 0;
+const DOWNLOAD_ACTION_PAUSE: u8 = 1;
+const DOWNLOAD_ACTION_CANCEL: u8 = 2;
+
+#[derive(Clone, Default)]
+pub struct ModelDownloadCoordinatorState {
+    controls: Arc<Mutex<HashMap<Uuid, Arc<AtomicU8>>>>,
+    running: Arc<Mutex<HashSet<Uuid>>>,
+}
+
+impl ModelDownloadCoordinatorState {
+    pub fn pause_all(&self) {
+        if let Ok(controls) = self.controls.lock() {
+            for control in controls.values() {
+                control.store(DOWNLOAD_ACTION_PAUSE, Ordering::Release);
+            }
+        }
+    }
+
+    fn begin(&self, job_id: Uuid) -> Result<Option<Arc<AtomicU8>>, AppError> {
+        let mut running = self.running.lock().map_err(|_| {
+            AppError::new(
+                "MODEL_DOWNLOAD_STATE_UNAVAILABLE",
+                "模型下载协调器暂时不可用",
+                true,
+            )
+        })?;
+        if !running.insert(job_id) {
+            return Ok(None);
+        }
+        let control = Arc::new(AtomicU8::new(DOWNLOAD_ACTION_RUN));
+        self.controls
+            .lock()
+            .map_err(|_| {
+                AppError::new(
+                    "MODEL_DOWNLOAD_STATE_UNAVAILABLE",
+                    "模型下载协调器暂时不可用",
+                    true,
+                )
+            })?
+            .insert(job_id, Arc::clone(&control));
+        Ok(Some(control))
+    }
+
+    fn set_action(&self, job_id: &Uuid, action: u8) -> Result<bool, AppError> {
+        let controls = self.controls.lock().map_err(|_| {
+            AppError::new(
+                "MODEL_DOWNLOAD_STATE_UNAVAILABLE",
+                "模型下载协调器暂时不可用",
+                true,
+            )
+        })?;
+        if let Some(control) = controls.get(job_id) {
+            control.store(action, Ordering::Release);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn finish(&self, job_id: &Uuid) {
+        if let Ok(mut controls) = self.controls.lock() {
+            controls.remove(job_id);
+        }
+        if let Ok(mut running) = self.running.lock() {
+            running.remove(job_id);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct OperationHandle {
@@ -168,19 +251,29 @@ pub struct EnvironmentCheck {
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelRuntimeState {
     status: &'static str,
-    runtime_mode: &'static str,
     active_profile_id: Option<String>,
     active_profile_name: Option<String>,
     runtime_backend: Option<&'static str>,
-    message: &'static str,
+    message: String,
     checked_at: String,
     capabilities: ModelCapabilities,
+    rag_complete: bool,
+    semantic_index_coverage: f64,
+    embedding_migration: Option<EmbeddingMigrationState>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbeddingMigrationState {
+    artifact_id: String,
+    status: String,
+    error: Option<AppError>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelCapabilities {
     generation: bool,
     embedding: bool,
+    vision: bool,
     reranker: bool,
     ocr: bool,
 }
@@ -243,16 +336,34 @@ fn memory_total_gb() -> Option<u64> {
 
 #[cfg(windows)]
 fn disk_available_gb(path: &Path) -> Option<u64> {
+    disk_space_bytes(path).map(|(_, available)| available / 1024 / 1024 / 1024)
+}
+
+#[cfg(windows)]
+fn disk_space_bytes(path: &Path) -> Option<(u64, u64)> {
     let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
     wide.push(0);
     let mut available = 0_u64;
-    unsafe { GetDiskFreeSpaceExW(PCWSTR(wide.as_ptr()), Some(&mut available), None, None) }
-        .ok()
-        .map(|_| available / 1024 / 1024 / 1024)
+    let mut total = 0_u64;
+    unsafe {
+        GetDiskFreeSpaceExW(
+            PCWSTR(wide.as_ptr()),
+            Some(&mut available),
+            Some(&mut total),
+            None,
+        )
+    }
+    .ok()
+    .map(|_| (total, available))
 }
 
 #[cfg(not(windows))]
 fn disk_available_gb(_path: &Path) -> Option<u64> {
+    None
+}
+
+#[cfg(not(windows))]
+fn disk_space_bytes(_path: &Path) -> Option<(u64, u64)> {
     None
 }
 
@@ -318,10 +429,87 @@ pub fn environment_detect(environment: State<'_, EnvironmentServiceState>) -> En
 
 #[tauri::command(async)]
 pub fn model_state_get(
+    catalog: State<'_, CatalogServiceState>,
     models: State<'_, ModelServiceState>,
 ) -> Result<ModelRuntimeState, AppError> {
     let models = models.get()?;
-    model_state_from_manager(&models)
+    let catalog = catalog.get()?;
+    model_state_from_manager(&models, Some(&catalog))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RagReadinessRequest {
+    scope: ScopeFilter,
+}
+
+#[tauri::command(async)]
+pub fn rag_readiness_get(
+    request: RagReadinessRequest,
+    catalog: State<'_, CatalogServiceState>,
+    models: State<'_, ModelServiceState>,
+) -> Result<RagReadiness, AppError> {
+    let models = models.get()?;
+    let catalog = catalog.get()?;
+    let snapshot = catalog.maintenance_snapshot()?;
+    let generation_ready = models.active_artifact(ModelRole::Generation)?.is_some();
+    let embedding = models.active_artifact(ModelRole::Embedding)?;
+    let embedding_ready = embedding.is_some();
+    let vision_ready = models.active_artifact(ModelRole::Vision)?.is_some();
+    let (image_total, image_ready, pending_image_assets) = catalog.image_understanding_stats()?;
+    let image_index_coverage = if image_total == 0 {
+        1.0
+    } else {
+        (image_ready as f64 / image_total as f64).clamp(0.0, 1.0)
+    };
+    let (coverage, scope_coverage) = match embedding.as_ref() {
+        Some(artifact) => {
+            catalog.semantic_index_coverage(&request.scope, &artifact.artifact_id.to_string())?
+        }
+        None => (0.0, 0.0),
+    };
+    let mut blockers = Vec::new();
+    if !generation_ready {
+        blockers.push(AppError::new(
+            "RAG_GENERATION_MISSING",
+            "未配置已通过自检的本地生成模型",
+            true,
+        ));
+    }
+    if !embedding_ready {
+        blockers.push(AppError::new(
+            "RAG_EMBEDDING_MISSING",
+            "未配置已通过自检的中文 Embedding 模型",
+            true,
+        ));
+    }
+    if scope_coverage <= 0.0 {
+        blockers.push(AppError::new(
+            "RAG_INDEX_EMPTY",
+            "当前资料尚未建立语义索引",
+            true,
+        ));
+    }
+    if snapshot.degradation_level == "core" {
+        blockers.push(AppError::new(
+            "RAG_CORE_MODE",
+            "后台资源繁忙，生成任务暂时暂停；搜索和预览仍可继续使用",
+            true,
+        ));
+    }
+    Ok(RagReadiness {
+        ready: blockers.is_empty(),
+        generation_ready,
+        embedding_ready,
+        vision_ready,
+        semantic_index_coverage: coverage,
+        scope_index_coverage: scope_coverage,
+        image_index_coverage,
+        pending_image_assets,
+        degradation_level: snapshot.degradation_level,
+        background_notice: snapshot.background_notice,
+        blockers,
+        checked_at: Utc::now(),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -358,6 +546,13 @@ pub fn model_artifact_list(
 }
 
 #[tauri::command(async)]
+pub fn model_role_config_list(
+    models: State<'_, ModelServiceState>,
+) -> Result<Vec<ModelRoleConfig>, AppError> {
+    models.get()?.role_configs()
+}
+
+#[tauri::command(async)]
 pub fn model_catalog_list() -> Vec<ModelEdition> {
     remin_core::built_in_model_editions()
 }
@@ -370,11 +565,15 @@ pub struct ModelDownloadRequest {
 }
 
 #[tauri::command]
-pub async fn model_download_install(
+pub async fn model_download_start(
     request: ModelDownloadRequest,
     app: AppHandle,
+    catalog: State<'_, CatalogServiceState>,
     models: State<'_, ModelServiceState>,
-) -> Result<ModelArtifact, AppError> {
+    downloads: State<'_, ModelDownloadCoordinatorState>,
+    worker: State<'_, WorkerServiceState>,
+    generation: State<'_, GenerationServiceState>,
+) -> Result<ModelDownloadJob, AppError> {
     if !request.confirmed {
         return Err(AppError::new(
             "MODEL_DOWNLOAD_CONFIRMATION_REQUIRED",
@@ -384,47 +583,585 @@ pub async fn model_download_install(
     }
     let edition = remin_core::model_edition_by_id(&request.edition_id, &request.source)?;
     let manager = models.get()?;
-    tauri::async_runtime::spawn_blocking(move || {
-        download_and_install_model(&manager, &edition, &app)
-    })
-    .await
-    .map_err(|error| AppError::new("MODEL_DOWNLOAD_TASK_FAILED", error.to_string(), true))?
+    let files = download_file_progress(&edition);
+    let job = manager.create_download_job(
+        &edition.edition_id,
+        &edition.name,
+        edition
+            .artifacts
+            .first()
+            .map(|artifact| artifact.source)
+            .ok_or_else(|| {
+                AppError::new("MODEL_EDITION_INVALID", "模型版本没有可下载组件", false)
+            })?,
+        files,
+    )?;
+    if job.phase == "indexing"
+        && manager
+            .pending_embedding_activation()?
+            .is_some_and(|pending| pending.download_job_id == Some(job.job_id))
+    {
+        spawn_embed_pending(app, catalog.get()?);
+        return Ok(job);
+    }
+    spawn_model_download(
+        app,
+        catalog.get()?,
+        Arc::clone(&manager),
+        edition,
+        job.job_id,
+        downloads.inner().clone(),
+        worker.client.isolated(),
+        Arc::clone(&generation.0),
+    )?;
+    manager_download_job(&models, &job.job_id)
 }
 
-fn download_and_install_model(
+#[tauri::command(async)]
+pub fn model_download_list(
+    models: State<'_, ModelServiceState>,
+) -> Result<Vec<ModelDownloadJob>, AppError> {
+    models.get()?.list_download_jobs()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ModelDownloadJobRequest {
+    job_id: Uuid,
+}
+
+#[tauri::command(async)]
+pub fn model_download_get(
+    request: ModelDownloadJobRequest,
+    models: State<'_, ModelServiceState>,
+) -> Result<ModelDownloadJob, AppError> {
+    models.get()?.download_job(&request.job_id)
+}
+
+#[tauri::command(async)]
+pub fn model_download_pause(
+    request: ModelDownloadJobRequest,
+    app: AppHandle,
+    models: State<'_, ModelServiceState>,
+    downloads: State<'_, ModelDownloadCoordinatorState>,
+) -> Result<ModelDownloadJob, AppError> {
+    let manager = models.get()?;
+    let mut job = manager.download_job(&request.job_id)?;
+    if matches!(job.status.as_str(), "completed" | "failed" | "cancelled") {
+        return Err(AppError::new(
+            "MODEL_DOWNLOAD_CONTROL_INVALID",
+            "当前模型下载任务不能暂停",
+            false,
+        ));
+    }
+    if job.phase == "indexing" {
+        manager.pause_embedding_activation(&request.job_id)?;
+        job.status = "paused".into();
+        job.phase = "paused".into();
+        job.bytes_per_second = 0;
+        job.eta_seconds = None;
+        job = manager.update_download_job(&job)?;
+        emit_download_state(&app, &job);
+        return Ok(job);
+    }
+    let running = downloads.set_action(&request.job_id, DOWNLOAD_ACTION_PAUSE)?;
+    if !running {
+        job.status = "paused".into();
+        job.phase = "paused".into();
+        job.bytes_per_second = 0;
+        job.eta_seconds = None;
+        job = manager.update_download_job(&job)?;
+        emit_download_state(&app, &job);
+    }
+    Ok(job)
+}
+
+#[tauri::command(async)]
+pub fn model_download_cancel(
+    request: ModelDownloadJobRequest,
+    app: AppHandle,
+    models: State<'_, ModelServiceState>,
+    downloads: State<'_, ModelDownloadCoordinatorState>,
+) -> Result<ModelDownloadJob, AppError> {
+    let manager = models.get()?;
+    let mut job = manager.download_job(&request.job_id)?;
+    if job.status == "completed" {
+        return Err(AppError::new(
+            "MODEL_DOWNLOAD_CONTROL_INVALID",
+            "已经完成的模型下载不能取消",
+            false,
+        ));
+    }
+    if job.phase == "indexing" {
+        manager.cancel_embedding_activation(&request.job_id)?;
+        job.status = "cancelled".into();
+        job.phase = "cancelled".into();
+        job.bytes_per_second = 0;
+        job.eta_seconds = None;
+        job.error = None;
+        job = manager.update_download_job(&job)?;
+        emit_download_state(&app, &job);
+        return Ok(job);
+    }
+    let running = downloads.set_action(&request.job_id, DOWNLOAD_ACTION_CANCEL)?;
+    if !running {
+        job.status = "cancelled".into();
+        job.phase = "cancelled".into();
+        job.bytes_per_second = 0;
+        job.eta_seconds = None;
+        job.error = None;
+        job = manager.update_download_job(&job)?;
+        emit_download_state(&app, &job);
+    }
+    Ok(job)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ModelDownloadRetryRequest {
+    job_id: Uuid,
+    source: Option<String>,
+}
+
+#[tauri::command]
+pub async fn model_download_retry(
+    request: ModelDownloadRetryRequest,
+    app: AppHandle,
+    catalog: State<'_, CatalogServiceState>,
+    models: State<'_, ModelServiceState>,
+    downloads: State<'_, ModelDownloadCoordinatorState>,
+    worker: State<'_, WorkerServiceState>,
+    generation: State<'_, GenerationServiceState>,
+) -> Result<ModelDownloadJob, AppError> {
+    let manager = models.get()?;
+    let previous = manager.download_job(&request.job_id)?;
+    let source = request.source.unwrap_or_else(|| match previous.source {
+        ModelSource::Modelscope => "modelscope".into(),
+        _ => "huggingface".into(),
+    });
+    let edition = remin_core::model_edition_by_id(&previous.edition_id, &source)?;
+    let selected_source = edition.artifacts[0].source;
+    if selected_source == previous.source
+        && manager
+            .pending_embedding_activation()?
+            .is_some_and(|pending| pending.download_job_id == Some(request.job_id))
+    {
+        manager.resume_embedding_activation(&request.job_id)?;
+        let mut job = previous;
+        job.status = "running".into();
+        job.phase = "indexing".into();
+        job.bytes_per_second = 0;
+        job.eta_seconds = None;
+        job.error = None;
+        let job = manager.update_download_job(&job)?;
+        emit_download_state(&app, &job);
+        spawn_embed_pending(app, catalog.get()?);
+        return Ok(job);
+    }
+    let job = if selected_source == previous.source {
+        let mut job = previous;
+        job.status = "queued".into();
+        job.phase = "queued".into();
+        job.retry_count = job.retry_count.saturating_add(1);
+        job.bytes_per_second = 0;
+        job.eta_seconds = None;
+        job.current_file = None;
+        job.error = None;
+        manager.update_download_job(&job)?
+    } else {
+        manager.create_download_job(
+            &edition.edition_id,
+            &edition.name,
+            selected_source,
+            download_file_progress(&edition),
+        )?
+    };
+    spawn_model_download(
+        app,
+        catalog.get()?,
+        Arc::clone(&manager),
+        edition,
+        job.job_id,
+        downloads.inner().clone(),
+        worker.client.isolated(),
+        Arc::clone(&generation.0),
+    )?;
+    manager.download_job(&job.job_id)
+}
+
+fn manager_download_job(
+    models: &State<'_, ModelServiceState>,
+    job_id: &Uuid,
+) -> Result<ModelDownloadJob, AppError> {
+    models.get()?.download_job(job_id)
+}
+
+fn download_file_progress(edition: &ModelEdition) -> Vec<ModelDownloadFileProgress> {
+    edition
+        .artifacts
+        .iter()
+        .flat_map(|artifact| {
+            artifact
+                .files()
+                .into_iter()
+                .map(|file| ModelDownloadFileProgress {
+                    role: artifact.role,
+                    file_name: file.file_name,
+                    downloaded_bytes: 0,
+                    total_bytes: file.size_bytes,
+                    status: "queued".into(),
+                })
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_model_download(
+    app: AppHandle,
+    catalog: Arc<CatalogService>,
+    models: Arc<ModelManager>,
+    edition: ModelEdition,
+    job_id: Uuid,
+    coordinator: ModelDownloadCoordinatorState,
+    worker: WorkerClient,
+    generation: Arc<Mutex<LocalGenerationRuntime>>,
+) -> Result<(), AppError> {
+    let Some(control) = coordinator.begin(job_id)? else {
+        return Ok(());
+    };
+    thread::spawn(move || {
+        run_model_download(
+            &app,
+            &catalog,
+            &models,
+            &edition,
+            job_id,
+            &control,
+            &worker,
+            &generation,
+        );
+        coordinator.finish(&job_id);
+    });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_model_download(
+    app: &AppHandle,
+    catalog: &Arc<CatalogService>,
     models: &ModelManager,
     edition: &ModelEdition,
-    app: &AppHandle,
-) -> Result<ModelArtifact, AppError> {
-    let artifact = &edition.artifact;
-    let staging = models.download_staging_directory()?;
-    let completed_path = staging.join(&artifact.file_name);
-    let partial_path = staging.join(format!("{}.part", artifact.file_name));
-    if completed_path.is_file()
-        && models
-            .verify_download(&completed_path, &artifact.sha256, artifact.size_bytes)
-            .is_err()
-    {
-        fs::remove_file(&completed_path).map_err(|error| {
-            AppError::new("MODEL_DOWNLOAD_CLEANUP_FAILED", error.to_string(), true)
+    job_id: Uuid,
+    control: &AtomicU8,
+    worker: &WorkerClient,
+    generation: &Arc<Mutex<LocalGenerationRuntime>>,
+) {
+    let result = (|| {
+        let mut job = models.download_job(&job_id)?;
+        job.status = "running".into();
+        job.phase = "downloading".into();
+        job.error = None;
+        persist_download_job(app, models, &mut job)?;
+        let _ = app.emit("model.download_started", &job);
+
+        for artifact in &edition.artifacts {
+            let staging = models.download_artifact_staging_directory(
+                artifact.source,
+                &edition.edition_id,
+                artifact.role,
+            )?;
+            for file in artifact.files() {
+                download_model_file(
+                    app,
+                    models,
+                    &mut job,
+                    artifact.role,
+                    &file,
+                    &staging,
+                    control,
+                )?;
+            }
+        }
+
+        job.phase = "verifying".into();
+        job.current_file = None;
+        persist_download_job(app, models, &mut job)?;
+        for artifact in &edition.artifacts {
+            let staging = models.download_artifact_staging_directory(
+                artifact.source,
+                &edition.edition_id,
+                artifact.role,
+            )?;
+            for file in artifact.files() {
+                models.verify_download(
+                    &staging.join(&file.file_name),
+                    &file.sha256,
+                    file.size_bytes,
+                )?;
+            }
+        }
+
+        job.phase = "installing".into();
+        persist_download_job(app, models, &mut job)?;
+        let mut installed = Vec::new();
+        for artifact in &edition.artifacts {
+            check_download_control(control)?;
+            let staging = models.download_artifact_staging_directory(
+                artifact.source,
+                &edition.edition_id,
+                artifact.role,
+            )?;
+            let installed_artifact = models.import_downloaded_artifact(
+                &ModelImportSelection {
+                    source_path: staging
+                        .join(&artifact.file_name)
+                        .to_string_lossy()
+                        .into_owned(),
+                    role: artifact.role,
+                },
+                &DownloadedModelMetadata {
+                    source: artifact.source,
+                    repository_id: artifact.repository_id.clone(),
+                    revision: artifact.revision.clone(),
+                    license_name: artifact.license_name.clone(),
+                    model_id: Some(artifact.model_id.clone()),
+                    query_prefix: artifact.query_prefix.clone(),
+                    max_length: artifact.max_length,
+                },
+            )?;
+            installed.push(installed_artifact);
+            job.installed_artifact_ids = installed
+                .iter()
+                .map(|artifact: &ModelArtifact| artifact.artifact_id)
+                .collect();
+            persist_download_job(app, models, &mut job)?;
+        }
+
+        job.phase = "self_testing".into();
+        persist_download_job(app, models, &mut job)?;
+        let embedding = installed
+            .iter()
+            .find(|artifact| artifact.role == ModelRole::Embedding)
+            .ok_or_else(|| {
+                AppError::new("MODEL_PROFILE_INCOMPLETE", "完整RAG缺少语义模型", false)
+            })?;
+        let generation_artifact = installed
+            .iter()
+            .find(|artifact| artifact.role == ModelRole::Generation)
+            .ok_or_else(|| {
+                AppError::new("MODEL_PROFILE_INCOMPLETE", "完整RAG缺少生成模型", false)
+            })?;
+        let tokenizer = PathBuf::from(&embedding.local_path)
+            .parent()
+            .map(|parent| parent.join("tokenizer.json"))
+            .ok_or_else(|| {
+                AppError::new("EMBEDDING_TOKENIZER_UNAVAILABLE", "语义模型目录无效", false)
+            })?;
+        let embedding_test = worker.encode_embeddings(&EmbeddingRequest {
+            model_path: embedding.local_path.clone(),
+            tokenizer_path: Some(tokenizer.to_string_lossy().into_owned()),
+            texts: vec!["拾起散落的信息，连接过去的自己".into()],
+            max_length: embedding.max_length.unwrap_or(512),
+            threads: 2,
         })?;
-    }
-    if !completed_path.is_file() {
-        if partial_path.exists()
-            && fs::symlink_metadata(&partial_path)
-                .map(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
-                .unwrap_or(true)
-        {
+        let embedding_valid = embedding_test.dimension > 0
+            && embedding_test.vectors.len() == 1
+            && embedding_test.vectors[0].len() == embedding_test.dimension as usize
+            && embedding_test.vectors[0]
+                .iter()
+                .all(|value| value.is_finite());
+        if !embedding_valid {
             return Err(AppError::new(
-                "MODEL_DOWNLOAD_INCOMPLETE",
-                "模型断点文件不是普通文件",
-                false,
+                "MODEL_SELF_TEST_FAILED",
+                "语义模型自检返回了无效维度或向量",
+                true,
             ));
         }
-        let _ = app.emit(
-            "model.download_started",
-            json!({"edition_id": edition.edition_id, "model_id": artifact.model_id, "size_bytes": artifact.size_bytes}),
+        let threads = std::thread::available_parallelism()
+            .map(|value| value.get() as u32)
+            .unwrap_or(2)
+            .clamp(1, 8);
+        {
+            let mut runtime = generation.lock().map_err(|_| {
+                AppError::new(
+                    "GENERATION_RUNTIME_LOCK_FAILED",
+                    "生成运行时状态已损坏",
+                    true,
+                )
+            })?;
+            runtime.activate(&generation_artifact.local_path, 4096, threads)?;
+            let generated = match runtime.complete(
+                "只根据给定证据回答；每个事实句必须保留证据编号[S1]，不得补充证据外事实。",
+                "证据[S1]：拾忆在本地处理资料。请用一句完整中文事实句复述并引用。",
+                64,
+            ) {
+                Ok(generated) => generated,
+                Err(error) => {
+                    runtime.stop();
+                    return Err(error);
+                }
+            };
+            if generated.trim().is_empty()
+                || !generated.contains("[S1]")
+                || !(generated.contains("本地") && generated.contains("资料"))
+            {
+                runtime.stop();
+                return Err(AppError::new(
+                    "MODEL_SELF_TEST_FAILED",
+                    "生成模型未通过最小严格引文问答自检",
+                    true,
+                ));
+            }
+        }
+
+        job.phase = "activating".into();
+        persist_download_job(app, models, &mut job)?;
+        let profile = match models.activate_profile(
+            &edition.edition_id,
+            &edition.name,
+            &generation_artifact.artifact_id,
+            &embedding.artifact_id,
+            embedding_test.dimension,
+            Some(job_id),
+        ) {
+            Ok(profile) => profile,
+            Err(error) => {
+                if let Ok(mut runtime) = generation.lock() {
+                    runtime.stop();
+                }
+                return Err(error);
+            }
+        };
+        job.profile_id = Some(profile.profile_id);
+        if profile.status == "indexing" {
+            job.status = "running".into();
+            job.phase = "indexing".into();
+            job.progress = 1.0;
+            job.current_file = None;
+            job.bytes_per_second = 0;
+            job.eta_seconds = None;
+            job.error = None;
+            persist_download_job(app, models, &mut job)?;
+            for artifact in &edition.artifacts {
+                if let Ok(staging) = models.download_artifact_staging_directory(
+                    artifact.source,
+                    &edition.edition_id,
+                    artifact.role,
+                ) {
+                    let _ = fs::remove_dir_all(staging);
+                }
+            }
+            spawn_embed_pending(app.clone(), Arc::clone(catalog));
+            let _ = app.emit("model.download_indexing", &job);
+            return Ok::<(), AppError>(());
+        }
+        job.status = "completed".into();
+        job.phase = "completed".into();
+        job.current_file = None;
+        job.bytes_per_second = 0;
+        job.eta_seconds = Some(0);
+        job.error = None;
+        for file in &mut job.files {
+            file.status = "completed".into();
+            file.downloaded_bytes = file.total_bytes;
+        }
+        persist_download_job(app, models, &mut job)?;
+        for artifact in &edition.artifacts {
+            if let Ok(staging) = models.download_artifact_staging_directory(
+                artifact.source,
+                &edition.edition_id,
+                artifact.role,
+            ) {
+                let _ = fs::remove_dir_all(staging);
+            }
+        }
+        spawn_embed_pending(app.clone(), Arc::clone(catalog));
+        let _ = app.emit("model.download_completed", &job);
+        Ok::<(), AppError>(())
+    })();
+
+    if let Err(error) = result {
+        let action = control.load(Ordering::Acquire);
+        if let Ok(mut job) = models.download_job(&job_id) {
+            match action {
+                DOWNLOAD_ACTION_PAUSE => {
+                    job.status = "paused".into();
+                    job.phase = "paused".into();
+                    job.error = None;
+                }
+                DOWNLOAD_ACTION_CANCEL => {
+                    job.status = "cancelled".into();
+                    job.phase = "cancelled".into();
+                    job.error = None;
+                }
+                _ => {
+                    job.status = "failed".into();
+                    job.phase = "failed".into();
+                    job.error = Some(error.clone());
+                }
+            }
+            job.bytes_per_second = 0;
+            job.eta_seconds = None;
+            job.current_file = None;
+            if let Ok(job) = models.update_download_job(&job) {
+                emit_download_state(app, &job);
+            }
+        }
+        if action == DOWNLOAD_ACTION_RUN {
+            let _ = app.emit("model.download_failed", error);
+        }
+    }
+}
+
+fn download_model_file(
+    app: &AppHandle,
+    models: &ModelManager,
+    job: &mut ModelDownloadJob,
+    role: ModelRole,
+    file: &DownloadFile,
+    staging: &Path,
+    control: &AtomicU8,
+) -> Result<(), AppError> {
+    let completed_path = staging.join(&file.file_name);
+    let partial_path = staging.join(format!("{}.part", file.file_name));
+    if completed_path.is_file()
+        && models
+            .verify_download(&completed_path, &file.sha256, file.size_bytes)
+            .is_ok()
+    {
+        update_download_file(job, role, file, file.size_bytes, "completed");
+        persist_download_job(app, models, job)?;
+        return Ok(());
+    }
+    if completed_path.exists() {
+        quarantine_download_file(&completed_path)?;
+    }
+    for attempt in 0..=1 {
+        check_download_control(control)?;
+        if partial_path.exists() {
+            let metadata = fs::symlink_metadata(&partial_path).map_err(|error| {
+                AppError::new("MODEL_DOWNLOAD_INCOMPLETE", error.to_string(), true)
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(AppError::new(
+                    "MODEL_DOWNLOAD_INCOMPLETE",
+                    "模型断点不是拾忆管理的普通文件",
+                    false,
+                ));
+            }
+            if metadata.len() > file.size_bytes {
+                quarantine_download_file(&partial_path)?;
+            }
+        }
+        job.current_file = Some(file.file_name.clone());
+        update_download_file(
+            job,
+            role,
+            file,
+            fs::metadata(&partial_path)
+                .map(|value| value.len())
+                .unwrap_or(0),
+            "downloading",
         );
+        persist_download_job(app, models, job)?;
         let mut command = Command::new("curl.exe");
         command
             .args([
@@ -447,7 +1184,7 @@ fn download_and_install_model(
                 "--output",
             ])
             .arg(&partial_path)
-            .arg(&artifact.url)
+            .arg(&file.url)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -455,72 +1192,166 @@ fn download_and_install_model(
         let mut child = command.spawn().map_err(|error| {
             AppError::new("MODEL_DOWNLOADER_UNAVAILABLE", error.to_string(), true)
         })?;
+        let started = Instant::now();
+        let initial_bytes = fs::metadata(&partial_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
         let status = loop {
+            if control.load(Ordering::Acquire) != DOWNLOAD_ACTION_RUN {
+                let _ = child.kill();
+                let _ = child.wait();
+                check_download_control(control)?;
+            }
             if let Some(status) = child
                 .try_wait()
                 .map_err(|error| AppError::new("MODEL_DOWNLOAD_FAILED", error.to_string(), true))?
             {
                 break status;
             }
-            let downloaded_bytes = fs::metadata(&partial_path)
+            let downloaded = fs::metadata(&partial_path)
                 .map(|metadata| metadata.len())
                 .unwrap_or(0);
-            let _ = app.emit(
-                "model.download_progress",
-                json!({
-                    "edition_id": edition.edition_id,
-                    "downloaded_bytes": downloaded_bytes,
-                    "total_bytes": artifact.size_bytes,
-                    "progress": if artifact.size_bytes == 0 { 0.0 } else { downloaded_bytes as f64 / artifact.size_bytes as f64 }
-                }),
-            );
-            thread::sleep(std::time::Duration::from_millis(500));
+            if downloaded > file.size_bytes {
+                let _ = child.kill();
+                break child.wait().map_err(|error| {
+                    AppError::new("MODEL_DOWNLOAD_FAILED", error.to_string(), true)
+                })?;
+            }
+            let elapsed = started.elapsed().as_secs_f64().max(0.25);
+            job.bytes_per_second =
+                ((downloaded.saturating_sub(initial_bytes)) as f64 / elapsed).max(0.0) as u64;
+            update_download_file(job, role, file, downloaded, "downloading");
+            persist_download_job(app, models, job)?;
+            thread::sleep(Duration::from_millis(500));
         };
         let mut stderr = String::new();
         if let Some(mut pipe) = child.stderr.take() {
             let _ = pipe.read_to_string(&mut stderr);
         }
-        if !status.success() {
+        if status.success() {
+            fs::rename(&partial_path, &completed_path).map_err(|error| {
+                AppError::new("MODEL_DOWNLOAD_FINALIZE_FAILED", error.to_string(), true)
+            })?;
+            if models
+                .verify_download(&completed_path, &file.sha256, file.size_bytes)
+                .is_ok()
+            {
+                update_download_file(job, role, file, file.size_bytes, "completed");
+                persist_download_job(app, models, job)?;
+                return Ok(());
+            }
+            quarantine_download_file(&completed_path)?;
+        } else if partial_path.exists()
+            && fs::metadata(&partial_path).is_ok_and(|metadata| metadata.len() > file.size_bytes)
+        {
+            quarantine_download_file(&partial_path)?;
+        }
+        if attempt == 1 {
             let detail = stderr.chars().take(800).collect::<String>();
             return Err(AppError::new(
                 "MODEL_DOWNLOAD_FAILED",
                 if detail.trim().is_empty() {
-                    format!("模型下载进程退出：{status}")
+                    format!("模型组件 {} 下载或校验失败", file.file_name)
                 } else {
                     detail
                 },
                 true,
             ));
         }
-        fs::rename(&partial_path, &completed_path).map_err(|error| {
-            AppError::new("MODEL_DOWNLOAD_FINALIZE_FAILED", error.to_string(), true)
-        })?;
+        job.retry_count = job.retry_count.saturating_add(1);
     }
-    if let Err(error) =
-        models.verify_download(&completed_path, &artifact.sha256, artifact.size_bytes)
+    unreachable!("download attempts always return")
+}
+
+fn update_download_file(
+    job: &mut ModelDownloadJob,
+    role: ModelRole,
+    file: &DownloadFile,
+    downloaded_bytes: u64,
+    status: &str,
+) {
+    if let Some(progress) = job
+        .files
+        .iter_mut()
+        .find(|progress| progress.role == role && progress.file_name == file.file_name)
     {
-        let _ = fs::remove_file(&completed_path);
-        return Err(error);
+        progress.downloaded_bytes = downloaded_bytes.min(progress.total_bytes);
+        progress.status = status.into();
     }
-    let installed = models.import_downloaded_artifact(
-        &ModelImportSelection {
-            source_path: completed_path.to_string_lossy().into_owned(),
-            role: artifact.role,
-        },
-        &DownloadedModelMetadata {
-            source: artifact.source,
-            repository_id: artifact.repository_id.clone(),
-            revision: artifact.revision.clone(),
-            license_name: artifact.license_name.clone(),
-        },
-    )?;
-    fs::remove_file(&completed_path)
-        .map_err(|error| AppError::new("MODEL_DOWNLOAD_CLEANUP_FAILED", error.to_string(), true))?;
+}
+
+fn persist_download_job(
+    app: &AppHandle,
+    models: &ModelManager,
+    job: &mut ModelDownloadJob,
+) -> Result<(), AppError> {
+    job.downloaded_bytes = job.files.iter().map(|file| file.downloaded_bytes).sum();
+    job.total_bytes = job.files.iter().map(|file| file.total_bytes).sum();
+    job.progress = if job.total_bytes == 0 {
+        0.0
+    } else {
+        (job.downloaded_bytes as f64 / job.total_bytes as f64).clamp(0.0, 1.0)
+    };
+    job.eta_seconds = if job.bytes_per_second == 0 {
+        None
+    } else {
+        Some(
+            job.total_bytes
+                .saturating_sub(job.downloaded_bytes)
+                .div_ceil(job.bytes_per_second),
+        )
+    };
+    *job = models.update_download_job(job)?;
+    emit_download_state(app, job);
+    Ok(())
+}
+
+fn emit_download_state(app: &AppHandle, job: &ModelDownloadJob) {
+    let _ = app.emit("model.download_state", job);
     let _ = app.emit(
-        "model.download_completed",
-        json!({"edition_id": edition.edition_id, "artifact_id": installed.artifact_id}),
+        "model.download_progress",
+        json!({
+            "job_id": job.job_id,
+            "edition_id": job.edition_id,
+            "downloaded_bytes": job.downloaded_bytes,
+            "total_bytes": job.total_bytes,
+            "progress": job.progress,
+            "phase": job.phase,
+            "status": job.status,
+        }),
     );
-    Ok(installed)
+}
+
+fn check_download_control(control: &AtomicU8) -> Result<(), AppError> {
+    match control.load(Ordering::Acquire) {
+        DOWNLOAD_ACTION_PAUSE => Err(AppError::new(
+            "MODEL_DOWNLOAD_PAUSED",
+            "模型下载已暂停",
+            true,
+        )),
+        DOWNLOAD_ACTION_CANCEL => Err(AppError::new(
+            "MODEL_DOWNLOAD_CANCELLED",
+            "模型下载已取消",
+            false,
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn quarantine_download_file(path: &Path) -> Result<(), AppError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let file_name = path
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "model.part".into());
+    let quarantine = path.with_file_name(format!(
+        "{file_name}.invalid-{}",
+        Utc::now().timestamp_millis()
+    ));
+    fs::rename(path, quarantine)
+        .map_err(|error| AppError::new("MODEL_DOWNLOAD_QUARANTINE_FAILED", error.to_string(), true))
 }
 
 #[cfg(windows)]
@@ -566,8 +1397,19 @@ pub fn model_artifact_activate(
                 max_length: 128,
                 threads: 2,
             })?;
-            models.activate_artifact(&artifact_id, Some(response.dimension))?;
-            spawn_embed_pending(app, catalog);
+            if response.dimension == 0
+                || response.vectors.len() != 1
+                || response.vectors[0].len() != response.dimension as usize
+                || response.vectors[0].iter().any(|value| !value.is_finite())
+            {
+                return Err(AppError::new(
+                    "MODEL_SELF_TEST_FAILED",
+                    "语义模型自检返回了无效维度或向量",
+                    true,
+                ));
+            }
+            models.begin_embedding_activation(&artifact_id, response.dimension)?;
+            spawn_embed_pending(app.clone(), Arc::clone(&catalog));
         }
         (ModelRole::Generation, ModelFormat::Gguf) => {
             let threads = std::thread::available_parallelism()
@@ -587,6 +1429,59 @@ pub fn model_artifact_activate(
                 .activate(&artifact.local_path, 4096, threads)?;
             models.activate_artifact(&artifact_id, None)?;
         }
+        (ModelRole::Vision, ModelFormat::Gguf) => {
+            let projector = models.vision_projector_path(&artifact)?;
+            let threads = std::thread::available_parallelism()
+                .map(|value| value.get() as u32)
+                .unwrap_or(2)
+                .clamp(1, 8);
+            generation
+                .0
+                .lock()
+                .map_err(|_| {
+                    AppError::new(
+                        "VISION_RUNTIME_LOCK_FAILED",
+                        "图片理解运行时状态已损坏",
+                        true,
+                    )
+                })?
+                .activate_multimodal(
+                    &artifact.local_path,
+                    &projector.to_string_lossy(),
+                    4096,
+                    threads,
+                )?;
+            models.activate_artifact(&artifact_id, None)?;
+            spawn_image_understanding_pending(app.clone(), Arc::clone(&catalog));
+        }
+        (ModelRole::Reranker, ModelFormat::Onnx) => {
+            let tokenizer_path = PathBuf::from(&artifact.local_path)
+                .parent()
+                .map(|parent| parent.join("tokenizer.json"))
+                .ok_or_else(|| {
+                    AppError::new("RERANK_TOKENIZER_UNAVAILABLE", "模型目录无效", false)
+                })?;
+            let response = worker.client.rerank(&RerankRequest {
+                model_path: artifact.local_path.clone(),
+                tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
+                query: "哪段资料描述了本地知识库？".into(),
+                documents: vec![
+                    "拾忆在本地建立可检索的资料知识库。".into(),
+                    "今天窗外天气晴朗。".into(),
+                ],
+                max_length: artifact.max_length.unwrap_or(512),
+                threads: 2,
+            })?;
+            if response.scores.len() != 2 || response.scores.iter().any(|score| !score.is_finite())
+            {
+                return Err(AppError::new(
+                    "MODEL_SELF_TEST_FAILED",
+                    "重排模型自检返回了无效分数",
+                    true,
+                ));
+            }
+            models.activate_artifact(&artifact_id, None)?;
+        }
         _ => {
             return Err(AppError::new(
                 "MODEL_RUNTIME_UNSUPPORTED",
@@ -595,44 +1490,84 @@ pub fn model_artifact_activate(
             ));
         }
     }
-    model_state_from_manager(&models)
+    model_state_from_manager(&models, Some(&catalog))
 }
 
-fn model_state_from_manager(models: &ModelManager) -> Result<ModelRuntimeState, AppError> {
+fn model_state_from_manager(
+    models: &ModelManager,
+    catalog: Option<&CatalogService>,
+) -> Result<ModelRuntimeState, AppError> {
     let artifacts = models.list_artifacts()?;
+    let active_profile = models.active_profile()?;
+    let pending_embedding = models.pending_embedding_activation()?;
+    let active_embedding = models.active_artifact(ModelRole::Embedding)?;
     let capabilities = ModelCapabilities {
         generation: models.active_artifact(ModelRole::Generation)?.is_some(),
-        embedding: models.active_artifact(ModelRole::Embedding)?.is_some(),
+        embedding: active_embedding.is_some(),
+        vision: models.active_artifact(ModelRole::Vision)?.is_some(),
         reranker: models.active_artifact(ModelRole::Reranker)?.is_some(),
         ocr: models.active_artifact(ModelRole::Ocr)?.is_some(),
     };
     let any_active = capabilities.generation
         || capabilities.embedding
+        || capabilities.vision
         || capabilities.reranker
         || capabilities.ocr;
+    let semantic_index_coverage = match (catalog, active_embedding.as_ref()) {
+        (Some(catalog), Some(embedding)) => catalog
+            .active_vector_generation(&embedding.artifact_id.to_string())?
+            .map(|generation| generation.coverage)
+            .unwrap_or(0.0),
+        _ => 0.0,
+    };
+    let rag_complete =
+        capabilities.generation && capabilities.embedding && semantic_index_coverage >= 0.999_999;
+    let message = match pending_embedding
+        .as_ref()
+        .map(|pending| pending.status.as_str())
+    {
+        Some("indexing") => "正在为新 Embedding 构建并校验语义索引，完成前继续使用原索引".into(),
+        Some("paused") => "新 Embedding 索引构建已暂停，当前仍使用原索引".into(),
+        Some("cancelled") => "新 Embedding 索引切换已取消，当前仍使用原索引".into(),
+        Some("failed") => "新 Embedding 索引构建失败，当前仍使用原索引；可重试模型任务".into(),
+        _ if capabilities.generation && capabilities.embedding && !rag_complete => format!(
+            "模型已就绪，语义索引覆盖率 {}%",
+            (semantic_index_coverage * 100.0).round() as u32
+        ),
+        _ if capabilities.generation => "本地生成模型已配置，将在提问时按需加载".into(),
+        _ if capabilities.embedding => "语义检索已就绪，问资料仍需生成模型".into(),
+        _ if capabilities.vision => "本地多模态模型已配置，图片理解将在后台串行处理".into(),
+        _ if artifacts.is_empty() => "未配置本地模型".into(),
+        _ => "模型已导入，等待运行自检".into(),
+    };
     Ok(ModelRuntimeState {
         status: if any_active {
             "ready"
+        } else if pending_embedding
+            .as_ref()
+            .is_some_and(|pending| pending.status == "indexing")
+        {
+            "checking"
         } else if artifacts.is_empty() {
             "unconfigured"
         } else {
             "unavailable"
         },
-        runtime_mode: "basic",
-        active_profile_id: None,
-        active_profile_name: None,
+        active_profile_id: active_profile
+            .as_ref()
+            .map(|profile| profile.profile_id.to_string()),
+        active_profile_name: active_profile.as_ref().map(|profile| profile.name.clone()),
         runtime_backend: if any_active { Some("cpu") } else { None },
-        message: if capabilities.generation {
-            "本地生成模型已配置，将在提问时按需加载"
-        } else if capabilities.embedding {
-            "语义检索已就绪，问资料仍需生成模型"
-        } else if artifacts.is_empty() {
-            "未配置本地模型"
-        } else {
-            "模型已导入，等待运行自检"
-        },
+        message,
         checked_at: Utc::now().to_rfc3339(),
         capabilities,
+        rag_complete,
+        semantic_index_coverage,
+        embedding_migration: pending_embedding.map(|pending| EmbeddingMigrationState {
+            artifact_id: pending.artifact_id.to_string(),
+            status: pending.status,
+            error: pending.error,
+        }),
     })
 }
 
@@ -772,36 +1707,6 @@ pub fn candidate_root_action(
 }
 
 #[tauri::command(async)]
-pub fn root_discover_defaults(
-    app: AppHandle,
-    catalog: State<'_, CatalogServiceState>,
-    watcher: State<'_, WatcherServiceState>,
-) -> Result<RootDiscoveryResult, AppError> {
-    let catalog = catalog.get()?;
-    let result = catalog.discover_default_roots();
-    for root in &result.roots {
-        if let Err(error) = watcher
-            .with_mut(|watcher| watcher.watch_root(root))
-            .and_then(|result| result)
-        {
-            let _ = app.emit("catalog.watch_degraded", &error);
-        }
-        if root.last_scan_at.is_none()
-            && let Ok(prepared) = catalog.prepare_scan(&root.root_id, "first_launch")
-            && prepared.should_start
-        {
-            spawn_scan(
-                app.clone(),
-                Arc::clone(&catalog),
-                root.root_id,
-                prepared.job.job_id,
-            );
-        }
-    }
-    Ok(result)
-}
-
-#[tauri::command(async)]
 pub fn root_list(catalog: State<'_, CatalogServiceState>) -> Result<Vec<RootRecord>, AppError> {
     catalog.get()?.list_roots()
 }
@@ -813,12 +1718,17 @@ pub fn root_add(
     catalog: State<'_, CatalogServiceState>,
     watcher: State<'_, WatcherServiceState>,
 ) -> Result<RootRecord, AppError> {
-    let root = catalog.get()?.add_root(request)?;
+    let catalog = catalog.get()?;
+    let root = catalog.add_root(request)?;
     if let Err(error) = watcher
         .with_mut(|watcher| watcher.watch_root(&root))
         .and_then(|result| result)
     {
         let _ = app.emit("catalog.watch_degraded", &error);
+    }
+    let prepared = catalog.prepare_scan(&root.root_id, "user_authorized")?;
+    if prepared.should_start {
+        spawn_scan(app, Arc::clone(&catalog), root.root_id, prepared.job.job_id);
     }
     Ok(root)
 }
@@ -926,11 +1836,175 @@ pub fn ocr_retry(
     Ok(true)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ImageUnderstandingActionRequest {
+    asset_id: Uuid,
+}
+
+#[tauri::command(async)]
+pub fn image_understanding_retry(
+    request: ImageUnderstandingActionRequest,
+    app: AppHandle,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<bool, AppError> {
+    let catalog = catalog.get()?;
+    catalog.retry_image_understanding(&request.asset_id)?;
+    spawn_image_understanding_pending(app, catalog);
+    Ok(true)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImageDeepAnalyzeRequest {
+    asset_id: Uuid,
+    question: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImageDeepAnalysis {
+    asset_id: Uuid,
+    question: String,
+    answer: String,
+    observations: Vec<String>,
+    uncertainties: Vec<String>,
+    model_artifact_id: Uuid,
+    analyzed_at: String,
+}
+
+#[tauri::command]
+pub async fn image_deep_analyze(
+    request: ImageDeepAnalyzeRequest,
+    catalog: State<'_, CatalogServiceState>,
+    models: State<'_, ModelServiceState>,
+    generation: State<'_, GenerationServiceState>,
+) -> Result<ImageDeepAnalysis, AppError> {
+    let question = request.question.trim().to_owned();
+    if question.is_empty() || question.chars().count() > 2_000 {
+        return Err(AppError::new(
+            "VISION_REQUEST_INVALID",
+            "原图深度分析需要1到2000个字符的问题",
+            false,
+        ));
+    }
+    let asset_id = request.asset_id;
+    let catalog = catalog.get()?;
+    let models = models.get()?;
+    let generation = Arc::clone(&generation.0);
+    tauri::async_runtime::spawn_blocking(move || {
+        let (image_path, mime_type, _) = catalog.authorized_image_asset_path(&asset_id)?;
+        let artifact = models
+            .active_artifact(ModelRole::Vision)?
+            .ok_or_else(|| {
+                AppError::new(
+                    "VISION_MODEL_INVALID",
+                    "原图深度分析需要先配置并自检本地多模态模型",
+                    true,
+                )
+            })?;
+        let projector = models.vision_projector_path(&artifact)?;
+        let threads = std::thread::available_parallelism()
+            .map(|value| value.get() as u32)
+            .unwrap_or(2)
+            .clamp(1, 8);
+        let mut runtime = generation.lock().map_err(|_| {
+            AppError::new(
+                "VISION_RUNTIME_LOCK_FAILED",
+                "图片理解运行时状态已损坏",
+                true,
+            )
+        })?;
+        let projector_path = projector.to_string_lossy();
+        if runtime.active_model_path() != Some(artifact.local_path.as_str())
+            || runtime.active_mmproj_path() != Some(projector_path.as_ref())
+            || !runtime.is_active()
+        {
+            runtime.activate_multimodal(
+                &artifact.local_path,
+                projector_path.as_ref(),
+                4096,
+                threads,
+            )?;
+        }
+        let cancelled = AtomicBool::new(false);
+        let response = runtime.describe_image_cancellable(
+            "你是拾忆的本地图片证据分析器。只能根据当前图片中可验证的内容回答，不得补充外部知识；看不清或图片不支持的问题必须明确说明。",
+            &format!(
+                "用户问题：{question}\n只输出一个JSON对象，不要Markdown：{{\"answer\":\"基于图片的中文回答\",\"observations\":[\"支持回答的可见细节\"],\"uncertainties\":[\"看不清或无法确认的内容\"]}}。"
+            ),
+            &image_path,
+            &mime_type,
+            512,
+            &cancelled,
+        )?;
+        let payload = parse_vision_question_answer(&response)?;
+        Ok(ImageDeepAnalysis {
+            asset_id,
+            question,
+            answer: payload.answer,
+            observations: payload.observations,
+            uncertainties: payload.uncertainties,
+            model_artifact_id: artifact.artifact_id,
+            analyzed_at: Utc::now().to_rfc3339(),
+        })
+    })
+    .await
+    .map_err(|error| AppError::new("VISION_REQUEST_FAILED", error.to_string(), true))?
+}
+
 #[tauri::command(async)]
 pub fn collection_list(
     catalog: State<'_, CatalogServiceState>,
 ) -> Result<Vec<CollectionRecord>, AppError> {
     catalog.get()?.list_collections()
+}
+
+#[tauri::command(async)]
+pub fn knowledge_space_list(
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<Vec<KnowledgeSpace>, AppError> {
+    catalog.get()?.list_knowledge_spaces()
+}
+
+#[tauri::command(async)]
+pub fn knowledge_space_create(
+    request: KnowledgeSpaceRequest,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<KnowledgeSpace, AppError> {
+    catalog.get()?.create_knowledge_space(&request)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct KnowledgeSpaceUpdateRequest {
+    space_id: String,
+    space: KnowledgeSpaceRequest,
+}
+
+#[tauri::command(async)]
+pub fn knowledge_space_update(
+    request: KnowledgeSpaceUpdateRequest,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<KnowledgeSpace, AppError> {
+    let space_id = Uuid::parse_str(&request.space_id).map_err(|error| {
+        AppError::new("KNOWLEDGE_SPACE_REQUEST_INVALID", error.to_string(), false)
+    })?;
+    catalog
+        .get()?
+        .update_knowledge_space(&space_id, &request.space)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct KnowledgeSpaceIdRequest {
+    space_id: String,
+}
+
+#[tauri::command(async)]
+pub fn knowledge_space_delete(
+    request: KnowledgeSpaceIdRequest,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<(), AppError> {
+    let space_id = Uuid::parse_str(&request.space_id).map_err(|error| {
+        AppError::new("KNOWLEDGE_SPACE_REQUEST_INVALID", error.to_string(), false)
+    })?;
+    catalog.get()?.delete_knowledge_space(&space_id)
 }
 
 #[tauri::command(async)]
@@ -999,6 +2073,7 @@ pub fn collection_file_query(
         &FileQuery {
             cursor: request.cursor,
             page_size: request.page_size,
+            ..FileQuery::default()
         },
     )
 }
@@ -1048,6 +2123,213 @@ pub fn collection_remove_file(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct CollectionSuggestionRefreshRequest {
+    #[serde(default = "default_suggestion_refresh_limit")]
+    max_files: u32,
+}
+
+fn default_suggestion_refresh_limit() -> u32 {
+    500
+}
+
+#[tauri::command(async)]
+pub fn collection_suggestion_refresh(
+    request: CollectionSuggestionRefreshRequest,
+    app: AppHandle,
+    catalog: State<'_, CatalogServiceState>,
+    models: State<'_, ModelServiceState>,
+    generation: State<'_, GenerationServiceState>,
+) -> Result<CollectionSuggestionRefreshResult, AppError> {
+    let catalog = catalog.get()?;
+    if catalog.maintenance_snapshot()?.degradation_level == "core" {
+        return Err(AppError::new(
+            "COLLECTION_AI_PAUSED_CORE_MODE",
+            "后台资源繁忙，AI集合分析已暂停；已有虚拟集合仍可使用",
+            true,
+        ));
+    }
+    let models = models.get()?;
+    let embedding = models
+        .active_artifact(ModelRole::Embedding)?
+        .ok_or_else(|| {
+            AppError::new(
+                "COLLECTION_AI_EMBEDDING_MISSING",
+                "AI智能集合需要已通过自检的Embedding模型",
+                true,
+            )
+        })?;
+    let generation_artifact = models
+        .active_artifact(ModelRole::Generation)?
+        .ok_or_else(|| {
+            AppError::new(
+                "COLLECTION_AI_GENERATION_MISSING",
+                "AI智能集合需要已通过自检的本地生成模型完成候选组复核",
+                true,
+            )
+        })?;
+    let mut result = catalog
+        .refresh_collection_suggestions(&embedding.artifact_id.to_string(), request.max_files)?;
+    if !result.suggestion_ids.is_empty() {
+        let new_ids = result
+            .suggestion_ids
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let candidates = catalog.query_collection_suggestions(&CollectionSuggestionQuery {
+            cursor: None,
+            page_size: 100,
+            status: Some("suggested".into()),
+        })?;
+        let mut reviewed_ids = Vec::new();
+        for suggestion in candidates
+            .items
+            .into_iter()
+            .filter(|item| new_ids.contains(&item.suggestion_id))
+        {
+            let _ = app.emit(
+                "collection.suggestion_phase",
+                json!({"suggestion_id": suggestion.suggestion_id, "phase": "model_review"}),
+            );
+            let candidate_json = serde_json::to_string(
+                &suggestion
+                    .members
+                    .iter()
+                    .map(|member| {
+                        json!({
+                            "file_id": member.file.file_id,
+                            "title": member.file.display_name,
+                            "semantic_reason": member.rationale,
+                            "confidence": member.confidence,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|error| {
+                AppError::new("COLLECTION_MODEL_REVIEW_INVALID", error.to_string(), false)
+            })?;
+            let cancelled = AtomicBool::new(false);
+            let reviewed = complete_with_model(
+                generation.0.as_ref(),
+                &generation_artifact,
+                "你是本地文档分类复核器。只复核给定候选，不得添加候选外文件。只输出JSON对象：{\"suggested_name\":\"不超过40字\",\"description\":\"说明共同主题和判断依据\",\"members\":[{\"file_id\":\"原UUID\",\"rationale\":\"该成员与主题的具体联系\"}]}。不相关成员应省略；少于2个相关成员也必须按原格式返回空members。",
+                &format!("请结构化复核这个Embedding候选组：\n{candidate_json}"),
+                640,
+                &cancelled,
+            ).and_then(|value| parse_collection_model_review(&value));
+            match reviewed.and_then(|review| {
+                catalog.apply_collection_model_review(
+                    &suggestion.suggestion_id,
+                    &review,
+                    &generation_artifact.artifact_id.to_string(),
+                )
+            }) {
+                Ok(_) => reviewed_ids.push(suggestion.suggestion_id),
+                Err(_) => catalog.reject_collection_suggestion(&suggestion.suggestion_id)?,
+            }
+        }
+        if reviewed_ids.is_empty() {
+            return Err(AppError::new(
+                "COLLECTION_MODEL_REVIEW_FAILED",
+                "候选关系已计算，但没有候选组通过本地模型结构化复核",
+                true,
+            ));
+        }
+        result.created_suggestions = reviewed_ids.len() as u64;
+        result.suggestion_ids = reviewed_ids;
+        result.model_version = generation_artifact.artifact_id.to_string();
+    }
+    let _ = app.emit("collection.suggestions_changed", &result);
+    Ok(result)
+}
+
+fn parse_collection_model_review(value: &str) -> Result<CollectionModelReview, AppError> {
+    let trimmed = value.trim();
+    let parsed = serde_json::from_str(trimmed)
+        .or_else(|_| {
+            let start = trimmed
+                .find('{')
+                .ok_or(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing JSON object",
+                )))?;
+            let end = trimmed
+                .rfind('}')
+                .ok_or(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing JSON object",
+                )))?;
+            serde_json::from_str(&trimmed[start..=end])
+        })
+        .map_err(|error| {
+            AppError::new(
+                "COLLECTION_MODEL_REVIEW_INVALID",
+                format!("本地模型没有返回有效的集合复核JSON：{error}"),
+                true,
+            )
+        })?;
+    Ok(parsed)
+}
+
+#[tauri::command(async)]
+pub fn collection_suggestion_query(
+    request: CollectionSuggestionQuery,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<CollectionSuggestionPage, AppError> {
+    catalog.get()?.query_collection_suggestions(&request)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CollectionSuggestionUpdateCommandRequest {
+    suggestion_id: Uuid,
+    suggestion: CollectionSuggestionUpdateRequest,
+}
+
+#[tauri::command(async)]
+pub fn collection_suggestion_update(
+    request: CollectionSuggestionUpdateCommandRequest,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<CollectionSuggestion, AppError> {
+    catalog
+        .get()?
+        .update_collection_suggestion(&request.suggestion_id, &request.suggestion)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CollectionSuggestionActionRequest {
+    suggestion_id: Uuid,
+}
+
+#[tauri::command(async)]
+pub fn collection_suggestion_confirm(
+    request: CollectionSuggestionActionRequest,
+    app: AppHandle,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<CollectionRecord, AppError> {
+    let collection = catalog
+        .get()?
+        .confirm_collection_suggestion(&request.suggestion_id)?;
+    let _ = app.emit("collection.suggestions_changed", &collection);
+    let _ = app.emit("catalog.changed", &collection);
+    Ok(collection)
+}
+
+#[tauri::command(async)]
+pub fn collection_suggestion_reject(
+    request: CollectionSuggestionActionRequest,
+    app: AppHandle,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<(), AppError> {
+    catalog
+        .get()?
+        .reject_collection_suggestion(&request.suggestion_id)?;
+    let _ = app.emit(
+        "collection.suggestions_changed",
+        json!({"suggestion_id": request.suggestion_id, "status": "rejected"}),
+    );
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
 pub struct RelationRefreshRequest {
     max_files: u32,
 }
@@ -1093,6 +2375,34 @@ pub fn file_query(
 }
 
 #[tauri::command(async)]
+pub fn exclusion_rule_list(
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<Vec<ExclusionRule>, AppError> {
+    catalog.get()?.list_exclusion_rules()
+}
+
+#[tauri::command(async)]
+pub fn exclusion_rule_upsert(
+    request: ExclusionRuleInput,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<ExclusionRule, AppError> {
+    catalog.get()?.upsert_exclusion_rule(&request)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ExclusionRuleDeleteRequest {
+    rule_id: Uuid,
+}
+
+#[tauri::command(async)]
+pub fn exclusion_rule_delete(
+    request: ExclusionRuleDeleteRequest,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<(), AppError> {
+    catalog.get()?.delete_exclusion_rule(&request.rule_id)
+}
+
+#[tauri::command(async)]
 pub fn extraction_preset_list() -> Vec<ExtractionPreset> {
     remin_core::extraction_presets()
 }
@@ -1118,6 +2428,7 @@ pub fn task_plan(request: PlanSkillRequest) -> Result<TaskPlan, AppError> {
 #[tauri::command(async)]
 pub fn task_execute(
     request: PlanSkillRequest,
+    app: AppHandle,
     catalog: State<'_, CatalogServiceState>,
     worker: State<'_, WorkerServiceState>,
 ) -> Result<TaskExecutionResult, AppError> {
@@ -1145,6 +2456,7 @@ pub fn task_execute(
                 ocr_policy: "force".to_owned(),
                 language_hints: vec!["zh".to_owned(), "en".to_owned()],
                 max_pages: None,
+                asset_cache_dir: image_asset_cache_dir(&app, &revision_id),
                 parser_version: "0.1.0".to_owned(),
             };
             let result = worker.client.parse_document(&parse_request)?;
@@ -1274,6 +2586,345 @@ pub fn maintenance_check(
     catalog.get()?.maintenance_check(&request.level)
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageUsageCategory {
+    key: String,
+    label: String,
+    size_bytes: u64,
+    clearable: bool,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageUsageSnapshot {
+    categories: Vec<StorageUsageCategory>,
+    total_bytes: u64,
+    data_directory: String,
+    disk_capacity_bytes: Option<u64>,
+    disk_available_bytes: Option<u64>,
+    soft_quota_bytes: u64,
+    soft_quota_is_custom: bool,
+    over_soft_quota: bool,
+    background_tasks_paused: bool,
+    notice: Option<String>,
+    measured_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CacheClearRequest {
+    category: String,
+    confirmation: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheClearResult {
+    category: String,
+    removed_entries: u64,
+    freed_bytes: u64,
+}
+
+#[tauri::command(async)]
+pub fn storage_usage_get(
+    environment: State<'_, EnvironmentServiceState>,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<StorageUsageSnapshot, AppError> {
+    storage_usage_snapshot(
+        &environment.data_directory,
+        catalog.get()?.storage_quota_override()?,
+    )
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StoragePolicySetRequest {
+    quota_bytes: u64,
+    confirmation: String,
+}
+
+#[tauri::command(async)]
+pub fn storage_policy_set(
+    request: StoragePolicySetRequest,
+    environment: State<'_, EnvironmentServiceState>,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<StorageUsageSnapshot, AppError> {
+    if request.confirmation != "SET_STORAGE_QUOTA" {
+        return Err(AppError::new(
+            "STORAGE_POLICY_CONFIRMATION_REQUIRED",
+            "调整存储软配额前需要明确确认",
+            false,
+        ));
+    }
+    let catalog = catalog.get()?;
+    let quota = catalog.set_storage_quota_override(request.quota_bytes)?;
+    storage_usage_snapshot(&environment.data_directory, Some(quota))
+}
+
+#[tauri::command(async)]
+pub fn cache_clear(
+    request: CacheClearRequest,
+    environment: State<'_, EnvironmentServiceState>,
+) -> Result<CacheClearResult, AppError> {
+    if request.confirmation != "CLEAR_CACHE" {
+        return Err(AppError::new(
+            "CACHE_CLEAR_CONFIRMATION_REQUIRED",
+            "清理缓存前需要明确确认",
+            false,
+        ));
+    }
+    let target = match request.category.as_str() {
+        "temporary_cache" => environment.data_directory.join("cache"),
+        "failed_downloads" => environment
+            .data_directory
+            .join("models")
+            .join(".downloads")
+            .join("quarantine"),
+        _ => {
+            return Err(AppError::new(
+                "CACHE_CATEGORY_INVALID",
+                "只允许清理临时缓存或失败下载隔离区",
+                false,
+            ));
+        }
+    };
+    let freed_bytes = directory_size(&target)?;
+    let removed_entries = clear_directory_contents(&target)?;
+    Ok(CacheClearResult {
+        category: request.category,
+        removed_entries,
+        freed_bytes,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AppDataResetRequest {
+    confirmation: String,
+}
+
+#[tauri::command(async)]
+pub fn app_data_reset_schedule(
+    request: AppDataResetRequest,
+    app: AppHandle,
+) -> Result<(), AppError> {
+    if request.confirmation != "RESET_APPLICATION_DATA" {
+        return Err(AppError::new(
+            "APP_DATA_RESET_CONFIRMATION_REQUIRED",
+            "重置应用数据前需要输入完整确认短语",
+            false,
+        ));
+    }
+    let config_dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| AppError::new("APP_DATA_RESET_PATH_INVALID", error.to_string(), false))?;
+    let parent = config_dir.parent().ok_or_else(|| {
+        AppError::new(
+            "APP_DATA_RESET_PATH_INVALID",
+            "无法确定应用配置目录的父目录",
+            false,
+        )
+    })?;
+    let marker = parent.join(".com.remin.desktop-reset-request");
+    fs::write(&marker, "RESET_APPLICATION_DATA")
+        .map_err(|error| AppError::new("APP_DATA_RESET_MARKER_FAILED", error.to_string(), true))?;
+    app.restart();
+}
+
+fn storage_usage_snapshot(
+    data_directory: &Path,
+    quota_override: Option<u64>,
+) -> Result<StorageUsageSnapshot, AppError> {
+    let database_size = ["remin.db", "remin.db-wal", "remin.db-shm"]
+        .iter()
+        .try_fold(0_u64, |total, name| {
+            Ok::<u64, AppError>(total + file_size(&data_directory.join(name))?)
+        })?;
+    let model_root = data_directory.join("models");
+    let installed_models = ["generation", "embedding", "vision", "reranker", "ocr"]
+        .iter()
+        .try_fold(0_u64, |total, name| {
+            Ok::<u64, AppError>(total + directory_size(&model_root.join(name))?)
+        })?;
+    let downloads = model_root.join(".downloads");
+    let failed_downloads = directory_size(&downloads.join("quarantine"))?;
+    let download_staging = directory_size(&downloads)?.saturating_sub(failed_downloads);
+    let temporary_cache = directory_size(&data_directory.join("cache"))?;
+    let vector_indexes = directory_size(&data_directory.join("vector-indexes"))?;
+    let categories = vec![
+        StorageUsageCategory {
+            key: "database".into(),
+            label: "资料索引数据库".into(),
+            size_bytes: database_size,
+            clearable: false,
+            detail: "元数据、全文索引和语义向量；请使用重建索引维护".into(),
+        },
+        StorageUsageCategory {
+            key: "vector_indexes".into(),
+            label: "语义向量索引".into(),
+            size_bytes: vector_indexes,
+            clearable: false,
+            detail: "由SQLite真值构建的USearch索引；切换Embedding时按世代原子替换".into(),
+        },
+        StorageUsageCategory {
+            key: "installed_models".into(),
+            label: "已安装模型".into(),
+            size_bytes: installed_models,
+            clearable: false,
+            detail: "已经校验并激活的本地模型组件".into(),
+        },
+        StorageUsageCategory {
+            key: "resumable_downloads".into(),
+            label: "可续传模型下载".into(),
+            size_bytes: download_staging,
+            clearable: false,
+            detail: "保留暂停任务的断点，避免重新下载".into(),
+        },
+        StorageUsageCategory {
+            key: "temporary_cache".into(),
+            label: "解析与预览临时缓存".into(),
+            size_bytes: temporary_cache,
+            clearable: true,
+            detail: "可安全重建，不含源文件与索引数据库".into(),
+        },
+        StorageUsageCategory {
+            key: "failed_downloads".into(),
+            label: "失败下载隔离区".into(),
+            size_bytes: failed_downloads,
+            clearable: true,
+            detail: "大小或哈希异常的下载副本，不用于续传".into(),
+        },
+    ];
+    let total_bytes = categories.iter().map(|item| item.size_bytes).sum();
+    let (disk_capacity_bytes, disk_available_bytes) = disk_space_bytes(data_directory)
+        .map(|(total, available)| (Some(total), Some(available)))
+        .unwrap_or((None, None));
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let default_quota = disk_capacity_bytes
+        .map(|capacity| (capacity / 10).clamp(10 * GIB, 50 * GIB))
+        .unwrap_or(10 * GIB);
+    let soft_quota_bytes = quota_override.unwrap_or(default_quota);
+    let over_soft_quota = total_bytes >= soft_quota_bytes;
+    Ok(StorageUsageSnapshot {
+        total_bytes,
+        categories,
+        data_directory: data_directory.to_string_lossy().into_owned(),
+        disk_capacity_bytes,
+        disk_available_bytes,
+        soft_quota_bytes,
+        soft_quota_is_custom: quota_override.is_some(),
+        over_soft_quota,
+        background_tasks_paused: over_soft_quota,
+        notice: over_soft_quota
+            .then(|| "存储已达到软配额，暂停图片缓存、OCR和语义索引；搜索与预览继续可用".into()),
+        measured_at: Utc::now().to_rfc3339(),
+    })
+}
+
+fn background_storage_budget_allows(app: &AppHandle, catalog: &CatalogService) -> bool {
+    let environment = app.state::<EnvironmentServiceState>();
+    let quota = match catalog.storage_quota_override() {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = app.emit("background.paused", error);
+            return false;
+        }
+    };
+    match storage_usage_snapshot(&environment.data_directory, quota) {
+        Ok(snapshot) if snapshot.background_tasks_paused => {
+            let _ = app.emit(
+                "background.paused",
+                json!({
+                    "reason": "storage_soft_quota",
+                    "notice": snapshot.notice,
+                    "used_bytes": snapshot.total_bytes,
+                    "soft_quota_bytes": snapshot.soft_quota_bytes,
+                }),
+            );
+            false
+        }
+        Ok(_) => true,
+        Err(error) => {
+            let _ = app.emit("background.paused", error);
+            false
+        }
+    }
+}
+
+fn file_size(path: &Path) -> Result<u64, AppError> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(metadata.len()),
+        Ok(_) => Ok(0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(AppError::new(
+            "STORAGE_USAGE_READ_FAILED",
+            error.to_string(),
+            true,
+        )),
+    }
+}
+
+fn directory_size(path: &Path) -> Result<u64, AppError> {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(AppError::new(
+                "STORAGE_USAGE_READ_FAILED",
+                error.to_string(),
+                true,
+            ));
+        }
+    };
+    let mut total = 0_u64;
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| AppError::new("STORAGE_USAGE_READ_FAILED", error.to_string(), true))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| AppError::new("STORAGE_USAGE_READ_FAILED", error.to_string(), true))?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        total = total.saturating_add(if file_type.is_dir() {
+            directory_size(&entry.path())?
+        } else if file_type.is_file() {
+            entry
+                .metadata()
+                .map_err(|error| {
+                    AppError::new("STORAGE_USAGE_READ_FAILED", error.to_string(), true)
+                })?
+                .len()
+        } else {
+            0
+        });
+    }
+    Ok(total)
+}
+
+fn clear_directory_contents(path: &Path) -> Result<u64, AppError> {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(AppError::new("CACHE_CLEAR_FAILED", error.to_string(), true));
+        }
+    };
+    let mut removed = 0_u64;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| AppError::new("CACHE_CLEAR_FAILED", error.to_string(), true))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| AppError::new("CACHE_CLEAR_FAILED", error.to_string(), true))?;
+        let result = if file_type.is_dir() && !file_type.is_symlink() {
+            fs::remove_dir_all(entry.path())
+        } else {
+            fs::remove_file(entry.path())
+        };
+        result.map_err(|error| AppError::new("CACHE_CLEAR_FAILED", error.to_string(), true))?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
 fn environment_degradation(check: &EnvironmentCheck) -> Option<(DegradationLevel, Vec<String>)> {
     let severe = check.memory_total_gb.is_some_and(|value| value < 4)
         || check.disk_available_gb.is_some_and(|value| value < 2);
@@ -1292,7 +2943,7 @@ fn environment_degradation(check: &EnvironmentCheck) -> Option<(DegradationLevel
                     .warnings
                     .first()
                     .map(String::as_str)
-                    .unwrap_or("环境信息不完整，暂用均衡模式")
+                    .unwrap_or("环境信息不完整，已降低后台任务并发")
             )],
         ));
     }
@@ -1429,6 +3080,7 @@ pub fn ask_start(
     worker: State<'_, WorkerServiceState>,
     generation: State<'_, GenerationServiceState>,
 ) -> Result<OperationHandle, AppError> {
+    request.validate()?;
     let catalog = catalog.get()?;
     let models = models.get()?;
     let operation_id = Uuid::now_v7();
@@ -1485,6 +3137,13 @@ pub fn ask_start(
         {
             entry.handle.status = "running";
         }
+        let phase_app = app.clone();
+        let phase = |name: &str, progress: f64| {
+            let _ = phase_app.emit(
+                "ask.phase",
+                json!({"operation_id": operation_id, "phase": name, "progress": progress}),
+            );
+        };
         let result = compute_answer(
             &request,
             &catalog,
@@ -1492,6 +3151,7 @@ pub fn ask_start(
             &worker,
             &generation,
             &cancelled,
+            &phase,
         );
         if cancelled.load(Ordering::Acquire) {
             let error = AppError::new("OPERATION_CANCELLED", "问答已取消", false);
@@ -1521,17 +3181,14 @@ pub fn ask_start(
                         json!({"operation_id": operation_id, "claim": claim}),
                     );
                 }
-                let characters = answer.answer.chars().collect::<Vec<_>>();
-                for chunk in characters.chunks(24) {
+                for claim in &answer.claims {
                     if cancelled.load(Ordering::Acquire) {
                         break;
                     }
-                    let token = chunk.iter().collect::<String>();
                     let _ = app.emit(
                         "ask.token",
-                        json!({"operation_id": operation_id, "token": token}),
+                        json!({"operation_id": operation_id, "token": format!("{}\n", claim.text), "verified": true}),
                     );
-                    std::thread::sleep(Duration::from_millis(8));
                 }
                 if cancelled.load(Ordering::Acquire) {
                     let error = AppError::new("OPERATION_CANCELLED", "问答已取消", false);
@@ -1582,45 +3239,187 @@ fn compute_answer(
     worker: &WorkerClient,
     generation: &Mutex<LocalGenerationRuntime>,
     cancelled: &AtomicBool,
+    phase: &dyn Fn(&str, f64),
 ) -> Result<AnswerResult, AppError> {
     if cancelled.load(Ordering::Acquire) {
         return Err(AppError::new("OPERATION_CANCELLED", "问答已取消", false));
     }
-    let mut semantic_result = None;
-    if let Some(artifact) = models.active_artifact(ModelRole::Embedding)? {
-        let tokenizer_path = PathBuf::from(&artifact.local_path)
+    phase("understanding", 0.08);
+    let embedding = models.active_artifact(ModelRole::Embedding)?;
+    let generation_artifact = models.active_artifact(ModelRole::Generation)?;
+    let maintenance = catalog.maintenance_snapshot()?;
+    let index_coverage = if let Some(embedding) = embedding.as_ref() {
+        catalog
+            .semantic_index_coverage(&request.scope, &embedding.artifact_id.to_string())?
+            .1
+    } else {
+        0.0
+    };
+    let degradation_reason = if generation_artifact.is_none() {
+        Some("缺少已自检的本地生成模型".to_owned())
+    } else if embedding.is_none() {
+        Some("缺少已自检的中文 Embedding 模型".to_owned())
+    } else if index_coverage <= 0.0 {
+        Some("当前检索范围尚未建立语义索引".to_owned())
+    } else if maintenance.degradation_level == "core" {
+        Some("后台资源繁忙，语义检索与生成暂时暂停；搜索和预览仍可继续使用".to_owned())
+    } else {
+        None
+    };
+    let explicit_extracts = request.mode == AskMode::EvidenceExtracts;
+    if !explicit_extracts && degradation_reason.is_some() && !request.allow_degraded_extractive {
+        return Err(AppError::new(
+            "RAG_DEGRADED_CONFIRMATION_REQUIRED",
+            format!(
+                "完整 RAG 暂不可用：{}。如需继续，请明确切换到证据摘录模式。",
+                degradation_reason.as_deref().unwrap_or("组件未就绪")
+            ),
+            true,
+        ));
+    }
+    if explicit_extracts || degradation_reason.is_some() {
+        phase("evidence_retrieval", 0.35);
+        let mut result = catalog.answer_extractively(request, None)?;
+        result.degradation_reason =
+            degradation_reason.or_else(|| Some("用户明确选择证据摘录模式".into()));
+        result.index_coverage = index_coverage;
+        result.retrieval_channels = vec!["filename".into(), "fts".into()];
+        catalog.validate_answer_evidence(&result)?;
+        catalog.record_ask_exchange(request, &result)?;
+        phase("completed", 1.0);
+        return Ok(result);
+    }
+    let embedding = embedding.expect("RAG readiness checked embedding");
+    let generation_artifact = generation_artifact.expect("RAG readiness checked generation");
+    let history = request
+        .session_id
+        .map(|session_id| catalog.load_ask_history(&session_id, 8))
+        .transpose()?
+        .unwrap_or_default();
+    let retrieval_question = if history.is_empty() {
+        request.question.trim().to_owned()
+    } else {
+        let history_text = history
+            .iter()
+            .map(|message| {
+                format!(
+                    "{}：{}",
+                    message.role,
+                    compact_for_prompt(&message.content, 500)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prompt = format!(
+            "对话历史：\n{history_text}\n\n当前追问：{}\n\n把当前追问改写成可独立检索的问题。只输出改写后的问题，不回答。",
+            request.question.trim()
+        );
+        let rewritten = complete_with_model(
+            generation,
+            &generation_artifact,
+            "你负责将连续追问改写为独立的中文检索问题，不得引入历史中不存在的事实。",
+            &prompt,
+            160,
+            cancelled,
+        )?;
+        let rewritten = rewritten.trim();
+        if rewritten.is_empty() {
+            return Err(AppError::new(
+                "RAG_QUERY_REWRITE_FAILED",
+                "追问改写没有产生有效检索问题",
+                true,
+            ));
+        }
+        compact_for_prompt(rewritten, 2_000)
+    };
+    if cancelled.load(Ordering::Acquire) {
+        return Err(AppError::new("OPERATION_CANCELLED", "问答已取消", false));
+    }
+    phase("hybrid_retrieval", 0.25);
+    let tokenizer_path = PathBuf::from(&embedding.local_path)
+        .parent()
+        .map(|parent| parent.join("tokenizer.json"))
+        .ok_or_else(|| {
+            AppError::new(
+                "EMBEDDING_TOKENIZER_MISSING",
+                "Embedding 模型目录无效",
+                false,
+            )
+        })?;
+    if !tokenizer_path.is_file() {
+        return Err(AppError::new(
+            "EMBEDDING_TOKENIZER_MISSING",
+            "Embedding tokenizer 不存在，完整 RAG 已停止",
+            true,
+        ));
+    }
+    let embedding_text = format!(
+        "{}{}",
+        embedding.query_prefix.as_deref().unwrap_or(""),
+        retrieval_question
+    );
+    let response = worker.encode_embeddings(&EmbeddingRequest {
+        model_path: embedding.local_path.clone(),
+        tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
+        texts: vec![embedding_text],
+        max_length: embedding.max_length.unwrap_or(512),
+        threads: 2,
+    })?;
+    let vector = response.vectors.first().ok_or_else(|| {
+        AppError::new("EMBEDDING_EMPTY", "Embedding 运行时没有返回查询向量", true)
+    })?;
+    let mut retrieval_request = request.clone();
+    retrieval_request.question = retrieval_question;
+    let artifact_id = embedding.artifact_id.to_string();
+    let mut extractive = catalog.answer_extractively(
+        &retrieval_request,
+        Some(SemanticQuery {
+            model_artifact_id: &artifact_id,
+            vector,
+        }),
+    )?;
+    extractive.index_coverage = index_coverage;
+    extractive.retrieval_channels = vec![
+        "filename".into(),
+        "fts".into(),
+        "embedding".into(),
+        "rrf".into(),
+    ];
+    if extractive.insufficient_evidence {
+        extractive.answer_mode = "rag_refusal".into();
+        catalog.record_ask_exchange(request, &extractive)?;
+        phase("completed", 1.0);
+        return Ok(extractive);
+    }
+    if maintenance.degradation_level == "full"
+        && let Some(reranker) = models.active_artifact(ModelRole::Reranker)?
+        && reranker.format == ModelFormat::Onnx
+        && !extractive.claims.is_empty()
+    {
+        phase("reranking", 0.42);
+        let tokenizer_path = PathBuf::from(&reranker.local_path)
             .parent()
             .map(|parent| parent.join("tokenizer.json"));
-        if let Some(tokenizer_path) = tokenizer_path
-            && let Ok(response) = worker.encode_embeddings(&EmbeddingRequest {
-                model_path: artifact.local_path,
+        if let Some(tokenizer_path) = tokenizer_path.filter(|path| path.is_file()) {
+            let documents = extractive
+                .claims
+                .iter()
+                .map(|claim| compact_for_prompt(&claim.text, 12_000))
+                .collect::<Vec<_>>();
+            if let Ok(response) = worker.rerank(&RerankRequest {
+                model_path: reranker.local_path,
                 tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
-                texts: vec![request.question.clone()],
-                max_length: 512,
+                query: retrieval_request.question.clone(),
+                documents,
+                max_length: reranker.max_length.unwrap_or(512),
                 threads: 2,
-            })
-            && let Some(vector) = response.vectors.first()
-        {
-            let artifact_id = artifact.artifact_id.to_string();
-            semantic_result = Some(catalog.answer_extractively(
-                request,
-                Some(SemanticQuery {
-                    model_artifact_id: &artifact_id,
-                    vector,
-                }),
-            )?);
+            }) && apply_rerank_scores(&mut extractive, &response.scores).is_ok()
+            {
+                extractive.retrieval_channels.push("reranker".into());
+            }
         }
     }
-    let extractive = match semantic_result {
-        Some(result) => result,
-        None => catalog.answer_extractively(request, None)?,
-    };
-    if extractive.insufficient_evidence {
-        return Ok(extractive);
-    }
-    let Some(artifact) = models.active_artifact(ModelRole::Generation)? else {
-        return Ok(extractive);
-    };
+    phase("evidence_selection", 0.48);
     let mut runtime = generation.lock().map_err(|_| {
         AppError::new(
             "GENERATION_RUNTIME_LOCK_FAILED",
@@ -1632,28 +3431,129 @@ fn compute_answer(
         .map(|value| value.get() as u32)
         .unwrap_or(2)
         .clamp(1, 8);
-    if (runtime.active_model_path() != Some(artifact.local_path.as_str()) || !runtime.is_active())
+    if (runtime.active_model_path() != Some(generation_artifact.local_path.as_str())
+        || !runtime.is_active())
         && runtime
-            .activate(&artifact.local_path, 4096, threads)
+            .activate(&generation_artifact.local_path, 4096, threads)
             .is_err()
     {
-        return Ok(extractive);
+        return Err(AppError::new(
+            "GENERATION_ACTIVATION_FAILED",
+            "本地生成模型加载失败，未降级为关键词答案",
+            true,
+        ));
     }
+    phase("generating", 0.62);
     let prompt = remin_core::generation_prompt(request, &extractive);
-    let generated = match runtime.complete_cancellable(
+    let generated = runtime.complete_cancellable(
         "你是拾忆的本地资料回答器。只能使用用户提供的证据，严格保留[S数字]引用，不得补充外部知识。",
         &prompt,
         512,
         cancelled,
-    ) {
-        Ok(answer) => answer,
-        Err(error) if error.code == "OPERATION_CANCELLED" => {
+    )
+    .inspect_err(|error| {
+        if error.code == "OPERATION_CANCELLED" {
             runtime.stop();
-            return Err(error);
         }
-        Err(_) => return Ok(extractive),
-    };
-    Ok(remin_core::apply_grounded_generation(&extractive, &generated).unwrap_or(extractive))
+    })?;
+    drop(runtime);
+    phase("citation_validation", 0.88);
+    let mut grounded =
+        remin_core::apply_grounded_generation(&extractive, &generated).ok_or_else(|| {
+            AppError::new(
+                "RAG_CITATION_VALIDATION_FAILED",
+                "生成内容未通过逐句引用校验，回答已拒绝显示；不会回退为伪装的关键词答案",
+                true,
+            )
+        })?;
+    for claim in &grounded.claims {
+        let evidence = claim
+            .citations
+            .iter()
+            .enumerate()
+            .map(|(index, citation)| format!("[E{}] {}", index + 1, citation.quote))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let verification = complete_with_model(
+            generation,
+            &generation_artifact,
+            "你是严格的中文证据核验器。判断事实句是否完全由给定原文证据支持，只输出SUPPORTED或UNSUPPORTED。",
+            &format!("事实句：{}\n\n原文证据：\n{}", claim.text, evidence),
+            32,
+            cancelled,
+        )?;
+        if !claim_support_is_verified(&verification) {
+            return Err(AppError::new(
+                "RAG_CLAIM_UNSUPPORTED",
+                "至少一个事实句未通过原文支持性校验，整条回答已拒绝显示",
+                true,
+            ));
+        }
+    }
+    grounded.index_coverage = index_coverage;
+    grounded.retrieval_channels = extractive.retrieval_channels;
+    catalog.validate_answer_evidence(&grounded)?;
+    catalog.record_ask_exchange(request, &grounded)?;
+    phase("completed", 1.0);
+    Ok(grounded)
+}
+
+fn apply_rerank_scores(result: &mut AnswerResult, scores: &[f32]) -> Result<(), AppError> {
+    if scores.len() != result.claims.len() || scores.iter().any(|score| !score.is_finite()) {
+        return Err(AppError::new(
+            "RERANK_OUTPUT_INVALID",
+            "重排分数数量或数值无效，已保留融合检索顺序",
+            false,
+        ));
+    }
+    let mut ranked = result
+        .claims
+        .drain(..)
+        .zip(scores.iter().copied())
+        .collect::<Vec<_>>();
+    for (claim, score) in &mut ranked {
+        for citation in &mut claim.citations {
+            citation.retrieval_score = *score;
+        }
+    }
+    ranked.sort_by(|left, right| right.1.total_cmp(&left.1));
+    result.claims = ranked.into_iter().map(|(claim, _)| claim).collect();
+    Ok(())
+}
+
+fn compact_for_prompt(value: &str, limit: usize) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalized.chars().take(limit).collect()
+}
+
+fn complete_with_model(
+    generation: &Mutex<LocalGenerationRuntime>,
+    artifact: &ModelArtifact,
+    system_prompt: &str,
+    prompt: &str,
+    max_tokens: u32,
+    cancelled: &AtomicBool,
+) -> Result<String, AppError> {
+    let mut runtime = generation.lock().map_err(|_| {
+        AppError::new(
+            "GENERATION_RUNTIME_LOCK_FAILED",
+            "生成运行时状态已损坏",
+            true,
+        )
+    })?;
+    let threads = std::thread::available_parallelism()
+        .map(|value| value.get() as u32)
+        .unwrap_or(2)
+        .clamp(1, 8);
+    if runtime.active_model_path() != Some(artifact.local_path.as_str()) || !runtime.is_active() {
+        runtime.activate(&artifact.local_path, 4096, threads)?;
+    }
+    runtime.complete_cancellable(system_prompt, prompt, max_tokens, cancelled)
+}
+
+fn claim_support_is_verified(value: &str) -> bool {
+    let normalized = value.to_ascii_uppercase();
+    !normalized.contains("UNSUPPORTED") && normalized.contains("SUPPORTED")
 }
 
 #[derive(Debug, Deserialize)]
@@ -1824,9 +3724,7 @@ pub(crate) fn spawn_scan(
     root_id: Uuid,
     job_id: Uuid,
 ) {
-    thread::spawn(move || {
-        run_scan(&app, &catalog, root_id, job_id);
-    });
+    enqueue_scans(app, catalog, [(root_id, job_id)]);
 }
 
 pub(crate) fn spawn_scan_queue(
@@ -1837,9 +3735,60 @@ pub(crate) fn spawn_scan_queue(
     if recovered.is_empty() {
         return;
     }
+    enqueue_scans(
+        app,
+        catalog,
+        recovered
+            .into_iter()
+            .map(|(root_id, job)| (root_id, job.job_id)),
+    );
+}
+
+fn enqueue_scans(
+    app: AppHandle,
+    catalog: Arc<CatalogService>,
+    scans: impl IntoIterator<Item = (Uuid, Uuid)>,
+) {
+    let state = app.state::<ScanCoordinatorState>();
+    if let Ok(mut queue) = state.queue.lock() {
+        for scan in scans {
+            if !queue.iter().any(|queued| queued.1 == scan.1) {
+                queue.push_back(scan);
+            }
+        }
+    } else {
+        let _ = app.emit(
+            "catalog.watch_degraded",
+            AppError::new("SCAN_QUEUE_UNAVAILABLE", "扫描调度队列暂时不可用", true),
+        );
+        return;
+    }
+    if state.running.swap(true, Ordering::AcqRel) {
+        return;
+    }
     thread::spawn(move || {
-        for (root_id, job) in recovered {
-            run_scan(&app, &catalog, root_id, job.job_id);
+        loop {
+            let next = app
+                .state::<ScanCoordinatorState>()
+                .queue
+                .lock()
+                .ok()
+                .and_then(|mut queue| queue.pop_front());
+            if let Some((root_id, job_id)) = next {
+                run_scan(&app, &catalog, root_id, job_id);
+                continue;
+            }
+            let state = app.state::<ScanCoordinatorState>();
+            state.running.store(false, Ordering::Release);
+            let has_more = state
+                .queue
+                .lock()
+                .map(|queue| !queue.is_empty())
+                .unwrap_or(false);
+            if has_more && !state.running.swap(true, Ordering::AcqRel) {
+                continue;
+            }
+            break;
         }
     });
 }
@@ -1870,12 +3819,12 @@ pub(crate) fn spawn_parse_pending(app: AppHandle, catalog: Arc<CatalogService>) 
                 self.0.store(false, Ordering::Release);
             }
         }
-        let should_continue = {
-            let worker = app.state::<WorkerServiceState>();
-            if worker.running.swap(true, Ordering::AcqRel) {
-                return;
-            }
-            let _running_reset = RunningReset(&worker.running);
+        let worker = app.state::<WorkerServiceState>();
+        if worker.running.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _running_reset = RunningReset(&worker.running);
+        loop {
             let degradation = catalog
                 .maintenance_snapshot()
                 .map(|snapshot| snapshot.degradation_level)
@@ -1886,76 +3835,208 @@ pub(crate) fn spawn_parse_pending(app: AppHandle, catalog: Arc<CatalogService>) 
                 _ => 16,
             };
             if batch_size == 0 {
-                false
-            } else {
-                let pending = match catalog.list_pending_parse_files(batch_size) {
-                    Ok(files) => files,
+                break;
+            }
+            let pending = match catalog.list_pending_parse_files(batch_size) {
+                Ok(files) => files,
+                Err(error) => {
+                    let _ = app.emit("index.failed", error);
+                    break;
+                }
+            };
+            if pending.is_empty() {
+                break;
+            }
+            for file in pending {
+                let Some(revision_id) = file.current_revision_id else {
+                    continue;
+                };
+                if let Err(error) = catalog.mark_file_parsing(&file.file_id, &revision_id) {
+                    let _ = app.emit("index.failed", error);
+                    continue;
+                }
+                let request = ParseRequest {
+                    job_id: Uuid::now_v7(),
+                    file_id: file.file_id,
+                    revision_id,
+                    source_path: file.canonical_path.clone(),
+                    format: file.extension.clone(),
+                    ocr_policy: "auto".to_owned(),
+                    language_hints: vec!["zh".to_owned()],
+                    max_pages: None,
+                    asset_cache_dir: image_asset_cache_dir(&app, &revision_id),
+                    parser_version: "0.1.0".to_owned(),
+                };
+                let result = worker
+                    .client
+                    .parse_document(&request)
+                    .unwrap_or_else(|error| ParseResult {
+                        revision_id,
+                        status: ParseOutcome::Failed,
+                        parser_name: "none".to_owned(),
+                        parser_version: request.parser_version.clone(),
+                        nodes: vec![],
+                        image_assets: vec![],
+                        warnings: vec![],
+                        metrics: ParseMetrics {
+                            page_count: 0,
+                            node_count: 0,
+                            character_count: 0,
+                            ocr_page_count: 0,
+                            elapsed_ms: 0,
+                        },
+                        error: Some(error),
+                    });
+                match catalog.commit_parse_result(&file.file_id, &result) {
+                    Ok(()) => {
+                        let _ = app.emit("index.changed", file.file_id.to_string());
+                    }
                     Err(error) => {
                         let _ = app.emit("index.failed", error);
-                        return;
-                    }
-                };
-                for file in pending {
-                    let Some(revision_id) = file.current_revision_id else {
-                        continue;
-                    };
-                    if let Err(error) = catalog.mark_file_parsing(&file.file_id, &revision_id) {
-                        let _ = app.emit("index.failed", error);
-                        continue;
-                    }
-                    let request = ParseRequest {
-                        job_id: Uuid::now_v7(),
-                        file_id: file.file_id,
-                        revision_id,
-                        source_path: file.canonical_path.clone(),
-                        format: file.extension.clone(),
-                        ocr_policy: "auto".to_owned(),
-                        language_hints: vec!["zh".to_owned()],
-                        max_pages: None,
-                        parser_version: "0.1.0".to_owned(),
-                    };
-                    let result = worker
-                        .client
-                        .parse_document(&request)
-                        .unwrap_or_else(|error| ParseResult {
-                            revision_id,
-                            status: ParseOutcome::Failed,
-                            parser_name: "none".to_owned(),
-                            parser_version: request.parser_version.clone(),
-                            nodes: vec![],
-                            warnings: vec![],
-                            metrics: ParseMetrics {
-                                page_count: 0,
-                                node_count: 0,
-                                character_count: 0,
-                                ocr_page_count: 0,
-                                elapsed_ms: 0,
-                            },
-                            error: Some(error),
-                        });
-                    match catalog.commit_parse_result(&file.file_id, &result) {
-                        Ok(()) => {
-                            let _ = app.emit("index.changed", file.file_id.to_string());
-                        }
-                        Err(error) => {
-                            let _ = app.emit("index.failed", error);
-                        }
                     }
                 }
-                spawn_embed_pending(app.clone(), Arc::clone(&catalog));
-                catalog
-                    .list_pending_parse_files(1)
-                    .is_ok_and(|files| !files.is_empty())
             }
-        };
-        if should_continue {
-            thread::sleep(std::time::Duration::from_millis(250));
-            spawn_parse_pending(app, catalog);
+            thread::yield_now();
         }
+        drop(_running_reset);
+        spawn_image_understanding_pending(app.clone(), Arc::clone(&catalog));
+        spawn_embed_pending(app, catalog);
     });
 }
 
-pub(crate) fn spawn_embed_pending(app: AppHandle, catalog: Arc<CatalogService>) {
+fn image_asset_cache_dir(app: &AppHandle, revision_id: &Uuid) -> Option<String> {
+    app.path()
+        .app_cache_dir()
+        .ok()
+        .map(|path| path.join("image-assets").join(revision_id.to_string()))
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+#[derive(Debug, Deserialize)]
+struct VisionDescriptionPayload {
+    summary: String,
+    #[serde(default)]
+    visible_text: Option<String>,
+    #[serde(default)]
+    keywords: Vec<String>,
+    #[serde(default)]
+    entities: Vec<String>,
+    #[serde(default)]
+    chart_summary: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VisionQuestionPayload {
+    answer: String,
+    #[serde(default)]
+    observations: Vec<String>,
+    #[serde(default)]
+    uncertainties: Vec<String>,
+}
+
+fn parse_vision_question_answer(value: &str) -> Result<VisionQuestionPayload, AppError> {
+    let trimmed = value.trim();
+    let mut parsed = serde_json::from_str::<VisionQuestionPayload>(trimmed)
+        .or_else(|_| {
+            let start = trimmed.find('{').ok_or_else(|| {
+                serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing JSON object",
+                ))
+            })?;
+            let end = trimmed.rfind('}').ok_or_else(|| {
+                serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing JSON object",
+                ))
+            })?;
+            serde_json::from_str(&trimmed[start..=end])
+        })
+        .map_err(|error| {
+            AppError::new(
+                "VISION_RESPONSE_SCHEMA_INVALID",
+                format!("本地多模态模型没有返回有效的原图分析JSON：{error}"),
+                true,
+            )
+        })?;
+    parsed.answer = parsed.answer.trim().chars().take(6_000).collect();
+    if parsed.answer.is_empty() {
+        return Err(AppError::new(
+            "VISION_RESPONSE_SCHEMA_INVALID",
+            "本地多模态模型返回的原图分析为空",
+            true,
+        ));
+    }
+    let normalize = |values: Vec<String>| {
+        values
+            .into_iter()
+            .map(|value| value.trim().chars().take(500).collect::<String>())
+            .filter(|value| !value.is_empty())
+            .take(32)
+            .collect::<Vec<_>>()
+    };
+    parsed.observations = normalize(parsed.observations);
+    parsed.uncertainties = normalize(parsed.uncertainties);
+    Ok(parsed)
+}
+
+fn parse_vision_description(value: &str) -> Result<VisionDescriptionPayload, AppError> {
+    let trimmed = value.trim();
+    let mut parsed = serde_json::from_str::<VisionDescriptionPayload>(trimmed)
+        .or_else(|_| {
+            let start = trimmed.find('{').ok_or_else(|| {
+                serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing JSON object",
+                ))
+            })?;
+            let end = trimmed.rfind('}').ok_or_else(|| {
+                serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing JSON object",
+                ))
+            })?;
+            serde_json::from_str(&trimmed[start..=end])
+        })
+        .map_err(|error| {
+            AppError::new(
+                "VISION_RESPONSE_SCHEMA_INVALID",
+                format!("本地多模态模型没有返回有效的图片说明JSON：{error}"),
+                true,
+            )
+        })?;
+    parsed.summary = parsed.summary.trim().chars().take(6_000).collect();
+    if parsed.summary.is_empty() {
+        return Err(AppError::new(
+            "VISION_RESPONSE_SCHEMA_INVALID",
+            "本地多模态模型返回的图片摘要为空",
+            true,
+        ));
+    }
+    parsed.visible_text = parsed
+        .visible_text
+        .take()
+        .map(|value| value.trim().chars().take(12_000).collect::<String>())
+        .filter(|value| !value.is_empty());
+    parsed.chart_summary = parsed
+        .chart_summary
+        .take()
+        .map(|value| value.trim().chars().take(4_000).collect::<String>())
+        .filter(|value| !value.is_empty());
+    let normalize_list = |values: Vec<String>| {
+        values
+            .into_iter()
+            .map(|value| value.trim().chars().take(80).collect::<String>())
+            .filter(|value| !value.is_empty())
+            .take(32)
+            .collect::<Vec<_>>()
+    };
+    parsed.keywords = normalize_list(parsed.keywords);
+    parsed.entities = normalize_list(parsed.entities);
+    Ok(parsed)
+}
+
+pub(crate) fn spawn_image_understanding_pending(app: AppHandle, catalog: Arc<CatalogService>) {
     thread::spawn(move || {
         struct RunningReset<'a>(&'a AtomicBool);
         impl Drop for RunningReset<'_> {
@@ -1963,63 +4044,303 @@ pub(crate) fn spawn_embed_pending(app: AppHandle, catalog: Arc<CatalogService>) 
                 self.0.store(false, Ordering::Release);
             }
         }
-        let should_continue = {
-            let models = app.state::<ModelServiceState>();
-            let models = match models.get() {
-                Ok(models) => models,
-                Err(_) => return,
-            };
-            let artifact = match models.active_artifact(ModelRole::Embedding) {
-                Ok(Some(artifact)) => artifact,
-                Ok(None) => return,
-                Err(error) => {
-                    let _ = app.emit("embedding.failed", error);
-                    return;
-                }
-            };
-            let Some(tokenizer_path) = PathBuf::from(&artifact.local_path)
-                .parent()
-                .map(|parent| parent.join("tokenizer.json"))
-            else {
-                return;
-            };
-            let worker = app.state::<WorkerServiceState>();
-            if worker.embedding_running.swap(true, Ordering::AcqRel) {
+
+        if !background_storage_budget_allows(&app, &catalog) {
+            return;
+        }
+        let models = app.state::<ModelServiceState>();
+        let models = match models.get() {
+            Ok(models) => models,
+            Err(_) => return,
+        };
+        let artifact = match models.active_artifact(ModelRole::Vision) {
+            Ok(Some(artifact)) => artifact,
+            Ok(None) => return,
+            Err(error) => {
+                let _ = app.emit("vision.failed", error);
                 return;
             }
-            let _running_reset = RunningReset(&worker.embedding_running);
-            let model_artifact_id = artifact.artifact_id.to_string();
-            let chunks = match catalog.list_pending_embedding_chunks(&model_artifact_id, 16) {
-                Ok(chunks) if chunks.is_empty() => return,
-                Ok(chunks) => chunks,
+        };
+        let projector = match models.vision_projector_path(&artifact) {
+            Ok(path) => path,
+            Err(error) => {
+                let _ = app.emit("vision.failed", error);
+                return;
+            }
+        };
+        let worker = app.state::<WorkerServiceState>();
+        if worker.vision_running.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _running_reset = RunningReset(&worker.vision_running);
+        let generation = app.state::<GenerationServiceState>();
+        let model_artifact_id = artifact.artifact_id.to_string();
+        let projector_path = projector.to_string_lossy().into_owned();
+        let threads = std::thread::available_parallelism()
+            .map(|value| value.get() as u32)
+            .unwrap_or(2)
+            .clamp(1, 8);
+        let mut committed = 0_u64;
+        loop {
+            let degradation = catalog
+                .maintenance_snapshot()
+                .map(|snapshot| snapshot.degradation_level)
+                .unwrap_or_else(|_| "balanced".to_owned());
+            if degradation == "core" {
+                break;
+            }
+            let pending = match catalog.claim_pending_image_understanding(&model_artifact_id) {
+                Ok(Some(pending)) => pending,
+                Ok(None) => match catalog.image_understanding_stats() {
+                    Ok((_, _, pending)) if pending > 0 => {
+                        thread::yield_now();
+                        continue;
+                    }
+                    _ => break,
+                },
                 Err(error) => {
-                    let _ = app.emit("embedding.failed", error);
-                    return;
+                    let _ = app.emit("vision.failed", error);
+                    break;
                 }
             };
-            let response = match worker.client.encode_embeddings(&EmbeddingRequest {
+            let _ = app.emit(
+                "vision.progress",
+                json!({
+                    "asset_id": pending.asset_id,
+                    "revision_id": pending.revision_id,
+                    "stage": "understanding",
+                    "attempt": pending.attempt_count,
+                }),
+            );
+            let operation = (|| {
+                let mut runtime = generation.0.lock().map_err(|_| {
+                    AppError::new(
+                        "VISION_RUNTIME_LOCK_FAILED",
+                        "图片理解运行时状态已损坏",
+                        true,
+                    )
+                })?;
+                if runtime.active_model_path() != Some(artifact.local_path.as_str())
+                    || runtime.active_mmproj_path() != Some(projector_path.as_str())
+                    || !runtime.is_active()
+                {
+                    runtime.activate_multimodal(
+                        &artifact.local_path,
+                        &projector_path,
+                        4096,
+                        threads,
+                    )?;
+                }
+                let location = serde_json::to_string(&pending.locator).map_err(|error| {
+                    AppError::new("IMAGE_ASSET_INVALID", error.to_string(), false)
+                })?;
+                let ocr_hint = pending
+                    .ocr_text
+                    .as_deref()
+                    .map(|value| compact_for_prompt(value, 4_000))
+                    .unwrap_or_default();
+                let prompt = format!(
+                    "请理解这张本地资料图片。位置元数据：{location}\n已有OCR（可能为空或有误）：{ocr_hint}\n只输出一个JSON对象，不要Markdown：{{\"summary\":\"客观完整的中文摘要\",\"visible_text\":\"可辨认文字或null\",\"keywords\":[\"关键词\"],\"entities\":[\"人名/机构/地点/产品\"],\"chart_summary\":\"若为图表则描述坐标、趋势与关键数值，否则null\"}}。不得猜测看不清的内容。"
+                );
+                let cancelled = AtomicBool::new(false);
+                let response = runtime.describe_image_cancellable(
+                    "你是拾忆的本地图片与图表理解器。只描述图中可验证内容，并严格输出指定JSON。",
+                    &prompt,
+                    Path::new(&pending.cache_path),
+                    &pending.mime_type,
+                    768,
+                    &cancelled,
+                )?;
+                let description = parse_vision_description(&response)?;
+                Ok::<_, AppError>(ImageUnderstandingResult {
+                    asset_id: pending.asset_id,
+                    revision_id: pending.revision_id,
+                    model_artifact_id: model_artifact_id.clone(),
+                    summary: description.summary,
+                    visible_text: description.visible_text,
+                    keywords: description.keywords,
+                    entities: description.entities,
+                    chart_summary: description.chart_summary,
+                    idempotency_key: pending.idempotency_key.clone(),
+                })
+            })();
+            match operation.and_then(|result| catalog.commit_image_understanding(&result)) {
+                Ok(()) => {
+                    committed = committed.saturating_add(1);
+                    let _ = app.emit(
+                        "vision.completed",
+                        json!({"asset_id": pending.asset_id, "revision_id": pending.revision_id}),
+                    );
+                    let _ = app.emit("index.changed", pending.file_id.to_string());
+                    if committed.is_multiple_of(8) {
+                        spawn_embed_pending(app.clone(), Arc::clone(&catalog));
+                    }
+                }
+                Err(error) => {
+                    let _ = catalog.fail_image_understanding(&pending.asset_id, &error);
+                    let _ = app.emit(
+                        "vision.failed",
+                        json!({"asset_id": pending.asset_id, "error": error}),
+                    );
+                }
+            }
+            thread::yield_now();
+        }
+        if let Ok(mut runtime) = generation.0.lock()
+            && runtime.active_model_path() == Some(artifact.local_path.as_str())
+            && runtime.active_mmproj_path() == Some(projector_path.as_str())
+        {
+            runtime.stop();
+        }
+        drop(_running_reset);
+        if committed > 0 {
+            spawn_embed_pending(app, catalog);
+        }
+    });
+}
+
+pub(crate) fn spawn_embed_pending(app: AppHandle, catalog: Arc<CatalogService>) {
+    let worker = app.state::<WorkerServiceState>();
+    worker.embedding_reschedule.store(true, Ordering::Release);
+    if worker.embedding_running.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    thread::spawn(move || {
+        struct RunningReset<'a>(&'a AtomicBool);
+        impl Drop for RunningReset<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let worker = app.state::<WorkerServiceState>();
+        let _running_reset = RunningReset(&worker.embedding_running);
+        loop {
+            worker.embedding_reschedule.store(false, Ordering::Release);
+            run_embedding_cycle(&app, &catalog, &worker);
+            if !worker.embedding_reschedule.swap(false, Ordering::AcqRel) {
+                break;
+            }
+        }
+    });
+}
+
+fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &WorkerServiceState) {
+    if !background_storage_budget_allows(app, catalog) {
+        return;
+    }
+    let models_state = app.state::<ModelServiceState>();
+    let models = match models_state.get() {
+        Ok(models) => models,
+        Err(error) => {
+            let _ = app.emit("embedding.failed", error);
+            return;
+        }
+    };
+    let pending = match models.pending_embedding_activation() {
+        Ok(Some(pending)) if pending.status == "indexing" => Some(pending),
+        Ok(_) => None,
+        Err(error) => {
+            let _ = app.emit("embedding.failed", error);
+            return;
+        }
+    };
+    let artifact = match pending.as_ref() {
+        Some(pending) => models.artifact_by_id(&pending.artifact_id),
+        None => models
+            .active_artifact(ModelRole::Embedding)
+            .and_then(|artifact| {
+                artifact.ok_or_else(|| {
+                    AppError::new(
+                        "RAG_EMBEDDING_MISSING",
+                        "尚未启用可用于后台索引的 Embedding 模型",
+                        true,
+                    )
+                })
+            }),
+    };
+    let artifact = match artifact {
+        Ok(artifact) => artifact,
+        Err(error) => {
+            if pending.is_some() {
+                record_embedding_activation_failure(
+                    app,
+                    catalog,
+                    &models,
+                    pending.as_ref(),
+                    &error,
+                );
+            }
+            return;
+        }
+    };
+    let tokenizer_path = match PathBuf::from(&artifact.local_path)
+        .parent()
+        .map(|parent| parent.join("tokenizer.json"))
+        .filter(|path| path.is_file())
+    {
+        Some(path) => path,
+        None => {
+            let error = AppError::new(
+                "EMBEDDING_TOKENIZER_UNAVAILABLE",
+                "Embedding 模型缺少受管理的 tokenizer.json",
+                false,
+            );
+            record_embedding_activation_failure(app, catalog, &models, pending.as_ref(), &error);
+            return;
+        }
+    };
+    let model_artifact_id = artifact.artifact_id.to_string();
+    let expected_dimension = pending
+        .as_ref()
+        .map(|pending| pending.dimension)
+        .or(artifact.embedding_dimension);
+    let mut committed_total = 0_u64;
+    let mut completed_dimension = expected_dimension;
+    let result = (|| -> Result<bool, AppError> {
+        loop {
+            if let Some(expected) = pending.as_ref() {
+                let still_current = models
+                    .pending_embedding_activation()?
+                    .is_some_and(|current| {
+                        current.artifact_id == expected.artifact_id
+                            && current.dimension == expected.dimension
+                            && current.status == "indexing"
+                    });
+                if !still_current {
+                    return Ok(false);
+                }
+            }
+            let degradation = catalog
+                .maintenance_snapshot()
+                .map(|snapshot| snapshot.degradation_level)
+                .unwrap_or_else(|_| "balanced".to_owned());
+            if degradation == "core" {
+                return Ok(false);
+            }
+            let chunks = catalog.list_pending_embedding_chunks(&model_artifact_id, 16)?;
+            if chunks.is_empty() {
+                break;
+            }
+            let response = worker.client.encode_embeddings(&EmbeddingRequest {
                 model_path: artifact.local_path.clone(),
                 tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
                 texts: chunks.iter().map(|chunk| chunk.text.clone()).collect(),
-                max_length: 512,
+                max_length: artifact.max_length.unwrap_or(512),
                 threads: 2,
-            }) {
-                Ok(response) => response,
-                Err(error) => {
-                    let _ = app.emit("embedding.failed", error);
-                    return;
-                }
-            };
-            if response.vectors.len() != chunks.len() {
-                let _ = app.emit(
-                    "embedding.failed",
-                    AppError::new(
-                        "EMBEDDING_OUTPUT_INVALID",
-                        "向量数量与输入分块数量不一致",
-                        false,
-                    ),
-                );
-                return;
+            })?;
+            if response.dimension == 0
+                || expected_dimension.is_some_and(|dimension| dimension != response.dimension)
+                || response.vectors.len() != chunks.len()
+                || response
+                    .vectors
+                    .iter()
+                    .any(|vector| vector.len() != response.dimension as usize)
+            {
+                return Err(AppError::new(
+                    "EMBEDDING_OUTPUT_INVALID",
+                    "向量数量或维度与模型自检结果不一致",
+                    false,
+                ));
             }
             let inputs = chunks
                 .iter()
@@ -2029,30 +4350,167 @@ pub(crate) fn spawn_embed_pending(app: AppHandle, catalog: Arc<CatalogService>) 
                     vector,
                 })
                 .collect::<Vec<_>>();
-            match catalog.commit_chunk_embeddings(&model_artifact_id, response.dimension, &inputs) {
-                Ok(0) => false,
-                Ok(committed) => {
-                    let _ = app.emit("embedding.changed", committed);
-                    catalog
-                        .list_pending_embedding_chunks(&model_artifact_id, 1)
-                        .is_ok_and(|chunks| !chunks.is_empty())
-                }
-                Err(error) => {
-                    let _ = app.emit("embedding.failed", error);
-                    false
+            let committed =
+                catalog.commit_chunk_embeddings(&model_artifact_id, response.dimension, &inputs)?;
+            if committed == 0 {
+                break;
+            }
+            committed_total = committed_total.saturating_add(committed);
+            completed_dimension = Some(response.dimension);
+            let _ = app.emit("embedding.changed", committed);
+            thread::yield_now();
+        }
+
+        let searchable_chunks = catalog.maintenance_snapshot()?.searchable_chunks;
+        let Some(dimension) = completed_dimension else {
+            if searchable_chunks == 0 {
+                return Ok(true);
+            }
+            return Err(AppError::new(
+                "EMBEDDING_OUTPUT_INVALID",
+                "Embedding 模型没有已验证的向量维度",
+                false,
+            ));
+        };
+        let existing_generation = catalog.active_vector_generation(&model_artifact_id)?;
+        let needs_rebuild = searchable_chunks > 0
+            && (committed_total > 0
+                || existing_generation
+                    .as_ref()
+                    .is_none_or(|generation| generation.dimension != dimension));
+        if needs_rebuild {
+            let _ = app.emit("embedding.index_phase", "building");
+            let generation = catalog.rebuild_vector_generation(&model_artifact_id, dimension)?;
+            if generation.status != "active"
+                || generation.dimension != dimension
+                || generation.item_count == 0
+                || generation.coverage < 0.999_999
+            {
+                return Err(AppError::new(
+                    "VECTOR_INDEX_INCOMPLETE",
+                    "新语义索引未覆盖当前全部有效分块，未切换活动 Embedding",
+                    true,
+                ));
+            }
+            let _ = app.emit("embedding.index_phase", "active");
+            let _ = app.emit("embedding.index_changed", generation);
+        } else if searchable_chunks > 0 {
+            let generation = existing_generation.ok_or_else(|| {
+                AppError::new(
+                    "VECTOR_INDEX_INCOMPLETE",
+                    "新语义索引尚未建立，未切换活动 Embedding",
+                    true,
+                )
+            })?;
+            if generation.dimension != dimension
+                || generation.item_count == 0
+                || generation.coverage < 0.999_999
+            {
+                return Err(AppError::new(
+                    "VECTOR_INDEX_INCOMPLETE",
+                    "新语义索引尚未通过覆盖率校验，未切换活动 Embedding",
+                    true,
+                ));
+            }
+        }
+        Ok(true)
+    })();
+
+    match result {
+        Ok(true) => {
+            if let Some(pending) = pending {
+                match models.complete_embedding_activation(&pending.artifact_id, pending.dimension)
+                {
+                    Ok(completed) => {
+                        finalize_embedding_download(app, &models, &completed);
+                        if let Ok(state) = model_state_from_manager(&models, Some(catalog)) {
+                            let _ = app.emit("model.state", state);
+                        }
+                    }
+                    Err(error) => {
+                        record_embedding_activation_failure(
+                            app,
+                            catalog,
+                            &models,
+                            Some(&pending),
+                            &error,
+                        );
+                    }
                 }
             }
-        };
-        if should_continue {
-            thread::sleep(std::time::Duration::from_millis(250));
-            spawn_embed_pending(app, catalog);
         }
-    });
+        Ok(false) => {}
+        Err(error) => {
+            let _ = app.emit("embedding.index_phase", "fallback");
+            record_embedding_activation_failure(app, catalog, &models, pending.as_ref(), &error);
+        }
+    }
+}
+
+fn record_embedding_activation_failure(
+    app: &AppHandle,
+    catalog: &CatalogService,
+    models: &ModelManager,
+    pending: Option<&PendingEmbeddingActivation>,
+    error: &AppError,
+) {
+    let mut download_failed = false;
+    if let Some(pending) = pending {
+        let _ = models.fail_embedding_activation(&pending.artifact_id, error);
+        if let Some(job_id) = pending.download_job_id
+            && let Ok(mut job) = models.download_job(&job_id)
+        {
+            download_failed = true;
+            job.status = "failed".into();
+            job.phase = "failed".into();
+            job.bytes_per_second = 0;
+            job.eta_seconds = None;
+            job.error = Some(error.clone());
+            if let Ok(job) = models.update_download_job(&job) {
+                emit_download_state(app, &job);
+            }
+        }
+    }
+    let _ = app.emit("embedding.failed", error.clone());
+    if download_failed {
+        let _ = app.emit("model.download_failed", error.clone());
+    }
+    if let Ok(state) = model_state_from_manager(models, Some(catalog)) {
+        let _ = app.emit("model.state", state);
+    }
+}
+
+fn finalize_embedding_download(
+    app: &AppHandle,
+    models: &ModelManager,
+    completed: &PendingEmbeddingActivation,
+) {
+    if let Some(job_id) = completed.download_job_id
+        && let Ok(mut job) = models.download_job(&job_id)
+    {
+        job.status = "completed".into();
+        job.phase = "completed".into();
+        job.current_file = None;
+        job.bytes_per_second = 0;
+        job.eta_seconds = Some(0);
+        job.error = None;
+        for file in &mut job.files {
+            file.status = "completed".into();
+            file.downloaded_bytes = file.total_bytes;
+        }
+        if let Ok(job) = models.update_download_job(&job) {
+            emit_download_state(app, &job);
+            let _ = app.emit("model.download_completed", &job);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use remin_core::{
+        AnswerClaim, AnswerSourceFile, EvidenceRef, GroundingStatus, SourceLocator, SupportStatus,
+    };
 
     #[cfg(windows)]
     #[test]
@@ -2092,6 +4550,101 @@ mod tests {
         assert_eq!(
             environment_degradation(&core).map(|value| value.0),
             Some(DegradationLevel::Core)
+        );
+    }
+
+    #[test]
+    fn vision_description_requires_structured_bounded_json() {
+        let parsed = parse_vision_description(
+            r#"```json
+            {"summary":"柱状图显示收入增长","visible_text":"收入 128 万元","keywords":["收入","增长"],"entities":["第二季度"],"chart_summary":"第二季度最高"}
+            ```"#,
+        )
+        .expect("parse fenced vision JSON");
+        assert_eq!(parsed.summary, "柱状图显示收入增长");
+        assert_eq!(parsed.keywords, vec!["收入", "增长"]);
+        assert_eq!(
+            parse_vision_description(r#"{"summary":""}"#)
+                .expect_err("empty summary must fail")
+                .code,
+            "VISION_RESPONSE_SCHEMA_INVALID"
+        );
+    }
+
+    #[test]
+    fn vision_question_answer_requires_grounded_structured_output() {
+        let parsed = parse_vision_question_answer(
+            r#"回答如下：{"answer":"图中第二季度柱形最高。","observations":["第二季度柱形高于第一季度"],"uncertainties":["纵轴单位看不清"]}"#,
+        )
+        .expect("parse bounded image answer");
+        assert_eq!(parsed.answer, "图中第二季度柱形最高。");
+        assert_eq!(parsed.observations.len(), 1);
+        assert_eq!(parsed.uncertainties, vec!["纵轴单位看不清"]);
+        assert_eq!(
+            parse_vision_question_answer(r#"{"answer":""}"#)
+                .expect_err("empty image answer must fail")
+                .code,
+            "VISION_RESPONSE_SCHEMA_INVALID"
+        );
+    }
+
+    #[test]
+    fn rerank_scores_reorder_claims_and_update_all_citations() {
+        let first_file = Uuid::now_v7();
+        let second_file = Uuid::now_v7();
+        let claim = |file_id, text: &str| AnswerClaim {
+            claim_id: Uuid::now_v7(),
+            text: text.into(),
+            support_status: SupportStatus::Supported,
+            citations: vec![EvidenceRef {
+                evidence_id: Uuid::now_v7(),
+                file_id,
+                revision_id: Uuid::now_v7(),
+                node_id: Uuid::now_v7(),
+                chunk_id: Uuid::now_v7(),
+                image_asset_id: None,
+                quote: text.into(),
+                locator: SourceLocator::default(),
+                retrieval_score: 0.0,
+            }],
+        };
+        let mut result = AnswerResult {
+            session_id: Uuid::now_v7(),
+            message_id: Uuid::now_v7(),
+            answer: String::new(),
+            grounding_status: GroundingStatus::Grounded,
+            insufficient_evidence: false,
+            claims: vec![claim(first_file, "低相关"), claim(second_file, "高相关")],
+            source_files: vec![
+                AnswerSourceFile {
+                    file_id: first_file,
+                    display_name: "低相关.txt".into(),
+                    canonical_path: "资料/低相关.txt".into(),
+                },
+                AnswerSourceFile {
+                    file_id: second_file,
+                    display_name: "高相关.txt".into(),
+                    canonical_path: "资料/高相关.txt".into(),
+                },
+            ],
+            used_file_ids: vec![first_file, second_file],
+            elapsed_ms: 1,
+            answer_mode: "extractive".into(),
+            retrieval_channels: vec!["fts".into()],
+            index_coverage: 1.0,
+            degradation_reason: None,
+        };
+
+        apply_rerank_scores(&mut result, &[0.1, 0.9]).expect("apply valid rerank scores");
+
+        assert_eq!(result.claims[0].text, "高相关");
+        assert_eq!(result.claims[0].citations[0].retrieval_score, 0.9);
+        assert_eq!(result.claims[1].citations[0].retrieval_score, 0.1);
+        assert_eq!(
+            apply_rerank_scores(&mut result, &[f32::NAN])
+                .expect_err("invalid score count and value must fail")
+                .code,
+            "RERANK_OUTPUT_INVALID"
         );
     }
 }

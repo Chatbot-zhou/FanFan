@@ -15,6 +15,7 @@ def recognize_with_windows(
     max_pages: int | None,
     language_hints: tuple[str, ...],
     page_numbers: list[int] | None = None,
+    render_pages_dir: Path | None = None,
 ) -> tuple[dict[str, Any] | None, WorkerError | None]:
     if os.name != "nt":
         return None, WorkerError("OCR_RUNTIME_UNAVAILABLE", "Windows OCR只在Windows桌面版可用", False)
@@ -30,28 +31,34 @@ def recognize_with_windows(
         return None, WorkerError("OCR_INPUT_INVALID", "OCR页码超出本次文档范围", False)
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     before = source_path.stat()
+    command = [
+        "powershell.exe",
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(script_path),
+        "-SourcePath",
+        str(source_path),
+        "-SourceKind",
+        source_kind,
+        "-MaxPages",
+        str(page_limit),
+        "-LanguageTag",
+        language,
+        "-PageNumbers",
+        ",".join(str(page) for page in selected_pages),
+    ]
+    if render_pages_dir is not None:
+        if source_kind != "pdf":
+            return None, WorkerError("OCR_INPUT_INVALID", "只有PDF OCR可以请求页面渲染缓存", False)
+        render_pages_dir.mkdir(parents=True, exist_ok=True)
+        command.extend(["-AssetCacheDir", str(render_pages_dir)])
     try:
         completed = subprocess.run(
-            [
-                "powershell.exe",
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(script_path),
-                "-SourcePath",
-                str(source_path),
-                "-SourceKind",
-                source_kind,
-                "-MaxPages",
-                str(page_limit),
-                "-LanguageTag",
-                language,
-                "-PageNumbers",
-                ",".join(str(page) for page in selected_pages),
-            ],
+            command,
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -78,4 +85,57 @@ def recognize_with_windows(
     lines = result.get("lines")
     if not isinstance(lines, list):
         return None, WorkerError("OCR_RESPONSE_INVALID", "Windows OCR响应缺少文本行", False)
+    if render_pages_dir is not None:
+        try:
+            result["rendered_pages"] = _validated_rendered_pages(
+                result.get("rendered_pages"), render_pages_dir, set(selected_pages)
+            )
+        except (OSError, ValueError) as error:
+            return None, WorkerError("OCR_RESPONSE_INVALID", str(error), False)
     return result, None
+
+
+def _validated_rendered_pages(
+    value: Any,
+    render_pages_dir: Path,
+    selected_pages: set[int],
+) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise ValueError("Windows OCR响应缺少扫描页渲染清单")
+    root = render_pages_dir.resolve(strict=True)
+    output: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("扫描页渲染记录必须是对象")
+        page_no = item.get("page_no")
+        raw_path = item.get("path")
+        if (
+            not isinstance(page_no, int)
+            or page_no not in selected_pages
+            or page_no in seen
+            or not isinstance(raw_path, str)
+        ):
+            raise ValueError("扫描页渲染页码或路径无效")
+        candidate = Path(raw_path)
+        if candidate.is_symlink():
+            raise ValueError("扫描页渲染缓存不得是符号链接")
+        resolved = candidate.resolve(strict=True)
+        try:
+            resolved.relative_to(root)
+        except ValueError as error:
+            raise ValueError("扫描页渲染缓存超出应用临时目录") from error
+        metadata = resolved.stat()
+        if (
+            not resolved.is_file()
+            or resolved.suffix.lower() != ".png"
+            or metadata.st_size == 0
+            or metadata.st_size > 64 * 1024 * 1024
+        ):
+            raise ValueError("扫描页渲染缓存格式或大小无效")
+        seen.add(page_no)
+        output.append({"page_no": page_no, "path": str(resolved), "mime_type": "image/png"})
+    if seen != selected_pages:
+        raise ValueError("扫描页渲染清单与OCR页码不一致")
+    output.sort(key=lambda item: item["page_no"])
+    return output

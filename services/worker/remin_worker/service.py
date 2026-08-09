@@ -5,6 +5,7 @@ from pathlib import Path
 from .protocol import WorkerError, WorkerRequest, WorkerResponse
 from .parsing import ParseRequest, parse_document
 from .embedding import encode_texts
+from .reranking import rerank_documents
 from .exporting import export_table
 
 
@@ -32,6 +33,14 @@ class WorkerService:
             )
         if request.operation == "embedding.encode":
             result, error = encode_texts(request.payload)
+            return WorkerResponse(
+                request_id=request.request_id,
+                ok=error is None,
+                result=result,
+                error=error,
+            )
+        if request.operation == "rerank.score":
+            result, error = rerank_documents(request.payload)
             return WorkerResponse(
                 request_id=request.request_id,
                 ok=error is None,
