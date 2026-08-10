@@ -11,8 +11,8 @@ use crate::AppError;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemePreference {
-    #[default]
     System,
+    #[default]
     DayGradient,
     NightDark,
 }
@@ -114,13 +114,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn system_theme_follows_windows_and_manual_choice_persists() {
+    fn default_is_day_gradient_and_system_follows_windows() {
         let directory = tempfile::tempdir().expect("tempdir");
         let service = ThemeService::new(directory.path());
+        // 默认应为白天渐变
         assert_eq!(
             service.get_state(false).expect("default").effective_theme,
             EffectiveTheme::DayGradient
         );
+        assert_eq!(
+            service.get_state(false).expect("default").preference,
+            ThemePreference::DayGradient
+        );
+        // 手动切换到跟随系统后，应跟随 Windows 设置
+        service
+            .set_preference(ThemePreference::System, true)
+            .expect("switch to system");
         assert_eq!(
             service
                 .get_state(true)
@@ -128,6 +137,14 @@ mod tests {
                 .effective_theme,
             EffectiveTheme::NightDark
         );
+        assert_eq!(
+            service
+                .get_state(false)
+                .expect("system light")
+                .effective_theme,
+            EffectiveTheme::DayGradient
+        );
+        // 手动选择白天后，系统暗色不生效
         service
             .set_preference(ThemePreference::DayGradient, true)
             .expect("persist manual theme");

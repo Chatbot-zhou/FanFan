@@ -206,7 +206,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
 .image-deep-analysis small { color: var(--muted); }
 .collection-create > .primary-button { justify-self: end; align-self: end; }
 .collection-create .inline-error { grid-column: 1/-1; }
-.ai-suggestions { margin: -8px 0 24px; padding: 18px; border: 1px solid #d9d3ee; border-radius: 16px; background: linear-gradient(135deg,#faf9ff,#fff); }.ai-suggestions > header { margin-bottom: 12px; display: flex; justify-content: space-between; align-items: flex-start; }.ai-suggestions h2,.ai-suggestions h3 { margin: 0; }.ai-suggestions header p { margin: 5px 0 0; color: var(--muted); font-size: 12px; }.ai-suggestions > article { padding: 15px 0; display: grid; grid-template-columns: minmax(230px,1fr) minmax(320px,1.7fr); gap: 14px 20px; border-top: 1px solid var(--line); }.ai-suggestion__summary input { width: 100%; height: 36px; padding: 0 10px; border: 1px solid #8d84ca; border-radius: 9px; }.ai-suggestion__summary p { margin: 7px 0; color: #5d5c68; font-size: 12px; line-height: 1.55; }.ai-suggestion__summary small { color: #817c90; }.ai-suggestion__members { display: grid; gap: 6px; }.ai-suggestion__members label { padding: 8px 10px; display: flex; align-items: center; gap: 9px; border-radius: 9px; background: #f6f4fb; }.ai-suggestion__members label.excluded { opacity: .5; }.ai-suggestion__members span { min-width: 0; display: flex; flex-direction: column; gap: 3px; }.ai-suggestion__members small { color: var(--muted); }.ai-suggestion__actions { grid-column: 1/-1; display: flex; justify-content: flex-end; gap: 8px; }.ai-suggestion__actions button { min-height: 34px; padding: 0 12px; border: 1px solid var(--line); border-radius: 9px; background: #fff; cursor: pointer; }
+.ai-suggestions { margin: -8px 0 24px; padding: 18px; border: 1px solid #d9d3ee; border-radius: 16px; background: linear-gradient(135deg,#faf9ff,#fff); }.ai-suggestions > header { margin-bottom: 12px; display: flex; justify-content: space-between; align-items: flex-start; }.ai-suggestions h2,.ai-suggestions h3 { margin: 0; }.ai-suggestions header p { margin: 5px 0 0; color: var(--muted); font-size: 12px; }.ai-suggestions > article { padding: 15px 0; display: grid; grid-template-columns: minmax(230px,1fr) minmax(320px,1.7fr); gap: 14px 20px; border-top: 1px solid var(--line); }.ai-suggestion__summary input { width: 100%; height: 36px; padding: 0 10px; border: 1px solid #8d84ca; border-radius: 9px; }.ai-suggestion__summary p { margin: 7px 0; color: #5d5c68; font-size: 12px; line-height: 1.55; }.ai-suggestion__summary small { color: #817c90; }.ai-suggestion__members { display: grid; gap: 6px; }.ai-suggestion__members label { padding: 8px 10px; display: flex; align-items: center; gap: 9px; border-radius: 9px; background: #f6f4fb; }.ai-suggestion__members label.excluded { opacity: .5; }.ai-suggestion__members span { min-width: 0; display: flex; flex-direction: column; gap: 3px; }.ai-suggestion__members small { color: var(--muted); }.ai-suggestion__actions { grid-column: 1/-1; display: flex; justify-content: flex-end; gap: 8px; }.ai-suggestion__actions button { min-height: 34px; padding: 0 12px; border: 1px solid var(--line); border-radius: 9px; background: #fff; color: var(--ink); cursor: pointer; }.ai-suggestion__actions button.primary-button { background: #5a53bb; color: #fff; border: 0; }.ai-suggestion__actions button.danger-button { background: #fff; color: #ad4654; }
 .collection-detail { margin-top: 22px; padding: 19px; border: 1px solid var(--line); border-radius: 15px; background: rgba(255,255,255,.72); }
 .collection-detail header { display: flex; align-items: center; justify-content: space-between; }
 .collection-detail h2 { margin: 0 0 12px; font-size: 17px; }
@@ -369,20 +369,269 @@ html[data-theme="night_dark"] .welcome-screen { background: radial-gradient(circ
 html[data-theme="night_dark"] .welcome-copy h1 { color: #fff; text-shadow: 0 6px 24px rgba(0,0,0,.7); }
 html[data-theme="night_dark"] .authorization-page { background: radial-gradient(circle at 20% 90%,rgba(36,83,119,.25),transparent 38%),radial-gradient(circle at 82% 20%,rgba(120,42,73,.22),transparent 36%),#07080b; }
 html[data-theme="night_dark"] .authorization-card__mark { color: #ddd9ff; background: linear-gradient(135deg,#172a3a,#292040,#3b1e2a); }
-html[data-theme="night_dark"] :is(.content-card,.metric-card,.search-result,.search-page__form,.conversation-item,.composer,.collection-card,.ai-suggestions,.file-select-table,.collection-detail,.settings-content section,.current-model,.model-roles,.model-roles article,.import-panel,.edition-grid>button,.install-plan,.model-job,.authorization-card) { color: var(--ink); border-color: var(--line); background: var(--surface); }
+
+/* 全局输入控件 */
 html[data-theme="night_dark"] :is(input,textarea,select) { color: var(--ink); background-color: transparent; }
-html[data-theme="night_dark"] :is(.settings-actions button,.setting-row button,.theme-options button,.model-job__actions button,.plan-actions>button:not(.primary-button),.search-result__actions button,.load-more-button,.rag-readiness button,.authorization-actions button) { color: var(--ink); border-color: var(--line); background: #121318; }
-html[data-theme="night_dark"] :is(.scope-bar,.search-filters label,.search-result__preview,.preview-panel,.candidate-source,.ai-suggestions,.rag-readiness,.readonly-note,.metric-strip span,.health-list>div) { color: var(--ink); border-color: var(--line); background: #101116; }
-html[data-theme="night_dark"] :is(.home-hero h1,.page-heading h1,.page-empty h2,.search-result h2,.content-card h2,.settings-content h2,.conversation-item strong,.authorization-card h1) { color: #fff; }
-html[data-theme="night_dark"] :is(.search-result p,.metric-card small,.ai-suggestion__summary p) { color: #d1d2da; }
-html[data-theme="night_dark"] .model-prompt,html[data-theme="night_dark"] .model-download-pill { color: #fff; border-color: var(--line); background: rgba(18,19,24,.82); }
-html[data-theme="night_dark"] .answer-keyword { background: rgba(178,132,212,.38); color: #fff; }
-html[data-theme="night_dark"] .model-ready { color: #bdebd2; background: rgba(38,93,63,.48); }
+
+/* 白色背景容器 → 暗色 */
+html[data-theme="night_dark"] :is(
+  .content-card,.metric-card,.search-result,.search-page__form,
+  .collection-card,.ai-suggestions,.file-select-table,.collection-detail,
+  .settings-content section,.current-model,.model-roles,.model-roles article,
+  .import-panel,.edition-grid>button,.install-plan,.model-job,.authorization-card,
+  .inbox-item,.root-table,.root-table__row,.managed-models,.relation-panel,
+  .task-plan-card,.library-files,.extraction-result,.answer-card,
+  .collection-create,.device-summary,.candidate-source,
+  .collection-members--virtual,.file-select-table--virtual
+) {
+  color: var(--ink);
+  border-color: var(--line);
+  background: var(--surface);
+}
+
+/* 输入搜索框 */
+html[data-theme="night_dark"] :is(.hero-search,.search-page__form,.ask-composer) {
+  background: var(--surface);
+  border-color: var(--line);
+}
+html[data-theme="night_dark"] .hero-search input::placeholder,
+html[data-theme="night_dark"] .ask-composer textarea::placeholder { color: #6e6f7b; }
+
+/* 按钮 */
+html[data-theme="night_dark"] :is(
+  .settings-actions button,.setting-row button,.theme-options button,
+  .model-job__actions button,.plan-actions>button:not(.primary-button),
+  .search-result__actions button,.load-more-button,.rag-readiness button,
+  .authorization-actions button,.collection-add-file select,.collection-create input,
+  .collection-create select,.import-panel__actions>button:not(.primary-button),
+  .import-candidates select,.managed-models article button,.inbox-item button,
+  .scan-controls button,.model-methods>button,.source-options label,
+  .candidate-source button,.ai-suggestion__actions button:not(.primary-button):not(.danger-button),
+  .relation-list .relation-actions button,.search-filters label
+) {
+  color: var(--ink);
+  border-color: var(--line);
+  background: #121318;
+}
+
+/* 浅色面板 → 深色 */
+html[data-theme="night_dark"] :is(
+  .scope-bar,.search-filters label,.search-result__preview,
+  .candidate-source,.ai-suggestions,.rag-readiness,.readonly-note,
+  .metric-strip span,.health-list>div,.ai-suggestion__members label,
+  .collection-add-file,.collection-create__rules .collection-rule-exclusions,
+  .answer-preview,.processing-bar,.root-table__head,.model-roles,
+  .inline-notice,.conversation-empty,.import-candidates article,
+  .extraction-table-wrap thead th,.log-list,.relation-summary
+) {
+  color: var(--ink);
+  border-color: var(--line);
+  background: #101116;
+}
+
+/* 标题 */
+html[data-theme="night_dark"] :is(
+  .home-hero h1,.page-heading h1,.page-empty h2,.search-result h2,
+  .content-card h2,.settings-content h2,.authorization-card h1,
+  .answer-card>header,.conversation-empty h2,.collection-card h2
+) { color: #fff; }
+
+/* 标题栏元素 */
+html[data-theme="night_dark"] :is(.model-prompt,.model-download-pill) {
+  color: #fff;
+  border-color: var(--line);
+  background: rgba(18,19,24,.82);
+}
+html[data-theme="night_dark"] .model-prompt button { color: #cfcee4; }
+html[data-theme="night_dark"] .model-prompt button:hover { color: #aaa3ff; }
+
+/* 文本颜色 */
+html[data-theme="night_dark"] :is(.search-result p,.metric-card small,.ai-suggestion__summary p,
+  .page-heading p,.inbox-item p,.answer-card__text,.collection-card p,.answer-claims section p,
+  .model-roles>p,.edition-grid p,.settings-content p,.candidate-panel p,.relation-panel p,
+  .library-files header p,.extraction-result header p,.collection-create>label,
+  .collection-create legend,.inbox-item__state,.root-table__row>span:first-child small,
+  .inline-notice,.device-summary small,.import-candidates small,.managed-models small,
+  .model-roles article small,.install-plan dt,.search-status,.search-status span:first-child,
+  .collection-card h2 small,.answer-card>header small,.inbox-item small,
+  .collection-detail>button small,.relation-list small
+) { color: #c7c8d2; }
+html[data-theme="night_dark"] .search-status span:first-child { color: #e0e0e8; }
+html[data-theme="night_dark"] .inbox-item h2 strong { color: #e0e0e8; }
+
+/* 链接/强调色 */
+html[data-theme="night_dark"] :is(
+  .card-link,.primary-button:hover,.scope-bar select,
+  .search-filters select,.sidebar-item--active,.collection-card strong,
+  .inbox-item button,.candidate-source button:first-of-type,
+  .search-result__actions button,.relation-list .relation-actions button,
+  .managed-models article button,.ai-suggestion__actions button:not(.primary-button):not(.danger-button),
+  .import-panel__actions>.primary-button,.model-methods>button:hover
+) { color: #bab5ff; }
+html[data-theme="night_dark"] .primary-button { background: #6b63c9; color: #fff; }
+html[data-theme="night_dark"] .text-button { color: #b0afbd; }
+
+/* 高亮圆环 */
 html[data-theme="night_dark"] .progress-ring>div { background: #111218; }
+html[data-theme="night_dark"] .progress-ring { background: conic-gradient(#7a6ff0 var(--progress),#1f1b32 0); }
+
+/* PDF 预览 */
 html[data-theme="night_dark"] .pdf-preview { background: #15161b; }
 html[data-theme="night_dark"] .pdf-preview>header { background: #101116; }
 html[data-theme="night_dark"] .preview-node--anchor { border-left-color: #ff9acb; background: rgba(128,54,96,.34); }
 html[data-theme="night_dark"] .pdf-preview__highlight { border-color: #cba2ff; background: rgba(172,112,245,.31); box-shadow: 0 0 0 2px rgba(7,8,11,.7); }
+
+/* 状态/通知 */
 html[data-theme="night_dark"] .startup-notice { color: #ffe2a8; border-color: #765b2d; background: #211b10; }
 html[data-theme="night_dark"] .inline-success { color: #b7edcf; border-color: #316346; background: #102419; }
 html[data-theme="night_dark"] .inline-error { color: #ffc6cc; border-color: #763f47; background: #2a1216; }
+html[data-theme="night_dark"] .model-ready { color: #bdebd2; background: rgba(38,93,63,.48); }
+html[data-theme="night_dark"] .model-download-pill--failed { border-color: #8f4750; background: #201214; }
+html[data-theme="night_dark"] .model-download-pill--paused { background: #1f1a0e; }
+html[data-theme="night_dark"] .model-job--failed { border-color: #8f4750; background: #1a1012; }
+html[data-theme="night_dark"] .model-job--completed { border-color: #316346; background: #0f1e17; }
+html[data-theme="night_dark"] .inline-notice { color: #cbc4f0; }
+
+/* 关键词高亮 */
+html[data-theme="night_dark"] .answer-keyword { background: rgba(178,132,212,.38); color: #fff; }
+
+/* badge / 标签 */
+html[data-theme="night_dark"] .sidebar-item__badge { background: #4c2e3a; color: #f0b8c8; }
+html[data-theme="night_dark"] .edition-badge { background: #252046; color: #bab5ff; }
+html[data-theme="night_dark"] .collection-card h2 small { background: #252046; color: #bab5ff; }
+html[data-theme="night_dark"] .inbox-item__tags span { background: #252046; color: #bab5ff; }
+html[data-theme="night_dark"] .source-options em { background: #142e22; color: #87d6b0; }
+
+/* 扫描控制 */
+html[data-theme="night_dark"] .scan-controls button { color: #bab5ff; background: #15131f; border-color: var(--line); }
+html[data-theme="night_dark"] .candidate-panel { background: linear-gradient(120deg,rgba(25,30,48,.7),rgba(30,20,38,.7)); }
+html[data-theme="night_dark"] .candidate-source__icon { background: #1e1c2e; }
+
+/* 集合图标色 */
+html[data-theme="night_dark"] .collection-row__icon { background: #1e1c2e; }
+html[data-theme="night_dark"] .collection-card__icon { background: #1e1c2e; }
+
+/* Ant Design 下拉弹窗 (portal) */
+html[data-theme="night_dark"] .ant-select-dropdown {
+  background: #16171e;
+  border-color: var(--line);
+}
+html[data-theme="night_dark"] .ant-select-item {
+  color: var(--ink);
+}
+html[data-theme="night_dark"] .ant-select-item-option-selected {
+  background: rgba(169,162,255,.15) !important;
+}
+html[data-theme="night_dark"] .ant-select-item-option-active {
+  background: rgba(255,255,255,.06) !important;
+}
+
+/* antd popover/modal */
+html[data-theme="night_dark"] .ant-modal-content {
+  background: #14151c;
+  color: var(--ink);
+}
+html[data-theme="night_dark"] .ant-modal-header {
+  background: #14151c;
+  border-bottom-color: var(--line);
+}
+html[data-theme="night_dark"] .ant-modal-title { color: #fff; }
+
+/* 滚动条 */
+html[data-theme="night_dark"] .workspace { scrollbar-color: #2a2940 transparent; }
+
+/* 表格 */
+html[data-theme="night_dark"] .root-table { background: var(--surface); }
+html[data-theme="night_dark"] .root-table__head { background: #101116; }
+html[data-theme="night_dark"] .extraction-table-wrap { background: var(--surface); }
+html[data-theme="night_dark"] .extraction-table-wrap th { background: #101116; }
+html[data-theme="night_dark"] .extraction-table-wrap td.needs-review { background: #201a0e; }
+html[data-theme="night_dark"] .extraction-table-wrap details p { color: #b7b4c4; }
+
+/* 搜索页面特定 */
+html[data-theme="night_dark"] .search-page__form button { background: #6b63c9; color: #fff; }
+html[data-theme="night_dark"] .source-locator { color: #b0a9f0 !important; }
+html[data-theme="night_dark"] .match-reasons { color: #b0a9f0; }
+html[data-theme="night_dark"] .file-icon--word { color: #6ea4ff; }
+html[data-theme="night_dark"] .file-icon--pdf { color: #ff7b83; }
+html[data-theme="night_dark"] .file-icon--excel { color: #4dca7a; }
+html[data-theme="night_dark"] .file-icon--folder { color: #f5c859; }
+
+/* 问答页面 */
+html[data-theme="night_dark"] .conversation-empty__mark { color: #ddd8ff; background: linear-gradient(135deg,#1e2d3e,#292044,#3b1e2c); }
+html[data-theme="night_dark"] .answer-claims { border-top-color: var(--line); }
+html[data-theme="night_dark"] .answer-claims button { color: #bab5ff; background: #14121e; border-color: var(--line); }
+html[data-theme="night_dark"] .image-deep-analysis-button { color: #bab5ff; }
+html[data-theme="night_dark"] .answer-citation--image { color: #bab5ff; }
+
+/* 收件箱 */
+html[data-theme="night_dark"] .inbox-tabs button.active { border-bottom-color: #7a71d4; color: #bab5ff; }
+html[data-theme="night_dark"] .inbox-item__icon { background: #181e2c; color: #7ba0e0; }
+html[data-theme="night_dark"] .inbox-item__icon--suggestion { background: #221c32; color: #a086d6; }
+html[data-theme="night_dark"] .inbox-item__icon--failed,.inbox-item__icon--parse_failed,.inbox-item__icon--ocr_required { background: #281218; color: #e8808b; }
+
+/* 设置 */
+html[data-theme="night_dark"] .settings-nav button.active { background: #1c1a2e; color: #bab5ff; }
+html[data-theme="night_dark"] .health-list i { background: #4dba7a; }
+html[data-theme="night_dark"] .health-list .health-warning i { background: #e1a545; }
+html[data-theme="night_dark"] .health-list .health-failed i { background: #e8707c; }
+html[data-theme="night_dark"] .status-dot { background: #4dba7a; }
+html[data-theme="night_dark"] .status-dot--scanning { background: #7a71d4; }
+
+/* 模型设置 */
+html[data-theme="night_dark"] .model-methods>button>span { background: #1c1a2e; color: #aaa3ff; }
+html[data-theme="night_dark"] .model-roles article span { color: #aaa3ff; }
+html[data-theme="night_dark"] .edition-grid>button.selected { border-color: #7a71d4; background: #12101f; }
+html[data-theme="night_dark"] .import-panel { border-color: #2a2848; }
+html[data-theme="night_dark"] .import-panel>.anticon { color: #aaa3ff; }
+html[data-theme="night_dark"] .import-panel small { color: #6e6e7c; }
+
+/* 任务计划 */
+html[data-theme="night_dark"] .task-plan-card li>i { background: #1e1c2e; color: #aaa3ff; }
+html[data-theme="night_dark"] .collection-add-file { background: #101015; }
+html[data-theme="night_dark"] .collection-create__rules .collection-rule-exclusions legend { color: #b7b4c4; }
+
+/* 主题选择器 */
+html[data-theme="night_dark"] .theme-options button.selected { border-color: #7a71d4; box-shadow: inset 0 0 0 1px #7a71d4; }
+
+/* Ask 文本区 */
+html[data-theme="night_dark"] .ask-composer button { background: #6b63c9; color: #fff; }
+html[data-theme="night_dark"] .ask-composer button:disabled { background: #2a2935; }
+
+/* 排除规则 */
+html[data-theme="night_dark"] .exclusion-rule-editor select,
+html[data-theme="night_dark"] .exclusion-rule-editor input { color: var(--ink); background: #121318; border-color: var(--line); }
+
+/* 索引数据与背景 */
+html[data-theme="night_dark"] .answer-card { border-color: var(--line); background: var(--surface); }
+html[data-theme="night_dark"] .answer-card>header { color: #bab5ff; }
+html[data-theme="night_dark"] .back-button { background: var(--surface); }
+
+/* 设置页危险按钮 */
+html[data-theme="night_dark"] .setting-row .danger-button { color: #e8808b; }
+
+/* 兜底：所有按钮和白底元素 */
+html[data-theme="night_dark"] button:not(.primary-button):not(.window-control):not(.sidebar-item):not(.model-ready):not(.model-download-pill) {
+  color: var(--ink);
+}
+html[data-theme="night_dark"] :is(
+  .back-button,
+  .import-panel__actions > button:not(.primary-button),
+  .relation-list .relation-actions button,
+  .collection-create input,
+  .collection-create select,
+  .import-candidates select,
+  .source-options label,
+  .processing-bar select,
+  .export-bar select,
+  .scan-controls button,
+  .exclusion-rule-editor select,
+  .exclusion-rule-editor input
+) {
+  background: #121318;
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+/* PDF canvas 保持白色（这是真实渲染的文档页面） */
+html[data-theme="night_dark"] .pdf-preview__page canvas { background: white; }

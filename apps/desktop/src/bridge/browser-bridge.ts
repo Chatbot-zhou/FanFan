@@ -244,7 +244,7 @@ export const browserBridge: ReminBridge = {
     return state;
   },
   async theme_get_state(system_dark) {
-    const preference = (window.localStorage.getItem(THEME_KEY) as ThemePreference | null) ?? "system";
+    const preference = (window.localStorage.getItem(THEME_KEY) as ThemePreference | null) ?? "day_gradient";
     return { preference, effective_theme: preference === "night_dark" || (preference === "system" && system_dark) ? "night_dark" : "day_gradient", updated_at: null };
   },
   async theme_set_preference(preference, system_dark) {

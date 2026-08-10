@@ -17,8 +17,8 @@ const resolveEffective = (preference: ThemePreference, dark: boolean): Effective
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<ThemeState>(() => ({
-    preference: "system",
-    effective_theme: resolveEffective("system", systemDark()),
+    preference: "day_gradient",
+    effective_theme: "day_gradient",
     updated_at: null,
   }));
 

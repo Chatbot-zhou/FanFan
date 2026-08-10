@@ -8,6 +8,82 @@ use uuid::Uuid;
 
 use crate::{AppError, EvidenceRef, ScopeFilter, SearchSession};
 
+/// 查询意图：从自然语言中提取的结构化检索参数
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QueryIntent {
+    #[serde(default)]
+    pub rewritten_query: String,
+    pub time_hint: Option<TimeHint>,
+    #[serde(default)]
+    pub extension_hints: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TimeHint {
+    pub from: String,
+    pub to: String,
+}
+
+/// 构建查询改写 prompt。只输出 JSON，不输出其他内容。
+pub fn query_understanding_prompt(query: &str, today: &str) -> (String, String) {
+    let system = "你是查询理解助手。只输出JSON，不要输出其他任何文字、解释或 markdown 标记。".into();
+    let user = format!(
+        r#"将自然语言问题转换为结构化检索参数。只输出JSON：
+{{"rewritten_query":"核心关键词","time_hint":null或{{"from":"YYYY-MM-DD","to":"YYYY-MM-DD"}},"extension_hints":["docx","pdf"]}}
+- rewritten_query: 去除口语词（"那个""在哪里""帮我找"），保留核心检索关键词
+- time_hint: 解析时间指代（"去年""上个月""2025年"），以当前日期 {today} 为基准，仅当明确时才设置
+- extension_hints: 用户提到的文件格式（"word文档"→docx,"excel表格"→xlsx,"ppt"→pptx,"pdf"→pdf）
+若查询已经是关键词则照写 rewritten_query，未提及的字段用 null 或空数组。
+
+查询：{query}"#,
+        today = today,
+        query = query
+    );
+    (system, user)
+}
+
+/// 解析生成模型返回的 JSON 为 QueryIntent，失败时用原始查询回退
+pub fn parse_query_intent(raw: &str, fallback_query: &str) -> QueryIntent {
+    let trimmed = raw.trim();
+    // 去除可能的 markdown 代码块包裹
+    let json = trimmed
+        .strip_prefix("```json")
+        .and_then(|s| s.strip_suffix("```"))
+        .map(str::trim)
+        .or_else(|| trimmed.strip_prefix("```").and_then(|s| s.strip_suffix("```")).map(str::trim))
+        .unwrap_or(trimmed);
+    let mut intent: QueryIntent = serde_json::from_str(json).unwrap_or_else(|_| QueryIntent {
+        rewritten_query: String::new(),
+        time_hint: None,
+        extension_hints: Vec::new(),
+    });
+    if intent.rewritten_query.trim().is_empty() {
+        intent.rewritten_query = fallback_query.to_owned();
+    }
+    // 校验时间格式基本合法
+    if let Some(ref hint) = intent.time_hint {
+        if hint.from.len() != 10 || hint.to.len() != 10 {
+            intent.time_hint = None;
+        }
+    }
+    intent
+}
+
+/// 判断查询是否需要自然语言理解
+pub fn is_natural_language_query(query: &str) -> bool {
+    let nl_patterns = [
+        Regex::new(r"去[年天]|上个?[月周]|前[几些]|最[近新]|这[个些]|那[个些]").unwrap(),
+        Regex::new(r"在哪里|找一?[下个]|帮我|有没有|什么是|如何|怎么|什么时[候间]").unwrap(),
+        Regex::new(r"[，。！？,\.!\?]").unwrap(),
+    ];
+    let trimmed = query.trim();
+    // 纯关键词通常短且无标点
+    if trimmed.chars().count() <= 4 && !nl_patterns[2].is_match(trimmed) {
+        return false;
+    }
+    nl_patterns.iter().any(|p| p.is_match(trimmed))
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AnswerStyle {

@@ -195,7 +195,7 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
 
   return (
     <section className="page page--ask">
-      <header className="page-heading"><div><h1>问资料</h1><p>回答只使用你的本地资料，并在回答中标出来源。</p></div>{turns.length > 0 && !loading && <button type="button" className="text-button" onClick={() => { setTurns([]); setAnswer(null); setPreview(null); setDeepAnalyses({}); }}>新建会话</button>}</header>
+      <header className="page-heading"><div><h1>问资料</h1><p>回答只使用你的本地资料</p></div>{turns.length > 0 && !loading && <button type="button" className="text-button" onClick={() => { setTurns([]); setAnswer(null); setPreview(null); setDeepAnalyses({}); }}>新建会话</button>}</header>
       <div className="scope-bar">
         <FileSearchOutlined /> 检索范围：
         <select aria-label="问答范围" value={knowledgeSpaceId ? `space:${knowledgeSpaceId}` : collectionId ? `collection:${collectionId}` : ""} onChange={(event) => {
@@ -215,9 +215,7 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
       </div>}
       <div className={`conversation-area${answer ? " conversation-area--answered" : ""}`}>
         {!answer && <div className="conversation-empty">
-          <div className="conversation-empty__mark">拾</div>
           <h2>从你的资料中寻找答案</h2>
-          <p>{readiness?.ready ? "使用会话历史理解追问，经混合召回、RRF 融合和逐句引文校验后显示回答。" : "不会静默退回关键词答案；只有你明确选择后才会进入证据摘录模式。"}</p>
         </div>}
         {turns.slice(0, -1).map((turn, index) => <article className={`answer-card answer-card--${turn.answer.grounding_status}`} key={`${turn.answer.session_id}-${index}`}><header><span>你：{turn.question}</span><small>{turn.answer.elapsed_ms} ms</small></header><p className="answer-card__text">{highlightQuestionTerms(turn.answer.answer, turn.question)}</p></article>)}
         {answer && <article className={`answer-card answer-card--${answer.grounding_status}`}>

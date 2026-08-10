@@ -29,7 +29,8 @@ use remin_core::{
     PendingEmbeddingActivation, PlanSkillRequest, RagReadiness, RelationPage, RelationQuery,
     RelationRefreshResult, RelationType, RerankRequest, RootRecord, ScopeFilter, SearchMode,
     SearchRequest, SearchSession, SemanticQuery, SkillDefinition, TaskExecutionResult, TaskPlan,
-    TriageStatus, WorkerClient,
+    TriageStatus, WorkerClient, is_natural_language_query, parse_query_intent,
+    query_understanding_prompt,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -3036,13 +3037,64 @@ pub fn index_rebuild(
 
 #[tauri::command(async)]
 pub fn search_start(
-    request: SearchRequest,
+    mut request: SearchRequest,
     catalog: State<'_, CatalogServiceState>,
     models: State<'_, ModelServiceState>,
     worker: State<'_, WorkerServiceState>,
+    generation: State<'_, GenerationServiceState>,
 ) -> Result<SearchSession, AppError> {
     let catalog = catalog.get()?;
     let models = models.get()?;
+    // 查询理解：将自然语言转换为结构化检索参数
+    let intent: Option<remin_core::QueryIntent> = if is_natural_language_query(&request.query) {
+        models.active_artifact(ModelRole::Generation)
+            .ok()
+            .flatten()
+            .and_then(|artifact| {
+                generation.0.lock().ok().and_then(|mut runtime| {
+                    let threads = std::thread::available_parallelism()
+                        .map(|v| v.get() as u32)
+                        .unwrap_or(2)
+                        .clamp(1, 8);
+                    let _ = runtime
+                        .activate(&artifact.local_path, 4096, threads)
+                        .or_else(|_| runtime.activate(&artifact.local_path, 2048, threads));
+                    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+                    let (system, user) = query_understanding_prompt(&request.query, &today);
+                    let cancelled = std::sync::atomic::AtomicBool::new(false);
+                    let generated: String = runtime
+                        .complete_cancellable(&system, &user, 256, &cancelled)
+                        .ok()?;
+                    Some(parse_query_intent(&generated, &request.query))
+                })
+            })
+    } else {
+        None
+    };
+    if let Some(intent) = intent {
+        request.query = intent.rewritten_query;
+        if let Some(hint) = intent.time_hint {
+            if request.scope.modified_from.is_none() {
+                request.scope.modified_from = chrono::NaiveDate::parse_from_str(&hint.from, "%Y-%m-%d")
+                    .ok()
+                    .and_then(|d| d.and_hms_opt(0, 0, 0))
+                    .map(|t| chrono::DateTime::<Utc>::from_naive_utc_and_offset(t, Utc));
+            }
+            if request.scope.modified_to.is_none() {
+                request.scope.modified_to = chrono::NaiveDate::parse_from_str(&hint.to, "%Y-%m-%d")
+                    .ok()
+                    .and_then(|d| d.and_hms_opt(23, 59, 59))
+                    .map(|t| chrono::DateTime::<Utc>::from_naive_utc_and_offset(t, Utc));
+            }
+        }
+        if !intent.extension_hints.is_empty() && request.scope.extensions.is_empty() {
+            request.scope.extensions = intent
+                .extension_hints
+                .into_iter()
+                .map(|e| e.trim_start_matches('.').to_lowercase())
+                .collect();
+        }
+    }
     if matches!(request.mode, SearchMode::Semantic | SearchMode::Hybrid)
         && let Some(artifact) = models.active_artifact(ModelRole::Embedding)?
     {

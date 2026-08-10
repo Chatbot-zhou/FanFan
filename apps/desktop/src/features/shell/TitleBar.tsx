@@ -53,7 +53,6 @@ export function TitleBar({ model_state, model_download = null, welcome = false }
           <button type="button" onClick={dismiss}>稍后</button>
         </div>
       )}
-      {!incompleteDownload && model_state?.status === "ready" && <button type="button" className="model-ready" onClick={() => navigate("model_setup")}>{fullRagReady ? "完整 RAG 已就绪" : model_state.message}</button>}
       <WindowControls />
     </header>
   );
