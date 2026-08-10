@@ -49,6 +49,13 @@ export interface EvidenceRef {
   retrieval_score: number;
 }
 
+export interface SystemNotice {
+  level: "urgent" | "warning" | "info";
+  message: string;
+  action_label: string | null;
+  action_route: AppRoute | null;
+}
+
 export interface AppError {
   code: string;
   message: string;

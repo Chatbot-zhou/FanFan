@@ -1,4 +1,4 @@
-import type { ModelDownloadJob, ModelRuntimeState } from "../../bridge";
+import type { ModelDownloadJob, ModelRuntimeState, SystemNotice } from "../../bridge";
 import { BrandMark } from "../../components/BrandMark";
 import { WindowControls } from "../../components/WindowControls";
 import { useAppStore } from "../../state/app-store";
@@ -6,6 +6,7 @@ import { useAppStore } from "../../state/app-store";
 interface TitleBarProps {
   model_state: ModelRuntimeState | null;
   model_download?: ModelDownloadJob | null;
+  notices?: SystemNotice[];
   welcome?: boolean;
 }
 
@@ -23,13 +24,44 @@ const PHASE_LABELS: Record<ModelDownloadJob["phase"], string> = {
   cancelled: "模型下载已取消",
 };
 
-export function TitleBar({ model_state, model_download = null, welcome = false }: TitleBarProps) {
+export function TitleBar({ model_state, model_download = null, notices = [], welcome = false }: TitleBarProps) {
   const navigate = useAppStore((state) => state.navigate);
   const dismissed = useAppStore((state) => state.model_prompt_dismissed);
   const dismiss = useAppStore((state) => state.dismiss_model_prompt);
-  const incompleteDownload = !welcome && model_download && model_download.status !== "completed";
-  const showPrompt = !incompleteDownload && !welcome && !dismissed && model_state?.status === "unconfigured";
-  const fullRagReady = model_state?.status === "ready" && model_state.rag_complete;
+
+  // 汇集所有系统通知
+  const resolved: SystemNotice[] = [...notices];
+
+  // 模型下载进度
+  if (!welcome && model_download && model_download.status !== "completed") {
+    resolved.push({
+      level: model_download.status === "failed" ? "warning" : "info",
+      message: `${PHASE_LABELS[model_download.phase]} · ${Math.round(model_download.progress * 100)}%`,
+      action_label: "查看",
+      action_route: "model_setup",
+    });
+  }
+
+  // 模型未配置
+  if (!dismissed && !welcome && model_state?.status === "unconfigured" && !model_download) {
+    resolved.push({
+      level: "info",
+      message: "未配置本地模型",
+      action_label: "去配置",
+      action_route: "model_setup",
+    });
+  }
+
+  // 取优先级最高的一条：urgent > warning > info
+  const priority = { urgent: 0, warning: 1, info: 2 } as const;
+  resolved.sort((a, b) => priority[a.level] - priority[b.level]);
+  const top = resolved[0];
+
+  const dot = top?.level === "urgent"
+    ? "system-dot system-dot--urgent"
+    : top?.level === "warning"
+      ? "system-dot system-dot--warning"
+      : "system-dot system-dot--info";
 
   return (
     <header className={`title-bar${welcome ? " title-bar--welcome" : ""}`} data-tauri-drag-region>
@@ -37,20 +69,18 @@ export function TitleBar({ model_state, model_download = null, welcome = false }
         <BrandMark compact />
       </div>
       <div className="title-bar__spacer" data-tauri-drag-region />
-      {incompleteDownload && (
-        <button type="button" className={`model-download-pill model-download-pill--${model_download.status}`} onClick={() => navigate("model_setup")} aria-label="查看模型下载详情">
-          <span className="model-prompt__dot" aria-hidden="true" />
-          <span>{PHASE_LABELS[model_download.phase]}</span>
-          <strong>{Math.round(model_download.progress * 100)}%</strong>
-          <progress value={model_download.progress} max={1} />
-        </button>
-      )}
-      {showPrompt && (
-        <div className="model-prompt" aria-label="模型配置提示">
-          <span className="model-prompt__dot" aria-hidden="true" />
-          <span>未配置本地模型</span>
-          <button type="button" onClick={() => navigate("model_setup")}>去配置</button>
-          <button type="button" onClick={dismiss}>稍后</button>
+      {top && (
+        <div className="system-status" aria-label="系统状态">
+          <span className={dot} aria-hidden="true" />
+          <span>{top.message}</span>
+          {top.action_label && top.action_route && (
+            <button type="button" onClick={() => navigate(top.action_route!)}>
+              {top.action_label}
+            </button>
+          )}
+          {top.level === "info" && top.message.includes("未配置本地模型") && (
+            <button type="button" onClick={dismiss}>稍后</button>
+          )}
         </div>
       )}
       <WindowControls />

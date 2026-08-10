@@ -157,7 +157,9 @@ impl LocalGenerationRuntime {
         }
         hide_child_console(&mut command);
         let child = command.spawn().map_err(|error| {
-            AppError::new("GENERATION_RUNTIME_START_FAILED", error.to_string(), true)
+            let mut err = AppError::new("GENERATION_RUNTIME_START_FAILED", "本地模型服务启动失败，请重启拾忆后重试", true);
+            err.details = Some(Box::new(serde_json::json!({"technical": error.to_string()})));
+            err
         })?;
         self.process = Some(GenerationProcess {
             child,
@@ -178,7 +180,7 @@ impl LocalGenerationRuntime {
             }
             if let Some(process) = self.process.as_mut()
                 && let Some(status) = process.child.try_wait().map_err(|error| {
-                    AppError::new("GENERATION_RUNTIME_CHECK_FAILED", error.to_string(), true)
+                    AppError::new("GENERATION_RUNTIME_CHECK_FAILED", "本地模型服务状态检查失败", true)
                 })?
             {
                 self.stop();
@@ -266,7 +268,7 @@ impl LocalGenerationRuntime {
             .child
             .try_wait()
             .map_err(|error| {
-                AppError::new("GENERATION_RUNTIME_CHECK_FAILED", error.to_string(), true)
+                AppError::new("GENERATION_RUNTIME_CHECK_FAILED", "本地模型服务状态检查失败", true)
             })?
             .is_some()
         {
@@ -289,7 +291,7 @@ impl LocalGenerationRuntime {
             ]
         });
         let body = serde_json::to_vec(&payload).map_err(|error| {
-            AppError::new("GENERATION_REQUEST_INVALID", error.to_string(), false)
+            AppError::new("GENERATION_REQUEST_INVALID", "本地模型请求构造失败", false)
         })?;
         let (status, response) = http_request_internal(
             process.port,
@@ -307,7 +309,7 @@ impl LocalGenerationRuntime {
             ));
         }
         let value: serde_json::Value = serde_json::from_str(&response).map_err(|error| {
-            AppError::new("GENERATION_RESPONSE_INVALID", error.to_string(), false)
+            AppError::new("GENERATION_RESPONSE_INVALID", "本地模型响应格式异常，请稍后重试", false)
         })?;
         value
             .pointer("/choices/0/message/content")
@@ -342,7 +344,7 @@ impl LocalGenerationRuntime {
             ));
         }
         let metadata = fs::metadata(image_path)
-            .map_err(|error| AppError::new("VISION_IMAGE_UNAVAILABLE", error.to_string(), true))?;
+            .map_err(|error| AppError::new("VISION_IMAGE_UNAVAILABLE", "图片缓存不可用，请稍后重试", true))?;
         if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 32 * 1024 * 1024 {
             return Err(AppError::new(
                 "VISION_IMAGE_SIZE_UNSUPPORTED",
@@ -351,7 +353,7 @@ impl LocalGenerationRuntime {
             ));
         }
         let bytes = fs::read(image_path)
-            .map_err(|error| AppError::new("VISION_IMAGE_UNAVAILABLE", error.to_string(), true))?;
+            .map_err(|error| AppError::new("VISION_IMAGE_UNAVAILABLE", "图片缓存不可用，请稍后重试", true))?;
         let data_url = format!("data:{mime_type};base64,{}", STANDARD.encode(bytes));
         self.complete_multimodal_data_url(system, prompt, &data_url, max_tokens, Some(cancelled))
     }
@@ -377,7 +379,7 @@ impl LocalGenerationRuntime {
         if process
             .child
             .try_wait()
-            .map_err(|error| AppError::new("VISION_RUNTIME_CHECK_FAILED", error.to_string(), true))?
+            .map_err(|error| AppError::new("VISION_RUNTIME_CHECK_FAILED", "图片理解模型状态检查失败", true))?
             .is_some()
         {
             self.process = None;
@@ -402,7 +404,7 @@ impl LocalGenerationRuntime {
             ]
         });
         let body = serde_json::to_vec(&payload)
-            .map_err(|error| AppError::new("VISION_REQUEST_INVALID", error.to_string(), false))?;
+            .map_err(|error| AppError::new("VISION_REQUEST_INVALID", "图片理解请求构造失败", false))?;
         let (status, response) = http_request_internal(
             process.port,
             "POST",
@@ -419,7 +421,7 @@ impl LocalGenerationRuntime {
             ));
         }
         let value: serde_json::Value = serde_json::from_str(&response)
-            .map_err(|error| AppError::new("VISION_RESPONSE_INVALID", error.to_string(), false))?;
+            .map_err(|error| AppError::new("VISION_RESPONSE_INVALID", "图片理解响应格式异常", false))?;
         value
             .pointer("/choices/0/message/content")
             .and_then(|value| value.as_str())
@@ -464,7 +466,7 @@ fn reserve_local_port() -> Result<u16, AppError> {
     TcpListener::bind(("127.0.0.1", 0))
         .and_then(|listener| listener.local_addr())
         .map(|address| address.port())
-        .map_err(|error| AppError::new("GENERATION_PORT_UNAVAILABLE", error.to_string(), true))
+        .map_err(|error| AppError::new("GENERATION_PORT_UNAVAILABLE", "本地模型通信端口异常，请重启拾忆", true))
 }
 
 fn http_request(
@@ -492,17 +494,17 @@ fn http_request_internal(
             .expect("loopback socket"),
         Duration::from_secs(3),
     )
-    .map_err(|error| AppError::new("GENERATION_RUNTIME_UNREACHABLE", error.to_string(), true))?;
+    .map_err(|error| AppError::new("GENERATION_RUNTIME_UNREACHABLE", "本地模型服务无响应，请重启拾忆后重试", true))?;
     stream
         .set_read_timeout(Some(if cancelled.is_some() {
             Duration::from_millis(250)
         } else {
             Duration::from_secs(180)
         }))
-        .map_err(|error| AppError::new("GENERATION_RUNTIME_IO_FAILED", error.to_string(), true))?;
+        .map_err(|error| AppError::new("GENERATION_RUNTIME_IO_FAILED", "本地模型通信失败，请重启拾忆后重试", true))?;
     stream
         .set_write_timeout(Some(Duration::from_secs(10)))
-        .map_err(|error| AppError::new("GENERATION_RUNTIME_IO_FAILED", error.to_string(), true))?;
+        .map_err(|error| AppError::new("GENERATION_RUNTIME_IO_FAILED", "本地模型通信失败，请重启拾忆后重试", true))?;
     let payload = body.unwrap_or_default();
     let authorization = token
         .map(|value| format!("Authorization: Bearer {value}\r\n"))
@@ -515,7 +517,7 @@ fn http_request_internal(
         .write_all(request.as_bytes())
         .and_then(|_| stream.write_all(payload))
         .and_then(|_| stream.flush())
-        .map_err(|error| AppError::new("GENERATION_RUNTIME_IO_FAILED", error.to_string(), true))?;
+        .map_err(|error| AppError::new("GENERATION_RUNTIME_IO_FAILED", "本地模型通信失败，请重启拾忆后重试", true))?;
     let mut response = Vec::new();
     let started = Instant::now();
     let mut buffer = [0_u8; 16 * 1024];
@@ -571,7 +573,7 @@ fn parse_http_response(response: &[u8]) -> Result<(u16, String), AppError> {
             )
         })?;
     let headers = std::str::from_utf8(&response[..separator])
-        .map_err(|error| AppError::new("GENERATION_RESPONSE_INVALID", error.to_string(), false))?;
+        .map_err(|error| AppError::new("GENERATION_RESPONSE_INVALID", "本地模型响应格式异常，请稍后重试", false))?;
     let raw_body = &response[separator + 4..];
     let status = headers
         .lines()
@@ -609,7 +611,7 @@ fn parse_http_response(response: &[u8]) -> Result<(u16, String), AppError> {
     };
     String::from_utf8(body)
         .map(|body| (status, body))
-        .map_err(|error| AppError::new("GENERATION_RESPONSE_INVALID", error.to_string(), false))
+        .map_err(|error| AppError::new("GENERATION_RESPONSE_INVALID", "本地模型响应格式异常，请稍后重试", false))
 }
 
 fn decode_chunked_body(mut input: &[u8]) -> Result<Vec<u8>, AppError> {
@@ -626,11 +628,11 @@ fn decode_chunked_body(mut input: &[u8]) -> Result<Vec<u8>, AppError> {
                 )
             })?;
         let length_text = std::str::from_utf8(&input[..line_end]).map_err(|error| {
-            AppError::new("GENERATION_RESPONSE_INVALID", error.to_string(), false)
+            AppError::new("GENERATION_RESPONSE_INVALID", "本地模型响应格式异常，请稍后重试", false)
         })?;
         let length = usize::from_str_radix(length_text.split(';').next().unwrap_or("").trim(), 16)
             .map_err(|error| {
-                AppError::new("GENERATION_RESPONSE_INVALID", error.to_string(), false)
+                AppError::new("GENERATION_RESPONSE_INVALID", "本地模型响应格式异常，请稍后重试", false)
             })?;
         input = &input[line_end + 2..];
         if length == 0 {

@@ -7581,7 +7581,36 @@ fn parse_datetime_column(value: &str, index: usize) -> rusqlite::Result<DateTime
 }
 
 fn storage_error(code: &str, error: rusqlite::Error, retryable: bool) -> AppError {
-    AppError::new(code, error.to_string(), retryable)
+    let (user_message, user_action) = map_storage_error(&error, code);
+    let mut err = AppError::new(code, user_message, retryable);
+    if let Some(action) = user_action {
+        err.user_action = Some(action.into());
+    }
+    let mut details = serde_json::Map::new();
+    details.insert("technical".to_owned(), serde_json::Value::String(error.to_string()));
+    err.details = Some(Box::new(serde_json::Value::Object(details)));
+    err
+}
+
+fn map_storage_error(error: &rusqlite::Error, _code: &str) -> (String, Option<&'static str>) {
+    let text = error.to_string().to_lowercase();
+    if text.contains("database is locked") || text.contains("database locked") {
+        ("本地资料库暂时繁忙，请稍后重试".into(), Some("如果频繁出现，可尝试关闭其他同时访问资料的软件"))
+    } else if text.contains("disk i/o") || text.contains("disk full") || text.contains("no space") {
+        ("磁盘读写出现问题".into(), Some("请检查磁盘空间是否充足，或是否有杀毒软件干扰了拾忆"))
+    } else if text.contains("readonly") || text.contains("read-only") || text.contains("permission denied") {
+        ("资料库写入权限异常".into(), Some("请检查杀毒软件或系统权限设置，确保拾忆可以正常写入应用数据"))
+    } else if text.contains("no such table") || text.contains("no such column") {
+        ("资料库结构需要升级，重启拾忆即可完成自动迁移".into(), None)
+    } else if text.contains("unable to open") || text.contains("cannot open") {
+        ("无法打开资料库文件".into(), Some("请确认拾忆应用数据目录未被移动或删除，重启后会自动修复"))
+    } else if text.contains("malformed") || text.contains("corrupt") || text.contains("not a database") {
+        ("资料库文件损坏".into(), Some("请在设置中重建索引，源文件不会受到影响"))
+    } else if text.contains("busy") || text.contains("timeout") {
+        ("资料库操作超时，请稍后重试".into(), None)
+    } else {
+        ("资料库操作失败，请重启拾忆后重试".into(), Some("如仍未解决，可在设置中导出诊断信息"))
+    }
 }
 
 fn checkpoint_type_as_str(value: CheckpointType) -> &'static str {

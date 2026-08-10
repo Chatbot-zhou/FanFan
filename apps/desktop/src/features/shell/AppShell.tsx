@@ -1,6 +1,6 @@
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { bridge } from "../../bridge";
+import { bridge, type SystemNotice } from "../../bridge";
 import { useAppStore } from "../../state/app-store";
 import { AskPage } from "../../pages/AskPage";
 import { CollectionsPage } from "../../pages/CollectionsPage";
@@ -113,6 +113,48 @@ export function AppShell({ startup_notice }: AppShellProps) {
     );
   }
 
+  // 汇集系统通知给 TitleBar
+  const notices = useMemo<SystemNotice[]>(() => {
+    const items: SystemNotice[] = [];
+    // 启动阻塞（最高优先级）
+    if (startup.data?.blocker) {
+      items.push({
+        level: "urgent",
+        message: startup.data.blocker.message,
+        action_label: null,
+        action_route: null,
+      });
+    }
+    // 后台事件通知（模型下载失败等）
+    if (eventNotice) {
+      items.push({
+        level: "warning",
+        message: eventNotice,
+        action_label: null,
+        action_route: null,
+      });
+    }
+    // 欢迎页持久化失败
+    if (startup_notice) {
+      items.push({
+        level: "warning",
+        message: startup_notice,
+        action_label: null,
+        action_route: null,
+      });
+    }
+    // 后台维护通知（磁盘不足、降级等）
+    if (maintenance.data?.background_notice) {
+      items.push({
+        level: "warning",
+        message: maintenance.data.background_notice,
+        action_label: null,
+        action_route: null,
+      });
+    }
+    return items;
+  }, [startup.data?.blocker, eventNotice, startup_notice, maintenance.data?.background_notice]);
+
   const page = {
     home: <HomePage summary={home.data ?? null} loading={home.isLoading} />,
     search: <SearchPage />,
@@ -126,12 +168,11 @@ export function AppShell({ startup_notice }: AppShellProps) {
 
   return (
     <div className="app-window">
-      <TitleBar model_state={currentModelState} model_download={modelDownloads.data?.[0] ?? null} />
+      <TitleBar model_state={currentModelState} model_download={modelDownloads.data?.[0] ?? null} notices={notices} />
       <div className="app-window__body">
         <Sidebar />
         <main className="workspace">
           {!backendReady && <div className="startup-notice" role="status">{STARTUP_PHASE_LABELS[startup.data?.phase ?? "opening_catalog"]} · {Math.round((startup.data?.progress ?? 0.1) * 100)}%</div>}
-          {(startup_notice || eventNotice || startup.data?.blocker) && <div className="startup-notice" role="status">{startup_notice || eventNotice || startup.data?.blocker?.message}</div>}
           {page}
         </main>
       </div>

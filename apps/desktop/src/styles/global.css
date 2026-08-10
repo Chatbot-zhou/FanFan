@@ -45,6 +45,15 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
 .model-download-pill { min-width: 255px; height: 36px; padding: 0 11px; display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 8px; border: 1px solid rgba(81,73,185,.14); border-radius: 18px; background: rgba(255,255,255,.62); color: #363348; cursor: pointer; }
 .model-download-pill strong { font-size: 12px; }.model-download-pill progress { grid-column: 2 / 4; width: 100%; height: 3px; margin-top: -7px; accent-color: #665dc1; }.model-download-pill--failed { border-color: #e2a8ae; background: #fff1f2; }.model-download-pill--failed .model-prompt__dot { background: #c54f5d; }.model-download-pill--paused { background: #fff8e9; }
 
+/* 系统状态条——TitleBar 统一状态展示 */
+.system-status { height: 32px; display: flex; align-items: center; gap: 10px; padding: 0 12px; border-radius: 16px; background: rgba(255,255,255,.34); color: #2c2b40; font-size: 13px; white-space: nowrap; }
+.system-status button { padding: 0; border: 0; background: transparent; cursor: pointer; color: #35334f; font-weight: 700; }
+.system-status button:hover { color: #4f49b5; }
+.system-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; }
+.system-dot--urgent { background: #d85d69; box-shadow: 0 0 0 3px rgba(216,93,105,.15); }
+.system-dot--warning { background: #e1a545; box-shadow: 0 0 0 3px rgba(225,165,69,.15); }
+.system-dot--info { background: #5149b9; box-shadow: 0 0 0 3px rgba(81,73,185,.10); }
+
 /* Welcome */
 .welcome-screen { width: 100%; height: 100%; position: relative; overflow: hidden; background:
   radial-gradient(circle at 25% 72%, rgba(108, 177, 243, .54) 0%, rgba(115, 160, 241, .18) 25%, transparent 49%),
@@ -269,7 +278,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
 .edition-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }.edition-grid > button { min-height: 185px; position: relative; padding: 22px; border: 1px solid var(--line); border-radius: 16px; background: #fff; text-align: left; cursor: pointer; }.edition-grid > button.selected { border: 2px solid #665dc1; background: #fbfaff; }.edition-grid h3 { margin: 0 0 6px; font-size: 18px; }.edition-grid p { margin: 0; color: var(--muted); }.edition-grid ul { padding-left: 19px; color: #555663; font-size: 13px; line-height: 1.9; }.edition-badge { position: absolute; top: 16px; right: 16px; padding: 4px 9px; border-radius: 10px; background: #ece9fa; color: #5d54b5; font-size: 11px; }
 .source-options { display: flex; gap: 14px; }.source-options label { flex: 1; padding: 15px 17px; border: 1px solid var(--line); border-radius: 12px; background: #fff; }.source-options input { margin-right: 9px; accent-color: #5d55ba; }.source-options em { margin-left: 7px; padding: 3px 7px; border-radius: 8px; background: #e7f5ed; color: #39735a; font-size: 10px; font-style: normal; }.download-next { float: right; margin-top: 22px; }
 .install-plan { padding: 25px; border: 1px solid var(--line); border-radius: 16px; background: #fff; }.install-plan h2 { margin: 0 0 20px; }.install-plan dl { margin: 0; }.install-plan dl div { padding: 12px 0; border-bottom: 1px solid var(--line); display: grid; grid-template-columns: 150px 1fr; }.install-plan dt { color: var(--muted); }.install-plan dd { margin: 0; }.plan-actions { margin-top: 22px; display: flex; justify-content: flex-end; gap: 10px; }.plan-actions > button:not(.primary-button) { padding: 0 16px; border: 1px solid var(--line); border-radius: 11px; background: #fff; cursor: pointer; }
-.model-job { margin: 16px 0 24px; padding: 15px 18px; display: grid; grid-template-columns: minmax(220px,1fr) minmax(240px,2fr) auto; align-items: center; gap: 9px 16px; border: 1px solid #d8d4ee; border-radius: 14px; background: #fbfaff; }.model-job > div:first-child { display: flex; flex-direction: column; gap: 4px; }.model-job small,.model-job > span { color: var(--muted); font-size: 12px; }.model-job progress { width: 100%; accent-color: #655ac1; }.model-job .inline-error { grid-column: 1 / -1; margin: 0; }.model-job__actions { grid-column: 1 / -1; display: flex; gap: 8px; justify-content: flex-end; }.model-job__actions button { min-height: 32px; padding: 0 12px; border: 1px solid var(--line); border-radius: 9px; background: #fff; cursor: pointer; }.model-job--failed { border-color: #e4b3b7; background: #fff6f6; }.model-job--completed { border-color: #b9ddc9; background: #f2fbf6; }
+.model-job { margin: 16px 0 24px; padding: 15px 18px; display: grid; grid-template-columns: minmax(220px,1fr) minmax(240px,2fr) auto; align-items: center; gap: 9px 16px; border: 1px solid #d8d4ee; border-radius: 14px; background: #fbfaff; }.model-job > div:first-child { display: flex; flex-direction: column; gap: 4px; }.model-job small,.model-job > span { color: var(--muted); font-size: 12px; }.model-job progress { width: 100%; accent-color: #655ac1; }.model-job .inline-error { grid-column: 1 / -1; margin: 0; }.model-job__actions { grid-column: 1 / -1; display: flex; gap: 8px; justify-content: flex-end; }.model-job__actions button { min-height: 32px; padding: 0 12px; border: 1px solid var(--line); border-radius: 9px; background: #fff; color: var(--ink); cursor: pointer; }.model-job__actions button.primary-button { background: #5a53bb; color: #fff; border: 0; }.model-job--failed { border-color: #e4b3b7; background: #fff6f6; }.model-job--completed { border-color: #b9ddc9; background: #f2fbf6; }
 .answer-keyword { padding: 0 .12em; border-radius: .25em; background: rgba(245,188,207,.34); color: inherit; font-weight: 750; }
 
 /* Settings */
@@ -400,7 +409,7 @@ html[data-theme="night_dark"] .ask-composer textarea::placeholder { color: #6e6f
 /* 按钮 */
 html[data-theme="night_dark"] :is(
   .settings-actions button,.setting-row button,.theme-options button,
-  .model-job__actions button,.plan-actions>button:not(.primary-button),
+  .model-job__actions button:not(.primary-button),.plan-actions>button:not(.primary-button),
   .search-result__actions button,.load-more-button,.rag-readiness button,
   .authorization-actions button,.collection-add-file select,.collection-create input,
   .collection-create select,.import-panel__actions>button:not(.primary-button),
@@ -444,6 +453,12 @@ html[data-theme="night_dark"] :is(.model-prompt,.model-download-pill) {
 }
 html[data-theme="night_dark"] .model-prompt button { color: #cfcee4; }
 html[data-theme="night_dark"] .model-prompt button:hover { color: #aaa3ff; }
+html[data-theme="night_dark"] .system-status { color: #fff; background: rgba(18,19,24,.82); }
+html[data-theme="night_dark"] .system-status button { color: #cfcee4; }
+html[data-theme="night_dark"] .system-status button:hover { color: #aaa3ff; }
+html[data-theme="night_dark"] .system-dot--urgent { background: #e8707c; }
+html[data-theme="night_dark"] .system-dot--warning { background: #e8b44a; }
+html[data-theme="night_dark"] .system-dot--info { background: #aaa3ff; }
 
 /* 文本颜色 */
 html[data-theme="night_dark"] :is(.search-result p,.metric-card small,.ai-suggestion__summary p,
