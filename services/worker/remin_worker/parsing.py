@@ -364,6 +364,7 @@ def _code_nodes(path: Path, source_format: str) -> list[DocumentNode]:
 
 
 def _zip_manifest_nodes(path: Path) -> tuple[list[DocumentNode], list[ParseWarning]]:
+    """Read only the ZIP central directory; never extract archive members."""
     nodes: list[DocumentNode] = []
     warnings: list[ParseWarning] = []
     with zipfile.ZipFile(path) as package:
@@ -497,7 +498,6 @@ def _ocr_nodes(result: dict[str, Any], kind: str, start_ordinal: int = 0) -> lis
 def _pdf_result(request: ParseRequest, path: Path, started_at: float) -> ParseResult:
     try:
         from pypdf import PdfReader
-        from pypdf.errors import PdfReadError
     except ImportError:
         return _failure(request, "PARSER_DEPENDENCY_MISSING", "PDF解析依赖尚未安装", True)
     try:
@@ -595,7 +595,9 @@ def _pdf_result(request: ParseRequest, path: Path, started_at: float) -> ParseRe
                     shutil.rmtree(render_directory, ignore_errors=True)
         status: Literal["parsed", "partial"] = "partial" if warnings else "parsed"
         return _result(request, status, parser_name, nodes, warnings, len(pages), started_at, ocr_page_count, image_assets)
-    except (PdfReadError, OSError, ValueError) as error:
+    except Exception as error:
+        # pypdf 内部还会抛出 PdfStreamError/TypeError/struct.error 等不在
+        # (PdfReadError, OSError, ValueError) 里的异常；宽捕获避免 worker 进程死亡。
         return _failure(request, "PDF_PARSE_FAILED", str(error), False)
 
 
@@ -766,4 +768,7 @@ def parse_document(request: ParseRequest) -> ParseResult:
     except PermissionError:
         return _failure(request, "FILE_PERMISSION_DENIED", "没有读取此文件的权限", True)
     except (OSError, KeyError, ValueError, zipfile.BadZipFile, ElementTree.ParseError) as error:
+        return _failure(request, "DOCUMENT_PARSE_FAILED", str(error), False)
+    except Exception as error:
+        # 最后防线：任何未预料的异常都转为文件级失败而不是让 worker 进程退出。
         return _failure(request, "DOCUMENT_PARSE_FAILED", str(error), False)

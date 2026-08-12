@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex, RwLock},
 };
@@ -10,17 +10,14 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
-    AnswerResult, AppError, AppLogRecord, AskRequest, CandidateStatus, CatalogStore,
-    CheckpointType, ChunkEmbeddingInput, CollectionRecord, CreateCollectionRequest,
-    DegradationLevel, DegradationState, ExplorationCandidate, ExtractionRunRequest,
-    ExtractionRunResult, FilePreview, FileRecord, FileRelation, FileSystemEvent,
-    ImageUnderstandingResult, InboxPage, InboxQuery, InboxUpdateRequest, IndexActivityStats,
-    IndexRebuildResult, JobRecord, JobStatus, KnowledgeSpace, KnowledgeSpaceRequest, LogEventInput,
-    LogPage, LogQuery, MaintenanceSnapshot, ParseResult, PendingEmbeddingChunk,
-    PendingImageUnderstanding, PlanSkillRequest, RelationPage, RelationQuery,
-    RelationRefreshResult, RootRegistration, ScanControl, ScanPolicy, SearchRequest, SearchSession,
-    SemanticQuery, TaskExecutionResult, file_identity_for_path, path_key, plan_skill,
-    scan_root_with_control,
+    AnswerResult, AppError, AppLogRecord, AskRequest, CatalogStore, ChunkEmbeddingInput,
+    CollectionRecord, CreateCollectionRequest, DegradationLevel, DegradationState, FilePreview,
+    FileRecord, FileRelation, FileSystemEvent, ImageUnderstandingResult, InboxPage, InboxQuery,
+    InboxUpdateRequest, IndexActivityStats, IndexRebuildResult, JobRecord, JobStatus,
+    LogEventInput, LogPage, LogQuery, MaintenanceSnapshot, ParseResult, PendingEmbeddingChunk,
+    PendingImageUnderstanding, RelationPage, RelationQuery, RelationRefreshResult,
+    RootRegistration, ScanControl, ScanPolicy, SearchRequest, SearchSession, SemanticQuery,
+    file_identity_for_path, path_key, scan_root_with_control,
 };
 
 #[cfg(windows)]
@@ -415,6 +412,10 @@ impl CatalogService {
         self.store.list_candidate_roots()
     }
 
+    pub fn list_candidate_roots(&self) -> Result<Vec<CandidateRoot>, AppError> {
+        self.store.list_candidate_roots()
+    }
+
     pub fn candidate_root_action(
         &self,
         candidate_id: &Uuid,
@@ -581,16 +582,16 @@ impl CatalogService {
         self.store.disable_root(root_id)
     }
 
+    pub fn cleanup_disabled_root(&self, root_id: &Uuid) -> Result<u64, AppError> {
+        self.store.cleanup_disabled_root(root_id)
+    }
+
     pub fn list_files(&self) -> Result<Vec<FileRecord>, AppError> {
         self.store.list_files()
     }
 
     pub fn query_files(&self, request: &crate::FileQuery) -> Result<crate::FilePage, AppError> {
         self.store.query_files(request)
-    }
-
-    pub fn authorized_files_by_ids(&self, file_ids: &[Uuid]) -> Result<Vec<FileRecord>, AppError> {
-        self.store.authorized_files_by_ids(file_ids)
     }
 
     pub fn list_exclusion_rules(&self) -> Result<Vec<crate::ExclusionRule>, AppError> {
@@ -624,275 +625,6 @@ impl CatalogService {
         self.store.home_file_summary(local_date)
     }
 
-    pub fn run_extraction(
-        &self,
-        request: &ExtractionRunRequest,
-    ) -> Result<ExtractionRunResult, AppError> {
-        self.store.run_extraction(request)
-    }
-
-    pub fn execute_task(
-        &self,
-        request: &PlanSkillRequest,
-    ) -> Result<TaskExecutionResult, AppError> {
-        let requested_plan = plan_skill(request)?;
-        let (mut plan, initial_job) =
-            if let Some(stored_plan) = self.store.task_plan_by_id(&requested_plan.task_id)? {
-                let same_contract = stored_plan.skill_id == requested_plan.skill_id
-                    && stored_plan.steps.len() == requested_plan.steps.len()
-                    && stored_plan.steps.iter().zip(&requested_plan.steps).all(
-                        |(stored, requested)| {
-                            stored.ordinal == requested.ordinal
-                                && stored.step_type == requested.step_type
-                                && stored.inputs == requested.inputs
-                                && stored.expected_outputs == requested.expected_outputs
-                                && stored.checkpoint == requested.checkpoint
-                        },
-                    );
-                if !same_contract {
-                    return Err(AppError::new(
-                        "TASK_RESUME_CONTRACT_MISMATCH",
-                        "恢复请求与原任务计划不一致，请重新预览任务",
-                        false,
-                    ));
-                }
-                let job = self.store.resume_task(&stored_plan.task_id)?;
-                (stored_plan, job)
-            } else {
-                let job = self.store.begin_task(&requested_plan)?;
-                (requested_plan, job)
-            };
-        let execution = (|| {
-            if request.skill_id == "duplicate_review" {
-                self.store
-                    .refresh_selected_file_relations(&request.file_ids)?;
-            }
-            let selected_files = self.store.authorized_files_by_ids(&request.file_ids)?;
-            if selected_files.len() != request.file_ids.len() {
-                return Err(AppError::new(
-                    "TASK_FILE_UNAVAILABLE",
-                    "任务中至少一份资料已离开授权范围，请刷新后重试",
-                    false,
-                ));
-            }
-            let mut checkpoints = self.store.task_checkpoints(&plan.task_id)?;
-            let mut completed = checkpoints
-                .iter()
-                .filter(|checkpoint| checkpoint.status == crate::CheckpointStatus::Passed)
-                .map(|checkpoint| checkpoint.unit_id)
-                .collect::<HashSet<_>>();
-            if !completed.contains(&plan.steps[0].step_id) {
-                let checkpoint = self.store.pass_task_step(
-                    &plan.task_id,
-                    &plan.steps[0],
-                    CheckpointType::Permission,
-                    json!({"authorized_files": selected_files.len(), "source_files_readonly": true}),
-                )?;
-                completed.insert(checkpoint.unit_id);
-                checkpoints.push(checkpoint);
-            }
-            if !completed.contains(&plan.steps[1].step_id) {
-                let checkpoint = self.store.pass_task_step(
-                    &plan.task_id,
-                    &plan.steps[1],
-                    CheckpointType::Invariant,
-                    json!({"revision_count": selected_files.iter().filter(|file| file.current_revision_id.is_some()).count()}),
-                )?;
-                completed.insert(checkpoint.unit_id);
-                checkpoints.push(checkpoint);
-            }
-
-            let preset_id = match request.skill_id.as_str() {
-                "generate_catalog" | "export_index" => "file_catalog".to_owned(),
-                "multi_document_summary" => "extractive_summary".to_owned(),
-                "recommend_filename" => "filename_suggestions".to_owned(),
-                "recommend_folders" => "folder_suggestions".to_owned(),
-                "duplicate_review" => "duplicate_review".to_owned(),
-                "version_compare" => "version_compare".to_owned(),
-                "merge_tables" => "merge_tables".to_owned(),
-                "rerun_ocr" => "ocr_report".to_owned(),
-                _ => request
-                    .parameters
-                    .get("preset_id")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("file_catalog")
-                    .to_owned(),
-            };
-            let result = self.store.run_extraction(&ExtractionRunRequest {
-                file_ids: request.file_ids.clone(),
-                preset_id,
-            })?;
-            let values = result.rows.iter().flat_map(|row| row.values.iter());
-            let (non_empty_values, evidence_values) =
-                values.fold((0_u64, 0_u64), |mut counts, value| {
-                    if !value.normalized_value.is_null() {
-                        counts.0 += 1;
-                        if !value.evidence.is_empty() {
-                            counts.1 += 1;
-                        }
-                    }
-                    counts
-                });
-            if non_empty_values != evidence_values {
-                return Err(AppError::new(
-                    "TASK_EVIDENCE_VALIDATION_FAILED",
-                    "抽取结果中存在没有来源的非空字段",
-                    false,
-                ));
-            }
-            let evidence_score = if non_empty_values == 0 {
-                1.0
-            } else {
-                evidence_values as f32 / non_empty_values as f32
-            };
-            let strategies: &[&str] = match request.skill_id.as_str() {
-                "multi_document_summary" => &[
-                    "extractive_first",
-                    "metadata_outline",
-                    "conservative_fallback",
-                ],
-                "recommend_filename" => &[
-                    "content_heading",
-                    "existing_name_normalized",
-                    "conservative_keep_current",
-                ],
-                "recommend_folders" => &[
-                    "content_keywords",
-                    "path_and_type",
-                    "conservative_virtual_inbox",
-                ],
-                _ => &[],
-            };
-            let candidates = strategies
-                .iter()
-                .enumerate()
-                .map(|(index, strategy)| ExplorationCandidate {
-                    candidate_id: Uuid::now_v7(),
-                    job_id: plan.task_id,
-                    strategy: (*strategy).into(),
-                    status: if index == 0 {
-                        CandidateStatus::Selected
-                    } else {
-                        CandidateStatus::Valid
-                    },
-                    result_ref: (index == 0)
-                        .then(|| format!("remin://extraction/{}", result.run_id)),
-                    quality_score: Some(match index {
-                        0 => 0.9,
-                        1 => 0.72,
-                        _ => 0.6,
-                    }),
-                    evidence_score: Some(evidence_score),
-                    latency_ms: None,
-                    resource_cost: Some(match index {
-                        0 => 0.5,
-                        1 => 0.2,
-                        _ => 0.05,
-                    }),
-                    rejection_reasons: Vec::new(),
-                })
-                .collect::<Vec<_>>();
-            if !candidates.is_empty() {
-                self.store
-                    .replace_task_exploration_candidates(&plan.task_id, &candidates)?;
-            }
-            if !completed.contains(&plan.steps[2].step_id) {
-                let checkpoint = self.store.pass_task_step(
-                    &plan.task_id,
-                    &plan.steps[2],
-                    CheckpointType::Evidence,
-                      json!({"rows": result.rows.len(), "non_empty_values": non_empty_values, "values_with_evidence": evidence_values, "exploration_candidates": candidates.len()}),
-                )?;
-                completed.insert(checkpoint.unit_id);
-                checkpoints.push(checkpoint);
-            }
-            if !completed.contains(&plan.steps[3].step_id) {
-                let checkpoint = self.store.pass_task_step(
-                    &plan.task_id,
-                    &plan.steps[3],
-                    CheckpointType::Schema,
-                    json!({"run_id": result.run_id, "status": result.status, "exported": false}),
-                )?;
-                completed.insert(checkpoint.unit_id);
-                checkpoints.push(checkpoint);
-            }
-            let job = self.store.finish_task(&plan.task_id)?;
-            for step in &mut plan.steps {
-                if completed.contains(&step.step_id) {
-                    step.status = "succeeded".into();
-                    step.attempt_count = 1;
-                }
-            }
-            Ok(TaskExecutionResult {
-                plan,
-                job,
-                result,
-                checkpoints,
-                candidates,
-            })
-        })();
-        match execution {
-            Ok(result) => Ok(result),
-            Err(error) => {
-                let _ = self.store.fail_task(&initial_job.job_id, &error);
-                Err(error)
-            }
-        }
-    }
-
-    pub fn recover_interrupted_tasks(&self) -> Result<u64, AppError> {
-        self.store.recover_interrupted_tasks()
-    }
-
-    pub fn latest_recoverable_task_plan(&self) -> Result<Option<crate::TaskPlan>, AppError> {
-        self.store.latest_recoverable_task_plan()
-    }
-
-    pub fn resume_task_execution(&self, task_id: &Uuid) -> Result<TaskExecutionResult, AppError> {
-        let plan = self
-            .store
-            .task_plan_by_id(task_id)?
-            .ok_or_else(|| AppError::new("TASK_JOB_NOT_FOUND", "待恢复任务不存在", false))?;
-        let file_ids = plan
-            .steps
-            .first()
-            .and_then(|step| step.inputs.get("file_ids"))
-            .and_then(|value| value.as_array())
-            .ok_or_else(|| {
-                AppError::new(
-                    "TASK_PLAN_DESERIALIZE_FAILED",
-                    "恢复计划缺少文件范围",
-                    false,
-                )
-            })?
-            .iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .and_then(|value| Uuid::parse_str(value).ok())
-                    .ok_or_else(|| {
-                        AppError::new(
-                            "TASK_PLAN_DESERIALIZE_FAILED",
-                            "恢复计划包含无效文件标识",
-                            false,
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let parameters = plan
-            .steps
-            .get(2)
-            .map(|step| step.inputs.clone())
-            .unwrap_or_else(|| json!({}));
-        self.execute_task(&PlanSkillRequest {
-            task_id: Some(*task_id),
-            skill_id: plan.skill_id,
-            file_ids,
-            parameters,
-            user_instruction: None,
-        })
-    }
-
     pub fn query_inbox(&self, request: &InboxQuery) -> Result<InboxPage, AppError> {
         self.store.query_inbox(request)
     }
@@ -904,27 +636,8 @@ impl CatalogService {
         self.store.update_inbox_item(request)
     }
 
-    pub fn list_knowledge_spaces(&self) -> Result<Vec<KnowledgeSpace>, AppError> {
-        self.store.list_knowledge_spaces()
-    }
-
-    pub fn create_knowledge_space(
-        &self,
-        request: &KnowledgeSpaceRequest,
-    ) -> Result<KnowledgeSpace, AppError> {
-        self.store.create_knowledge_space(request)
-    }
-
-    pub fn update_knowledge_space(
-        &self,
-        space_id: &Uuid,
-        request: &KnowledgeSpaceRequest,
-    ) -> Result<KnowledgeSpace, AppError> {
-        self.store.update_knowledge_space(space_id, request)
-    }
-
-    pub fn delete_knowledge_space(&self, space_id: &Uuid) -> Result<(), AppError> {
-        self.store.delete_knowledge_space(space_id)
+    pub fn retry_inbox_item(&self, inbox_id: &Uuid) -> Result<crate::InboxItem, AppError> {
+        self.store.retry_inbox_item(inbox_id)
     }
 
     pub fn storage_quota_override(&self) -> Result<Option<u64>, AppError> {
@@ -1048,11 +761,13 @@ impl CatalogService {
         self.store.refresh_file_relations(max_files)
     }
 
-    pub fn refresh_selected_file_relations(
+    pub fn refresh_semantic_file_relations(
         &self,
-        file_ids: &[Uuid],
-    ) -> Result<RelationRefreshResult, AppError> {
-        self.store.refresh_selected_file_relations(file_ids)
+        model_artifact_id: &str,
+        max_files: u32,
+    ) -> Result<(u64, u64), AppError> {
+        self.store
+            .refresh_semantic_file_relations(model_artifact_id, max_files)
     }
 
     pub fn list_file_relations(&self, limit: u32) -> Result<Vec<FileRelation>, AppError> {
@@ -1065,6 +780,14 @@ impl CatalogService {
 
     pub fn review_file_relation(&self, relation_id: &Uuid, action: &str) -> Result<(), AppError> {
         self.store.review_file_relation(relation_id, action)
+    }
+
+    pub fn review_file_relations(
+        &self,
+        relation_ids: &[Uuid],
+        action: &str,
+    ) -> Result<u64, AppError> {
+        self.store.review_file_relations(relation_ids, action)
     }
 
     pub fn list_pending_parse_files(&self, limit: usize) -> Result<Vec<FileRecord>, AppError> {
@@ -1160,6 +883,43 @@ impl CatalogService {
         limit: usize,
     ) -> Result<Vec<crate::AskMessage>, AppError> {
         self.store.load_ask_history(session_id, limit)
+    }
+
+    pub fn list_ask_sessions(
+        &self,
+        cursor: Option<&str>,
+        page_size: u32,
+    ) -> Result<crate::AskSessionPage, AppError> {
+        self.store.list_ask_sessions(cursor, page_size)
+    }
+
+    pub fn list_ask_messages(
+        &self,
+        session_id: &Uuid,
+        cursor: Option<&str>,
+        page_size: u32,
+    ) -> Result<crate::AskMessagePage, AppError> {
+        self.store.list_ask_messages(session_id, cursor, page_size)
+    }
+
+    pub fn rename_ask_session(&self, session_id: &Uuid, title: &str) -> Result<(), AppError> {
+        self.store.rename_ask_session(session_id, title)
+    }
+
+    pub fn delete_ask_session(&self, session_id: &Uuid) -> Result<(), AppError> {
+        self.store.delete_ask_session(session_id)
+    }
+
+    pub fn record_ask_failure(
+        &self,
+        request: &AskRequest,
+        error: &AppError,
+    ) -> Result<(), AppError> {
+        self.store.record_ask_failure(request, error)
+    }
+
+    pub fn answer_result(&self, message_id: &Uuid) -> Result<AnswerResult, AppError> {
+        self.store.answer_result(message_id)
     }
 
     pub fn record_ask_exchange(

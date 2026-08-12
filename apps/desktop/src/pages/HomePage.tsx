@@ -14,13 +14,14 @@ import {
   CaretRightOutlined,
   StopOutlined,
   RightOutlined,
-  SearchOutlined,
   StarFilled,
 } from "@ant-design/icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { bridge, type CandidateRoot, type HomeSummary, type RecentFile } from "../bridge";
+import { confirmAction } from "../components/AppConfirm";
 import { useAppStore } from "../state/app-store";
+import { errorMessage } from "../utils/app-error";
 
 interface HomePageProps {
   summary: HomeSummary | null;
@@ -56,22 +57,27 @@ function FileList({ files, favorite = false, onOpen }: { files: RecentFile[]; fa
 }
 
 function CandidateSourceCard({ candidate, onResolved }: { candidate: CandidateRoot; onResolved: (id: string) => void }) {
-  const [busy, setBusy] = useState(false);
+  const [busyAction, setBusyAction] = useState<"add" | "ignore" | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const act = async (action: "add" | "ignore") => {
-    setBusy(true);
+    setBusyAction(action);
+    setError(null);
     try {
       await bridge.candidate_root_action(candidate.candidate_id, action);
       onResolved(candidate.candidate_id);
+    } catch (actionError) {
+      setError(errorMessage(actionError));
     } finally {
-      setBusy(false);
+      setBusyAction(null);
     }
   };
   return (
     <div className="candidate-source">
       <div className="candidate-source__icon"><InboxOutlined /></div>
       <div><strong>{candidate.label}</strong><small>{candidate.display_path}</small></div>
-      <button type="button" disabled={busy} onClick={() => void act("add")}><PlusOutlined /> 添加到拾忆</button>
-      <button type="button" aria-label={`暂不添加${candidate.label}`} disabled={busy} onClick={() => void act("ignore")}><CloseOutlined /></button>
+      <button type="button" disabled={busyAction !== null} onClick={() => void act("add")}><PlusOutlined /> {busyAction === "add" ? "正在添加" : "添加到拾忆"}</button>
+      <button type="button" aria-label={`暂不添加${candidate.label}`} disabled={busyAction !== null} onClick={() => void act("ignore")}><CloseOutlined />{busyAction === "ignore" && <span className="sr-only">正在忽略</span>}</button>
+      {error && <small role="alert" className="inline-error candidate-source__error">{error}</small>}
     </div>
   );
 }
@@ -82,7 +88,6 @@ export function HomePage({ summary, loading }: HomePageProps) {
   const navigate = useAppStore((state) => state.navigate);
   const openInbox = useAppStore((state) => state.open_inbox);
   const openCollection = useAppStore((state) => state.open_collection);
-  const [query, setQuery] = useState("");
   const [resolvedCandidates, setResolvedCandidates] = useState<string[]>([]);
   const candidates = summary?.candidate_roots.filter((item) => !resolvedCandidates.includes(item.candidate_id)) ?? [];
   const scan = summary?.scan_progress ?? null;
@@ -100,14 +105,6 @@ export function HomePage({ summary, loading }: HomePageProps) {
 
   return (
     <section className="page page--home">
-      <div className="home-hero">
-        <h1>你好，今天想找什么？</h1>
-        <form className="hero-search" onSubmit={(event) => { event.preventDefault(); startSearch(query); }}>
-          <SearchOutlined />
-          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索你的文件、资料和过去的记录" aria-label="搜索资料" />
-        </form>
-      </div>
-
       <div className="metric-grid" aria-busy={loading}>
         {loading && Array.from({ length: 4 }, (_, index) => <div className="metric-card metric-card--loading" key={index}>正在读取…</div>)}
         {(summary?.metrics ?? []).map((metric) => (
@@ -156,9 +153,9 @@ export function HomePage({ summary, loading }: HomePageProps) {
           {scan && <div className="scan-controls">
             {scan.status === "running" && <button type="button" disabled={scanControl.isPending} onClick={() => scanControl.mutate({ action: "pause", jobId: scan.scan_job_id })}><PauseOutlined /> 暂停</button>}
             {scan.status === "paused" && <button type="button" disabled={scanControl.isPending} onClick={() => scanControl.mutate({ action: "resume", jobId: scan.scan_job_id })}><CaretRightOutlined /> 继续</button>}
-            {(scan.status === "running" || scan.status === "paused") && <button type="button" disabled={scanControl.isPending} onClick={() => { if (window.confirm("取消本次扫描？已经提交的索引会保留，源文件不会发生变化。")) scanControl.mutate({ action: "cancel", jobId: scan.scan_job_id }); }}><StopOutlined /> 取消</button>}
+            {(scan.status === "running" || scan.status === "paused") && <button type="button" disabled={scanControl.isPending} onClick={() => void confirmAction({ actionKey: "scan_cancel", title: "取消本次扫描？", description: "已经提交的索引会保留，源文件不会发生变化。", confirmLabel: "取消扫描", danger: true }).then((confirmed) => { if (confirmed) scanControl.mutate({ action: "cancel", jobId: scan.scan_job_id }); })}><StopOutlined /> 取消</button>}
           </div>}
-          {scanControl.isError && <small className="inline-error">{scanControl.error instanceof Error ? scanControl.error.message : String(scanControl.error)}</small>}
+          {scanControl.isError && <small className="inline-error">{errorMessage(scanControl.error)}</small>}
           <button className="card-link" type="button" onClick={() => navigate("settings")}>查看详情 <RightOutlined /></button>
         </article>
       </div>

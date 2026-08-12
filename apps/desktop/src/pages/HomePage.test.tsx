@@ -29,9 +29,9 @@ const summary: HomeSummary = {
   candidate_roots: [],
 };
 
-function renderHome() {
+function renderHome(value = summary) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-  return render(<QueryClientProvider client={client}><HomePage summary={summary} loading={false} /></QueryClientProvider>);
+  return render(<QueryClientProvider client={client}><HomePage summary={value} loading={false} /></QueryClientProvider>);
 }
 
 describe("HomePage", () => {
@@ -84,5 +84,15 @@ describe("HomePage", () => {
     fireEvent.click(screen.getByRole("button", { name: /暂停/ }));
 
     await waitFor(() => expect(pause).toHaveBeenCalledWith(summary.scan_progress!.scan_job_id));
+  });
+
+  it("dismisses a discovered source immediately after the backend confirms it", async () => {
+    const action = vi.spyOn(bridge, "candidate_root_action").mockResolvedValue({ candidate_id: "candidate-1", candidate_type: "wechat", label: "微信资料", display_path: "…\\WeChat Files", status: "ignored" });
+    renderHome({ ...summary, candidate_roots: [{ candidate_id: "candidate-1", candidate_type: "wechat", label: "微信资料", display_path: "…\\WeChat Files", status: "suggested" }] });
+
+    fireEvent.click(screen.getByRole("button", { name: "暂不添加微信资料" }));
+
+    await waitFor(() => expect(action).toHaveBeenCalledWith("candidate-1", "ignore"));
+    await waitFor(() => expect(screen.queryByText("微信资料")).not.toBeInTheDocument());
   });
 });

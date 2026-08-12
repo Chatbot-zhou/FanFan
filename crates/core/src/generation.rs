@@ -16,7 +16,9 @@ use crate::AppError;
 #[derive(Debug)]
 pub struct LocalGenerationRuntime {
     executable: PathBuf,
+    fallback_executable: Option<PathBuf>,
     process: Option<GenerationProcess>,
+    last_capability: Option<RuntimeCapability>,
 }
 
 #[derive(Debug)]
@@ -26,6 +28,20 @@ struct GenerationProcess {
     token: String,
     model_path: String,
     mmproj_path: Option<String>,
+    backend: String,
+    device: Option<String>,
+    threads: u32,
+    gpu_layers: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeCapability {
+    pub executable_available: bool,
+    pub backend: String,
+    pub devices: Vec<String>,
+    pub gpu_available: bool,
+    pub checked_at: chrono::DateTime<chrono::Utc>,
+    pub error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -35,18 +51,63 @@ pub struct GenerationActivation {
     pub context_size: u32,
     pub self_test: String,
     pub multimodal: bool,
+    pub device: Option<String>,
+    pub threads: u32,
+    pub gpu_layers: Option<u32>,
 }
 
 impl LocalGenerationRuntime {
     pub fn new(executable: PathBuf) -> Self {
         Self {
             executable,
+            fallback_executable: None,
             process: None,
+            last_capability: None,
+        }
+    }
+
+    pub fn new_with_fallback(executable: PathBuf, fallback_executable: PathBuf) -> Self {
+        Self {
+            executable,
+            fallback_executable: Some(fallback_executable),
+            process: None,
+            last_capability: None,
+        }
+    }
+
+    pub fn new_with_fallback_and_capability(
+        executable: PathBuf,
+        fallback_executable: PathBuf,
+        capability: RuntimeCapability,
+    ) -> Self {
+        Self {
+            executable,
+            fallback_executable: Some(fallback_executable),
+            process: None,
+            last_capability: Some(capability),
         }
     }
 
     pub fn executable_available(&self) -> bool {
         self.executable.is_file()
+    }
+
+    pub fn cpu_fallback_available(&self) -> bool {
+        self.fallback_executable
+            .as_ref()
+            .is_some_and(|path| path.is_file())
+    }
+
+    /// Ask llama.cpp itself which devices the packaged binary can use. WMI GPU
+    /// discovery is intentionally not enough: a CPU-only binary must report CPU.
+    pub fn probe_capability(&mut self) -> RuntimeCapability {
+        let capability = probe_runtime_capability(&self.executable);
+        self.last_capability = Some(capability.clone());
+        capability
+    }
+
+    pub fn current_capability(&self) -> Option<&RuntimeCapability> {
+        self.last_capability.as_ref()
     }
 
     pub fn is_active(&mut self) -> bool {
@@ -96,6 +157,33 @@ impl LocalGenerationRuntime {
         context_size: u32,
         threads: u32,
     ) -> Result<GenerationActivation, AppError> {
+        let primary_executable = self.executable.clone();
+        let result = self.activate_internal_once(model_path, mmproj_path, context_size, threads);
+        let gpu_attempted = self
+            .last_capability
+            .as_ref()
+            .is_some_and(|capability| capability.gpu_available);
+        if result.is_err()
+            && gpu_attempted
+            && let Some(fallback) = self.fallback_executable.clone()
+            && fallback.is_file()
+            && fallback != primary_executable
+        {
+            self.stop();
+            self.executable = fallback;
+            self.last_capability = None;
+            return self.activate_internal_once(model_path, mmproj_path, context_size, threads);
+        }
+        result
+    }
+
+    fn activate_internal_once(
+        &mut self,
+        model_path: &str,
+        mmproj_path: Option<&str>,
+        context_size: u32,
+        threads: u32,
+    ) -> Result<GenerationActivation, AppError> {
         if !self.executable.is_file() {
             return Err(AppError::new(
                 "GENERATION_RUNTIME_UNAVAILABLE",
@@ -126,6 +214,12 @@ impl LocalGenerationRuntime {
             ));
         }
         self.stop();
+        let capability = self.probe_capability();
+        let safe_threads = threads.clamp(1, 4);
+        let batch_threads = safe_threads.min(2);
+        let requested_gpu_layers = if capability.gpu_available { 999 } else { 0 };
+        let backend = capability.backend.clone();
+        let device = capability.devices.first().cloned();
         let port = reserve_local_port()?;
         let token = format!("remin-{}", uuid::Uuid::now_v7());
         let mut command = Command::new(&self.executable);
@@ -142,9 +236,19 @@ impl LocalGenerationRuntime {
                 "--ctx-size",
                 &context_size.to_string(),
                 "--threads",
-                &threads.to_string(),
+                &safe_threads.to_string(),
+                "--threads-batch",
+                &batch_threads.to_string(),
                 "--n-gpu-layers",
+                &requested_gpu_layers.to_string(),
+                "--batch-size",
+                "256",
+                "--ubatch-size",
+                "128",
+                "--poll",
                 "0",
+                "--prio",
+                "-1",
                 "--jinja",
                 "--sleep-idle-seconds",
                 "300",
@@ -152,21 +256,47 @@ impl LocalGenerationRuntime {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if capability.gpu_available {
+            command.args(["--fit", "on", "--fit-target", "1024"]);
+            if let Some(device_id) = capability
+                .devices
+                .first()
+                .and_then(|device| device.split(':').next())
+                .map(str::trim)
+                .filter(|device| !device.is_empty())
+            {
+                command.args(["--device", device_id]);
+            }
+        }
         if let Some(mmproj_path) = mmproj_path {
-            command.args(["--mmproj", mmproj_path, "--no-mmproj-offload"]);
+            command.args(["--mmproj", mmproj_path]);
+            if !capability.gpu_available {
+                command.arg("--no-mmproj-offload");
+            }
         }
         hide_child_console(&mut command);
         let child = command.spawn().map_err(|error| {
-            let mut err = AppError::new("GENERATION_RUNTIME_START_FAILED", "本地模型服务启动失败，请重启拾忆后重试", true);
-            err.details = Some(Box::new(serde_json::json!({"technical": error.to_string()})));
+            let mut err = AppError::new(
+                "GENERATION_RUNTIME_START_FAILED",
+                "本地模型服务启动失败，请重启拾忆后重试",
+                true,
+            );
+            err.details = Some(Box::new(
+                serde_json::json!({"technical": error.to_string()}),
+            ));
             err
         })?;
+        set_child_below_normal_priority(&child);
         self.process = Some(GenerationProcess {
             child,
             port,
             token,
             model_path: model_path.to_owned(),
             mmproj_path: mmproj_path.map(str::to_owned),
+            backend: backend.clone(),
+            device: device.clone(),
+            threads: safe_threads,
+            gpu_layers: (!capability.gpu_available).then_some(0),
         });
         let started = Instant::now();
         loop {
@@ -179,8 +309,12 @@ impl LocalGenerationRuntime {
                 ));
             }
             if let Some(process) = self.process.as_mut()
-                && let Some(status) = process.child.try_wait().map_err(|error| {
-                    AppError::new("GENERATION_RUNTIME_CHECK_FAILED", "本地模型服务状态检查失败", true)
+                && let Some(status) = process.child.try_wait().map_err(|_error| {
+                    AppError::new(
+                        "GENERATION_RUNTIME_CHECK_FAILED",
+                        "本地模型服务状态检查失败",
+                        true,
+                    )
                 })?
             {
                 self.stop();
@@ -227,11 +361,14 @@ impl LocalGenerationRuntime {
             ));
         }
         Ok(GenerationActivation {
-            backend: "cpu".into(),
+            backend,
             model_path: model_path.into(),
             context_size,
             self_test,
             multimodal: mmproj_path.is_some(),
+            device,
+            threads: safe_threads,
+            gpu_layers: (!capability.gpu_available).then_some(0),
         })
     }
 
@@ -267,8 +404,12 @@ impl LocalGenerationRuntime {
         if process
             .child
             .try_wait()
-            .map_err(|error| {
-                AppError::new("GENERATION_RUNTIME_CHECK_FAILED", "本地模型服务状态检查失败", true)
+            .map_err(|_error| {
+                AppError::new(
+                    "GENERATION_RUNTIME_CHECK_FAILED",
+                    "本地模型服务状态检查失败",
+                    true,
+                )
             })?
             .is_some()
         {
@@ -290,7 +431,7 @@ impl LocalGenerationRuntime {
                 {"role":"user","content":user}
             ]
         });
-        let body = serde_json::to_vec(&payload).map_err(|error| {
+        let body = serde_json::to_vec(&payload).map_err(|_error| {
             AppError::new("GENERATION_REQUEST_INVALID", "本地模型请求构造失败", false)
         })?;
         let (status, response) = http_request_internal(
@@ -308,8 +449,12 @@ impl LocalGenerationRuntime {
                 status >= 500,
             ));
         }
-        let value: serde_json::Value = serde_json::from_str(&response).map_err(|error| {
-            AppError::new("GENERATION_RESPONSE_INVALID", "本地模型响应格式异常，请稍后重试", false)
+        let value: serde_json::Value = serde_json::from_str(&response).map_err(|_error| {
+            AppError::new(
+                "GENERATION_RESPONSE_INVALID",
+                "本地模型响应格式异常，请稍后重试",
+                false,
+            )
         })?;
         value
             .pointer("/choices/0/message/content")
@@ -343,8 +488,13 @@ impl LocalGenerationRuntime {
                 false,
             ));
         }
-        let metadata = fs::metadata(image_path)
-            .map_err(|error| AppError::new("VISION_IMAGE_UNAVAILABLE", "图片缓存不可用，请稍后重试", true))?;
+        let metadata = fs::metadata(image_path).map_err(|_error| {
+            AppError::new(
+                "VISION_IMAGE_UNAVAILABLE",
+                "图片缓存不可用，请稍后重试",
+                true,
+            )
+        })?;
         if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 32 * 1024 * 1024 {
             return Err(AppError::new(
                 "VISION_IMAGE_SIZE_UNSUPPORTED",
@@ -352,8 +502,13 @@ impl LocalGenerationRuntime {
                 false,
             ));
         }
-        let bytes = fs::read(image_path)
-            .map_err(|error| AppError::new("VISION_IMAGE_UNAVAILABLE", "图片缓存不可用，请稍后重试", true))?;
+        let bytes = fs::read(image_path).map_err(|_error| {
+            AppError::new(
+                "VISION_IMAGE_UNAVAILABLE",
+                "图片缓存不可用，请稍后重试",
+                true,
+            )
+        })?;
         let data_url = format!("data:{mime_type};base64,{}", STANDARD.encode(bytes));
         self.complete_multimodal_data_url(system, prompt, &data_url, max_tokens, Some(cancelled))
     }
@@ -379,7 +534,13 @@ impl LocalGenerationRuntime {
         if process
             .child
             .try_wait()
-            .map_err(|error| AppError::new("VISION_RUNTIME_CHECK_FAILED", "图片理解模型状态检查失败", true))?
+            .map_err(|_error| {
+                AppError::new(
+                    "VISION_RUNTIME_CHECK_FAILED",
+                    "图片理解模型状态检查失败",
+                    true,
+                )
+            })?
             .is_some()
         {
             self.process = None;
@@ -403,8 +564,9 @@ impl LocalGenerationRuntime {
                 ]}
             ]
         });
-        let body = serde_json::to_vec(&payload)
-            .map_err(|error| AppError::new("VISION_REQUEST_INVALID", "图片理解请求构造失败", false))?;
+        let body = serde_json::to_vec(&payload).map_err(|_error| {
+            AppError::new("VISION_REQUEST_INVALID", "图片理解请求构造失败", false)
+        })?;
         let (status, response) = http_request_internal(
             process.port,
             "POST",
@@ -420,8 +582,9 @@ impl LocalGenerationRuntime {
                 status >= 500,
             ));
         }
-        let value: serde_json::Value = serde_json::from_str(&response)
-            .map_err(|error| AppError::new("VISION_RESPONSE_INVALID", "图片理解响应格式异常", false))?;
+        let value: serde_json::Value = serde_json::from_str(&response).map_err(|_error| {
+            AppError::new("VISION_RESPONSE_INVALID", "图片理解响应格式异常", false)
+        })?;
         value
             .pointer("/choices/0/message/content")
             .and_then(|value| value.as_str())
@@ -448,11 +611,133 @@ impl LocalGenerationRuntime {
             .and_then(|process| process.mmproj_path.as_deref())
     }
 
+    pub fn active_backend(&self) -> Option<&str> {
+        self.process
+            .as_ref()
+            .map(|process| process.backend.as_str())
+    }
+
+    pub fn active_device(&self) -> Option<&str> {
+        self.process
+            .as_ref()
+            .and_then(|process| process.device.as_deref())
+    }
+
+    pub fn active_threads(&self) -> Option<u32> {
+        self.process.as_ref().map(|process| process.threads)
+    }
+
+    pub fn active_gpu_layers(&self) -> Option<u32> {
+        self.process.as_ref().and_then(|process| process.gpu_layers)
+    }
+
     pub fn stop(&mut self) {
         if let Some(mut process) = self.process.take() {
             let _ = process.child.kill();
             let _ = process.child.wait();
         }
+    }
+}
+
+const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+fn probe_runtime_capability(executable: &Path) -> RuntimeCapability {
+    let checked_at = chrono::Utc::now();
+    if !executable.is_file() {
+        return RuntimeCapability {
+            executable_available: false,
+            backend: "unavailable".into(),
+            devices: Vec::new(),
+            gpu_available: false,
+            checked_at,
+            error_code: Some("GENERATION_RUNTIME_UNAVAILABLE".into()),
+        };
+    }
+    let mut command = Command::new(executable);
+    command
+        .arg("--list-devices")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    hide_child_console(&mut command);
+    // A cold GPU can take tens of seconds to come back online, so bound the
+    // wait: a hung runtime must never block a caller indefinitely.
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            return RuntimeCapability {
+                executable_available: true,
+                backend: "cpu".into(),
+                devices: Vec::new(),
+                gpu_available: false,
+                checked_at,
+                error_code: Some("GENERATION_DEVICE_PROBE_FAILED".into()),
+            };
+        }
+    };
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let mut timed_out = false;
+    let mut exited_successfully = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exited_successfully = Some(status.success());
+                break;
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(PROBE_POLL_INTERVAL),
+            _ => {
+                timed_out = true;
+                break;
+            }
+        }
+    }
+    if timed_out {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    // `--list-devices` output is a few hundred bytes, far below the 64 KiB
+    // pipe buffer, so draining after the process exits cannot deadlock.
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut stream) = child.stdout.take() {
+        let _ = stream.read_to_string(&mut stdout);
+    }
+    if let Some(mut stream) = child.stderr.take() {
+        let _ = stream.read_to_string(&mut stderr);
+    }
+    let combined = format!("{stdout}\n{stderr}");
+    let devices = combined
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && !line.eq_ignore_ascii_case("available devices:")
+                && *line != "(none)"
+        })
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let normalized = devices.join(" ").to_ascii_lowercase();
+    let backend = if normalized.contains("cuda") || normalized.contains("nvidia") {
+        "cuda"
+    } else if normalized.contains("vulkan") {
+        "vulkan"
+    } else if normalized.contains("metal") {
+        "metal"
+    } else {
+        "cpu"
+    };
+    RuntimeCapability {
+        executable_available: true,
+        backend: backend.into(),
+        gpu_available: backend != "cpu" && !devices.is_empty(),
+        devices,
+        checked_at,
+        error_code: if timed_out {
+            Some("GENERATION_DEVICE_PROBE_TIMEOUT".into())
+        } else {
+            (!exited_successfully.unwrap_or(false)).then(|| "GENERATION_DEVICE_PROBE_FAILED".into())
+        },
     }
 }
 
@@ -466,7 +751,13 @@ fn reserve_local_port() -> Result<u16, AppError> {
     TcpListener::bind(("127.0.0.1", 0))
         .and_then(|listener| listener.local_addr())
         .map(|address| address.port())
-        .map_err(|error| AppError::new("GENERATION_PORT_UNAVAILABLE", "本地模型通信端口异常，请重启拾忆", true))
+        .map_err(|_error| {
+            AppError::new(
+                "GENERATION_PORT_UNAVAILABLE",
+                "本地模型通信端口异常，请重启拾忆",
+                true,
+            )
+        })
 }
 
 fn http_request(
@@ -494,17 +785,35 @@ fn http_request_internal(
             .expect("loopback socket"),
         Duration::from_secs(3),
     )
-    .map_err(|error| AppError::new("GENERATION_RUNTIME_UNREACHABLE", "本地模型服务无响应，请重启拾忆后重试", true))?;
+    .map_err(|_error| {
+        AppError::new(
+            "GENERATION_RUNTIME_UNREACHABLE",
+            "本地模型服务无响应，请重启拾忆后重试",
+            true,
+        )
+    })?;
     stream
         .set_read_timeout(Some(if cancelled.is_some() {
             Duration::from_millis(250)
         } else {
             Duration::from_secs(180)
         }))
-        .map_err(|error| AppError::new("GENERATION_RUNTIME_IO_FAILED", "本地模型通信失败，请重启拾忆后重试", true))?;
+        .map_err(|_error| {
+            AppError::new(
+                "GENERATION_RUNTIME_IO_FAILED",
+                "本地模型通信失败，请重启拾忆后重试",
+                true,
+            )
+        })?;
     stream
         .set_write_timeout(Some(Duration::from_secs(10)))
-        .map_err(|error| AppError::new("GENERATION_RUNTIME_IO_FAILED", "本地模型通信失败，请重启拾忆后重试", true))?;
+        .map_err(|_error| {
+            AppError::new(
+                "GENERATION_RUNTIME_IO_FAILED",
+                "本地模型通信失败，请重启拾忆后重试",
+                true,
+            )
+        })?;
     let payload = body.unwrap_or_default();
     let authorization = token
         .map(|value| format!("Authorization: Bearer {value}\r\n"))
@@ -517,7 +826,13 @@ fn http_request_internal(
         .write_all(request.as_bytes())
         .and_then(|_| stream.write_all(payload))
         .and_then(|_| stream.flush())
-        .map_err(|error| AppError::new("GENERATION_RUNTIME_IO_FAILED", "本地模型通信失败，请重启拾忆后重试", true))?;
+        .map_err(|_error| {
+            AppError::new(
+                "GENERATION_RUNTIME_IO_FAILED",
+                "本地模型通信失败，请重启拾忆后重试",
+                true,
+            )
+        })?;
     let mut response = Vec::new();
     let started = Instant::now();
     let mut buffer = [0_u8; 16 * 1024];
@@ -572,8 +887,13 @@ fn parse_http_response(response: &[u8]) -> Result<(u16, String), AppError> {
                 false,
             )
         })?;
-    let headers = std::str::from_utf8(&response[..separator])
-        .map_err(|error| AppError::new("GENERATION_RESPONSE_INVALID", "本地模型响应格式异常，请稍后重试", false))?;
+    let headers = std::str::from_utf8(&response[..separator]).map_err(|_error| {
+        AppError::new(
+            "GENERATION_RESPONSE_INVALID",
+            "本地模型响应格式异常，请稍后重试",
+            false,
+        )
+    })?;
     let raw_body = &response[separator + 4..];
     let status = headers
         .lines()
@@ -611,7 +931,13 @@ fn parse_http_response(response: &[u8]) -> Result<(u16, String), AppError> {
     };
     String::from_utf8(body)
         .map(|body| (status, body))
-        .map_err(|error| AppError::new("GENERATION_RESPONSE_INVALID", "本地模型响应格式异常，请稍后重试", false))
+        .map_err(|_error| {
+            AppError::new(
+                "GENERATION_RESPONSE_INVALID",
+                "本地模型响应格式异常，请稍后重试",
+                false,
+            )
+        })
 }
 
 fn decode_chunked_body(mut input: &[u8]) -> Result<Vec<u8>, AppError> {
@@ -627,12 +953,20 @@ fn decode_chunked_body(mut input: &[u8]) -> Result<Vec<u8>, AppError> {
                     false,
                 )
             })?;
-        let length_text = std::str::from_utf8(&input[..line_end]).map_err(|error| {
-            AppError::new("GENERATION_RESPONSE_INVALID", "本地模型响应格式异常，请稍后重试", false)
+        let length_text = std::str::from_utf8(&input[..line_end]).map_err(|_error| {
+            AppError::new(
+                "GENERATION_RESPONSE_INVALID",
+                "本地模型响应格式异常，请稍后重试",
+                false,
+            )
         })?;
         let length = usize::from_str_radix(length_text.split(';').next().unwrap_or("").trim(), 16)
-            .map_err(|error| {
-                AppError::new("GENERATION_RESPONSE_INVALID", "本地模型响应格式异常，请稍后重试", false)
+            .map_err(|_error| {
+                AppError::new(
+                    "GENERATION_RESPONSE_INVALID",
+                    "本地模型响应格式异常，请稍后重试",
+                    false,
+                )
             })?;
         input = &input[line_end + 2..];
         if length == 0 {
@@ -658,6 +992,22 @@ fn hide_child_console(command: &mut Command) {
 
 #[cfg(not(windows))]
 fn hide_child_console(_command: &mut Command) {}
+
+#[cfg(windows)]
+fn set_child_below_normal_priority(child: &Child) {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Threading::{BELOW_NORMAL_PRIORITY_CLASS, SetPriorityClass};
+
+    // The process is already restricted by llama.cpp's --prio flag. Setting
+    // the Windows process class as well keeps scheduler pressure away from the
+    // desktop and foreground applications during long generations.
+    let handle = HANDLE(child.as_raw_handle());
+    let _ = unsafe { SetPriorityClass(handle, BELOW_NORMAL_PRIORITY_CLASS) };
+}
+
+#[cfg(not(windows))]
+fn set_child_below_normal_priority(_child: &Child) {}
 
 #[cfg(test)]
 mod tests {

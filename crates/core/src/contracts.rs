@@ -47,8 +47,6 @@ impl std::error::Error for AppError {}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ScopeFilter {
-    #[serde(default)]
-    pub knowledge_space_ids: Vec<Uuid>,
     pub root_ids: Vec<Uuid>,
     pub collection_ids: Vec<Uuid>,
     pub file_ids: Vec<Uuid>,
@@ -204,14 +202,6 @@ impl FileQuery {
         self.page_size.clamp(1, 200)
     }
 
-    pub fn offset(&self) -> Result<u64, AppError> {
-        self.cursor
-            .as_deref()
-            .unwrap_or("0")
-            .parse::<u64>()
-            .map_err(|_| AppError::new("FILE_CURSOR_INVALID", "资料分页游标无效", false))
-    }
-
     pub fn validate_filters(&self) -> Result<(), AppError> {
         if self
             .query
@@ -234,7 +224,8 @@ impl FileQuery {
 pub struct FilePage {
     pub items: Vec<FileRecord>,
     pub next_cursor: Option<String>,
-    pub total: u64,
+    pub has_more: bool,
+    pub total: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -394,6 +385,79 @@ impl JobRecord {
                         JobStatus::Paused | JobStatus::AwaitingUser,
                         JobStatus::Running | JobStatus::Failed | JobStatus::Cancelled
                     )
+            )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DegradationLevel {
+    Full,
+    Balanced,
+    Core,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DegradationState {
+    pub level: DegradationLevel,
+    pub triggers: Vec<String>,
+    pub disabled_features: Vec<String>,
+    pub entered_at: Option<DateTime<Utc>>,
+    pub recover_after: Option<DateTime<Utc>>,
+    pub manual_override: bool,
+}
+
+impl DegradationState {
+    pub fn full() -> Self {
+        Self {
+            level: DegradationLevel::Full,
+            triggers: Vec::new(),
+            disabled_features: Vec::new(),
+            entered_at: None,
+            recover_after: None,
+            manual_override: false,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), AppError> {
+        if self.level == DegradationLevel::Full
+            && (!self.triggers.is_empty() || !self.disabled_features.is_empty())
+        {
+            return Err(AppError::new(
+                "SCHEMA_INVALID_DEGRADATION_STATE",
+                "full状态不能保留降级触发原因或禁用能力",
+                false,
+            ));
+        }
+        if self.level != DegradationLevel::Full
+            && (self.triggers.is_empty() || self.entered_at.is_none())
+        {
+            return Err(AppError::new(
+                "SCHEMA_INVALID_DEGRADATION_STATE",
+                "降级状态必须记录触发原因和进入时间",
+                false,
+            ));
+        }
+        if let (Some(entered_at), Some(recover_after)) = (self.entered_at, self.recover_after)
+            && recover_after < entered_at
+        {
+            return Err(AppError::new(
+                "SCHEMA_INVALID_RECOVERY_TIME",
+                "恢复检查时间不能早于降级进入时间",
+                false,
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn can_transition_to(&self, next: DegradationLevel) -> bool {
+        self.level == next
+            || matches!(
+                (self.level, next),
+                (DegradationLevel::Full, DegradationLevel::Balanced)
+                    | (DegradationLevel::Balanced, DegradationLevel::Full)
+                    | (DegradationLevel::Balanced, DegradationLevel::Core)
+                    | (DegradationLevel::Core, DegradationLevel::Balanced)
             )
     }
 }

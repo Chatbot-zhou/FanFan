@@ -25,6 +25,8 @@ pub enum ModelRole {
     Vision,
     Reranker,
     Ocr,
+    Tts,
+    Asr,
 }
 
 impl ModelRole {
@@ -35,6 +37,8 @@ impl ModelRole {
             Self::Vision => "vision",
             Self::Reranker => "reranker",
             Self::Ocr => "ocr",
+            Self::Tts => "tts",
+            Self::Asr => "asr",
         }
     }
 }
@@ -187,6 +191,10 @@ pub struct ModelDownloadJob {
     pub installed_artifact_ids: Vec<Uuid>,
     pub profile_id: Option<Uuid>,
     pub error: Option<AppError>,
+    #[serde(default)]
+    pub activation_status: Option<String>,
+    #[serde(default)]
+    pub activation_error: Option<AppError>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -575,6 +583,27 @@ impl ModelManager {
                 optional: true,
                 load_policy: "on_demand".into(),
             },
+            ModelRoleConfig {
+                role: ModelRole::Ocr,
+                active_artifact_id: active(ModelRole::Ocr),
+                required_for: "扫描件与图片文字识别".into(),
+                optional: true,
+                load_policy: "on_demand".into(),
+            },
+            ModelRoleConfig {
+                role: ModelRole::Tts,
+                active_artifact_id: active(ModelRole::Tts),
+                required_for: "语音合成（TTS）模型".into(),
+                optional: true,
+                load_policy: "on_demand".into(),
+            },
+            ModelRoleConfig {
+                role: ModelRole::Asr,
+                active_artifact_id: active(ModelRole::Asr),
+                required_for: "语音识别（ASR）模型".into(),
+                optional: true,
+                load_policy: "on_demand".into(),
+            },
         ])
     }
 
@@ -696,6 +725,15 @@ impl ModelManager {
         artifact_id: &Uuid,
         embedding_dimension: u32,
     ) -> Result<Option<PendingEmbeddingActivation>, AppError> {
+        self.begin_embedding_activation_with_job(artifact_id, embedding_dimension, None)
+    }
+
+    pub fn begin_embedding_activation_with_job(
+        &self,
+        artifact_id: &Uuid,
+        embedding_dimension: u32,
+        download_job_id: Option<Uuid>,
+    ) -> Result<Option<PendingEmbeddingActivation>, AppError> {
         if embedding_dimension == 0 {
             return Err(AppError::new(
                 "MODEL_ACTIVATION_INVALID",
@@ -739,7 +777,7 @@ impl ModelManager {
                 artifact_id: *artifact_id,
                 dimension: embedding_dimension,
                 profile_id: None,
-                download_job_id: None,
+                download_job_id,
                 status: "indexing".into(),
                 error: None,
                 requested_at: now,
@@ -963,6 +1001,27 @@ impl ModelManager {
         Ok(activated)
     }
 
+    pub fn deactivate_role(&self, role: ModelRole) -> Result<(), AppError> {
+        if role == ModelRole::Ocr {
+            return Err(AppError::new(
+                "MODEL_ROLE_DEACTIVATE_UNSUPPORTED",
+                "Windows OCR 由系统运行时管理，不能在这里停用",
+                false,
+            ));
+        }
+        let _registry_guard = self.lock_registry()?;
+        let mut registry = self.load_registry()?;
+        registry.active_artifacts.remove(role.directory_name());
+        if matches!(role, ModelRole::Generation | ModelRole::Embedding) {
+            registry.active_profile_id = None;
+        }
+        if role == ModelRole::Embedding {
+            registry.pending_embedding_activation = None;
+        }
+        registry.updated_at = Utc::now();
+        self.save_registry(&registry)
+    }
+
     pub fn vision_projector_path(&self, artifact: &ModelArtifact) -> Result<PathBuf, AppError> {
         if artifact.role != ModelRole::Vision || artifact.format != ModelFormat::Gguf {
             return Err(AppError::new(
@@ -1051,6 +1110,8 @@ impl ModelManager {
             installed_artifact_ids: Vec::new(),
             profile_id: None,
             error: None,
+            activation_status: Some("pending".into()),
+            activation_error: None,
             created_at: now,
             updated_at: now,
         };
@@ -1236,6 +1297,8 @@ impl ModelManager {
                         ),
                         true,
                     )),
+                    activation_status: None,
+                    activation_error: None,
                     created_at: now,
                     updated_at: now,
                 });
@@ -1563,6 +1626,18 @@ fn infer_role(path: &Path, format: ModelFormat) -> Option<ModelRole> {
         Some(ModelRole::Reranker)
     } else if value.contains("embed") || value.contains("bge-") || value.contains("gte-") {
         Some(ModelRole::Embedding)
+    } else if value.contains("tts")
+        || value.contains("vits")
+        || value.contains("cosyvoice")
+        || value.contains("melotts")
+    {
+        Some(ModelRole::Tts)
+    } else if value.contains("asr")
+        || value.contains("whisper")
+        || value.contains("paraformer")
+        || value.contains("sense-voice")
+    {
+        Some(ModelRole::Asr)
     } else if format == ModelFormat::Gguf {
         Some(ModelRole::Generation)
     } else {

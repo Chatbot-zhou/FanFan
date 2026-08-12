@@ -92,7 +92,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let session = catalog.search(&SearchRequest {
             query: case.query.clone(),
             scope: ScopeFilter {
-                knowledge_space_ids: vec![],
                 root_ids: vec![root.root_id],
                 collection_ids: vec![],
                 file_ids: vec![],

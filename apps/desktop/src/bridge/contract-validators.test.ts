@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ExecutionUnit, ValidationCheckpoint } from "./contracts";
-import { canTransitionJobStatus, validateCheckpoint, validateExecutionUnit } from "./contract-validators";
+import { canTransitionJobStatus, isValidRuntimeEventName, validateCheckpoint, validateExecutionUnit } from "./contract-validators";
+import { RUNTIME_EVENTS } from "./runtime-events";
 
 const uuid7 = "018f0000-0000-7000-8000-000000000001";
 
@@ -50,5 +51,10 @@ describe("public contract validators", () => {
       resume_token: null,
     };
     expect(validateCheckpoint(checkpoint).map((item) => item.code)).toEqual(["SCHEMA_CHECKPOINT_ERROR_REQUIRED"]);
+  });
+
+  it("uses only Tauri-compatible runtime event names", () => {
+    expect(Object.values(RUNTIME_EVENTS).every(isValidRuntimeEventName)).toBe(true);
+    expect(isValidRuntimeEventName("startup.state")).toBe(false);
   });
 });

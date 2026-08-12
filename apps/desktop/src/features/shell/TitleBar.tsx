@@ -33,10 +33,14 @@ export function TitleBar({ model_state, model_download = null, notices = [], wel
   const resolved: SystemNotice[] = [...notices];
 
   // 模型下载进度
-  if (!welcome && model_download && model_download.status !== "completed") {
+  if (!welcome && model_download && (model_download.status !== "completed" || model_download.activation_status === "failed")) {
     resolved.push({
-      level: model_download.status === "failed" ? "warning" : "info",
-      message: `${PHASE_LABELS[model_download.phase]} · ${Math.round(model_download.progress * 100)}%`,
+      notice_key: `model-download-${model_download.job_id}`,
+      level: model_download.status === "failed" || model_download.activation_status === "failed" ? "warning" : "info",
+      message: model_download.activation_status === "failed"
+        ? `模型已下载，语义索引启用失败 · ${model_download.activation_error?.code ?? "可重试"}`
+        : `${PHASE_LABELS[model_download.phase]} · ${Math.round(model_download.progress * 100)}%`,
+      details: model_download.activation_error?.message ?? null,
       action_label: "查看",
       action_route: "model_setup",
     });
@@ -45,8 +49,10 @@ export function TitleBar({ model_state, model_download = null, notices = [], wel
   // 模型未配置
   if (!dismissed && !welcome && model_state?.status === "unconfigured" && !model_download) {
     resolved.push({
+      notice_key: "model-unconfigured",
       level: "info",
       message: "未配置本地模型",
+      details: "配置生成与 Embedding 模型后可使用完整本地 RAG。",
       action_label: "去配置",
       action_route: "model_setup",
     });

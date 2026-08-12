@@ -2906,10 +2906,12 @@ dependencies = [
  "remin-core",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-single-instance",
+ "tempfile",
  "uuid",
  "windows",
 ]

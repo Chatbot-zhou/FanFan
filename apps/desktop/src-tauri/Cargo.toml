@@ -17,8 +17,12 @@ chrono.workspace = true
 remin-core = { path = "../../../crates/core" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
 uuid.workspace = true
 windows.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

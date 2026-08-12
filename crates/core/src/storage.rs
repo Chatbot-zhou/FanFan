@@ -1,34 +1,42 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::{fs, fs::File, io::Read, path::PathBuf, time::Duration};
+use std::{
+    fs,
+    fs::File,
+    io::Read,
+    path::PathBuf,
+    sync::{Arc, Condvar, Mutex, OnceLock},
+    thread,
+    time::Duration,
+};
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    AnswerResult, AnswerSourceFile, AppError, AppLogRecord, AskMessage, AskRequest,
-    AuthorizationSource, BUILT_IN_EXCLUSION_RULES, CandidateRoot, CandidateRootStatus,
-    CandidateRootType, CheckpointStatus, CheckpointType, ChunkEmbeddingInput, CollectionKind,
+    AnswerResult, AnswerSourceFile, AppError, AppLogRecord, AskMessage, AskMessagePage, AskRequest,
+    AskSessionPage, AskSessionSummary, AuthorizationSource, BUILT_IN_EXCLUSION_RULES,
+    CandidateRoot, CandidateRootStatus, CandidateRootType, ChunkEmbeddingInput, CollectionKind,
     CollectionModelReview, CollectionRecord, CollectionRule, CollectionSuggestedMember,
     CollectionSuggestion, CollectionSuggestionPage, CollectionSuggestionQuery,
     CollectionSuggestionRefreshResult, CollectionSuggestionUpdateRequest, CreateCollectionRequest,
     DegradationLevel, DegradationState, DiscoveredFile, DocumentNode, ExclusionRule,
-    ExclusionRuleClass, ExclusionRuleInput, ExclusionRuleType, ExplorationCandidate,
-    ExtractionChunk, ExtractionDocument, ExtractionRunRequest, ExtractionRunResult,
-    ExtractionTable, FilePage, FileQuery, FileRecord, FileRelation, FileSystemEvent,
-    HealthCheckItem, ImageAsset, ImageUnderstandingResult, InboxEventType, InboxItem, InboxPage,
-    InboxQuery, InboxUpdateRequest, IndexActivityStats, IndexRebuildResult, JobRecord, JobStatus,
-    KnowledgeSpace, KnowledgeSpaceRequest, LogPage, LogQuery, MaintenanceSnapshot, ParseOutcome,
+    ExclusionRuleClass, ExclusionRuleInput, ExclusionRuleType, FilePage, FileQuery, FileRecord,
+    FileRelation, FileSystemEvent, HealthCheckItem, ImageAsset, ImageUnderstandingResult,
+    InboxEventType, InboxItem, InboxPage, InboxQuery, InboxUpdateRequest, IndexActivityStats,
+    IndexRebuildResult, JobRecord, JobStatus, LogPage, LogQuery, MaintenanceSnapshot, ParseOutcome,
     ParseResult, ParseStatus, PendingEmbeddingChunk, PendingImageUnderstanding, RankedHit,
-    RelationPage, RelationQuery, RelationRefreshResult, RelationType, RootKind, RootRecord,
-    RootSource, RootStatus, ScanOutcome, ScopeFilter, SearchMode, SemanticQuery, SourceLocator,
-    TaskPlan, TaskStep, TriageStatus, ValidationCheckpoint, VolumeType, WatchMode,
-    chunks_from_nodes, fts_query, normalized_version_key,
+    RelationPage, RelationQuery, RelationRefreshResult, RelationType, ResolutionStatus, RootKind,
+    RootRecord, RootSource, RootStatus, ScanOutcome, ScopeFilter, SearchMode, SemanticQuery,
+    SourceLocator, TriageStatus, VolumeType, WatchMode, chunks_from_nodes, fts_query,
+    normalized_version_key,
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 14;
+pub const CURRENT_SCHEMA_VERSION: u32 = 18;
 
 type VectorSourceRow = (u64, String, String, String, Vec<f32>);
 type SemanticCandidate = (Uuid, (String, f32));
@@ -107,50 +115,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 2,
         name: "execution_contracts",
         sql: r#"
-            CREATE TABLE IF NOT EXISTS execution_units (
-                unit_id TEXT PRIMARY KEY,
-                job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
-                unit_type TEXT NOT NULL,
-                status TEXT NOT NULL,
-                idempotency_key TEXT NOT NULL UNIQUE,
-                contract_json TEXT NOT NULL,
-                attempt_count INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL,
-                started_at TEXT,
-                finished_at TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS validation_checkpoints (
-                checkpoint_id TEXT PRIMARY KEY,
-                job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
-                unit_id TEXT NOT NULL REFERENCES execution_units(unit_id) ON DELETE CASCADE,
-                checkpoint_type TEXT NOT NULL,
-                status TEXT NOT NULL,
-                rules_version TEXT NOT NULL,
-                metrics_json TEXT NOT NULL,
-                error_json TEXT,
-                resume_token TEXT,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS exploration_candidates (
-                candidate_id TEXT PRIMARY KEY,
-                job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
-                strategy TEXT NOT NULL,
-                status TEXT NOT NULL,
-                candidate_json TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-
             CREATE TABLE IF NOT EXISTS degradation_states (
                 state_id INTEGER PRIMARY KEY CHECK (state_id = 1),
                 state_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
-
-            CREATE INDEX IF NOT EXISTS idx_execution_units_job ON execution_units(job_id, created_at);
-            CREATE INDEX IF NOT EXISTS idx_checkpoints_unit ON validation_checkpoints(unit_id, created_at);
-            CREATE INDEX IF NOT EXISTS idx_candidates_job ON exploration_candidates(job_id, created_at);
         "#,
     },
     Migration {
@@ -614,32 +583,11 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 13,
-        name: "knowledge_spaces",
+        name: "knowledge_spaces_removed",
         sql: r#"
-            CREATE TABLE knowledge_spaces (
-                space_id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                description TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE knowledge_space_roots (
-                space_id TEXT NOT NULL REFERENCES knowledge_spaces(space_id) ON DELETE CASCADE,
-                root_id TEXT NOT NULL REFERENCES roots(root_id) ON DELETE CASCADE,
-                PRIMARY KEY (space_id, root_id)
-            );
-
-            CREATE TABLE knowledge_space_collections (
-                space_id TEXT NOT NULL REFERENCES knowledge_spaces(space_id) ON DELETE CASCADE,
-                collection_id TEXT NOT NULL REFERENCES collections(collection_id) ON DELETE CASCADE,
-                PRIMARY KEY (space_id, collection_id)
-            );
-
-            CREATE INDEX idx_knowledge_space_roots_root
-                ON knowledge_space_roots(root_id, space_id);
-            CREATE INDEX idx_knowledge_space_collections_collection
-                ON knowledge_space_collections(collection_id, space_id);
+            DROP TABLE IF EXISTS knowledge_space_collections;
+            DROP TABLE IF EXISTS knowledge_space_roots;
+            DROP TABLE IF EXISTS knowledge_spaces;
         "#,
     },
     Migration {
@@ -653,11 +601,175 @@ const MIGRATIONS: &[Migration] = &[
             );
         "#,
     },
+    Migration {
+        version: 15,
+        name: "relation_evidence_versions",
+        sql: r#"
+            ALTER TABLE file_relations ADD COLUMN algorithm_version TEXT;
+            ALTER TABLE file_relations ADD COLUMN model_version TEXT;
+            ALTER TABLE file_relations ADD COLUMN left_revision_id TEXT;
+            ALTER TABLE file_relations ADD COLUMN right_revision_id TEXT;
+            CREATE INDEX idx_file_relations_model_algorithm
+                ON file_relations(relation_type, model_version, algorithm_version, review_status);
+        "#,
+    },
+    Migration {
+        version: 16,
+        name: "stable_keyset_paging_and_scan_checkpoints",
+        sql: r#"
+            CREATE INDEX IF NOT EXISTS idx_files_keyset_page
+                ON files(last_seen_at DESC, file_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_inbox_keyset_page
+                ON inbox_events(triage_status, observed_at DESC, inbox_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_memberships_root_file
+                ON file_root_memberships(root_id, file_id);
+            CREATE TABLE IF NOT EXISTS scan_seen_memberships (
+                job_id TEXT NOT NULL,
+                root_id TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                PRIMARY KEY (job_id, root_id, file_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_scan_seen_root
+                ON scan_seen_memberships(job_id, root_id, file_id);
+        "#,
+    },
+    Migration {
+        version: 17,
+        name: "inbox_triage_resolution_split",
+        sql: r#"
+            ALTER TABLE inbox_events ADD COLUMN resolution_status TEXT NOT NULL DEFAULT 'normal';
+            ALTER TABLE inbox_events ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE inbox_events ADD COLUMN last_attempt_at TEXT;
+            ALTER TABLE inbox_events ADD COLUMN last_error_json TEXT;
+            ALTER TABLE ask_sessions ADD COLUMN title TEXT;
+            ALTER TABLE ask_sessions ADD COLUMN last_error_json TEXT;
+            ALTER TABLE ask_messages ADD COLUMN error_json TEXT;
+
+            UPDATE inbox_events
+                SET resolution_status = 'abandoned'
+                WHERE triage_status = 'ignored'
+                  AND (event_type IN ('parse_failed', 'ocr_required') OR error_code IS NOT NULL);
+            UPDATE inbox_events
+                SET resolution_status = 'resolved'
+                WHERE triage_status <> 'ignored'
+                  AND (event_type IN ('parse_failed', 'ocr_required') OR error_code IS NOT NULL)
+                  AND EXISTS (
+                      SELECT 1 FROM files f
+                      WHERE f.file_id = inbox_events.file_id
+                        AND f.parse_status = 'parsed'
+                  );
+            UPDATE inbox_events
+                SET resolution_status = 'pending_retry'
+                WHERE triage_status <> 'ignored'
+                  AND (event_type IN ('parse_failed', 'ocr_required') OR error_code IS NOT NULL)
+                  AND resolution_status = 'normal';
+            UPDATE inbox_events SET triage_status = 'new' WHERE triage_status = 'error';
+
+            CREATE INDEX idx_inbox_resolution_time
+                ON inbox_events(resolution_status, observed_at DESC, inbox_id DESC);
+        "#,
+    },
+    Migration {
+        version: 18,
+        name: "remove_knowledge_spaces",
+        sql: r#"
+            DROP TABLE IF EXISTS knowledge_space_collections;
+            DROP TABLE IF EXISTS knowledge_space_roots;
+            DROP TABLE IF EXISTS knowledge_spaces;
+        "#,
+    },
 ];
 
 #[derive(Debug, Clone)]
 pub struct CatalogStore {
     database_path: PathBuf,
+    write_coordinator: Arc<WriteCoordinator>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WritePriority {
+    Interactive,
+    Background,
+}
+
+#[derive(Debug, Default)]
+struct WriteCoordinatorState {
+    active: bool,
+    interactive_waiters: usize,
+}
+
+#[derive(Debug, Default)]
+struct WriteCoordinator {
+    state: Mutex<WriteCoordinatorState>,
+    changed: Condvar,
+}
+
+struct WritePermit<'a> {
+    coordinator: &'a WriteCoordinator,
+}
+
+impl WriteCoordinator {
+    fn acquire(&self, priority: WritePriority) -> WritePermit<'_> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if priority == WritePriority::Interactive {
+            state.interactive_waiters = state.interactive_waiters.saturating_add(1);
+        }
+        while state.active
+            || (priority == WritePriority::Background && state.interactive_waiters > 0)
+        {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        if priority == WritePriority::Interactive {
+            state.interactive_waiters = state.interactive_waiters.saturating_sub(1);
+        }
+        state.active = true;
+        WritePermit { coordinator: self }
+    }
+}
+
+impl Drop for WritePermit<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .coordinator
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.active = false;
+        self.coordinator.changed.notify_all();
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct FileKeysetCursor {
+    version: u8,
+    filter_digest: String,
+    last_seen_at: String,
+    file_id: String,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct InboxKeysetCursor {
+    version: u8,
+    filter_digest: String,
+    observed_at: String,
+    inbox_id: String,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct AskSessionKeysetCursor {
+    version: u8,
+    updated_at: String,
+    session_id: String,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct AskMessageKeysetCursor {
+    version: u8,
+    created_at: String,
+    message_id: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -704,6 +816,7 @@ impl CatalogStore {
     pub fn open(database_path: impl Into<PathBuf>) -> Result<Self, AppError> {
         let store = Self {
             database_path: database_path.into(),
+            write_coordinator: Arc::new(WriteCoordinator::default()),
         };
         if let Some(parent) = store.database_path.parent() {
             fs::create_dir_all(parent)
@@ -722,12 +835,18 @@ impl CatalogStore {
         let connection = Connection::open(&self.database_path)
             .map_err(|error| storage_error("DATABASE_OPEN_FAILED", error, true))?;
         connection
-            .busy_timeout(Duration::from_millis(250))
+            .busy_timeout(Duration::from_millis(1_500))
             .map_err(|error| storage_error("DATABASE_CONFIG_FAILED", error, true))?;
         connection
-            .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
+            .execute_batch(
+                "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA temp_store = MEMORY;",
+            )
             .map_err(|error| storage_error("DATABASE_CONFIG_FAILED", error, true))?;
         Ok(connection)
+    }
+
+    fn acquire_write(&self, priority: WritePriority) -> WritePermit<'_> {
+        self.write_coordinator.acquire(priority)
     }
 
     fn vector_index_directory(&self) -> Result<PathBuf, AppError> {
@@ -1086,6 +1205,7 @@ impl CatalogStore {
         canonical_path: &str,
         path_key: &str,
     ) -> Result<CandidateRoot, AppError> {
+        let _permit = self.acquire_write(WritePriority::Background);
         let connection = self.connect()?;
         connection
             .execute(
@@ -1130,6 +1250,7 @@ impl CatalogStore {
         candidate_id: &Uuid,
         status: CandidateRootStatus,
     ) -> Result<CandidateRoot, AppError> {
+        let _permit = self.acquire_write(WritePriority::Interactive);
         let connection = self.connect()?;
         let changed = connection
             .execute(
@@ -1152,6 +1273,7 @@ impl CatalogStore {
     }
 
     pub fn upsert_root(&self, registration: &RootRegistration) -> Result<RootRecord, AppError> {
+        let _permit = self.acquire_write(WritePriority::Interactive);
         let connection = self.connect()?;
         if let Some(existing) = self.root_by_path_key_with(&connection, &registration.path_key)? {
             if !existing.enabled
@@ -1209,13 +1331,11 @@ impl CatalogStore {
     }
 
     pub fn disable_root(&self, root_id: &Uuid) -> Result<(), AppError> {
+        let _permit = self.acquire_write(WritePriority::Interactive);
         let connection = self.connect()?;
-        let transaction = connection
-            .unchecked_transaction()
-            .map_err(|error| storage_error("DATABASE_TRANSACTION_FAILED", error, true))?;
-        let changed = transaction
+        let changed = connection
             .execute(
-                "UPDATE roots SET enabled = 0, user_disabled = 1, status = 'paused' WHERE root_id = ?1 AND enabled = 1",
+                "UPDATE roots SET enabled = 0, user_disabled = 1, status = 'removing' WHERE root_id = ?1 AND enabled = 1",
                 [root_id.to_string()],
             )
             .map_err(|error| storage_error("ROOT_DISABLE_FAILED", error, true))?;
@@ -1226,32 +1346,79 @@ impl CatalogStore {
                 false,
             ));
         }
-        transaction
-            .execute(
-                "DELETE FROM file_root_memberships WHERE root_id = ?1",
-                [root_id.to_string()],
-            )
-            .map_err(|error| storage_error("MEMBERSHIP_DELETE_FAILED", error, true))?;
-        transaction
-            .execute(
-                "DELETE FROM files WHERE NOT EXISTS (SELECT 1 FROM file_root_memberships m JOIN roots r ON r.root_id = m.root_id WHERE m.file_id = files.file_id AND r.enabled = 1)",
-                [],
-            )
-            .map_err(|error| storage_error("ROOT_INDEX_PURGE_FAILED", error, true))?;
-        transaction
-            .execute("UPDATE file_root_memberships SET is_primary = 0", [])
-            .map_err(|error| storage_error("MEMBERSHIP_UPDATE_FAILED", error, true))?;
-        transaction
-            .execute(
-                "UPDATE file_root_memberships SET is_primary = 1 WHERE rowid IN (SELECT MIN(rowid) FROM file_root_memberships GROUP BY file_id)",
-                [],
-            )
-            .map_err(|error| storage_error("MEMBERSHIP_UPDATE_FAILED", error, true))?;
-        refresh_root_coverage(&transaction)?;
-        transaction
-            .commit()
-            .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))?;
         Ok(())
+    }
+
+    pub fn cleanup_disabled_root(&self, root_id: &Uuid) -> Result<u64, AppError> {
+        const BATCH_SIZE: usize = 250;
+        let mut removed = 0_u64;
+        loop {
+            let batch = {
+                let connection = self.connect()?;
+                let mut statement = connection
+                    .prepare(
+                        "SELECT file_id FROM file_root_memberships WHERE root_id = ?1 LIMIT ?2",
+                    )
+                    .map_err(|error| storage_error("MEMBERSHIP_QUERY_FAILED", error, true))?;
+                statement
+                    .query_map(params![root_id.to_string(), BATCH_SIZE as u64], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .map_err(|error| storage_error("MEMBERSHIP_QUERY_FAILED", error, true))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| storage_error("MEMBERSHIP_QUERY_FAILED", error, true))?
+            };
+            if batch.is_empty() {
+                break;
+            }
+            {
+                let _permit = self.acquire_write(WritePriority::Background);
+                let mut connection = self.connect()?;
+                let transaction = connection
+                    .transaction()
+                    .map_err(|error| storage_error("DATABASE_TRANSACTION_FAILED", error, true))?;
+                for file_id in &batch {
+                    transaction
+                        .execute(
+                            "DELETE FROM file_root_memberships WHERE root_id = ?1 AND file_id = ?2",
+                            params![root_id.to_string(), file_id],
+                        )
+                        .map_err(|error| storage_error("MEMBERSHIP_DELETE_FAILED", error, true))?;
+                    transaction
+                        .execute(
+                            "DELETE FROM files WHERE file_id = ?1 AND NOT EXISTS (SELECT 1 FROM file_root_memberships WHERE file_id = ?1)",
+                            [file_id],
+                        )
+                        .map_err(|error| storage_error("ROOT_INDEX_PURGE_FAILED", error, true))?;
+                }
+                transaction
+                    .commit()
+                    .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))?;
+            }
+            removed = removed.saturating_add(batch.len() as u64);
+            std::thread::yield_now();
+        }
+        {
+            let _permit = self.acquire_write(WritePriority::Background);
+            let connection = self.connect()?;
+            connection
+                .execute("UPDATE file_root_memberships SET is_primary = 0", [])
+                .map_err(|error| storage_error("MEMBERSHIP_UPDATE_FAILED", error, true))?;
+            connection
+                .execute(
+                    "UPDATE file_root_memberships SET is_primary = 1 WHERE rowid IN (SELECT MIN(rowid) FROM file_root_memberships GROUP BY file_id)",
+                    [],
+                )
+                .map_err(|error| storage_error("MEMBERSHIP_UPDATE_FAILED", error, true))?;
+            refresh_root_coverage(&connection)?;
+            connection
+                .execute(
+                    "UPDATE roots SET status = 'paused', file_count = 0 WHERE root_id = ?1 AND enabled = 0",
+                    [root_id.to_string()],
+                )
+                .map_err(|error| storage_error("ROOT_UPDATE_FAILED", error, true))?;
+        }
+        Ok(removed)
     }
 
     pub fn root_by_id(&self, root_id: &Uuid) -> Result<RootRecord, AppError> {
@@ -1332,405 +1499,6 @@ impl CatalogStore {
                 job_from_row,
             )
             .map_err(|error| storage_error("JOB_NOT_FOUND", error, false))
-    }
-
-    pub fn begin_task(&self, plan: &TaskPlan) -> Result<JobRecord, AppError> {
-        let connection = self.connect()?;
-        let transaction = connection
-            .unchecked_transaction()
-            .map_err(|error| storage_error("DATABASE_TRANSACTION_FAILED", error, true))?;
-        let now = Utc::now();
-        let job = JobRecord {
-            job_id: plan.task_id,
-            job_type: format!("task.{}", plan.skill_id),
-            status: JobStatus::Running,
-            stage: plan
-                .steps
-                .first()
-                .map(|step| step.step_type.clone())
-                .unwrap_or_else(|| "running".into()),
-            progress: 0.0,
-            processed_items: 0,
-            total_items: plan.steps.len() as u64,
-            error: None,
-            created_at: now,
-            started_at: Some(now),
-            finished_at: None,
-        };
-        transaction
-            .execute(
-                "INSERT INTO jobs (job_id, job_type, root_id, reason, status, stage, progress, processed_items, total_items, created_at, started_at, last_heartbeat_at, resume_token) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?9, ?10)",
-                params![job.job_id.to_string(), job.job_type, plan.summary, job.status.as_str(), job.stage, job.progress, job.processed_items, job.total_items, now.to_rfc3339(), format!("{}:0", plan.task_id)],
-            )
-            .map_err(|error| storage_error("JOB_INSERT_FAILED", error, true))?;
-        for step in &plan.steps {
-            let contract = serde_json::to_string(step).map_err(|error| {
-                AppError::new("TASK_PLAN_SERIALIZE_FAILED", error.to_string(), false)
-            })?;
-            transaction
-                .execute(
-                    "INSERT INTO execution_units (unit_id, job_id, unit_type, status, idempotency_key, contract_json, attempt_count, created_at) VALUES (?1, ?2, ?3, 'pending', ?4, ?5, 0, ?6)",
-                    params![step.step_id.to_string(), plan.task_id.to_string(), step.step_type, format!("{}:{}", plan.task_id, step.ordinal), contract, now.to_rfc3339()],
-                )
-                .map_err(|error| storage_error("TASK_UNIT_INSERT_FAILED", error, true))?;
-        }
-        transaction
-            .commit()
-            .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))?;
-        Ok(job)
-    }
-
-    pub fn task_plan_by_id(&self, task_id: &Uuid) -> Result<Option<TaskPlan>, AppError> {
-        let connection = self.connect()?;
-        let task = connection
-            .query_row(
-                "SELECT job_type, reason FROM jobs WHERE job_id = ?1 AND job_type LIKE 'task.%'",
-                [task_id.to_string()],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()
-            .map_err(|error| storage_error("JOB_QUERY_FAILED", error, true))?;
-        let Some((job_type, summary)) = task else {
-            return Ok(None);
-        };
-        let mut statement = connection
-            .prepare("SELECT contract_json FROM execution_units WHERE job_id = ?1")
-            .map_err(|error| storage_error("TASK_UNIT_QUERY_FAILED", error, true))?;
-        let mut steps = statement
-            .query_map([task_id.to_string()], |row| row.get::<_, String>(0))
-            .map_err(|error| storage_error("TASK_UNIT_QUERY_FAILED", error, true))?
-            .map(|value| {
-                serde_json::from_str::<TaskStep>(
-                    &value.map_err(|error| storage_error("TASK_UNIT_QUERY_FAILED", error, true))?,
-                )
-                .map_err(|error| {
-                    AppError::new("TASK_PLAN_DESERIALIZE_FAILED", error.to_string(), false)
-                })
-            })
-            .collect::<Result<Vec<_>, AppError>>()?;
-        steps.sort_by_key(|step| step.ordinal);
-        let estimated_file_count = steps
-            .first()
-            .and_then(|step| step.inputs.get("file_ids"))
-            .and_then(|value| value.as_array())
-            .map_or(0, |items| items.len() as u64);
-        Ok(Some(TaskPlan {
-            task_id: *task_id,
-            skill_id: job_type.trim_start_matches("task.").to_owned(),
-            skill_version: "1.0.0".into(),
-            summary,
-            steps,
-            estimated_file_count,
-            warnings: vec![
-                "这是从本地检查点恢复的任务；已通过的原子步骤不会重复执行。".into(),
-                "任务只读取源文件；结果仍需复核并显式导出。".into(),
-            ],
-        }))
-    }
-
-    pub fn resume_task(&self, task_id: &Uuid) -> Result<JobRecord, AppError> {
-        let connection = self.connect()?;
-        let (status, resume_count): (String, u32) = connection
-            .query_row(
-                "SELECT status, resume_count FROM jobs WHERE job_id = ?1 AND job_type LIKE 'task.%'",
-                [task_id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|error| storage_error("JOB_QUERY_FAILED", error, true))?
-            .ok_or_else(|| AppError::new("TASK_JOB_NOT_FOUND", "待恢复任务不存在", false))?;
-        if matches!(status.as_str(), "succeeded" | "partial" | "cancelled") {
-            return Err(AppError::new(
-                "TASK_JOB_TERMINAL",
-                "任务已经结束，不能重复执行",
-                false,
-            ));
-        }
-        if resume_count >= 3 {
-            return Err(AppError::new(
-                "TASK_RECOVERY_LIMIT_REACHED",
-                "任务已连续恢复三次，请重新创建任务",
-                false,
-            ));
-        }
-        let next_step = connection
-            .query_row(
-                "SELECT unit_type FROM execution_units WHERE job_id = ?1 AND status <> 'succeeded' ORDER BY created_at LIMIT 1",
-                [task_id.to_string()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|error| storage_error("TASK_UNIT_QUERY_FAILED", error, true))?
-            .unwrap_or_else(|| "result.review".into());
-        let now = Utc::now().to_rfc3339();
-        connection
-            .execute(
-                "UPDATE jobs SET status = 'running', stage = ?1, error_json = NULL, finished_at = NULL, started_at = COALESCE(started_at, ?2), last_heartbeat_at = ?2, resume_count = resume_count + 1 WHERE job_id = ?3",
-                params![next_step, now, task_id.to_string()],
-            )
-            .map_err(|error| storage_error("JOB_UPDATE_FAILED", error, true))?;
-        self.job_by_id(task_id)
-    }
-
-    pub fn task_checkpoints(&self, task_id: &Uuid) -> Result<Vec<ValidationCheckpoint>, AppError> {
-        let connection = self.connect()?;
-        let mut statement = connection
-            .prepare(
-                "SELECT checkpoint_id, unit_id, checkpoint_type, status, rules_version, metrics_json, error_json, resume_token, created_at FROM validation_checkpoints WHERE job_id = ?1 ORDER BY created_at",
-            )
-            .map_err(|error| storage_error("TASK_CHECKPOINT_QUERY_FAILED", error, true))?;
-        statement
-            .query_map([task_id.to_string()], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, String>(8)?,
-                ))
-            })
-            .map_err(|error| storage_error("TASK_CHECKPOINT_QUERY_FAILED", error, true))?
-            .map(|row| {
-                let (checkpoint_id, unit_id, kind, status, rules, metrics, error, resume, created) =
-                    row.map_err(|error| {
-                        storage_error("TASK_CHECKPOINT_QUERY_FAILED", error, true)
-                    })?;
-                Ok(ValidationCheckpoint {
-                    checkpoint_id: parse_uuid_value(&checkpoint_id)?,
-                    job_id: *task_id,
-                    unit_id: parse_uuid_value(&unit_id)?,
-                    checkpoint_type: checkpoint_type_from_str(&kind)?,
-                    status: checkpoint_status_from_str(&status)?,
-                    rules_version: rules,
-                    metrics: serde_json::from_str(&metrics).map_err(|error| {
-                        AppError::new("TASK_CHECKPOINT_DATA_INVALID", error.to_string(), false)
-                    })?,
-                    error: error
-                        .map(|value| serde_json::from_str(&value))
-                        .transpose()
-                        .map_err(|error| {
-                            AppError::new("TASK_CHECKPOINT_DATA_INVALID", error.to_string(), false)
-                        })?,
-                    created_at: parse_datetime_value(&created)?,
-                    resume_token: resume,
-                })
-            })
-              .collect()
-    }
-
-    pub fn replace_task_exploration_candidates(
-        &self,
-        task_id: &Uuid,
-        candidates: &[ExplorationCandidate],
-    ) -> Result<(), AppError> {
-        if !(2..=3).contains(&candidates.len())
-            || candidates
-                .iter()
-                .any(|candidate| candidate.job_id != *task_id)
-        {
-            return Err(AppError::new(
-                "TASK_CANDIDATE_DATA_INVALID",
-                "多路径探索必须记录同一任务的2到3条候选路径",
-                false,
-            ));
-        }
-        for candidate in candidates {
-            candidate.validate()?;
-        }
-        let connection = self.connect()?;
-        let transaction = connection
-            .unchecked_transaction()
-            .map_err(|error| storage_error("DATABASE_TRANSACTION_FAILED", error, true))?;
-        transaction
-            .execute(
-                "DELETE FROM exploration_candidates WHERE job_id = ?1",
-                [task_id.to_string()],
-            )
-            .map_err(|error| storage_error("TASK_CANDIDATE_WRITE_FAILED", error, true))?;
-        let now = Utc::now().to_rfc3339();
-        for candidate in candidates {
-            let candidate_json = serde_json::to_string(candidate).map_err(|error| {
-                AppError::new("TASK_CANDIDATE_DATA_INVALID", error.to_string(), false)
-            })?;
-            transaction
-                .execute(
-                    "INSERT INTO exploration_candidates (candidate_id, job_id, strategy, status, candidate_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        candidate.candidate_id.to_string(),
-                        task_id.to_string(),
-                        candidate.strategy.as_str(),
-                        serde_json::to_value(candidate.status)
-                            .ok()
-                            .and_then(|value| value.as_str().map(ToOwned::to_owned))
-                            .unwrap_or_else(|| "pending".into()),
-                        candidate_json,
-                        now,
-                    ],
-                )
-                .map_err(|error| storage_error("TASK_CANDIDATE_WRITE_FAILED", error, true))?;
-        }
-        transaction
-            .commit()
-            .map_err(|error| storage_error("DATABASE_TRANSACTION_FAILED", error, true))
-    }
-
-    pub fn task_exploration_candidates(
-        &self,
-        task_id: &Uuid,
-    ) -> Result<Vec<ExplorationCandidate>, AppError> {
-        let connection = self.connect()?;
-        let mut statement = connection
-            .prepare(
-                "SELECT candidate_json FROM exploration_candidates WHERE job_id = ?1 ORDER BY created_at, candidate_id",
-            )
-            .map_err(|error| storage_error("TASK_CANDIDATE_QUERY_FAILED", error, true))?;
-        statement
-            .query_map([task_id.to_string()], |row| row.get::<_, String>(0))
-            .map_err(|error| storage_error("TASK_CANDIDATE_QUERY_FAILED", error, true))?
-            .map(|row| {
-                let value =
-                    row.map_err(|error| storage_error("TASK_CANDIDATE_QUERY_FAILED", error, true))?;
-                let candidate =
-                    serde_json::from_str::<ExplorationCandidate>(&value).map_err(|error| {
-                        AppError::new("TASK_CANDIDATE_DATA_INVALID", error.to_string(), false)
-                    })?;
-                candidate.validate()?;
-                Ok(candidate)
-            })
-            .collect()
-    }
-
-    pub fn recover_interrupted_tasks(&self) -> Result<u64, AppError> {
-        let connection = self.connect()?;
-        connection
-            .execute(
-                "UPDATE jobs SET status = 'paused', stage = 'recovery_pending', last_heartbeat_at = ?1 WHERE job_type LIKE 'task.%' AND status = 'running'",
-                [Utc::now().to_rfc3339()],
-            )
-            .map(|count| count as u64)
-            .map_err(|error| storage_error("TASK_RECOVERY_UPDATE_FAILED", error, true))
-    }
-
-    pub fn latest_recoverable_task_plan(&self) -> Result<Option<TaskPlan>, AppError> {
-        let connection = self.connect()?;
-        let task_id = connection
-            .query_row(
-                "SELECT job_id FROM jobs WHERE job_type LIKE 'task.%' AND status IN ('paused', 'failed') AND resume_count < 3 ORDER BY created_at DESC LIMIT 1",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|error| storage_error("JOB_QUERY_FAILED", error, true))?;
-        task_id
-            .map(|value| parse_uuid_value(&value))
-            .transpose()?
-            .map(|task_id| self.task_plan_by_id(&task_id))
-            .transpose()
-            .map(Option::flatten)
-    }
-
-    pub fn pass_task_step(
-        &self,
-        job_id: &Uuid,
-        step: &TaskStep,
-        checkpoint_type: CheckpointType,
-        metrics: serde_json::Value,
-    ) -> Result<ValidationCheckpoint, AppError> {
-        let connection = self.connect()?;
-        let transaction = connection
-            .unchecked_transaction()
-            .map_err(|error| storage_error("DATABASE_TRANSACTION_FAILED", error, true))?;
-        let now = Utc::now();
-        let changed = transaction
-            .execute(
-                "UPDATE execution_units SET status = 'succeeded', attempt_count = attempt_count + 1, started_at = COALESCE(started_at, ?1), finished_at = ?1 WHERE unit_id = ?2 AND job_id = ?3 AND status = 'pending'",
-                params![now.to_rfc3339(), step.step_id.to_string(), job_id.to_string()],
-            )
-            .map_err(|error| storage_error("TASK_UNIT_UPDATE_FAILED", error, true))?;
-        if changed == 0 {
-            return Err(AppError::new(
-                "TASK_UNIT_STATE_INVALID",
-                "任务步骤不处于待执行状态",
-                false,
-            ));
-        }
-        let checkpoint = ValidationCheckpoint {
-            checkpoint_id: Uuid::now_v7(),
-            job_id: *job_id,
-            unit_id: step.step_id,
-            checkpoint_type,
-            status: CheckpointStatus::Passed,
-            rules_version: "1.0.0".into(),
-            metrics,
-            error: None,
-            created_at: now,
-            resume_token: Some(format!("{}:{}", job_id, step.ordinal)),
-        };
-        checkpoint.validate()?;
-        transaction
-            .execute(
-                "INSERT INTO validation_checkpoints (checkpoint_id, job_id, unit_id, checkpoint_type, status, rules_version, metrics_json, error_json, resume_token, created_at) VALUES (?1, ?2, ?3, ?4, 'passed', ?5, ?6, NULL, ?7, ?8)",
-                params![checkpoint.checkpoint_id.to_string(), job_id.to_string(), step.step_id.to_string(), checkpoint_type_as_str(checkpoint_type), checkpoint.rules_version, serde_json::to_string(&checkpoint.metrics).map_err(|error| AppError::new("TASK_CHECKPOINT_SERIALIZE_FAILED", error.to_string(), false))?, checkpoint.resume_token, now.to_rfc3339()],
-            )
-            .map_err(|error| storage_error("TASK_CHECKPOINT_INSERT_FAILED", error, true))?;
-        let completed = step.ordinal as u64;
-        let total = transaction
-            .query_row(
-                "SELECT total_items FROM jobs WHERE job_id = ?1",
-                [job_id.to_string()],
-                |row| row.get::<_, u64>(0),
-            )
-            .map_err(|error| storage_error("JOB_QUERY_FAILED", error, true))?;
-        let progress = if total == 0 {
-            1.0
-        } else {
-            completed as f64 / total as f64
-        };
-        transaction
-            .execute(
-                "UPDATE jobs SET stage = ?1, processed_items = ?2, progress = ?3, last_heartbeat_at = ?4, resume_token = ?5 WHERE job_id = ?6 AND status = 'running'",
-                params![step.step_type, completed, progress, now.to_rfc3339(), checkpoint.resume_token, job_id.to_string()],
-            )
-            .map_err(|error| storage_error("JOB_UPDATE_FAILED", error, true))?;
-        transaction
-            .commit()
-            .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))?;
-        Ok(checkpoint)
-    }
-
-    pub fn finish_task(&self, job_id: &Uuid) -> Result<JobRecord, AppError> {
-        let connection = self.connect()?;
-        let now = Utc::now();
-        connection
-            .execute(
-                "UPDATE jobs SET status = 'succeeded', stage = 'completed', progress = 1.0, processed_items = total_items, finished_at = ?1, last_heartbeat_at = ?1, resume_token = NULL WHERE job_id = ?2 AND status = 'running'",
-                params![now.to_rfc3339(), job_id.to_string()],
-            )
-            .map_err(|error| storage_error("JOB_UPDATE_FAILED", error, true))?;
-        self.job_by_id(job_id)
-    }
-
-    pub fn fail_task(&self, job_id: &Uuid, error: &AppError) -> Result<JobRecord, AppError> {
-        let connection = self.connect()?;
-        let now = Utc::now();
-        let error_json = serde_json::to_string(error).map_err(|serialize_error| {
-            AppError::new(
-                "JOB_ERROR_SERIALIZE_FAILED",
-                serialize_error.to_string(),
-                false,
-            )
-        })?;
-        connection
-            .execute(
-                "UPDATE jobs SET status = 'failed', stage = 'failed', error_json = ?1, finished_at = ?2, last_heartbeat_at = ?2 WHERE job_id = ?3 AND status = 'running'",
-                params![error_json, now.to_rfc3339(), job_id.to_string()],
-            )
-            .map_err(|update_error| storage_error("JOB_UPDATE_FAILED", update_error, true))?;
-        self.job_by_id(job_id)
     }
 
     pub fn latest_active_scan_job(&self) -> Result<Option<JobRecord>, AppError> {
@@ -1950,16 +1718,84 @@ impl CatalogStore {
         job_id: &Uuid,
         outcome: &ScanOutcome,
     ) -> Result<JobRecord, AppError> {
-        let mut connection = self.connect()?;
-        let transaction = connection
-            .transaction()
-            .map_err(|error| storage_error("DATABASE_TRANSACTION_FAILED", error, true))?;
-        let mut seen_file_ids = Vec::with_capacity(outcome.files.len());
-        for file in &outcome.files {
-            seen_file_ids.push(upsert_file(&transaction, root_id, file)?);
+        const SCAN_WRITE_BATCH: usize = 250;
+        {
+            let _permit = self.acquire_write(WritePriority::Background);
+            let connection = self.connect()?;
+            connection
+                .execute(
+                    "DELETE FROM scan_seen_memberships WHERE job_id = ?1 AND root_id = ?2",
+                    params![job_id.to_string(), root_id.to_string()],
+                )
+                .map_err(|error| storage_error("SCAN_CHECKPOINT_WRITE_FAILED", error, true))?;
+        }
+        for (batch_index, batch) in outcome.files.chunks(SCAN_WRITE_BATCH).enumerate() {
+            let _permit = self.acquire_write(WritePriority::Background);
+            let mut connection = self.connect()?;
+            let root_enabled = connection
+                .query_row(
+                    "SELECT enabled FROM roots WHERE root_id = ?1",
+                    [root_id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|error| storage_error("ROOT_QUERY_FAILED", error, true))?
+                .unwrap_or_default()
+                != 0;
+            if !root_enabled {
+                return Err(AppError::new(
+                    "SCAN_ROOT_REVOKED",
+                    "资料位置授权已撤销，扫描结果未继续写入",
+                    false,
+                ));
+            }
+            let transaction = connection
+                .transaction()
+                .map_err(|error| storage_error("DATABASE_TRANSACTION_FAILED", error, true))?;
+            for file in batch {
+                let file_id = upsert_file(&transaction, root_id, file)?;
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO scan_seen_memberships (job_id, root_id, file_id) VALUES (?1, ?2, ?3)",
+                        params![job_id.to_string(), root_id.to_string(), file_id.to_string()],
+                    )
+                    .map_err(|error| storage_error("SCAN_CHECKPOINT_WRITE_FAILED", error, true))?;
+            }
+            let processed = ((batch_index + 1) * SCAN_WRITE_BATCH).min(outcome.files.len()) as u64;
+            transaction
+                .execute(
+                    "UPDATE jobs SET stage = 'committing', processed_items = ?1, total_items = ?2, progress = CASE WHEN ?2 = 0 THEN 0.9 ELSE MIN(0.95, 0.7 + (CAST(?1 AS REAL) / CAST(?2 AS REAL)) * 0.25) END, last_heartbeat_at = ?3 WHERE job_id = ?4",
+                    params![processed, outcome.files.len() as u64, Utc::now().to_rfc3339(), job_id.to_string()],
+                )
+                .map_err(|error| storage_error("JOB_UPDATE_FAILED", error, true))?;
+            transaction
+                .commit()
+                .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))?;
+            drop(_permit);
+            std::thread::yield_now();
         }
         if outcome.error_count == 0 && !outcome.deferred_by_budget {
-            reconcile_root_memberships(&transaction, root_id, &seen_file_ids)?;
+            loop {
+                let _permit = self.acquire_write(WritePriority::Background);
+                let mut connection = self.connect()?;
+                let transaction = connection
+                    .transaction()
+                    .map_err(|error| storage_error("DATABASE_TRANSACTION_FAILED", error, true))?;
+                let removed = reconcile_root_memberships_batch(
+                    &transaction,
+                    root_id,
+                    job_id,
+                    SCAN_WRITE_BATCH,
+                )?;
+                transaction
+                    .commit()
+                    .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))?;
+                drop(_permit);
+                if removed == 0 {
+                    break;
+                }
+                std::thread::yield_now();
+            }
         }
 
         let status = if outcome.error_count > 0 || outcome.deferred_by_budget {
@@ -1973,12 +1809,24 @@ impl CatalogStore {
             RootStatus::Ready
         };
         let finished_at = Utc::now();
+        let _permit = self.acquire_write(WritePriority::Background);
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| storage_error("DATABASE_TRANSACTION_FAILED", error, true))?;
+        let file_count = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM scan_seen_memberships WHERE job_id = ?1 AND root_id = ?2",
+                params![job_id.to_string(), root_id.to_string()],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(|error| storage_error("SCAN_CHECKPOINT_QUERY_FAILED", error, true))?;
         transaction
             .execute(
                 "UPDATE roots SET status = ?1, file_count = ?2, error_count = ?3, permission_error_count = ?3, last_scanned_at = ?4, last_scan_at = ?4 WHERE root_id = ?5",
                 params![
                     root_status.as_str(),
-                    outcome.files.len() as u64,
+                    file_count,
                     outcome.error_count,
                     finished_at.to_rfc3339(),
                     root_id.to_string(),
@@ -1996,6 +1844,12 @@ impl CatalogStore {
                 ],
             )
             .map_err(|error| storage_error("JOB_UPDATE_FAILED", error, true))?;
+        transaction
+            .execute(
+                "DELETE FROM scan_seen_memberships WHERE job_id = ?1 AND root_id = ?2",
+                params![job_id.to_string(), root_id.to_string()],
+            )
+            .map_err(|error| storage_error("SCAN_CHECKPOINT_WRITE_FAILED", error, true))?;
         transaction
             .commit()
             .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))?;
@@ -2054,8 +1908,8 @@ impl CatalogStore {
     pub fn query_files(&self, request: &FileQuery) -> Result<FilePage, AppError> {
         request.validate_filters()?;
         let connection = self.connect()?;
-        let offset = request.offset()?;
-        let page_size = u64::from(request.validated_page_size());
+        let page_size = usize::try_from(request.validated_page_size()).unwrap_or(200);
+        let filter_digest = file_filter_digest(request);
         let mut predicates = vec![AUTHORIZED_FILE_SQL.to_owned()];
         let mut values = Vec::<SqlValue>::new();
         if let Some(query) = request
@@ -2106,32 +1960,59 @@ impl CatalogStore {
             predicates.push("f.availability = ?".into());
             values.push(SqlValue::Text(availability.as_str().into()));
         }
+        if let Some(encoded) = request.cursor.as_deref() {
+            let cursor: FileKeysetCursor =
+                decode_keyset_cursor(encoded, "FILE_CURSOR_INVALID", "资料分页游标无效或已过期")?;
+            if cursor.version != 1 || cursor.filter_digest != filter_digest {
+                return Err(AppError::new(
+                    "FILE_CURSOR_INVALID",
+                    "资料筛选条件已变化，请从第一页重新加载",
+                    false,
+                ));
+            }
+            predicates
+                .push("(f.last_seen_at < ? OR (f.last_seen_at = ? AND f.file_id < ?))".into());
+            values.push(SqlValue::Text(cursor.last_seen_at.clone()));
+            values.push(SqlValue::Text(cursor.last_seen_at));
+            values.push(SqlValue::Text(cursor.file_id));
+        }
         let predicate = predicates.join(" AND ");
-        let count_sql = format!("SELECT COUNT(*) FROM files f WHERE {predicate}");
-        let total = connection
-            .query_row(&count_sql, params_from_iter(values.iter()), |row| {
-                row.get::<_, u64>(0)
-            })
-            .map_err(|error| storage_error("FILE_QUERY_FAILED", error, true))?;
         let sql = format!(
-            "{FILE_SELECT_WITH_ALIAS} WHERE {predicate} ORDER BY f.last_seen_at DESC, f.file_id DESC LIMIT ? OFFSET ?"
+            "{FILE_SELECT_WITH_ALIAS} WHERE {predicate} ORDER BY f.last_seen_at DESC, f.file_id DESC LIMIT ?"
         );
         let mut page_values = values;
-        page_values.push(SqlValue::Integer(page_size as i64));
-        page_values.push(SqlValue::Integer(offset as i64));
+        page_values.push(SqlValue::Integer((page_size + 1) as i64));
         let mut statement = connection
             .prepare(&sql)
             .map_err(|error| storage_error("FILE_QUERY_FAILED", error, true))?;
-        let items = statement
+        let mut items = statement
             .query_map(params_from_iter(page_values.iter()), file_from_row)
             .map_err(|error| storage_error("FILE_QUERY_FAILED", error, true))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| storage_error("FILE_QUERY_FAILED", error, true))?;
-        let consumed = offset.saturating_add(items.len() as u64);
+        let has_more = items.len() > page_size;
+        if has_more {
+            items.truncate(page_size);
+        }
+        let next_cursor = if has_more {
+            items
+                .last()
+                .map(|file| FileKeysetCursor {
+                    version: 1,
+                    filter_digest,
+                    last_seen_at: file.last_seen_at.to_rfc3339(),
+                    file_id: file.file_id.to_string(),
+                })
+                .map(encode_keyset_cursor)
+                .transpose()?
+        } else {
+            None
+        };
         Ok(FilePage {
             items,
-            next_cursor: (consumed < total).then(|| consumed.to_string()),
-            total,
+            next_cursor,
+            has_more,
+            total: None,
         })
     }
 
@@ -2157,108 +2038,87 @@ impl CatalogStore {
         Ok((today_added, recent))
     }
 
-    pub fn run_extraction(
-        &self,
-        request: &ExtractionRunRequest,
-    ) -> Result<ExtractionRunResult, AppError> {
-        request.validate()?;
-        let connection = self.connect()?;
-        let mut documents = Vec::with_capacity(request.file_ids.len());
-        for file_id in &request.file_ids {
-            let file = authorized_file_by_id(&connection, file_id)?;
-            let revision_id = file.current_revision_id.ok_or_else(|| {
-                AppError::new(
-                    "EXTRACTION_FILE_NOT_INDEXED",
-                    format!("{}尚未建立正文索引", file.display_name),
-                    true,
-                )
-            })?;
-            let mut statement = connection
-                .prepare("SELECT c.node_id, c.chunk_id, c.text, c.locator_json, n.node_type FROM chunks c JOIN document_nodes n ON n.node_id = c.node_id WHERE c.file_id = ?1 AND c.revision_id = ?2 ORDER BY c.ordinal LIMIT 5000")
-                .map_err(|error| storage_error("EXTRACTION_QUERY_FAILED", error, true))?;
-            let chunks = statement
-                .query_map(
-                    params![file_id.to_string(), revision_id.to_string()],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                        ))
-                    },
-                )
-                .map_err(|error| storage_error("EXTRACTION_QUERY_FAILED", error, true))?
-                .map(|row| {
-                    let (node_id, chunk_id, text, locator_json, node_type) =
-                        row.map_err(|error| storage_error("EXTRACTION_QUERY_FAILED", error, true))?;
-                    Ok(ExtractionChunk {
-                        node_id: parse_uuid_value(&node_id)?,
-                        chunk_id: parse_uuid_value(&chunk_id)?,
-                        node_type,
-                        text,
-                        locator: serde_json::from_str(&locator_json).map_err(|error| {
-                            AppError::new("EXTRACTION_EVIDENCE_INVALID", error.to_string(), false)
-                        })?,
-                    })
-                })
-                .collect::<Result<Vec<_>, AppError>>()?;
-            let mut table_statement = connection
-                .prepare("SELECT node_id, ordinal, table_json, locator_json FROM document_nodes WHERE revision_id = ?1 AND table_json IS NOT NULL ORDER BY ordinal LIMIT 50000")
-                .map_err(|error| storage_error("EXTRACTION_QUERY_FAILED", error, true))?;
-            let tables = table_statement
-                .query_map([revision_id.to_string()], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, u32>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                })
-                .map_err(|error| storage_error("EXTRACTION_QUERY_FAILED", error, true))?
-                .map(|row| {
-                    let (node_id, ordinal, table_json, locator_json) =
-                        row.map_err(|error| storage_error("EXTRACTION_QUERY_FAILED", error, true))?;
-                    Ok(ExtractionTable {
-                        node_id: parse_uuid_value(&node_id)?,
-                        ordinal,
-                        table_data: serde_json::from_str(&table_json).map_err(|error| {
-                            AppError::new("EXTRACTION_TABLE_INVALID", error.to_string(), false)
-                        })?,
-                        locator: serde_json::from_str(&locator_json).map_err(|error| {
-                            AppError::new("EXTRACTION_EVIDENCE_INVALID", error.to_string(), false)
-                        })?,
-                    })
-                })
-                .collect::<Result<Vec<_>, AppError>>()?;
-            documents.push(ExtractionDocument {
-                file,
-                revision_id,
-                chunks,
-                tables,
-            });
-        }
-        crate::run_rules_first_extraction(request, documents)
-    }
-
     pub fn query_inbox(&self, query: &InboxQuery) -> Result<InboxPage, AppError> {
         query.validate()?;
         let connection = self.connect()?;
         let collections = collection_rows(&connection)?;
+        let filter_digest = inbox_filter_digest(query);
+        let mut predicates = vec![AUTHORIZED_FILE_SQL.to_owned()];
+        let mut values = Vec::<SqlValue>::new();
+        if query.status == TriageStatus::Error {
+            predicates.push("i.resolution_status IN ('pending_retry','retrying')".into());
+        } else if query.status != TriageStatus::All {
+            predicates.push("i.triage_status = ?".into());
+            values.push(SqlValue::Text(query.status.as_storage().into()));
+        }
+        if !query.event_types.is_empty() {
+            predicates.push(format!(
+                "i.event_type IN ({})",
+                vec!["?"; query.event_types.len()].join(",")
+            ));
+            values.extend(
+                query
+                    .event_types
+                    .iter()
+                    .map(|value| SqlValue::Text(value.as_storage().into())),
+            );
+        }
+        if !query.root_ids.is_empty() {
+            predicates.push(format!(
+                "EXISTS (SELECT 1 FROM file_root_memberships fm JOIN roots rr ON rr.root_id = fm.root_id WHERE fm.file_id = f.file_id AND rr.enabled = 1 AND fm.root_id IN ({}))",
+                vec!["?"; query.root_ids.len()].join(",")
+            ));
+            values.extend(
+                query
+                    .root_ids
+                    .iter()
+                    .map(|value| SqlValue::Text(value.to_string())),
+            );
+        }
+        if let Some(date_from) = query.date_from {
+            predicates.push("i.observed_at >= ?".into());
+            values.push(SqlValue::Text(date_from.to_rfc3339()));
+        }
+        if let Some(date_to) = query.date_to {
+            predicates.push("i.observed_at <= ?".into());
+            values.push(SqlValue::Text(date_to.to_rfc3339()));
+        }
+        if let Some(encoded) = query.cursor.as_deref() {
+            let cursor: InboxKeysetCursor = decode_keyset_cursor(
+                encoded,
+                "INBOX_CURSOR_INVALID",
+                "收件箱分页游标无效或已过期",
+            )?;
+            if cursor.version != 1 || cursor.filter_digest != filter_digest {
+                return Err(AppError::new(
+                    "INBOX_CURSOR_INVALID",
+                    "收件箱筛选条件已变化，请从第一页重新加载",
+                    false,
+                ));
+            }
+            predicates.push("(i.observed_at < ? OR (i.observed_at = ? AND i.inbox_id < ?))".into());
+            values.push(SqlValue::Text(cursor.observed_at.clone()));
+            values.push(SqlValue::Text(cursor.observed_at));
+            values.push(SqlValue::Text(cursor.inbox_id));
+        }
+        let sql = format!(
+            "SELECT f.file_id, f.volume_id, f.canonical_path, f.display_name, f.extension, f.mime_type, f.size_bytes, f.fs_created_at, f.modified_at, f.windows_file_id, f.content_sha256, f.availability, f.current_revision_id, f.parse_status, f.first_seen_at, f.last_seen_at, i.inbox_id, i.event_type, i.observed_at, i.previous_path, i.triage_status, i.summary, i.error_code, i.resolution_status, i.attempt_count, i.last_attempt_at, (SELECT relation_id FROM file_relations r WHERE r.relation_type = 'exact_duplicate' AND (r.left_file_id = f.file_id OR r.right_file_id = f.file_id) AND r.review_status <> 'rejected' ORDER BY r.confidence DESC LIMIT 1) FROM inbox_events i JOIN files f ON f.file_id = i.file_id WHERE {} ORDER BY i.observed_at DESC, i.inbox_id DESC LIMIT ?",
+            predicates.join(" AND ")
+        );
+        values.push(SqlValue::Integer(i64::from(query.page_size) + 1));
         let mut statement = connection
-            .prepare(
-                "SELECT f.file_id, f.volume_id, f.canonical_path, f.display_name, f.extension, f.mime_type, f.size_bytes, f.fs_created_at, f.modified_at, f.windows_file_id, f.content_sha256, f.availability, f.current_revision_id, f.parse_status, f.first_seen_at, f.last_seen_at, i.inbox_id, i.event_type, i.observed_at, i.previous_path, i.triage_status, i.summary, i.error_code, (SELECT relation_id FROM file_relations r WHERE r.relation_type = 'exact_duplicate' AND (r.left_file_id = f.file_id OR r.right_file_id = f.file_id) AND r.review_status <> 'rejected' ORDER BY r.confidence DESC LIMIT 1) FROM inbox_events i JOIN files f ON f.file_id = i.file_id WHERE EXISTS (SELECT 1 FROM file_root_memberships m JOIN roots rt ON rt.root_id = m.root_id WHERE m.file_id = f.file_id AND rt.enabled = 1) ORDER BY i.observed_at DESC",
-            )
+            .prepare(&sql)
             .map_err(|error| storage_error("INBOX_QUERY_FAILED", error, true))?;
         let rows = statement
-            .query_map([], |row| {
+            .query_map(params_from_iter(values.iter()), |row| {
                 let file = file_from_row(row)?;
                 let inbox_id: String = row.get(16)?;
                 let event_type: String = row.get(17)?;
                 let observed_at: String = row.get(18)?;
                 let triage_status: String = row.get(20)?;
-                let duplicate_group_id: Option<String> = row.get(23)?;
+                let resolution_status: String = row.get(23)?;
+                let last_attempt_at: Option<String> = row.get(25)?;
+                let duplicate_group_id: Option<String> = row.get(26)?;
                 Ok((
                     file,
                     parse_uuid_column(&inbox_id, 16)?,
@@ -2268,22 +2128,19 @@ impl CatalogStore {
                     TriageStatus::from_storage(&triage_status),
                     row.get::<_, Option<String>>(21)?,
                     row.get::<_, Option<String>>(22)?,
+                    ResolutionStatus::from_storage(&resolution_status),
+                    row.get::<_, u32>(24)?,
+                    last_attempt_at
+                        .map(|value| parse_datetime_column(&value, 25))
+                        .transpose()?,
                     duplicate_group_id
-                        .map(|value| parse_uuid_column(&value, 23))
+                        .map(|value| parse_uuid_column(&value, 26))
                         .transpose()?,
                 ))
             })
             .map_err(|error| storage_error("INBOX_QUERY_FAILED", error, true))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| storage_error("INBOX_QUERY_FAILED", error, true))?;
-
-        let cursor_time = query
-            .cursor
-            .as_deref()
-            .map(DateTime::parse_from_rfc3339)
-            .transpose()
-            .map_err(|error| AppError::new("INBOX_CURSOR_INVALID", error.to_string(), false))?
-            .map(|value| value.with_timezone(&Utc));
         let mut items = Vec::new();
         for (
             file,
@@ -2294,26 +2151,12 @@ impl CatalogStore {
             triage_status,
             summary,
             error_code,
+            resolution_status,
+            attempt_count,
+            last_attempt_at,
             duplicate_group_id,
         ) in rows
         {
-            if query.status != TriageStatus::All && query.status != triage_status {
-                continue;
-            }
-            if !query.event_types.is_empty() && !query.event_types.contains(&event_type) {
-                continue;
-            }
-            if query.date_from.is_some_and(|from| observed_at < from)
-                || query.date_to.is_some_and(|to| observed_at > to)
-                || cursor_time.is_some_and(|cursor| observed_at >= cursor)
-            {
-                continue;
-            }
-            if !query.root_ids.is_empty()
-                && !file_belongs_to_any_root(&connection, &file.file_id, &query.root_ids)?
-            {
-                continue;
-            }
             let mut suggested_collection_ids = Vec::new();
             for collection in &collections {
                 if let Some(rule) = &collection.rule
@@ -2331,22 +2174,37 @@ impl CatalogStore {
                 observed_at,
                 previous_path,
                 triage_status,
+                resolution_status,
+                attempt_count,
+                last_attempt_at,
+                retry_action: retry_action_for(event_type, resolution_status),
                 suggested_collection_ids,
                 duplicate_group_id,
                 summary,
                 error_code,
             });
-            if items.len() > query.page_size as usize {
-                break;
-            }
         }
-        let next_cursor = if items.len() > query.page_size as usize {
+        let has_more = items.len() > query.page_size as usize;
+        let next_cursor = if has_more {
             items.truncate(query.page_size as usize);
-            items.last().map(|item| item.observed_at.to_rfc3339())
+            items
+                .last()
+                .map(|item| InboxKeysetCursor {
+                    version: 1,
+                    filter_digest,
+                    observed_at: item.observed_at.to_rfc3339(),
+                    inbox_id: item.inbox_id.to_string(),
+                })
+                .map(encode_keyset_cursor)
+                .transpose()?
         } else {
             None
         };
-        Ok(InboxPage { items, next_cursor })
+        Ok(InboxPage {
+            items,
+            next_cursor,
+            has_more,
+        })
     }
 
     pub fn update_inbox_item(&self, request: &InboxUpdateRequest) -> Result<InboxItem, AppError> {
@@ -2360,10 +2218,11 @@ impl CatalogStore {
                 false,
             ));
         }
+        let _permit = self.acquire_write(WritePriority::Interactive);
         let connection = self.connect()?;
         let changed = connection
             .execute(
-                "UPDATE inbox_events SET triage_status = ?1, processed_at = CASE WHEN ?1 = 'new' THEN NULL ELSE ?2 END WHERE inbox_id = ?3",
+                "UPDATE inbox_events SET triage_status = ?1, processed_at = CASE WHEN ?1 = 'new' THEN NULL ELSE ?2 END, resolution_status = CASE WHEN ?1 = 'ignored' AND resolution_status <> 'normal' THEN 'abandoned' WHEN ?1 = 'new' AND resolution_status = 'abandoned' THEN 'pending_retry' ELSE resolution_status END WHERE inbox_id = ?3",
                 params![request.triage_status.as_storage(), Utc::now().to_rfc3339(), request.inbox_id.to_string()],
             )
             .map_err(|error| storage_error("INBOX_UPDATE_FAILED", error, true))?;
@@ -2374,145 +2233,71 @@ impl CatalogStore {
                 false,
             ));
         }
-        let query = InboxQuery {
-            status: TriageStatus::All,
-            event_types: vec![],
-            root_ids: vec![],
-            date_from: None,
-            date_to: None,
-            cursor: None,
-            page_size: 200,
-        };
-        self.query_inbox(&query)?
-            .items
-            .into_iter()
-            .find(|item| item.inbox_id == request.inbox_id)
+        let collections = collection_rows(&connection)?;
+        inbox_item_by_id(&connection, &request.inbox_id, &collections)?
             .ok_or_else(|| AppError::new("INBOX_ITEM_NOT_FOUND", "收件箱项目不可访问", false))
     }
 
-    pub fn list_knowledge_spaces(&self) -> Result<Vec<KnowledgeSpace>, AppError> {
-        let connection = self.connect()?;
-        let mut statement = connection
-            .prepare(
-                "SELECT space_id, name, description, created_at, updated_at FROM knowledge_spaces ORDER BY updated_at DESC, space_id DESC",
-            )
-            .map_err(|error| storage_error("KNOWLEDGE_SPACE_QUERY_FAILED", error, true))?;
-        let rows = statement
-            .query_map([], |row| {
-                let space_id = row.get::<_, String>(0)?;
-                let created_at = row.get::<_, String>(3)?;
-                let updated_at = row.get::<_, String>(4)?;
-                Ok((
-                    parse_uuid_column(&space_id, 0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    parse_datetime_column(&created_at, 3)?,
-                    parse_datetime_column(&updated_at, 4)?,
-                ))
-            })
-            .map_err(|error| storage_error("KNOWLEDGE_SPACE_QUERY_FAILED", error, true))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| storage_error("KNOWLEDGE_SPACE_QUERY_FAILED", error, true))?;
-        drop(statement);
-
-        rows.into_iter()
-            .map(|(space_id, name, description, created_at, updated_at)| {
-                let (root_ids, collection_ids) = knowledge_space_members(&connection, &space_id)?;
-                let file_count =
-                    knowledge_space_file_count(&connection, &root_ids, &collection_ids)?;
-                Ok(KnowledgeSpace {
-                    space_id,
-                    name,
-                    description,
-                    root_ids,
-                    collection_ids,
-                    file_count,
-                    created_at,
-                    updated_at,
-                })
-            })
-            .collect()
-    }
-
-    pub fn create_knowledge_space(
-        &self,
-        request: &KnowledgeSpaceRequest,
-    ) -> Result<KnowledgeSpace, AppError> {
-        request.validate()?;
-        let space_id = Uuid::now_v7();
-        let now = Utc::now();
+    pub fn retry_inbox_item(&self, inbox_id: &Uuid) -> Result<InboxItem, AppError> {
+        let _permit = self.acquire_write(WritePriority::Interactive);
         let mut connection = self.connect()?;
         let transaction = connection
             .transaction()
-            .map_err(|error| storage_error("DATABASE_TRANSACTION_FAILED", error, true))?;
-        validate_knowledge_space_references(&transaction, request)?;
-        transaction
-            .execute(
-                "INSERT INTO knowledge_spaces (space_id, name, description, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)",
-                params![space_id.to_string(), request.name.trim(), request.description.as_ref().map(|value| value.trim()).filter(|value| !value.is_empty()), now.to_rfc3339()],
+            .map_err(|error| storage_error("INBOX_RETRY_FAILED", error, true))?;
+        let row = transaction
+            .query_row(
+                &format!(
+                    "SELECT i.file_id, i.event_type, i.resolution_status FROM inbox_events i JOIN files f ON f.file_id = i.file_id WHERE i.inbox_id = ?1 AND {AUTHORIZED_FILE_SQL} LIMIT 1"
+                ),
+                [inbox_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
-            .map_err(|error| storage_error("KNOWLEDGE_SPACE_CREATE_FAILED", error, true))?;
-        replace_knowledge_space_members(&transaction, &space_id, request)?;
-        transaction
-            .commit()
-            .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))?;
-        self.knowledge_space_by_id(&space_id)
-    }
-
-    pub fn update_knowledge_space(
-        &self,
-        space_id: &Uuid,
-        request: &KnowledgeSpaceRequest,
-    ) -> Result<KnowledgeSpace, AppError> {
-        request.validate()?;
-        let mut connection = self.connect()?;
-        let transaction = connection
-            .transaction()
-            .map_err(|error| storage_error("DATABASE_TRANSACTION_FAILED", error, true))?;
-        validate_knowledge_space_references(&transaction, request)?;
-        let updated = transaction
-            .execute(
-                "UPDATE knowledge_spaces SET name = ?2, description = ?3, updated_at = ?4 WHERE space_id = ?1",
-                params![space_id.to_string(), request.name.trim(), request.description.as_ref().map(|value| value.trim()).filter(|value| !value.is_empty()), Utc::now().to_rfc3339()],
-            )
-            .map_err(|error| storage_error("KNOWLEDGE_SPACE_UPDATE_FAILED", error, true))?;
-        if updated == 0 {
+            .optional()
+            .map_err(|error| storage_error("INBOX_RETRY_FAILED", error, true))?
+            .ok_or_else(|| {
+                AppError::new("INBOX_ITEM_NOT_FOUND", "收件箱项目不存在或不可访问", false)
+            })?;
+        let (file_id, event_type, resolution_status) = row;
+        if !matches!(event_type.as_str(), "parse_failed" | "ocr_required")
+            || !matches!(resolution_status.as_str(), "pending_retry" | "retrying")
+        {
             return Err(AppError::new(
-                "KNOWLEDGE_SPACE_NOT_FOUND",
-                "知识空间不存在",
+                "INBOX_RETRY_NOT_AVAILABLE",
+                "该项目当前没有可重试的处理任务",
                 false,
             ));
         }
-        replace_knowledge_space_members(&transaction, space_id, request)?;
-        transaction
-            .commit()
-            .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))?;
-        self.knowledge_space_by_id(space_id)
-    }
-
-    pub fn delete_knowledge_space(&self, space_id: &Uuid) -> Result<(), AppError> {
-        let connection = self.connect()?;
-        let deleted = connection
+        let changed = transaction
             .execute(
-                "DELETE FROM knowledge_spaces WHERE space_id = ?1",
-                [space_id.to_string()],
+                "UPDATE files SET parse_status = 'pending' WHERE file_id = ?1 AND availability = 'present' AND current_revision_id IS NOT NULL",
+                [file_id],
             )
-            .map_err(|error| storage_error("KNOWLEDGE_SPACE_DELETE_FAILED", error, true))?;
-        if deleted == 0 {
+            .map_err(|error| storage_error("INBOX_RETRY_FAILED", error, true))?;
+        if changed == 0 {
             return Err(AppError::new(
-                "KNOWLEDGE_SPACE_NOT_FOUND",
-                "知识空间不存在",
+                "INBOX_RETRY_NOT_AVAILABLE",
+                "资料已离线或当前修订不可用，无法重试",
                 false,
             ));
         }
-        Ok(())
-    }
-
-    fn knowledge_space_by_id(&self, space_id: &Uuid) -> Result<KnowledgeSpace, AppError> {
-        self.list_knowledge_spaces()?
-            .into_iter()
-            .find(|space| space.space_id == *space_id)
-            .ok_or_else(|| AppError::new("KNOWLEDGE_SPACE_NOT_FOUND", "知识空间不存在", false))
+        transaction
+            .execute(
+                "UPDATE inbox_events SET triage_status = 'new', resolution_status = 'retrying', attempt_count = attempt_count + 1, last_attempt_at = ?1, processed_at = NULL WHERE inbox_id = ?2",
+                params![Utc::now().to_rfc3339(), inbox_id.to_string()],
+            )
+            .map_err(|error| storage_error("INBOX_RETRY_FAILED", error, true))?;
+        transaction
+            .commit()
+            .map_err(|error| storage_error("INBOX_RETRY_FAILED", error, true))?;
+        let collections = collection_rows(&connection)?;
+        inbox_item_by_id(&connection, inbox_id, &collections)?
+            .ok_or_else(|| AppError::new("INBOX_ITEM_NOT_FOUND", "收件箱项目不可访问", false))
     }
 
     pub fn list_collections(&self) -> Result<Vec<CollectionRecord>, AppError> {
@@ -2525,6 +2310,7 @@ impl CatalogStore {
         request: &CreateCollectionRequest,
     ) -> Result<CollectionRecord, AppError> {
         request.validate()?;
+        let _permit = self.acquire_write(WritePriority::Interactive);
         let connection = self.connect()?;
         let collection_id = Uuid::now_v7();
         let now = Utc::now().to_rfc3339();
@@ -2549,6 +2335,7 @@ impl CatalogStore {
         request: &CreateCollectionRequest,
     ) -> Result<CollectionRecord, AppError> {
         request.validate()?;
+        let _permit = self.acquire_write(WritePriority::Interactive);
         let connection = self.connect()?;
         let current = collection_by_id(&connection, collection_id)?;
         if current.built_in {
@@ -2574,6 +2361,7 @@ impl CatalogStore {
     }
 
     pub fn delete_collection(&self, collection_id: &Uuid) -> Result<(), AppError> {
+        let _permit = self.acquire_write(WritePriority::Interactive);
         let mut connection = self.connect()?;
         let current = collection_by_id(&connection, collection_id)?;
         if current.built_in {
@@ -2608,6 +2396,7 @@ impl CatalogStore {
         collection_id: &Uuid,
         file_id: &Uuid,
     ) -> Result<(), AppError> {
+        let _permit = self.acquire_write(WritePriority::Interactive);
         let connection = self.connect()?;
         let collection = collection_by_id(&connection, collection_id)?;
         if collection.kind == CollectionKind::Rule {
@@ -2632,6 +2421,7 @@ impl CatalogStore {
         collection_id: &Uuid,
         file_id: &Uuid,
     ) -> Result<(), AppError> {
+        let _permit = self.acquire_write(WritePriority::Interactive);
         let connection = self.connect()?;
         let collection = collection_by_id(&connection, collection_id)?;
         if collection.kind == CollectionKind::Rule {
@@ -2708,7 +2498,12 @@ impl CatalogStore {
     ) -> Result<FilePage, AppError> {
         let connection = self.connect()?;
         let collection = collection_by_id(&connection, collection_id)?;
-        let offset = request.offset()?;
+        let offset = request
+            .cursor
+            .as_deref()
+            .unwrap_or("0")
+            .parse::<u64>()
+            .map_err(|_| AppError::new("FILE_CURSOR_INVALID", "集合分页游标无效", false))?;
         let page_size = request.validated_page_size();
         let (total, items) = match collection.kind {
             CollectionKind::Manual | CollectionKind::Ai => (
@@ -2729,7 +2524,8 @@ impl CatalogStore {
         Ok(FilePage {
             items,
             next_cursor: (consumed < total).then(|| consumed.to_string()),
-            total,
+            has_more: consumed < total,
+            total: Some(total),
         })
     }
 
@@ -2745,7 +2541,7 @@ impl CatalogStore {
                 false,
             ));
         }
-        const ALGORITHM_VERSION: &str = "semantic_lsh_v1";
+        const ALGORITHM_VERSION: &str = "semantic_lsh_v2";
         let mut connection = self.connect()?;
         let transaction = connection
             .transaction()
@@ -2841,7 +2637,7 @@ impl CatalogStore {
                         storage_error("COLLECTION_CANDIDATE_QUERY_FAILED", error, true)
                     })?
             };
-            for (other_file_id, _other_revision, other_title, dimension, bytes) in candidates {
+            for (other_file_id, other_revision, other_title, dimension, bytes) in candidates {
                 let other_file_id = parse_uuid_value(&other_file_id)?;
                 let other_vector = decode_vector(&bytes, dimension)?;
                 if other_vector.len() != profile.vector.len() {
@@ -2856,11 +2652,23 @@ impl CatalogStore {
                 if similarity < 0.78 {
                     continue;
                 }
-                let (left, right) = if profile.file_id < other_file_id {
-                    (profile.file_id, other_file_id)
-                } else {
-                    (other_file_id, profile.file_id)
-                };
+                let other_revision = parse_uuid_value(&other_revision)?;
+                let (left, right, left_revision, right_revision) =
+                    if profile.file_id < other_file_id {
+                        (
+                            profile.file_id,
+                            other_file_id,
+                            profile.revision_id,
+                            other_revision,
+                        )
+                    } else {
+                        (
+                            other_file_id,
+                            profile.file_id,
+                            other_revision,
+                            profile.revision_id,
+                        )
+                    };
                 let reasons = serde_json::to_string(&vec![
                     format!("文档语义画像相似度 {:.0}%", similarity * 100.0),
                     format!(
@@ -2873,8 +2681,8 @@ impl CatalogStore {
                 })?;
                 transaction
                     .execute(
-                        "INSERT INTO file_relations (relation_id, left_file_id, right_file_id, relation_type, confidence, reasons_json, review_status, created_at, updated_at) VALUES (?1, ?2, ?3, 'related', ?4, ?5, 'suggested', ?6, ?6) ON CONFLICT(left_file_id, right_file_id, relation_type) DO UPDATE SET confidence = excluded.confidence, reasons_json = excluded.reasons_json, updated_at = excluded.updated_at",
-                        params![Uuid::now_v7().to_string(), left.to_string(), right.to_string(), f64::from(similarity), reasons, now],
+                        "INSERT INTO file_relations (relation_id, left_file_id, right_file_id, relation_type, confidence, reasons_json, review_status, created_at, updated_at, algorithm_version, model_version, left_revision_id, right_revision_id) VALUES (?1, ?2, ?3, 'semantic_related', ?4, ?5, 'suggested', ?6, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(left_file_id, right_file_id, relation_type) DO UPDATE SET confidence = excluded.confidence, reasons_json = excluded.reasons_json, review_status = CASE WHEN file_relations.algorithm_version IS NOT excluded.algorithm_version OR file_relations.model_version IS NOT excluded.model_version OR file_relations.left_revision_id IS NOT excluded.left_revision_id OR file_relations.right_revision_id IS NOT excluded.right_revision_id THEN 'suggested' ELSE file_relations.review_status END, algorithm_version = excluded.algorithm_version, model_version = excluded.model_version, left_revision_id = excluded.left_revision_id, right_revision_id = excluded.right_revision_id, updated_at = excluded.updated_at",
+                        params![Uuid::now_v7().to_string(), left.to_string(), right.to_string(), f64::from(similarity), reasons, now, ALGORITHM_VERSION, model_artifact_id, left_revision.to_string(), right_revision.to_string()],
                     )
                     .map_err(|error| storage_error("COLLECTION_CANDIDATE_WRITE_FAILED", error, true))?;
                 candidate_edges += 1;
@@ -2892,12 +2700,17 @@ impl CatalogStore {
             }
             let related = {
                 let mut statement = transaction
-                    .prepare("SELECT CASE WHEN left_file_id = ?1 THEN right_file_id ELSE left_file_id END, confidence FROM file_relations WHERE relation_type = 'related' AND review_status <> 'rejected' AND confidence >= 0.78 AND (left_file_id = ?1 OR right_file_id = ?1) ORDER BY confidence DESC LIMIT 11")
+                    .prepare("SELECT CASE WHEN left_file_id = ?1 THEN right_file_id ELSE left_file_id END, confidence FROM file_relations WHERE relation_type IN ('semantic_related','related') AND review_status <> 'rejected' AND confidence >= 0.78 AND model_version = ?2 AND algorithm_version = ?3 AND (left_file_id = ?1 OR right_file_id = ?1) ORDER BY confidence DESC LIMIT 11")
                     .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?;
                 statement
-                    .query_map([profile.file_id.to_string()], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-                    })
+                    .query_map(
+                        params![
+                            profile.file_id.to_string(),
+                            model_artifact_id,
+                            ALGORITHM_VERSION
+                        ],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
+                    )
                     .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?
@@ -2905,6 +2718,7 @@ impl CatalogStore {
             if related.is_empty() {
                 continue;
             }
+            let mut member_titles = vec![profile.title.clone()];
             let mut members = vec![(
                 profile.file_id,
                 profile.revision_id,
@@ -2913,15 +2727,16 @@ impl CatalogStore {
             )];
             for (file_id, confidence) in related {
                 let file_id = parse_uuid_value(&file_id)?;
-                let revision_id = transaction
+                let profile_data = transaction
                     .query_row(
-                        "SELECT revision_id FROM document_profiles WHERE file_id = ?1",
+                        "SELECT revision_id, title FROM document_profiles WHERE file_id = ?1",
                         [file_id.to_string()],
-                        |row| row.get::<_, String>(0),
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                     )
                     .optional()
                     .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?;
-                if let Some(revision_id) = revision_id {
+                if let Some((revision_id, title)) = profile_data {
+                    member_titles.push(title);
                     members.push((
                         file_id,
                         parse_uuid_value(&revision_id)?,
@@ -2946,7 +2761,7 @@ impl CatalogStore {
             let suggestion_id = Uuid::now_v7();
             let confidence = members.iter().skip(1).map(|member| member.2).sum::<f64>()
                 / (members.len() - 1) as f64;
-            let name = format!("{} · 相关资料", collection_name_stem(&profile.title));
+            let name = deterministic_collection_name(&member_titles);
             let changed = transaction
                 .execute(
                     "INSERT OR IGNORE INTO collection_suggestions (suggestion_id, idempotency_key, suggested_name, description, confidence, status, model_version, algorithm_version, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'suggested', ?6, ?7, ?8, ?8)",
@@ -3124,8 +2939,22 @@ impl CatalogStore {
                 false,
             ));
         }
+        let member_titles = existing
+            .values()
+            .map(|member| member.file.display_name.clone())
+            .collect::<Vec<_>>();
+        let proposed_name = review.suggested_name.trim();
+        let repeats_member_name = member_titles.iter().any(|title| {
+            collection_name_stem(title).eq_ignore_ascii_case(proposed_name)
+                || title.eq_ignore_ascii_case(proposed_name)
+        });
+        let validated_name = if repeats_member_name || is_generic_collection_name(proposed_name) {
+            deterministic_collection_name(&member_titles)
+        } else {
+            proposed_name.to_owned()
+        };
         let now = Utc::now().to_rfc3339();
-        transaction.execute("UPDATE collection_suggestions SET suggested_name = ?1, description = ?2, model_version = ?3, updated_at = ?4 WHERE suggestion_id = ?5", params![review.suggested_name.trim(), review.description.trim(), model_version, now, suggestion_id.to_string()])
+        transaction.execute("UPDATE collection_suggestions SET suggested_name = ?1, description = ?2, model_version = ?3, updated_at = ?4 WHERE suggestion_id = ?5", params![validated_name, review.description.trim(), model_version, now, suggestion_id.to_string()])
             .map_err(|error| storage_error("COLLECTION_MODEL_REVIEW_FAILED", error, true))?;
         transaction
             .execute(
@@ -3430,127 +3259,191 @@ impl CatalogStore {
             hashed_files,
             exact_duplicate_pairs,
             version_candidate_pairs,
+            semantic_related_pairs: 0,
+            contains_or_summarizes_pairs: 0,
         })
-    }
-
-    pub fn refresh_selected_file_relations(
-        &self,
-        file_ids: &[Uuid],
-    ) -> Result<RelationRefreshResult, AppError> {
-        if !(2..=500).contains(&file_ids.len()) {
-            return Err(AppError::new(
-                "RELATION_SELECTION_INVALID",
-                "重复审查需要选择2到500份资料",
-                false,
-            ));
-        }
-        let mut connection = self.connect()?;
-        let files = file_ids
-            .iter()
-            .map(|file_id| authorized_file_by_id(&connection, file_id))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut size_counts = BTreeMap::<u64, usize>::new();
-        for file in &files {
-            *size_counts.entry(file.size_bytes).or_default() += 1;
-        }
-        let transaction = connection
-            .transaction()
-            .map_err(|error| storage_error("DATABASE_TRANSACTION_FAILED", error, true))?;
-        let mut hashed_files = 0_u64;
-        let mut hashes = BTreeMap::<String, Vec<Uuid>>::new();
-        for file in &files {
-            if file.size_bytes == 0 || size_counts.get(&file.size_bytes).copied().unwrap_or(0) < 2 {
-                continue;
-            }
-            let hash = if let Some(hash) = &file.content_sha256 {
-                hash.clone()
-            } else {
-                let hash = hash_file_sha256(&PathBuf::from(&file.canonical_path))?;
-                transaction
-                    .execute(
-                        "UPDATE files SET content_sha256 = ?1 WHERE file_id = ?2 AND current_revision_id = ?3",
-                        params![hash, file.file_id.to_string(), file.current_revision_id.map(|value| value.to_string())],
-                    )
-                    .map_err(|error| storage_error("FILE_HASH_UPDATE_FAILED", error, true))?;
-                if let Some(revision_id) = file.current_revision_id {
-                    transaction
-                        .execute(
-                            "UPDATE file_revisions SET content_sha256 = ?1 WHERE revision_id = ?2",
-                            params![hash, revision_id.to_string()],
-                        )
-                        .map_err(|error| storage_error("FILE_HASH_UPDATE_FAILED", error, true))?;
-                }
-                hashed_files += 1;
-                hash
-            };
-            hashes.entry(hash).or_default().push(file.file_id);
-        }
-        let mut exact_duplicate_pairs = 0_u64;
-        for group in hashes.values().filter(|group| group.len() > 1) {
-            for left_index in 0..group.len() {
-                for right_index in (left_index + 1)..group.len() {
-                    insert_relation(
-                        &transaction,
-                        group[left_index],
-                        group[right_index],
-                        RelationType::ExactDuplicate,
-                        1.0,
-                        &["文件字节SHA-256完全相同".to_owned()],
-                    )?;
-                    exact_duplicate_pairs += 1;
-                }
-            }
-        }
-        let mut version_groups = BTreeMap::<(String, String), Vec<Uuid>>::new();
-        for file in &files {
-            let key = normalized_version_key(&file.display_name);
-            if !key.is_empty() {
-                version_groups
-                    .entry((key, file.extension.to_lowercase()))
-                    .or_default()
-                    .push(file.file_id);
-            }
-        }
-        let mut version_candidate_pairs = 0_u64;
-        for group in version_groups.values().filter(|group| group.len() > 1) {
-            for left_index in 0..group.len() {
-                for right_index in (left_index + 1)..group.len() {
-                    insert_relation(
-                        &transaction,
-                        group[left_index],
-                        group[right_index],
-                        RelationType::VersionCandidate,
-                        0.78,
-                        &["文件名去除版本与副本后缀后相同".to_owned()],
-                    )?;
-                    version_candidate_pairs += 1;
-                }
-            }
-        }
-        transaction
-            .commit()
-            .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))?;
-        Ok(RelationRefreshResult {
-            hashed_files,
-            exact_duplicate_pairs,
-            version_candidate_pairs,
-        })
-    }
-
-    pub fn authorized_files_by_ids(&self, file_ids: &[Uuid]) -> Result<Vec<FileRecord>, AppError> {
-        let connection = self.connect()?;
-        file_ids
-            .iter()
-            .map(|file_id| authorized_file_by_id(&connection, file_id))
-            .collect()
     }
 
     pub fn list_file_relations(&self, limit: u32) -> Result<Vec<FileRelation>, AppError> {
         self.query_file_relations(&RelationQuery {
             cursor: None,
             page_size: limit,
+            relation_type: None,
+            review_status: None,
         })
         .map(|page| page.items)
+    }
+
+    pub fn refresh_semantic_file_relations(
+        &self,
+        model_artifact_id: &str,
+        max_files: u32,
+    ) -> Result<(u64, u64), AppError> {
+        if model_artifact_id.trim().is_empty() || !(2..=20_000).contains(&max_files) {
+            return Err(AppError::new(
+                "SEMANTIC_RELATION_REFRESH_INVALID",
+                "语义关系刷新需要有效的Embedding模型和文件预算",
+                false,
+            ));
+        }
+        const ALGORITHM_VERSION: &str = "semantic_relation_bucket_v1";
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| storage_error("SEMANTIC_RELATION_REFRESH_FAILED", error, true))?;
+        let sql = format!(
+            "WITH targets AS (SELECT f.file_id, f.current_revision_id, f.display_name, f.extension, f.size_bytes FROM files f WHERE f.current_revision_id IS NOT NULL AND f.parse_status = 'parsed' AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL} AND EXISTS (SELECT 1 FROM chunk_embeddings ce WHERE ce.file_id = f.file_id AND ce.revision_id = f.current_revision_id AND ce.model_artifact_id = ?1) ORDER BY f.last_seen_at DESC LIMIT ?2) SELECT t.file_id, t.current_revision_id, t.display_name, t.extension, t.size_bytes, e.dimension, e.vector_blob FROM targets t JOIN chunks c ON c.file_id = t.file_id AND c.revision_id = t.current_revision_id JOIN chunk_embeddings e ON e.chunk_id = c.chunk_id AND e.model_artifact_id = ?1 ORDER BY t.file_id, c.ordinal"
+        );
+        let rows = {
+            let mut statement = transaction
+                .prepare(&sql)
+                .map_err(|error| storage_error("SEMANTIC_RELATION_QUERY_FAILED", error, true))?;
+            statement
+                .query_map(params![model_artifact_id, i64::from(max_files)], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, u64>(4)?,
+                        row.get::<_, u32>(5)?,
+                        row.get::<_, Vec<u8>>(6)?,
+                    ))
+                })
+                .map_err(|error| storage_error("SEMANTIC_RELATION_QUERY_FAILED", error, true))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| storage_error("SEMANTIC_RELATION_QUERY_FAILED", error, true))?
+        };
+        type RelationProfileAggregate = (String, String, String, u64, Vec<Vec<f32>>);
+        let mut grouped = BTreeMap::<String, RelationProfileAggregate>::new();
+        for (file_id, revision_id, name, extension, size, dimension, bytes) in rows {
+            let entry = grouped
+                .entry(file_id)
+                .or_insert_with(|| (revision_id, name, extension, size, Vec::new()));
+            if entry.4.len() < 3 {
+                entry.4.push(decode_vector(&bytes, dimension)?);
+            }
+        }
+        let mut profiles = Vec::new();
+        for (file_id, (revision_id, name, extension, size, vectors)) in grouped {
+            let vector = mean_normalized_vector(&vectors)?;
+            profiles.push((
+                parse_uuid_value(&file_id)?,
+                parse_uuid_value(&revision_id)?,
+                name,
+                extension,
+                size,
+                semantic_bucket(&vector),
+                vector,
+            ));
+        }
+        let mut buckets = BTreeMap::<String, Vec<usize>>::new();
+        for (index, profile) in profiles.iter().enumerate() {
+            buckets.entry(profile.5.clone()).or_default().push(index);
+        }
+        transaction
+            .execute(
+                "DELETE FROM file_relations WHERE relation_type IN ('semantic_related','contains_or_summarizes') AND review_status = 'suggested' AND model_version = ?1",
+                [model_artifact_id],
+            )
+            .map_err(|error| storage_error("SEMANTIC_RELATION_REFRESH_FAILED", error, true))?;
+        let now = Utc::now().to_rfc3339();
+        let mut semantic_pairs = 0_u64;
+        let mut contains_pairs = 0_u64;
+        let mut touched_files = HashSet::new();
+        for indices in buckets.values() {
+            let bounded = indices.iter().copied().take(96).collect::<Vec<_>>();
+            for left_position in 0..bounded.len() {
+                let mut neighbors = 0_u8;
+                for right_position in (left_position + 1)..bounded.len() {
+                    if neighbors >= 12 {
+                        break;
+                    }
+                    let left = &profiles[bounded[left_position]];
+                    let right = &profiles[bounded[right_position]];
+                    if left.6.len() != right.6.len() {
+                        continue;
+                    }
+                    let similarity = left.6.iter().zip(&right.6).map(|(a, b)| a * b).sum::<f32>();
+                    if similarity < 0.78 {
+                        continue;
+                    }
+                    neighbors += 1;
+                    let left_summary = is_summary_like_name(&left.2);
+                    let right_summary = is_summary_like_name(&right.2);
+                    let size_ratio =
+                        (left.4.min(right.4) as f64) / (left.4.max(right.4).max(1) as f64);
+                    let contains = similarity >= 0.84
+                        && ((left_summary != right_summary) || size_ratio <= 0.42);
+                    let relation_type = if contains {
+                        RelationType::ContainsOrSummarizes
+                    } else {
+                        RelationType::SemanticRelated
+                    };
+                    let direction_reason = if contains {
+                        let (summary, source) = if left_summary || left.4 <= right.4 {
+                            (&left.2, &right.2)
+                        } else {
+                            (&right.2, &left.2)
+                        };
+                        format!("《{summary}》可能是《{source}》的摘要、提纲或派生资料")
+                    } else {
+                        format!(
+                            "两份资料的文档级语义相似度为 {:.0}%",
+                            f64::from(similarity) * 100.0
+                        )
+                    };
+                    let (left_id, right_id, left_revision, right_revision) = if left.0 < right.0 {
+                        (left.0, right.0, left.1, right.1)
+                    } else {
+                        (right.0, left.0, right.1, left.1)
+                    };
+                    let reasons = vec![
+                        direction_reason,
+                        format!(
+                            "共同内容候选桶 {}，文件类型 {} / {}",
+                            left.5, left.3, right.3
+                        ),
+                    ];
+                    let reasons_json = serde_json::to_string(&reasons).map_err(|error| {
+                        AppError::new("RELATION_DATA_INVALID", error.to_string(), false)
+                    })?;
+                    transaction.execute(
+                        "INSERT INTO file_relations (relation_id, left_file_id, right_file_id, relation_type, confidence, reasons_json, review_status, created_at, updated_at, algorithm_version, model_version, left_revision_id, right_revision_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'suggested', ?7, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(left_file_id, right_file_id, relation_type) DO UPDATE SET confidence = excluded.confidence, reasons_json = excluded.reasons_json, review_status = CASE WHEN file_relations.algorithm_version IS NOT excluded.algorithm_version OR file_relations.model_version IS NOT excluded.model_version OR file_relations.left_revision_id IS NOT excluded.left_revision_id OR file_relations.right_revision_id IS NOT excluded.right_revision_id THEN 'suggested' ELSE file_relations.review_status END, algorithm_version = excluded.algorithm_version, model_version = excluded.model_version, left_revision_id = excluded.left_revision_id, right_revision_id = excluded.right_revision_id, updated_at = excluded.updated_at",
+                        params![Uuid::now_v7().to_string(), left_id.to_string(), right_id.to_string(), relation_type.as_storage(), f64::from(similarity), reasons_json, now, ALGORITHM_VERSION, model_artifact_id, left_revision.to_string(), right_revision.to_string()],
+                    ).map_err(|error| storage_error("SEMANTIC_RELATION_WRITE_FAILED", error, true))?;
+                    touched_files.insert(left_id);
+                    touched_files.insert(right_id);
+                    if contains {
+                        contains_pairs += 1;
+                    } else {
+                        semantic_pairs += 1;
+                    }
+                }
+            }
+        }
+        for file_id in touched_files {
+            let revision_key = profiles
+                .iter()
+                .find(|profile| profile.0 == file_id)
+                .map(|profile| profile.1.to_string())
+                .unwrap_or_else(|| "no-revision".into());
+            insert_inbox_event(
+                &transaction,
+                &file_id,
+                InboxEventType::RelationSuggested,
+                Utc::now(),
+                None,
+                TriageStatus::New,
+                Some("关系分析发现同主题、同用途或包含关系，等待人工复核"),
+                None,
+                &format!("semantic_relation:{model_artifact_id}:{file_id}:{revision_key}"),
+            )?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| storage_error("SEMANTIC_RELATION_REFRESH_FAILED", error, true))?;
+        Ok((semantic_pairs, contains_pairs))
     }
 
     pub fn query_file_relations(&self, request: &RelationQuery) -> Result<RelationPage, AppError> {
@@ -3558,7 +3451,19 @@ impl CatalogStore {
         let offset = request.offset()?;
         let page_size = u64::from(request.page_size);
         let connection = self.connect()?;
-        let predicate = "review_status <> 'rejected' AND EXISTS (SELECT 1 FROM file_root_memberships m JOIN roots rt ON rt.root_id = m.root_id WHERE m.file_id = r.left_file_id AND rt.enabled = 1) AND EXISTS (SELECT 1 FROM file_root_memberships m JOIN roots rt ON rt.root_id = m.root_id WHERE m.file_id = r.right_file_id AND rt.enabled = 1)";
+        let mut predicates = vec![
+            "EXISTS (SELECT 1 FROM file_root_memberships m JOIN roots rt ON rt.root_id = m.root_id WHERE m.file_id = r.left_file_id AND rt.enabled = 1)".to_owned(),
+            "EXISTS (SELECT 1 FROM file_root_memberships m JOIN roots rt ON rt.root_id = m.root_id WHERE m.file_id = r.right_file_id AND rt.enabled = 1)".to_owned(),
+        ];
+        if let Some(relation_type) = request.relation_type {
+            predicates.push(format!("relation_type = '{}'", relation_type.as_storage()));
+        }
+        if let Some(review_status) = request.review_status.as_deref() {
+            predicates.push(format!("review_status = '{review_status}'"));
+        } else {
+            predicates.push("review_status <> 'rejected'".to_owned());
+        }
+        let predicate = predicates.join(" AND ");
         let total = connection
             .query_row(
                 &format!("SELECT COUNT(*) FROM file_relations r WHERE {predicate}"),
@@ -3641,7 +3546,7 @@ impl CatalogStore {
         let connection = self.connect()?;
         let changed = connection
             .execute(
-                "UPDATE file_relations SET review_status = ?1, updated_at = ?2 WHERE relation_id = ?3",
+                "UPDATE file_relations AS r SET review_status = ?1, updated_at = ?2 WHERE relation_id = ?3 AND EXISTS (SELECT 1 FROM file_root_memberships m JOIN roots rt ON rt.root_id = m.root_id WHERE m.file_id = r.left_file_id AND rt.enabled = 1) AND EXISTS (SELECT 1 FROM file_root_memberships m JOIN roots rt ON rt.root_id = m.root_id WHERE m.file_id = r.right_file_id AND rt.enabled = 1)",
                 params![action, Utc::now().to_rfc3339(), relation_id.to_string()],
             )
             .map_err(|error| storage_error("RELATION_REVIEW_FAILED", error, true))?;
@@ -3653,6 +3558,55 @@ impl CatalogStore {
             ));
         }
         Ok(())
+    }
+
+    pub fn review_file_relations(
+        &self,
+        relation_ids: &[Uuid],
+        action: &str,
+    ) -> Result<u64, AppError> {
+        if relation_ids.is_empty() || relation_ids.len() > 500 {
+            return Err(AppError::new(
+                "RELATION_REVIEW_INVALID",
+                "每次批量复核需要选择1到500条文件关系",
+                false,
+            ));
+        }
+        if !matches!(action, "accepted" | "rejected") {
+            return Err(AppError::new(
+                "RELATION_REVIEW_INVALID",
+                "关系复核动作只能是 accepted 或 rejected",
+                false,
+            ));
+        }
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| storage_error("RELATION_REVIEW_FAILED", error, true))?;
+        let updated_at = Utc::now().to_rfc3339();
+        let mut changed = 0_u64;
+        for relation_id in relation_ids.iter().collect::<HashSet<_>>() {
+            changed = changed.saturating_add(
+                transaction
+                    .execute(
+                        "UPDATE file_relations AS r SET review_status = ?1, updated_at = ?2 WHERE relation_id = ?3 AND EXISTS (SELECT 1 FROM file_root_memberships m JOIN roots rt ON rt.root_id = m.root_id WHERE m.file_id = r.left_file_id AND rt.enabled = 1) AND EXISTS (SELECT 1 FROM file_root_memberships m JOIN roots rt ON rt.root_id = m.root_id WHERE m.file_id = r.right_file_id AND rt.enabled = 1)",
+                        params![action, updated_at, relation_id.to_string()],
+                    )
+                    .map_err(|error| storage_error("RELATION_REVIEW_FAILED", error, true))?
+                    as u64,
+            );
+        }
+        if changed == 0 {
+            return Err(AppError::new(
+                "RELATION_REVIEW_INVALID",
+                "所选文件关系不存在或已不在授权范围",
+                false,
+            ));
+        }
+        transaction
+            .commit()
+            .map_err(|error| storage_error("RELATION_REVIEW_FAILED", error, true))?;
+        Ok(changed)
     }
 
     pub fn list_pending_parse_files(&self, limit: usize) -> Result<Vec<FileRecord>, AppError> {
@@ -3670,6 +3624,7 @@ impl CatalogStore {
     }
 
     pub fn retry_ocr(&self, file_id: &Uuid) -> Result<(), AppError> {
+        let _permit = self.acquire_write(WritePriority::Interactive);
         let connection = self.connect()?;
         let changed = connection
             .execute(
@@ -3743,6 +3698,7 @@ impl CatalogStore {
                 false,
             ));
         }
+        let _permit = self.acquire_write(WritePriority::Background);
         let mut connection = self.connect()?;
         let transaction = connection
             .transaction()
@@ -3859,13 +3815,17 @@ impl CatalogStore {
             .vector_index_directory()?
             .join(format!("{generation_id}.usearch"));
         let created_at = Utc::now();
-        let mut connection = self.connect()?;
-        connection
-            .execute(
-                "INSERT INTO index_generations (generation_id, model_artifact_id, dimension, metric, quantization, index_path, status, item_count, coverage, created_at) VALUES (?1, ?2, ?3, 'cosine', 'bf16', ?4, 'building', 0, 0, ?5)",
-                params![generation_id.to_string(), model_artifact_id, dimension, index_path.to_string_lossy(), created_at.to_rfc3339()],
-            )
-            .map_err(|error| storage_error("VECTOR_INDEX_GENERATION_WRITE_FAILED", error, true))?;
+        {
+            let _permit = self.acquire_write(WritePriority::Background);
+            let connection = self.connect()?;
+            connection
+                .execute(
+                    "INSERT INTO index_generations (generation_id, model_artifact_id, dimension, metric, quantization, index_path, status, item_count, coverage, created_at) VALUES (?1, ?2, ?3, 'cosine', 'bf16', ?4, 'building', 0, 0, ?5)",
+                    params![generation_id.to_string(), model_artifact_id, dimension, index_path.to_string_lossy(), created_at.to_rfc3339()],
+                )
+                .map_err(|error| storage_error("VECTOR_INDEX_GENERATION_WRITE_FAILED", error, true))?;
+        }
+        let connection = self.connect()?;
 
         let loaded = (|| -> Result<Vec<VectorSourceRow>, AppError> {
             let sql = format!(
@@ -3944,24 +3904,45 @@ impl CatalogStore {
         )?;
         let coverage = coverage_ratio(loaded.len() as u64, total_chunks);
         let activated_at = Utc::now();
+        drop(connection);
+        for batch in loaded.chunks(500) {
+            let _permit = self.acquire_write(WritePriority::Background);
+            let mut connection = self.connect()?;
+            let transaction = connection
+                .transaction()
+                .map_err(|error| storage_error("DATABASE_TRANSACTION_FAILED", error, true))?;
+            for (key, chunk_id, file_id, revision_id, _) in batch {
+                let key = i64::try_from(*key).map_err(|_| {
+                    AppError::new(
+                        "VECTOR_INDEX_CAPACITY_EXCEEDED",
+                        "向量键超出数据库范围",
+                        false,
+                    )
+                })?;
+                transaction
+                    .execute(
+                        "INSERT INTO vector_index_keys (generation_id, vector_key, chunk_id, file_id, revision_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![generation_id.to_string(), key, chunk_id, file_id, revision_id],
+                    )
+                    .map_err(|error| storage_error("VECTOR_INDEX_KEY_WRITE_FAILED", error, true))?;
+            }
+            transaction
+                .execute(
+                    "UPDATE index_generations SET item_count = ?2 WHERE generation_id = ?1 AND status = 'building'",
+                    params![generation_id.to_string(), batch.len() as u64],
+                )
+                .map_err(|error| storage_error("VECTOR_INDEX_GENERATION_WRITE_FAILED", error, true))?;
+            transaction
+                .commit()
+                .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))?;
+            drop(_permit);
+            std::thread::yield_now();
+        }
+        let _permit = self.acquire_write(WritePriority::Background);
+        let mut connection = self.connect()?;
         let transaction = connection
             .transaction()
             .map_err(|error| storage_error("DATABASE_TRANSACTION_FAILED", error, true))?;
-        for (key, chunk_id, file_id, revision_id, _) in &loaded {
-            let key = i64::try_from(*key).map_err(|_| {
-                AppError::new(
-                    "VECTOR_INDEX_CAPACITY_EXCEEDED",
-                    "向量键超出数据库范围",
-                    false,
-                )
-            })?;
-            transaction
-                .execute(
-                    "INSERT INTO vector_index_keys (generation_id, vector_key, chunk_id, file_id, revision_id) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![generation_id.to_string(), key, chunk_id, file_id, revision_id],
-                )
-                .map_err(|error| storage_error("VECTOR_INDEX_KEY_WRITE_FAILED", error, true))?;
-        }
         transaction
             .execute(
                 "UPDATE index_generations SET status = 'retired' WHERE model_artifact_id = ?1 AND status = 'active'",
@@ -3993,6 +3974,7 @@ impl CatalogStore {
     }
 
     pub fn mark_file_parsing(&self, file_id: &Uuid, revision_id: &Uuid) -> Result<(), AppError> {
+        let _permit = self.acquire_write(WritePriority::Background);
         let mut connection = self.connect()?;
         let transaction = connection
             .transaction()
@@ -4078,6 +4060,7 @@ impl CatalogStore {
                 ));
             }
         }
+        let _permit = self.acquire_write(WritePriority::Background);
         let mut connection = self.connect()?;
         let transaction = connection
             .transaction()
@@ -4192,11 +4175,7 @@ impl CatalogStore {
             } else {
                 InboxEventType::ParseFailed
             };
-            let triage_status = if parse_status == "ocr_pending" {
-                TriageStatus::New
-            } else {
-                TriageStatus::Error
-            };
+            let triage_status = TriageStatus::New;
             let summary = match parse_status {
                 "ocr_pending" => "资料需要OCR后才能建立全文索引",
                 "encrypted" => "资料已加密，无法读取正文",
@@ -4222,7 +4201,7 @@ impl CatalogStore {
         } else {
             transaction
                 .execute(
-                    "UPDATE inbox_events SET triage_status = 'reviewed' WHERE file_id = ?1 AND event_type IN ('ocr_required','parse_failed') AND triage_status IN ('new','error')",
+                    "UPDATE inbox_events SET resolution_status = 'resolved' WHERE file_id = ?1 AND event_type IN ('ocr_required','parse_failed') AND resolution_status IN ('pending_retry','retrying')",
                     [file_id.to_string()],
                 )
                 .map_err(|error| storage_error("INBOX_UPDATE_FAILED", error, true))?;
@@ -4858,7 +4837,7 @@ impl CatalogStore {
         let connection = self.connect()?;
         let mut statement = connection
             .prepare(
-                "SELECT message_id, role, content, answer_json, created_at FROM ask_messages WHERE session_id = ?1 ORDER BY created_at DESC, message_id DESC LIMIT ?2",
+                "SELECT message_id, role, content, answer_json, error_json, created_at FROM ask_messages WHERE session_id = ?1 ORDER BY created_at DESC, message_id DESC LIMIT ?2",
             )
             .map_err(|error| storage_error("ASK_HISTORY_QUERY_FAILED", error, true))?;
         let rows = statement
@@ -4870,7 +4849,8 @@ impl CatalogStore {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 },
             )
@@ -4879,25 +4859,367 @@ impl CatalogStore {
             .map_err(|error| storage_error("ASK_HISTORY_QUERY_FAILED", error, true))?;
         let mut messages = rows
             .into_iter()
-            .map(|(message_id, role, content, answer_json, created_at)| {
-                Ok(AskMessage {
-                    message_id: parse_uuid_value(&message_id)?,
-                    session_id: *session_id,
-                    role,
-                    content,
-                    answer: answer_json
-                        .map(|value| {
-                            serde_json::from_str(&value).map_err(|error| {
-                                AppError::new("ASK_HISTORY_INVALID", error.to_string(), false)
+            .map(
+                |(message_id, role, content, answer_json, error_json, created_at)| {
+                    Ok(AskMessage {
+                        message_id: parse_uuid_value(&message_id)?,
+                        session_id: *session_id,
+                        role,
+                        content,
+                        answer: answer_json
+                            .map(|value| {
+                                serde_json::from_str(&value).map_err(|error| {
+                                    AppError::new("ASK_HISTORY_INVALID", error.to_string(), false)
+                                })
                             })
-                        })
-                        .transpose()?,
-                    created_at: parse_datetime_value(&created_at)?,
-                })
-            })
+                            .transpose()?,
+                        error: error_json
+                            .map(|value| {
+                                serde_json::from_str(&value).map_err(|error| {
+                                    AppError::new("ASK_HISTORY_INVALID", error.to_string(), false)
+                                })
+                            })
+                            .transpose()?,
+                        created_at: parse_datetime_value(&created_at)?,
+                    })
+                },
+            )
             .collect::<Result<Vec<_>, AppError>>()?;
         messages.reverse();
         Ok(messages)
+    }
+
+    pub fn list_ask_sessions(
+        &self,
+        cursor: Option<&str>,
+        page_size: u32,
+    ) -> Result<AskSessionPage, AppError> {
+        if !(1..=100).contains(&page_size) {
+            return Err(AppError::new(
+                "ASK_SESSION_QUERY_INVALID",
+                "问答会话每页数量必须在1到100之间",
+                false,
+            ));
+        }
+        let connection = self.connect()?;
+        let mut predicates = Vec::new();
+        let mut values = Vec::<SqlValue>::new();
+        if let Some(encoded) = cursor {
+            let cursor: AskSessionKeysetCursor = decode_keyset_cursor(
+                encoded,
+                "ASK_SESSION_CURSOR_INVALID",
+                "问答会话分页游标无效或已过期",
+            )?;
+            if cursor.version != 1 {
+                return Err(AppError::new(
+                    "ASK_SESSION_CURSOR_INVALID",
+                    "问答会话分页游标版本无效",
+                    false,
+                ));
+            }
+            predicates.push("(s.updated_at < ? OR (s.updated_at = ? AND s.session_id < ?))");
+            values.push(SqlValue::Text(cursor.updated_at.clone()));
+            values.push(SqlValue::Text(cursor.updated_at));
+            values.push(SqlValue::Text(cursor.session_id));
+        }
+        let where_sql = if predicates.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", predicates.join(" AND "))
+        };
+        values.push(SqlValue::Integer(i64::from(page_size) + 1));
+        let sql = format!(
+            "SELECT s.session_id, s.title, s.scope_json, s.created_at, s.updated_at, s.last_error_json, (SELECT COUNT(*) FROM ask_messages m WHERE m.session_id = s.session_id) FROM ask_sessions s {where_sql} ORDER BY s.updated_at DESC, s.session_id DESC LIMIT ?"
+        );
+        let mut statement = connection
+            .prepare(&sql)
+            .map_err(|error| storage_error("ASK_SESSION_QUERY_FAILED", error, true))?;
+        let mut items = statement
+            .query_map(params_from_iter(values.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, u64>(6)?,
+                ))
+            })
+            .map_err(|error| storage_error("ASK_SESSION_QUERY_FAILED", error, true))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| storage_error("ASK_SESSION_QUERY_FAILED", error, true))?
+            .into_iter()
+            .map(
+                |(
+                    session_id,
+                    title,
+                    scope_json,
+                    created_at,
+                    updated_at,
+                    error_json,
+                    message_count,
+                )| {
+                    Ok(AskSessionSummary {
+                        session_id: parse_uuid_value(&session_id)?,
+                        title: title.unwrap_or_else(|| "未命名会话".into()),
+                        scope: serde_json::from_str(&scope_json).map_err(|error| {
+                            AppError::new("ASK_SCOPE_INVALID", error.to_string(), false)
+                        })?,
+                        message_count,
+                        created_at: parse_datetime_value(&created_at)?,
+                        updated_at: parse_datetime_value(&updated_at)?,
+                        last_error: error_json
+                            .map(|value| {
+                                serde_json::from_str(&value).map_err(|error| {
+                                    AppError::new("ASK_HISTORY_INVALID", error.to_string(), false)
+                                })
+                            })
+                            .transpose()?,
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>, AppError>>()?;
+        let has_more = items.len() > page_size as usize;
+        if has_more {
+            items.truncate(page_size as usize);
+        }
+        let next_cursor = if has_more {
+            items
+                .last()
+                .map(|item| AskSessionKeysetCursor {
+                    version: 1,
+                    updated_at: item.updated_at.to_rfc3339(),
+                    session_id: item.session_id.to_string(),
+                })
+                .map(encode_keyset_cursor)
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(AskSessionPage {
+            items,
+            next_cursor,
+            has_more,
+        })
+    }
+
+    pub fn list_ask_messages(
+        &self,
+        session_id: &Uuid,
+        cursor: Option<&str>,
+        page_size: u32,
+    ) -> Result<AskMessagePage, AppError> {
+        if !(1..=200).contains(&page_size) {
+            return Err(AppError::new(
+                "ASK_MESSAGE_QUERY_INVALID",
+                "问答消息每页数量必须在1到200之间",
+                false,
+            ));
+        }
+        let connection = self.connect()?;
+        let mut predicates = vec!["session_id = ?".to_owned()];
+        let mut values = vec![SqlValue::Text(session_id.to_string())];
+        if let Some(encoded) = cursor {
+            let cursor: AskMessageKeysetCursor = decode_keyset_cursor(
+                encoded,
+                "ASK_MESSAGE_CURSOR_INVALID",
+                "问答消息分页游标无效或已过期",
+            )?;
+            if cursor.version != 1 {
+                return Err(AppError::new(
+                    "ASK_MESSAGE_CURSOR_INVALID",
+                    "问答消息分页游标版本无效",
+                    false,
+                ));
+            }
+            predicates.push("(created_at < ? OR (created_at = ? AND message_id < ?))".into());
+            values.push(SqlValue::Text(cursor.created_at.clone()));
+            values.push(SqlValue::Text(cursor.created_at));
+            values.push(SqlValue::Text(cursor.message_id));
+        }
+        values.push(SqlValue::Integer(i64::from(page_size) + 1));
+        let sql = format!(
+            "SELECT message_id, role, content, answer_json, error_json, created_at FROM ask_messages WHERE {} ORDER BY created_at DESC, message_id DESC LIMIT ?",
+            predicates.join(" AND ")
+        );
+        let mut statement = connection
+            .prepare(&sql)
+            .map_err(|error| storage_error("ASK_HISTORY_QUERY_FAILED", error, true))?;
+        let mut items = statement
+            .query_map(params_from_iter(values.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(|error| storage_error("ASK_HISTORY_QUERY_FAILED", error, true))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| storage_error("ASK_HISTORY_QUERY_FAILED", error, true))?
+            .into_iter()
+            .map(
+                |(message_id, role, content, answer_json, error_json, created_at)| {
+                    Ok(AskMessage {
+                        message_id: parse_uuid_value(&message_id)?,
+                        session_id: *session_id,
+                        role,
+                        content,
+                        answer: answer_json
+                            .map(|value| {
+                                serde_json::from_str(&value).map_err(|error| {
+                                    AppError::new("ASK_HISTORY_INVALID", error.to_string(), false)
+                                })
+                            })
+                            .transpose()?,
+                        error: error_json
+                            .map(|value| {
+                                serde_json::from_str(&value).map_err(|error| {
+                                    AppError::new("ASK_HISTORY_INVALID", error.to_string(), false)
+                                })
+                            })
+                            .transpose()?,
+                        created_at: parse_datetime_value(&created_at)?,
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>, AppError>>()?;
+        let has_more = items.len() > page_size as usize;
+        if has_more {
+            items.truncate(page_size as usize);
+        }
+        let next_cursor = if has_more {
+            items
+                .last()
+                .map(|item| AskMessageKeysetCursor {
+                    version: 1,
+                    created_at: item.created_at.to_rfc3339(),
+                    message_id: item.message_id.to_string(),
+                })
+                .map(encode_keyset_cursor)
+                .transpose()?
+        } else {
+            None
+        };
+        items.reverse();
+        Ok(AskMessagePage {
+            items,
+            next_cursor,
+            has_more,
+        })
+    }
+
+    pub fn rename_ask_session(&self, session_id: &Uuid, title: &str) -> Result<(), AppError> {
+        let title = title.trim();
+        if !(1..=80).contains(&title.chars().count()) {
+            return Err(AppError::new(
+                "ASK_SESSION_TITLE_INVALID",
+                "会话名称需要在1到80个字符之间",
+                false,
+            ));
+        }
+        let _permit = self.acquire_write(WritePriority::Interactive);
+        let connection = self.connect()?;
+        let changed = connection
+            .execute(
+                "UPDATE ask_sessions SET title = ?1, updated_at = ?2 WHERE session_id = ?3",
+                params![title, Utc::now().to_rfc3339(), session_id.to_string()],
+            )
+            .map_err(|error| storage_error("ASK_SESSION_UPDATE_FAILED", error, true))?;
+        if changed == 0 {
+            return Err(AppError::new(
+                "ASK_SESSION_NOT_FOUND",
+                "问答会话不存在",
+                false,
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn delete_ask_session(&self, session_id: &Uuid) -> Result<(), AppError> {
+        let _permit = self.acquire_write(WritePriority::Interactive);
+        let connection = self.connect()?;
+        let changed = connection
+            .execute(
+                "DELETE FROM ask_sessions WHERE session_id = ?1",
+                [session_id.to_string()],
+            )
+            .map_err(|error| storage_error("ASK_SESSION_DELETE_FAILED", error, true))?;
+        if changed == 0 {
+            return Err(AppError::new(
+                "ASK_SESSION_NOT_FOUND",
+                "问答会话不存在",
+                false,
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn record_ask_failure(
+        &self,
+        request: &AskRequest,
+        error: &AppError,
+    ) -> Result<(), AppError> {
+        let session_id = request
+            .session_id
+            .ok_or_else(|| AppError::new("ASK_SESSION_INVALID", "失败问答缺少会话标识", false))?;
+        let _permit = self.acquire_write(WritePriority::Interactive);
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|db_error| storage_error("ASK_HISTORY_WRITE_FAILED", db_error, true))?;
+        let now = Utc::now();
+        let scope_json = serde_json::to_string(&request.scope).map_err(|json_error| {
+            AppError::new("ASK_SCOPE_INVALID", json_error.to_string(), false)
+        })?;
+        let error_json = serde_json::to_string(error).map_err(|json_error| {
+            AppError::new("ASK_HISTORY_INVALID", json_error.to_string(), false)
+        })?;
+        transaction
+            .execute(
+                "INSERT INTO ask_sessions (session_id, scope_json, created_at, updated_at, title, last_error_json) VALUES (?1, ?2, ?3, ?3, ?4, ?5) ON CONFLICT(session_id) DO UPDATE SET scope_json = excluded.scope_json, updated_at = excluded.updated_at, title = COALESCE(ask_sessions.title, excluded.title), last_error_json = excluded.last_error_json",
+                params![session_id.to_string(), scope_json, now.to_rfc3339(), ask_session_title(&request.question), error_json],
+            )
+            .map_err(|db_error| storage_error("ASK_HISTORY_WRITE_FAILED", db_error, true))?;
+        transaction
+            .execute(
+                "INSERT INTO ask_messages (message_id, session_id, role, content, answer_json, error_json, created_at) VALUES (?1, ?2, 'user', ?3, NULL, NULL, ?4)",
+                params![Uuid::now_v7().to_string(), session_id.to_string(), request.question.trim(), now.to_rfc3339()],
+            )
+            .map_err(|db_error| storage_error("ASK_HISTORY_WRITE_FAILED", db_error, true))?;
+        transaction
+            .execute(
+                "INSERT INTO ask_messages (message_id, session_id, role, content, answer_json, error_json, created_at) VALUES (?1, ?2, 'assistant', '', NULL, ?3, ?4)",
+                params![Uuid::now_v7().to_string(), session_id.to_string(), error_json, Utc::now().to_rfc3339()],
+            )
+            .map_err(|db_error| storage_error("ASK_HISTORY_WRITE_FAILED", db_error, true))?;
+        transaction
+            .commit()
+            .map_err(|db_error| storage_error("ASK_HISTORY_WRITE_FAILED", db_error, true))
+    }
+
+    pub fn answer_result(&self, message_id: &Uuid) -> Result<AnswerResult, AppError> {
+        let connection = self.connect()?;
+        let answer_json = connection
+            .query_row(
+                "SELECT answer_json FROM ask_messages WHERE message_id = ?1 AND role = 'assistant' AND answer_json IS NOT NULL",
+                [message_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| storage_error("ASK_HISTORY_QUERY_FAILED", error, true))?
+            .ok_or_else(|| {
+                AppError::new(
+                    "ASK_RESULT_NOT_FOUND",
+                    "要导出的问答结果不存在或尚未完成",
+                    false,
+                )
+            })?;
+        serde_json::from_str(&answer_json)
+            .map_err(|error| AppError::new("ASK_RESULT_INVALID", error.to_string(), false))
     }
 
     pub fn record_ask_exchange(
@@ -4912,15 +5234,16 @@ impl CatalogStore {
         let now = Utc::now();
         let scope_json = serde_json::to_string(&request.scope)
             .map_err(|error| AppError::new("ASK_SCOPE_INVALID", error.to_string(), false))?;
+        let title = ask_session_title(&request.question);
         transaction
             .execute(
-                "INSERT INTO ask_sessions (session_id, scope_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?3) ON CONFLICT(session_id) DO UPDATE SET scope_json = excluded.scope_json, updated_at = excluded.updated_at",
-                params![result.session_id.to_string(), scope_json, now.to_rfc3339()],
+                "INSERT INTO ask_sessions (session_id, scope_json, created_at, updated_at, title, last_error_json) VALUES (?1, ?2, ?3, ?3, ?4, NULL) ON CONFLICT(session_id) DO UPDATE SET scope_json = excluded.scope_json, updated_at = excluded.updated_at, title = COALESCE(ask_sessions.title, excluded.title), last_error_json = NULL",
+                params![result.session_id.to_string(), scope_json, now.to_rfc3339(), title],
             )
             .map_err(|error| storage_error("ASK_HISTORY_WRITE_FAILED", error, true))?;
         transaction
             .execute(
-                "INSERT INTO ask_messages (message_id, session_id, role, content, answer_json, created_at) VALUES (?1, ?2, 'user', ?3, NULL, ?4)",
+                "INSERT INTO ask_messages (message_id, session_id, role, content, answer_json, error_json, created_at) VALUES (?1, ?2, 'user', ?3, NULL, NULL, ?4)",
                 params![Uuid::now_v7().to_string(), result.session_id.to_string(), request.question.trim(), now.to_rfc3339()],
             )
             .map_err(|error| storage_error("ASK_HISTORY_WRITE_FAILED", error, true))?;
@@ -4928,7 +5251,7 @@ impl CatalogStore {
             .map_err(|error| AppError::new("ASK_RESULT_INVALID", error.to_string(), false))?;
         transaction
             .execute(
-                "INSERT INTO ask_messages (message_id, session_id, role, content, answer_json, created_at) VALUES (?1, ?2, 'assistant', ?3, ?4, ?5)",
+                "INSERT INTO ask_messages (message_id, session_id, role, content, answer_json, error_json, created_at) VALUES (?1, ?2, 'assistant', ?3, ?4, NULL, ?5)",
                 params![result.message_id.to_string(), result.session_id.to_string(), result.answer, answer_json, Utc::now().to_rfc3339()],
             )
             .map_err(|error| storage_error("ASK_HISTORY_WRITE_FAILED", error, true))?;
@@ -5485,45 +5808,37 @@ impl CatalogStore {
 
     pub fn rebuild_index(&self, confirmation: &str) -> Result<IndexRebuildResult, AppError> {
         crate::validate_rebuild_confirmation(confirmation)?;
-        let mut connection = self.connect()?;
-        let transaction = connection
-            .transaction()
-            .map_err(|error| storage_error("DATABASE_TRANSACTION_FAILED", error, true))?;
-        let removed_embeddings =
-            count_query(&transaction, "SELECT COUNT(*) FROM chunk_embeddings")?;
-        let removed_chunks = count_query(&transaction, "SELECT COUNT(*) FROM chunks")?;
-        let removed_nodes = count_query(&transaction, "SELECT COUNT(*) FROM document_nodes")?;
         let reset_files = count_query(
-            &transaction,
+            &self.connect()?,
             "SELECT COUNT(*) FROM files WHERE current_revision_id IS NOT NULL",
         )?;
-        transaction
-            .execute("DELETE FROM chunk_embeddings", [])
-            .map_err(|error| storage_error("INDEX_REBUILD_FAILED", error, true))?;
-        transaction
-            .execute("DELETE FROM chunks_fts", [])
-            .map_err(|error| storage_error("INDEX_REBUILD_FAILED", error, true))?;
-        transaction
-            .execute("DELETE FROM chunks", [])
-            .map_err(|error| storage_error("INDEX_REBUILD_FAILED", error, true))?;
-        transaction
-            .execute("DELETE FROM document_nodes", [])
-            .map_err(|error| storage_error("INDEX_REBUILD_FAILED", error, true))?;
-        transaction.execute("UPDATE file_revisions SET parse_status = 'pending', parser_name = NULL, parser_version = NULL, index_version = NULL, completed_at = NULL, error_code = NULL WHERE revision_id IN (SELECT current_revision_id FROM files WHERE current_revision_id IS NOT NULL)", []).map_err(|error| storage_error("INDEX_REBUILD_FAILED", error, true))?;
-        transaction
-            .execute(
-                "UPDATE files SET parse_status = 'pending' WHERE current_revision_id IS NOT NULL",
+        loop {
+            let _permit = self.acquire_write(WritePriority::Background);
+            let mut connection = self.connect()?;
+            let transaction = connection
+                .transaction()
+                .map_err(|error| storage_error("DATABASE_TRANSACTION_FAILED", error, true))?;
+            transaction.execute(
+                "UPDATE file_revisions SET parse_status = 'pending', parser_name = NULL, parser_version = NULL, index_version = NULL, completed_at = NULL, error_code = NULL WHERE revision_id IN (SELECT current_revision_id FROM files WHERE current_revision_id IS NOT NULL AND parse_status <> 'pending' ORDER BY last_seen_at DESC, file_id DESC LIMIT 250)",
                 [],
-            )
-            .map_err(|error| storage_error("INDEX_REBUILD_FAILED", error, true))?;
-        transaction
-            .commit()
-            .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))?;
+            ).map_err(|error| storage_error("INDEX_REBUILD_FAILED", error, true))?;
+            let marked = transaction.execute(
+                "UPDATE files SET parse_status = 'pending' WHERE file_id IN (SELECT file_id FROM files WHERE current_revision_id IS NOT NULL AND parse_status <> 'pending' ORDER BY last_seen_at DESC, file_id DESC LIMIT 250)",
+                [],
+            ).map_err(|error| storage_error("INDEX_REBUILD_FAILED", error, true))?;
+            transaction
+                .commit()
+                .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))?;
+            if marked == 0 {
+                break;
+            }
+            thread::yield_now();
+        }
         Ok(IndexRebuildResult {
             reset_files,
-            removed_nodes,
-            removed_chunks,
-            removed_embeddings,
+            removed_nodes: 0,
+            removed_chunks: 0,
+            removed_embeddings: 0,
             source_files_modified: false,
         })
     }
@@ -5533,6 +5848,7 @@ impl CatalogStore {
         root_id: &Uuid,
         events: &[FileSystemEvent],
     ) -> Result<(), AppError> {
+        let _permit = self.acquire_write(WritePriority::Background);
         let mut connection = self.connect()?;
         let transaction = connection
             .transaction()
@@ -5563,6 +5879,7 @@ impl CatalogStore {
     }
 
     pub fn mark_file_events_coalesced(&self, root_id: &Uuid) -> Result<(), AppError> {
+        let _permit = self.acquire_write(WritePriority::Background);
         let connection = self.connect()?;
         connection
             .execute(
@@ -5586,12 +5903,18 @@ fn count_query(connection: &Connection, query: &str) -> Result<u64, AppError> {
         .map_err(|error| storage_error("DATABASE_COUNT_QUERY_FAILED", error, true))
 }
 
-fn sanitize_log_value(value: &serde_json::Value, field_name: Option<&str>) -> serde_json::Value {
+pub fn sanitize_log_value(
+    value: &serde_json::Value,
+    field_name: Option<&str>,
+) -> serde_json::Value {
     let sensitive_field = field_name.is_some_and(|name| {
         let name = name.to_ascii_lowercase();
-        ["path", "text", "content", "body", "quote"]
-            .iter()
-            .any(|token| name.contains(token))
+        [
+            "path", "text", "content", "body", "quote", "query", "prompt", "question", "answer",
+            "snippet",
+        ]
+        .iter()
+        .any(|token| name.contains(token))
     });
     if sensitive_field {
         return serde_json::Value::String("[redacted]".to_owned());
@@ -5602,15 +5925,7 @@ fn sanitize_log_value(value: &serde_json::Value, field_name: Option<&str>) -> se
         {
             serde_json::Value::String("background_adjusted".to_owned())
         }
-        serde_json::Value::String(text)
-            if text.starts_with("\\\\")
-                || text
-                    .as_bytes()
-                    .get(1..3)
-                    .is_some_and(|bytes| bytes == b":\\" || bytes == b":/") =>
-        {
-            serde_json::Value::String("[redacted_path]".to_owned())
-        }
+        serde_json::Value::String(text) => serde_json::Value::String(redact_absolute_paths(text)),
         serde_json::Value::Array(items) => serde_json::Value::Array(
             items
                 .iter()
@@ -5633,6 +5948,17 @@ fn sanitize_log_value(value: &serde_json::Value, field_name: Option<&str>) -> se
         ),
         _ => value.clone(),
     }
+}
+
+fn redact_absolute_paths(text: &str) -> String {
+    static WINDOWS_PATH: OnceLock<Regex> = OnceLock::new();
+    let expression = WINDOWS_PATH.get_or_init(|| {
+        Regex::new(
+            r#"(?i)(?:\\\\\?\\)?[a-z]:[\\/][^\s\"'<>|,;)\]}]+|\\\\[^\\/\s]+\\[^\s\"'<>|,;)\]}]+"#,
+        )
+        .expect("absolute path redaction regex")
+    });
+    expression.replace_all(text, "[redacted_path]").into_owned()
 }
 
 fn degradation_rank(level: DegradationLevel) -> u8 {
@@ -5689,28 +6015,6 @@ fn file_is_authorized(connection: &Connection, file_id: &Uuid) -> Result<bool, A
         )
         .map(|value| value != 0)
         .map_err(|error| storage_error("FILE_AUTHORIZATION_QUERY_FAILED", error, true))
-}
-
-fn file_belongs_to_any_root(
-    connection: &Connection,
-    file_id: &Uuid,
-    root_ids: &[Uuid],
-) -> Result<bool, AppError> {
-    let expected = root_ids.iter().map(Uuid::to_string).collect::<HashSet<_>>();
-    let mut statement = connection
-        .prepare("SELECT root_id FROM file_root_memberships WHERE file_id = ?1")
-        .map_err(|error| storage_error("MEMBERSHIP_QUERY_FAILED", error, true))?;
-    let rows = statement
-        .query_map([file_id.to_string()], |row| row.get::<_, String>(0))
-        .map_err(|error| storage_error("MEMBERSHIP_QUERY_FAILED", error, true))?;
-    for root_id in rows {
-        if expected.contains(
-            &root_id.map_err(|error| storage_error("MEMBERSHIP_QUERY_FAILED", error, true))?,
-        ) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 fn collection_rule_matches(
@@ -5774,6 +6078,107 @@ fn collection_rule_matches(
             (has_metadata_conditions && metadata_matches) || (has_text_conditions && text_matches)
         }
     })
+}
+
+fn inbox_item_by_id(
+    connection: &Connection,
+    inbox_id: &Uuid,
+    collections: &[CollectionRecord],
+) -> Result<Option<InboxItem>, AppError> {
+    let sql = format!(
+        "SELECT f.file_id, f.volume_id, f.canonical_path, f.display_name, f.extension, f.mime_type, f.size_bytes, f.fs_created_at, f.modified_at, f.windows_file_id, f.content_sha256, f.availability, f.current_revision_id, f.parse_status, f.first_seen_at, f.last_seen_at, i.inbox_id, i.event_type, i.observed_at, i.previous_path, i.triage_status, i.summary, i.error_code, i.resolution_status, i.attempt_count, i.last_attempt_at, (SELECT relation_id FROM file_relations r WHERE r.relation_type = 'exact_duplicate' AND (r.left_file_id = f.file_id OR r.right_file_id = f.file_id) AND r.review_status <> 'rejected' ORDER BY r.confidence DESC LIMIT 1) FROM inbox_events i JOIN files f ON f.file_id = i.file_id WHERE i.inbox_id = ?1 AND {AUTHORIZED_FILE_SQL} LIMIT 1"
+    );
+    let row = connection
+        .query_row(&sql, [inbox_id.to_string()], |row| {
+            let file = file_from_row(row)?;
+            let inbox_id: String = row.get(16)?;
+            let event_type: String = row.get(17)?;
+            let observed_at: String = row.get(18)?;
+            let triage_status: String = row.get(20)?;
+            let resolution_status: String = row.get(23)?;
+            let last_attempt_at: Option<String> = row.get(25)?;
+            let duplicate_group_id: Option<String> = row.get(26)?;
+            Ok((
+                file,
+                parse_uuid_column(&inbox_id, 16)?,
+                InboxEventType::from_storage(&event_type),
+                parse_datetime_column(&observed_at, 18)?,
+                row.get::<_, Option<String>>(19)?,
+                TriageStatus::from_storage(&triage_status),
+                row.get::<_, Option<String>>(21)?,
+                row.get::<_, Option<String>>(22)?,
+                ResolutionStatus::from_storage(&resolution_status),
+                row.get::<_, u32>(24)?,
+                last_attempt_at
+                    .map(|value| parse_datetime_column(&value, 25))
+                    .transpose()?,
+                duplicate_group_id
+                    .map(|value| parse_uuid_column(&value, 26))
+                    .transpose()?,
+            ))
+        })
+        .optional()
+        .map_err(|error| storage_error("INBOX_QUERY_FAILED", error, true))?;
+    let Some((
+        file,
+        inbox_id,
+        event_type,
+        observed_at,
+        previous_path,
+        triage_status,
+        summary,
+        error_code,
+        resolution_status,
+        attempt_count,
+        last_attempt_at,
+        duplicate_group_id,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let mut suggested_collection_ids = Vec::new();
+    for collection in collections {
+        if let Some(rule) = &collection.rule
+            && collection_rule_matches(connection, rule, &file)?
+        {
+            suggested_collection_ids.push(collection.collection_id);
+        }
+    }
+    Ok(Some(InboxItem {
+        inbox_id,
+        file_id: file.file_id,
+        display_name: file.display_name,
+        canonical_path: file.canonical_path,
+        event_type,
+        observed_at,
+        previous_path,
+        triage_status,
+        resolution_status,
+        attempt_count,
+        last_attempt_at,
+        retry_action: retry_action_for(event_type, resolution_status),
+        suggested_collection_ids,
+        duplicate_group_id,
+        summary,
+        error_code,
+    }))
+}
+
+fn retry_action_for(
+    event_type: InboxEventType,
+    resolution_status: ResolutionStatus,
+) -> Option<String> {
+    if !matches!(
+        resolution_status,
+        ResolutionStatus::PendingRetry | ResolutionStatus::Retrying
+    ) {
+        return None;
+    }
+    match event_type {
+        InboxEventType::OcrRequired => Some("retry_ocr".into()),
+        InboxEventType::ParseFailed => Some("retry_parse".into()),
+        _ => Some("retry_processing".into()),
+    }
 }
 
 fn collection_rows(connection: &Connection) -> Result<Vec<CollectionRecord>, AppError> {
@@ -5864,6 +6269,82 @@ fn collection_rows(connection: &Connection) -> Result<Vec<CollectionRecord>, App
 }
 
 const FILE_SELECT_WITH_ALIAS: &str = "SELECT f.file_id, f.volume_id, f.canonical_path, f.display_name, f.extension, f.mime_type, f.size_bytes, f.fs_created_at, f.modified_at, f.windows_file_id, f.content_sha256, f.availability, f.current_revision_id, f.parse_status, f.first_seen_at, f.last_seen_at FROM files f";
+fn file_filter_digest(request: &FileQuery) -> String {
+    let mut extensions = request
+        .extensions
+        .iter()
+        .map(|value| value.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    extensions.sort();
+    let mut statuses = request.parse_statuses.clone();
+    statuses.sort();
+    stable_filter_digest(&serde_json::json!({
+        "query": request.query.as_deref().map(str::trim).unwrap_or(""),
+        "extensions": extensions,
+        "parse_statuses": statuses,
+        "availability": request.availability.map(|value| value.as_str()),
+    }))
+}
+
+fn inbox_filter_digest(query: &InboxQuery) -> String {
+    let mut event_types = query
+        .event_types
+        .iter()
+        .map(|value| value.as_storage())
+        .collect::<Vec<_>>();
+    event_types.sort();
+    let mut root_ids = query
+        .root_ids
+        .iter()
+        .map(Uuid::to_string)
+        .collect::<Vec<_>>();
+    root_ids.sort();
+    stable_filter_digest(&serde_json::json!({
+        "status": query.status.as_storage(),
+        "event_types": event_types,
+        "root_ids": root_ids,
+        "date_from": query.date_from,
+        "date_to": query.date_to,
+    }))
+}
+
+fn stable_filter_digest(value: &serde_json::Value) -> String {
+    let mut digest = Sha256::new();
+    digest.update(value.to_string().as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+fn encode_keyset_cursor<T: serde::Serialize>(cursor: T) -> Result<String, AppError> {
+    let bytes = serde_json::to_vec(&cursor)
+        .map_err(|error| AppError::new("CURSOR_SERIALIZE_FAILED", error.to_string(), false))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn ask_session_title(question: &str) -> String {
+    let normalized = question.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut title = normalized.chars().take(28).collect::<String>();
+    if normalized.chars().count() > 28 {
+        title.push('…');
+    }
+    if title.is_empty() {
+        "新会话".into()
+    } else {
+        title
+    }
+}
+
+fn decode_keyset_cursor<T: serde::de::DeserializeOwned>(
+    encoded: &str,
+    error_code: &str,
+    message: &str,
+) -> Result<T, AppError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| AppError::new(error_code, message, false))?;
+    serde_json::from_slice(&bytes).map_err(|_| AppError::new(error_code, message, false))
+}
+
 const AUTHORIZED_FILE_SQL: &str = "EXISTS (SELECT 1 FROM file_root_memberships m JOIN roots r ON r.root_id = m.root_id WHERE m.file_id = f.file_id AND r.enabled = 1)";
 
 fn count_manual_collection_files(
@@ -6079,6 +6560,93 @@ fn collection_name_stem(value: &str) -> String {
     } else {
         compact
     }
+}
+
+fn deterministic_collection_name(titles: &[String]) -> String {
+    let normalized = titles
+        .iter()
+        .map(|title| collection_name_stem(title))
+        .collect::<Vec<_>>();
+    let categories = [
+        (&["面试", "简历", "招聘"][..], "求职与面试"),
+        (&["考试", "题库", "试卷", "复习"][..], "考试与复习"),
+        (&["项目", "需求", "产品", "方案"][..], "项目与产品"),
+        (&["合同", "协议", "条款"][..], "合同与协议"),
+        (&["课程", "教程", "学习", "笔记"][..], "学习与笔记"),
+        (&["发票", "报销", "账单"][..], "财务与报销"),
+        (&["会议", "纪要", "议程"][..], "会议资料"),
+    ];
+    let common_category = categories.iter().find_map(|(markers, label)| {
+        (normalized
+            .iter()
+            .filter(|title| markers.iter().any(|marker| title.contains(marker)))
+            .count()
+            >= 2)
+            .then_some(*label)
+    });
+    let extensions = titles
+        .iter()
+        .filter_map(|title| {
+            title
+                .rsplit_once('.')
+                .map(|(_, extension)| extension.to_lowercase())
+        })
+        .collect::<Vec<_>>();
+    let type_label = if !extensions.is_empty()
+        && extensions
+            .iter()
+            .all(|extension| extension == &extensions[0])
+    {
+        match extensions[0].as_str() {
+            "pdf" => "PDF资料",
+            "doc" | "docx" => "Word文档",
+            "xls" | "xlsx" | "csv" => "表格资料",
+            "ppt" | "pptx" => "演示资料",
+            "png" | "jpg" | "jpeg" | "webp" | "bmp" => "图片资料",
+            "rs" | "py" | "js" | "ts" | "tsx" | "java" | "cpp" | "c" | "go" => "代码资料",
+            _ => "同类型资料",
+        }
+    } else {
+        "跨格式资料"
+    };
+    if let Some(category) = common_category {
+        return format!("{category} · {type_label}");
+    }
+    let mut frequency = HashMap::<String, usize>::new();
+    for title in &normalized {
+        let unique = profile_keywords(title).into_iter().collect::<HashSet<_>>();
+        for keyword in unique {
+            if !matches!(keyword.as_str(), "资料" | "文档" | "文件" | "最终" | "版本") {
+                *frequency.entry(keyword).or_default() += 1;
+            }
+        }
+    }
+    let mut common = frequency
+        .into_iter()
+        .filter(|(_, count)| *count >= 2)
+        .collect::<Vec<_>>();
+    common.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    if let Some((keyword, _)) = common.first() {
+        format!("{keyword}主题 · {type_label}")
+    } else {
+        format!("共同主题 · {type_label}")
+    }
+}
+
+fn is_generic_collection_name(value: &str) -> bool {
+    matches!(
+        value.trim().to_lowercase().as_str(),
+        "相关资料" | "相关文档" | "文档集合" | "资料集合" | "其他资料" | "related files"
+    )
+}
+
+fn is_summary_like_name(value: &str) -> bool {
+    let lowered = value.to_lowercase();
+    [
+        "摘要", "总结", "概览", "提纲", "速览", "要点", "summary", "overview", "outline",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker))
 }
 
 fn profile_keywords(value: &str) -> Vec<String> {
@@ -6401,212 +6969,12 @@ fn parse_json_column<T: serde::de::DeserializeOwned>(
     })
 }
 
-fn validate_knowledge_space_references(
-    transaction: &Transaction<'_>,
-    request: &KnowledgeSpaceRequest,
-) -> Result<(), AppError> {
-    for root_id in request.root_ids.iter().collect::<HashSet<_>>() {
-        let exists = transaction
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM roots WHERE root_id = ?1 AND enabled = 1)",
-                [root_id.to_string()],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|error| storage_error("KNOWLEDGE_SPACE_REFERENCE_FAILED", error, true))?
-            != 0;
-        if !exists {
-            return Err(AppError::new(
-                "KNOWLEDGE_SPACE_ROOT_INVALID",
-                "知识空间包含不存在或已停用的资料位置",
-                false,
-            ));
-        }
-    }
-    for collection_id in request.collection_ids.iter().collect::<HashSet<_>>() {
-        let exists = transaction
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM collections WHERE collection_id = ?1)",
-                [collection_id.to_string()],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|error| storage_error("KNOWLEDGE_SPACE_REFERENCE_FAILED", error, true))?
-            != 0;
-        if !exists {
-            return Err(AppError::new(
-                "KNOWLEDGE_SPACE_COLLECTION_INVALID",
-                "知识空间包含不存在的集合",
-                false,
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn replace_knowledge_space_members(
-    transaction: &Transaction<'_>,
-    space_id: &Uuid,
-    request: &KnowledgeSpaceRequest,
-) -> Result<(), AppError> {
-    transaction
-        .execute(
-            "DELETE FROM knowledge_space_roots WHERE space_id = ?1",
-            [space_id.to_string()],
-        )
-        .map_err(|error| storage_error("KNOWLEDGE_SPACE_UPDATE_FAILED", error, true))?;
-    transaction
-        .execute(
-            "DELETE FROM knowledge_space_collections WHERE space_id = ?1",
-            [space_id.to_string()],
-        )
-        .map_err(|error| storage_error("KNOWLEDGE_SPACE_UPDATE_FAILED", error, true))?;
-    for root_id in request.root_ids.iter().collect::<HashSet<_>>() {
-        transaction
-            .execute(
-                "INSERT INTO knowledge_space_roots (space_id, root_id) VALUES (?1, ?2)",
-                params![space_id.to_string(), root_id.to_string()],
-            )
-            .map_err(|error| storage_error("KNOWLEDGE_SPACE_UPDATE_FAILED", error, true))?;
-    }
-    for collection_id in request.collection_ids.iter().collect::<HashSet<_>>() {
-        transaction
-            .execute(
-                "INSERT INTO knowledge_space_collections (space_id, collection_id) VALUES (?1, ?2)",
-                params![space_id.to_string(), collection_id.to_string()],
-            )
-            .map_err(|error| storage_error("KNOWLEDGE_SPACE_UPDATE_FAILED", error, true))?;
-    }
-    Ok(())
-}
-
-fn knowledge_space_members(
-    connection: &Connection,
-    space_id: &Uuid,
-) -> Result<(Vec<Uuid>, Vec<Uuid>), AppError> {
-    let load_ids = |query: &str, code: &'static str| -> Result<Vec<Uuid>, AppError> {
-        let mut statement = connection
-            .prepare(query)
-            .map_err(|error| storage_error(code, error, true))?;
-        statement
-            .query_map([space_id.to_string()], |row| {
-                let value = row.get::<_, String>(0)?;
-                parse_uuid_column(&value, 0)
-            })
-            .map_err(|error| storage_error(code, error, true))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| storage_error(code, error, true))
-    };
-    Ok((
-        load_ids(
-            "SELECT root_id FROM knowledge_space_roots WHERE space_id = ?1 ORDER BY root_id",
-            "KNOWLEDGE_SPACE_ROOT_QUERY_FAILED",
-        )?,
-        load_ids(
-            "SELECT collection_id FROM knowledge_space_collections WHERE space_id = ?1 ORDER BY collection_id",
-            "KNOWLEDGE_SPACE_COLLECTION_QUERY_FAILED",
-        )?,
-    ))
-}
-
-fn file_matches_any_root(
-    connection: &Connection,
-    file_id: &Uuid,
-    root_ids: &[Uuid],
-) -> Result<bool, AppError> {
-    if root_ids.is_empty() {
-        return Ok(false);
-    }
-    let allowed = root_ids.iter().map(Uuid::to_string).collect::<HashSet<_>>();
-    let mut statement = connection
-        .prepare(
-            "SELECT m.root_id FROM file_root_memberships m JOIN roots r ON r.root_id = m.root_id WHERE m.file_id = ?1 AND r.enabled = 1",
-        )
-        .map_err(|error| storage_error("KNOWLEDGE_SPACE_SCOPE_FAILED", error, true))?;
-    let roots = statement
-        .query_map([file_id.to_string()], |row| row.get::<_, String>(0))
-        .map_err(|error| storage_error("KNOWLEDGE_SPACE_SCOPE_FAILED", error, true))?;
-    for root in roots {
-        if allowed.contains(
-            &root.map_err(|error| storage_error("KNOWLEDGE_SPACE_SCOPE_FAILED", error, true))?,
-        ) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn knowledge_space_contains_file(
-    connection: &Connection,
-    file: &FileRecord,
-    space_id: &Uuid,
-) -> Result<bool, AppError> {
-    let exists = connection
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM knowledge_spaces WHERE space_id = ?1)",
-            [space_id.to_string()],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(|error| storage_error("KNOWLEDGE_SPACE_SCOPE_FAILED", error, true))?
-        != 0;
-    if !exists {
-        return Err(AppError::new(
-            "KNOWLEDGE_SPACE_NOT_FOUND",
-            "检索范围中的知识空间不存在",
-            false,
-        ));
-    }
-    let (root_ids, collection_ids) = knowledge_space_members(connection, space_id)?;
-    Ok(file_matches_any_root(connection, &file.file_id, &root_ids)?
-        || (!collection_ids.is_empty()
-            && file_matches_collection_scope(connection, file, &collection_ids)?))
-}
-
-fn file_matches_knowledge_space_scope(
-    connection: &Connection,
-    file: &FileRecord,
-    space_ids: &[Uuid],
-) -> Result<bool, AppError> {
-    for space_id in space_ids {
-        if knowledge_space_contains_file(connection, file, space_id)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn knowledge_space_file_count(
-    connection: &Connection,
-    root_ids: &[Uuid],
-    collection_ids: &[Uuid],
-) -> Result<u64, AppError> {
-    let files = list_files_with_connection(connection)?;
-    let mut count = 0_u64;
-    for file in files {
-        if !file_is_authorized(connection, &file.file_id)?
-            || file.availability != crate::Availability::Present
-        {
-            continue;
-        }
-        if file_matches_any_root(connection, &file.file_id, root_ids)?
-            || (!collection_ids.is_empty()
-                && file_matches_collection_scope(connection, &file, collection_ids)?)
-        {
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
 fn file_matches_scope(
     connection: &Connection,
     file: &FileRecord,
     scope: &ScopeFilter,
 ) -> Result<bool, AppError> {
     if !file_is_authorized(connection, &file.file_id)? {
-        return Ok(false);
-    }
-    if !scope.knowledge_space_ids.is_empty()
-        && !file_matches_knowledge_space_scope(connection, file, &scope.knowledge_space_ids)?
-    {
         return Ok(false);
     }
     if !scope.collection_ids.is_empty()
@@ -6694,12 +7062,6 @@ fn collect_scoped_file_ids(
     let mut scoped = HashSet::new();
     for file in files {
         if !authorized.contains(&file.file_id)
-            || (!scope.knowledge_space_ids.is_empty()
-                && !file_matches_knowledge_space_scope(
-                    connection,
-                    file,
-                    &scope.knowledge_space_ids,
-                )?)
             || (!scope.file_ids.is_empty() && !scope.file_ids.contains(&file.file_id))
             || (!scope.extensions.is_empty()
                 && !scope.extensions.iter().any(|extension| {
@@ -7302,28 +7664,28 @@ fn upsert_file(
     Ok(file_id)
 }
 
-fn reconcile_root_memberships(
+fn reconcile_root_memberships_batch(
     transaction: &Transaction<'_>,
     root_id: &Uuid,
-    seen_file_ids: &[Uuid],
-) -> Result<(), AppError> {
+    job_id: &Uuid,
+    batch_size: usize,
+) -> Result<usize, AppError> {
     let mut statement = transaction
-        .prepare("SELECT file_id FROM file_root_memberships WHERE root_id = ?1")
+        .prepare(
+            "SELECT m.file_id FROM file_root_memberships m WHERE m.root_id = ?1 AND NOT EXISTS (SELECT 1 FROM scan_seen_memberships s WHERE s.job_id = ?2 AND s.root_id = ?1 AND s.file_id = m.file_id) LIMIT ?3",
+        )
         .map_err(|error| storage_error("MEMBERSHIP_QUERY_FAILED", error, true))?;
     let existing = statement
-        .query_map([root_id.to_string()], |row| row.get::<_, String>(0))
+        .query_map(
+            params![root_id.to_string(), job_id.to_string(), batch_size as u64],
+            |row| row.get::<_, String>(0),
+        )
         .map_err(|error| storage_error("MEMBERSHIP_QUERY_FAILED", error, true))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| storage_error("MEMBERSHIP_QUERY_FAILED", error, true))?;
     drop(statement);
-    let seen = seen_file_ids
-        .iter()
-        .map(Uuid::to_string)
-        .collect::<std::collections::HashSet<_>>();
-    for file_id in existing
-        .into_iter()
-        .filter(|file_id| !seen.contains(file_id))
-    {
+    let removed = existing.len();
+    for file_id in existing {
         transaction
             .execute(
                 "DELETE FROM file_root_memberships WHERE file_id = ?1 AND root_id = ?2",
@@ -7359,7 +7721,7 @@ fn reconcile_root_memberships(
             )?;
         }
     }
-    Ok(())
+    Ok(removed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7376,7 +7738,7 @@ fn insert_inbox_event(
 ) -> Result<(), AppError> {
     transaction
         .execute(
-            "INSERT INTO inbox_events (inbox_id, dedupe_key, file_id, event_type, observed_at, previous_path, triage_status, summary, error_code) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(dedupe_key) DO UPDATE SET observed_at = excluded.observed_at, triage_status = excluded.triage_status, summary = excluded.summary, error_code = excluded.error_code",
+            "INSERT INTO inbox_events (inbox_id, dedupe_key, file_id, event_type, observed_at, previous_path, triage_status, summary, error_code, resolution_status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, CASE WHEN ?4 IN ('parse_failed','ocr_required') OR ?9 IS NOT NULL THEN 'pending_retry' ELSE 'normal' END) ON CONFLICT(dedupe_key) DO UPDATE SET observed_at = excluded.observed_at, triage_status = excluded.triage_status, summary = excluded.summary, error_code = excluded.error_code, resolution_status = CASE WHEN inbox_events.resolution_status = 'abandoned' THEN 'abandoned' ELSE excluded.resolution_status END",
             params![
                 Uuid::now_v7().to_string(),
                 dedupe_key,
@@ -7587,7 +7949,10 @@ fn storage_error(code: &str, error: rusqlite::Error, retryable: bool) -> AppErro
         err.user_action = Some(action.into());
     }
     let mut details = serde_json::Map::new();
-    details.insert("technical".to_owned(), serde_json::Value::String(error.to_string()));
+    details.insert(
+        "technical".to_owned(),
+        serde_json::Value::String(error.to_string()),
+    );
     err.details = Some(Box::new(serde_json::Value::Object(details)));
     err
 }
@@ -7595,61 +7960,45 @@ fn storage_error(code: &str, error: rusqlite::Error, retryable: bool) -> AppErro
 fn map_storage_error(error: &rusqlite::Error, _code: &str) -> (String, Option<&'static str>) {
     let text = error.to_string().to_lowercase();
     if text.contains("database is locked") || text.contains("database locked") {
-        ("本地资料库暂时繁忙，请稍后重试".into(), Some("如果频繁出现，可尝试关闭其他同时访问资料的软件"))
+        (
+            "本地资料库暂时繁忙，请稍后重试".into(),
+            Some("如果频繁出现，可尝试关闭其他同时访问资料的软件"),
+        )
     } else if text.contains("disk i/o") || text.contains("disk full") || text.contains("no space") {
-        ("磁盘读写出现问题".into(), Some("请检查磁盘空间是否充足，或是否有杀毒软件干扰了拾忆"))
-    } else if text.contains("readonly") || text.contains("read-only") || text.contains("permission denied") {
-        ("资料库写入权限异常".into(), Some("请检查杀毒软件或系统权限设置，确保拾忆可以正常写入应用数据"))
+        (
+            "磁盘读写出现问题".into(),
+            Some("请检查磁盘空间是否充足，或是否有杀毒软件干扰了拾忆"),
+        )
+    } else if text.contains("readonly")
+        || text.contains("read-only")
+        || text.contains("permission denied")
+    {
+        (
+            "资料库写入权限异常".into(),
+            Some("请检查杀毒软件或系统权限设置，确保拾忆可以正常写入应用数据"),
+        )
     } else if text.contains("no such table") || text.contains("no such column") {
         ("资料库结构需要升级，重启拾忆即可完成自动迁移".into(), None)
     } else if text.contains("unable to open") || text.contains("cannot open") {
-        ("无法打开资料库文件".into(), Some("请确认拾忆应用数据目录未被移动或删除，重启后会自动修复"))
-    } else if text.contains("malformed") || text.contains("corrupt") || text.contains("not a database") {
-        ("资料库文件损坏".into(), Some("请在设置中重建索引，源文件不会受到影响"))
+        (
+            "无法打开资料库文件".into(),
+            Some("请确认拾忆应用数据目录未被移动或删除，重启后会自动修复"),
+        )
+    } else if text.contains("malformed")
+        || text.contains("corrupt")
+        || text.contains("not a database")
+    {
+        (
+            "资料库文件损坏".into(),
+            Some("请在设置中重建索引，源文件不会受到影响"),
+        )
     } else if text.contains("busy") || text.contains("timeout") {
         ("资料库操作超时，请稍后重试".into(), None)
     } else {
-        ("资料库操作失败，请重启拾忆后重试".into(), Some("如仍未解决，可在设置中导出诊断信息"))
-    }
-}
-
-fn checkpoint_type_as_str(value: CheckpointType) -> &'static str {
-    match value {
-        CheckpointType::Schema => "schema",
-        CheckpointType::Invariant => "invariant",
-        CheckpointType::Evidence => "evidence",
-        CheckpointType::Permission => "permission",
-        CheckpointType::Resource => "resource",
-        CheckpointType::Quality => "quality",
-    }
-}
-
-fn checkpoint_type_from_str(value: &str) -> Result<CheckpointType, AppError> {
-    match value {
-        "schema" => Ok(CheckpointType::Schema),
-        "invariant" => Ok(CheckpointType::Invariant),
-        "evidence" => Ok(CheckpointType::Evidence),
-        "permission" => Ok(CheckpointType::Permission),
-        "resource" => Ok(CheckpointType::Resource),
-        "quality" => Ok(CheckpointType::Quality),
-        _ => Err(AppError::new(
-            "TASK_CHECKPOINT_DATA_INVALID",
-            "持久化检查点类型无效",
-            false,
-        )),
-    }
-}
-
-fn checkpoint_status_from_str(value: &str) -> Result<CheckpointStatus, AppError> {
-    match value {
-        "passed" => Ok(CheckpointStatus::Passed),
-        "failed" => Ok(CheckpointStatus::Failed),
-        "warning" => Ok(CheckpointStatus::Warning),
-        _ => Err(AppError::new(
-            "TASK_CHECKPOINT_DATA_INVALID",
-            "持久化检查点状态无效",
-            false,
-        )),
+        (
+            "资料库操作失败，请重启拾忆后重试".into(),
+            Some("如仍未解决，可在设置中导出诊断信息"),
+        )
     }
 }
 
@@ -7684,6 +8033,52 @@ impl JobStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interactive_writes_are_not_starved_by_background_waiters() {
+        let coordinator = Arc::new(WriteCoordinator::default());
+        let held = coordinator.acquire(WritePriority::Background);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
+
+        let background = Arc::clone(&coordinator);
+        let background_sender = sender.clone();
+        let background_thread = thread::spawn(move || {
+            ready_sender.send(()).expect("signal background ready");
+            let _permit = background.acquire(WritePriority::Background);
+            background_sender
+                .send("background")
+                .expect("send background");
+        });
+        ready_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("background ready");
+
+        let interactive = Arc::clone(&coordinator);
+        let interactive_thread = thread::spawn(move || {
+            let _permit = interactive.acquire(WritePriority::Interactive);
+            sender.send("interactive").expect("send interactive");
+        });
+        while coordinator.state.lock().expect("state").interactive_waiters < 1 {
+            thread::yield_now();
+        }
+
+        drop(held);
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("first writer"),
+            "interactive"
+        );
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("second writer"),
+            "background"
+        );
+        interactive_thread.join().expect("interactive thread");
+        background_thread.join().expect("background thread");
+    }
 
     #[test]
     fn metadata_only_formats_never_enter_the_content_parser_queue() {
@@ -7749,143 +8144,6 @@ mod tests {
             .expect("explicitly reenable root");
         assert!(reenabled.enabled);
         assert_eq!(reenabled.root_id, root.root_id);
-    }
-
-    #[test]
-    fn task_steps_and_checkpoints_are_persisted_before_completion() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let store = CatalogStore::open(directory.path().join("remin.db")).expect("open store");
-        let plan = crate::plan_skill(&crate::PlanSkillRequest {
-            task_id: None,
-            skill_id: "generate_catalog".into(),
-            file_ids: vec![Uuid::now_v7()],
-            parameters: serde_json::json!({"preset_id": "file_catalog"}),
-            user_instruction: None,
-        })
-        .expect("plan task");
-        let job = store.begin_task(&plan).expect("begin task");
-        assert_eq!(job.status, JobStatus::Running);
-
-        let checkpoint_types = [
-            CheckpointType::Permission,
-            CheckpointType::Invariant,
-            CheckpointType::Evidence,
-            CheckpointType::Schema,
-        ];
-        for (step, checkpoint_type) in plan.steps.iter().zip(checkpoint_types) {
-            let checkpoint = store
-                .pass_task_step(
-                    &plan.task_id,
-                    step,
-                    checkpoint_type,
-                    serde_json::json!({"verified": true}),
-                )
-                .expect("pass task step");
-            assert_eq!(checkpoint.status, CheckpointStatus::Passed);
-        }
-        let completed = store.finish_task(&plan.task_id).expect("finish task");
-        assert_eq!(completed.status, JobStatus::Succeeded);
-        assert_eq!(completed.progress, 1.0);
-        assert_eq!(completed.processed_items, completed.total_items);
-    }
-
-    #[test]
-    fn failed_task_resumes_from_persisted_checkpoint() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let store = CatalogStore::open(directory.path().join("remin.db")).expect("open store");
-        let plan = crate::plan_skill(&crate::PlanSkillRequest {
-            task_id: None,
-            skill_id: "generate_catalog".into(),
-            file_ids: vec![Uuid::now_v7()],
-            parameters: serde_json::json!({"preset_id": "file_catalog"}),
-            user_instruction: None,
-        })
-        .expect("plan task");
-        store.begin_task(&plan).expect("begin task");
-        let candidates = [
-            ("content_heading", crate::CandidateStatus::Selected),
-            ("metadata_only", crate::CandidateStatus::Valid),
-            ("conservative_fallback", crate::CandidateStatus::Valid),
-        ]
-        .into_iter()
-        .map(|(strategy, status)| ExplorationCandidate {
-            candidate_id: Uuid::now_v7(),
-            job_id: plan.task_id,
-            strategy: strategy.into(),
-            status,
-            result_ref: (status == crate::CandidateStatus::Selected)
-                .then(|| "remin://extraction/test".into()),
-            quality_score: Some(0.8),
-            evidence_score: Some(1.0),
-            latency_ms: Some(1),
-            resource_cost: Some(0.1),
-            rejection_reasons: Vec::new(),
-        })
-        .collect::<Vec<_>>();
-        store
-            .replace_task_exploration_candidates(&plan.task_id, &candidates)
-            .expect("record exploration candidates");
-        assert_eq!(
-            store
-                .task_exploration_candidates(&plan.task_id)
-                .expect("list exploration candidates"),
-            candidates
-        );
-        let first = store
-            .pass_task_step(
-                &plan.task_id,
-                &plan.steps[0],
-                CheckpointType::Permission,
-                serde_json::json!({"verified": true}),
-            )
-            .expect("pass first checkpoint");
-        assert!(first.resume_token.is_some());
-        store
-            .fail_task(
-                &plan.task_id,
-                &AppError::new("WORKER_IO_FAILED", "temporary failure", true),
-            )
-            .expect("fail task");
-
-        let recovered_plan = store
-            .latest_recoverable_task_plan()
-            .expect("query recoverable plan")
-            .expect("recoverable plan");
-        assert_eq!(recovered_plan.task_id, plan.task_id);
-        assert_eq!(recovered_plan.steps[0].step_id, plan.steps[0].step_id);
-        assert_eq!(
-            store
-                .resume_task(&plan.task_id)
-                .expect("resume task")
-                .status,
-            JobStatus::Running
-        );
-        for (step, kind) in plan.steps.iter().skip(1).zip([
-            CheckpointType::Invariant,
-            CheckpointType::Evidence,
-            CheckpointType::Schema,
-        ]) {
-            store
-                .pass_task_step(
-                    &plan.task_id,
-                    step,
-                    kind,
-                    serde_json::json!({"verified": true}),
-                )
-                .expect("pass resumed checkpoint");
-        }
-        let checkpoints = store
-            .task_checkpoints(&plan.task_id)
-            .expect("list checkpoints");
-        assert_eq!(checkpoints.len(), 4);
-        assert!(checkpoints.iter().all(|item| item.resume_token.is_some()));
-        assert_eq!(
-            store
-                .finish_task(&plan.task_id)
-                .expect("finish task")
-                .status,
-            JobStatus::Succeeded
-        );
     }
 
     #[test]
@@ -8087,8 +8345,12 @@ mod tests {
                 (10, "multimodal_image_assets".to_owned()),
                 (11, "metadata_only_file_policy".to_owned()),
                 (12, "recoverable_image_understanding".to_owned()),
-                (13, "knowledge_spaces".to_owned()),
+                (13, "knowledge_spaces_removed".to_owned()),
                 (14, "application_settings".to_owned()),
+                (15, "relation_evidence_versions".to_owned()),
+                (16, "stable_keyset_paging_and_scan_checkpoints".to_owned()),
+                (17, "inbox_triage_resolution_split".to_owned()),
+                (18, "remove_knowledge_spaces".to_owned()),
             ]
         );
         let rules = store.list_exclusion_rules().expect("list exclusion rules");
@@ -8411,6 +8673,66 @@ mod tests {
             )
             .expect("commit scan");
 
+        let first_file_page = store
+            .query_files(&FileQuery {
+                cursor: None,
+                page_size: 1,
+                query: None,
+                extensions: vec![],
+                parse_statuses: vec![],
+                availability: None,
+            })
+            .expect("query first file page");
+        assert_eq!(first_file_page.items.len(), 1);
+        assert!(first_file_page.has_more);
+        let second_file_page = store
+            .query_files(&FileQuery {
+                cursor: first_file_page.next_cursor.clone(),
+                page_size: 1,
+                query: None,
+                extensions: vec![],
+                parse_statuses: vec![],
+                availability: None,
+            })
+            .expect("query second file page");
+        assert_eq!(second_file_page.items.len(), 1);
+        assert!(!second_file_page.has_more);
+        assert_ne!(
+            first_file_page.items[0].file_id,
+            second_file_page.items[0].file_id
+        );
+
+        let first_inbox_page = store
+            .query_inbox(&InboxQuery {
+                status: TriageStatus::New,
+                event_types: vec![InboxEventType::Discovered],
+                root_ids: vec![root.root_id],
+                date_from: None,
+                date_to: None,
+                cursor: None,
+                page_size: 1,
+            })
+            .expect("query first inbox page");
+        assert_eq!(first_inbox_page.items.len(), 1);
+        assert!(first_inbox_page.has_more);
+        let second_inbox_page = store
+            .query_inbox(&InboxQuery {
+                status: TriageStatus::New,
+                event_types: vec![InboxEventType::Discovered],
+                root_ids: vec![root.root_id],
+                date_from: None,
+                date_to: None,
+                cursor: first_inbox_page.next_cursor.clone(),
+                page_size: 1,
+            })
+            .expect("query second inbox page");
+        assert_eq!(second_inbox_page.items.len(), 1);
+        assert!(!second_inbox_page.has_more);
+        assert_ne!(
+            first_inbox_page.items[0].inbox_id,
+            second_inbox_page.items[0].inbox_id
+        );
+
         let inbox = store
             .query_inbox(&InboxQuery {
                 status: TriageStatus::New,
@@ -8461,22 +8783,12 @@ mod tests {
                 .len(),
             1
         );
-        let space = store
-            .create_knowledge_space(&KnowledgeSpaceRequest {
-                name: "归航知识空间".into(),
-                description: Some("只在拾忆中组合资料范围".into()),
-                root_ids: vec![],
-                collection_ids: vec![manual.collection_id],
-            })
-            .expect("create knowledge space");
-        assert_eq!(space.file_count, 1);
         let scoped = store
             .search(&crate::SearchRequest {
                 query: inbox.items[0].display_name.clone(),
                 scope: ScopeFilter {
-                    knowledge_space_ids: vec![space.space_id],
                     root_ids: vec![],
-                    collection_ids: vec![],
+                    collection_ids: vec![manual.collection_id],
                     file_ids: vec![],
                     extensions: vec![],
                     modified_from: None,
@@ -8488,21 +8800,8 @@ mod tests {
                 page_size: 20,
                 cursor: None,
             })
-            .expect("search knowledge space");
+            .expect("search collection scope");
         assert_eq!(scoped.results.len(), 1);
-        let updated_space = store
-            .update_knowledge_space(
-                &space.space_id,
-                &KnowledgeSpaceRequest {
-                    name: "全部归航资料".into(),
-                    description: None,
-                    root_ids: vec![root.root_id],
-                    collection_ids: vec![],
-                },
-            )
-            .expect("update knowledge space");
-        assert_eq!(updated_space.file_count, 2);
-        assert_eq!(store.list_knowledge_spaces().expect("list spaces").len(), 1);
         let filtered = store
             .create_collection(&CreateCollectionRequest {
                 name: "有效归航文本".into(),
@@ -8561,6 +8860,8 @@ mod tests {
             .query_file_relations(&RelationQuery {
                 cursor: None,
                 page_size: 1,
+                relation_type: None,
+                review_status: None,
             })
             .expect("first relation page");
         assert_eq!(first_relation_page.total, relations.len() as u64);
@@ -8570,24 +8871,43 @@ mod tests {
                 .query_file_relations(&RelationQuery {
                     cursor: first_relation_page.next_cursor,
                     page_size: 1,
+                    relation_type: None,
+                    review_status: None,
                 })
                 .expect("second relation page")
                 .items
                 .len(),
             relations.len().saturating_sub(1).min(1)
         );
+        let exact_relations = store
+            .query_file_relations(&RelationQuery {
+                cursor: None,
+                page_size: 20,
+                relation_type: Some(RelationType::ExactDuplicate),
+                review_status: Some("suggested".into()),
+            })
+            .expect("filter exact pending relations");
+        assert_eq!(exact_relations.items.len(), 1);
+        let reviewed = store
+            .review_file_relations(&[exact_relations.items[0].relation_id], "accepted")
+            .expect("batch review relation");
+        assert_eq!(reviewed, 1);
+        assert_eq!(
+            store
+                .query_file_relations(&RelationQuery {
+                    cursor: None,
+                    page_size: 20,
+                    relation_type: Some(RelationType::ExactDuplicate),
+                    review_status: Some("accepted".into()),
+                })
+                .expect("filter accepted relations")
+                .items
+                .len(),
+            1
+        );
         assert_eq!(
             fs::read_to_string(first_path).expect("read source after analysis"),
             "离线资料内容一致"
-        );
-        store
-            .delete_knowledge_space(&space.space_id)
-            .expect("delete knowledge space");
-        assert!(
-            store
-                .list_knowledge_spaces()
-                .expect("empty spaces")
-                .is_empty()
         );
     }
 
@@ -8731,7 +9051,6 @@ mod tests {
             Some(generation.generation_id)
         );
         let semantic_scope = ScopeFilter {
-            knowledge_space_ids: vec![],
             root_ids: vec![root.root_id],
             collection_ids: vec![],
             file_ids: vec![],
@@ -9006,7 +9325,6 @@ mod tests {
         let mut request = crate::SearchRequest {
             query: "分页资料".into(),
             scope: ScopeFilter {
-                knowledge_space_ids: vec![],
                 root_ids: vec![root.root_id],
                 collection_ids: vec![],
                 file_ids: vec![],
@@ -9112,7 +9430,6 @@ mod tests {
         let request = crate::SearchRequest {
             query: "不存在的检索词".into(),
             scope: ScopeFilter {
-                knowledge_space_ids: vec![],
                 root_ids: vec![root.root_id],
                 collection_ids: vec![],
                 file_ids: vec![],

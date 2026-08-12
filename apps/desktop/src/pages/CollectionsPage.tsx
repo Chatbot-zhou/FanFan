@@ -1,9 +1,12 @@
-import { AppstoreOutlined, CalendarOutlined, CloseOutlined, FileDoneOutlined, FolderAddOutlined, PlusOutlined, RobotOutlined } from "@ant-design/icons";
+import { AppstoreOutlined, CalendarOutlined, CloseOutlined, FileDoneOutlined, FolderAddOutlined, PlusOutlined, RobotOutlined, SafetyCertificateOutlined } from "@ant-design/icons";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { FormEvent, useRef, useState } from "react";
-import { bridge, type CollectionKind, type CollectionRule, type CreateCollectionRequest, type KnowledgeSpace } from "../bridge";
+import { FormEvent, useEffect, useRef, useState } from "react";
+import { bridge, type CollectionKind, type CollectionRule, type CreateCollectionRequest } from "../bridge";
+import { confirmAction } from "../components/AppConfirm";
+import { AppSelect } from "../components/AppSelect";
 import { useAppStore } from "../state/app-store";
+import { errorMessage } from "../utils/app-error";
 import { displayPath } from "../utils/display-path";
 
 const splitRuleValues = (value: string) => value.split(/[，,]+/).map((item) => item.trim()).filter(Boolean);
@@ -37,15 +40,7 @@ export function CollectionsPage() {
   const [editingSuggestionId, setEditingSuggestionId] = useState<string | null>(null);
   const [suggestionName, setSuggestionName] = useState("");
   const [suggestionMemberIds, setSuggestionMemberIds] = useState<string[]>([]);
-  const [spaceEditorOpen, setSpaceEditorOpen] = useState(false);
-  const [spaceEditingId, setSpaceEditingId] = useState<string | null>(null);
-  const [spaceName, setSpaceName] = useState("");
-  const [spaceDescription, setSpaceDescription] = useState("");
-  const [spaceRootIds, setSpaceRootIds] = useState<string[]>([]);
-  const [spaceCollectionIds, setSpaceCollectionIds] = useState<string[]>([]);
   const collections = useQuery({ queryKey: ["collections"], queryFn: () => bridge.collection_list() });
-  const roots = useQuery({ queryKey: ["roots"], queryFn: () => bridge.root_list() });
-  const knowledgeSpaces = useQuery({ queryKey: ["knowledge-spaces"], queryFn: () => bridge.knowledge_space_list() });
   const suggestions = useQuery({ queryKey: ["collection-suggestions"], queryFn: () => bridge.collection_suggestion_query(null, 50, "suggested") });
   const selectedCollection = collections.data?.find((item) => item.collection_id === selectedId) ?? null;
   const files = useInfiniteQuery({
@@ -58,7 +53,17 @@ export function CollectionsPage() {
   const collectionItems = files.data?.pages.flatMap((page) => page.items) ?? [];
   const allFiles = useQuery({ queryKey: ["collection-file-picker", filePickerQuery], queryFn: () => bridge.file_query({ cursor: null, page_size: 200, query: filePickerQuery || null, parse_statuses: ["parsed"], availability: "present" }), enabled: selectedCollection?.kind === "manual" || selectedCollection?.kind === "ai" });
   const collectionListRef = useRef<HTMLDivElement>(null);
+  const collectionDetailRef = useRef<HTMLElement>(null);
   const collectionVirtualizer = useVirtualizer({ count: collectionItems.length, getScrollElement: () => collectionListRef.current, estimateSize: () => 58, overscan: 8 });
+  useEffect(() => {
+    if (!selectedId) return;
+    requestAnimationFrame(() => {
+      const detail = collectionDetailRef.current;
+      if (detail && typeof detail.scrollIntoView === "function") {
+        detail.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+    });
+  }, [selectedId]);
   const create = useMutation({
     mutationFn: (request: CreateCollectionRequest) => bridge.collection_create(request),
     onSuccess: async (collection) => {
@@ -122,20 +127,6 @@ export function CollectionsPage() {
       return bridge.collection_suggestion_update(suggestionId, { suggested_name: suggestionName, description: current.description, member_file_ids: suggestionMemberIds });
     },
     onSuccess: async () => { setEditingSuggestionId(null); await queryClient.invalidateQueries({ queryKey: ["collection-suggestions"] }); },
-  });
-  const saveKnowledgeSpace = useMutation({
-    mutationFn: () => {
-      const request = { name: spaceName, description: spaceDescription || null, root_ids: spaceRootIds, collection_ids: spaceCollectionIds };
-      return spaceEditingId ? bridge.knowledge_space_update(spaceEditingId, request) : bridge.knowledge_space_create(request);
-    },
-    onSuccess: async () => {
-      setSpaceEditorOpen(false); setSpaceEditingId(null); setSpaceName(""); setSpaceDescription(""); setSpaceRootIds([]); setSpaceCollectionIds([]);
-      await queryClient.invalidateQueries({ queryKey: ["knowledge-spaces"] });
-    },
-  });
-  const deleteKnowledgeSpace = useMutation({
-    mutationFn: (spaceId: string) => bridge.knowledge_space_delete(spaceId),
-    onSuccess: async () => queryClient.invalidateQueries({ queryKey: ["knowledge-spaces"] }),
   });
 
   const resetRuleEditor = () => {
@@ -202,34 +193,18 @@ export function CollectionsPage() {
     resetRuleEditor(); setPreviewCount(null);
   };
 
-  const editKnowledgeSpace = (space: KnowledgeSpace) => {
-    setSpaceEditingId(space.space_id); setSpaceEditorOpen(true); setSpaceName(space.name);
-    setSpaceDescription(space.description ?? ""); setSpaceRootIds(space.root_ids); setSpaceCollectionIds(space.collection_ids);
-  };
-
-  const closeSpaceEditor = () => {
-    setSpaceEditorOpen(false); setSpaceEditingId(null); setSpaceName(""); setSpaceDescription(""); setSpaceRootIds([]); setSpaceCollectionIds([]);
-  };
-
   return (
     <section className="page">
-      <header className="page-heading">
-        <div><h1>智能集合</h1><p>AI判断资料之间的内容联系，只在拾忆中形成虚拟分类，不改变原文件位置。</p></div>
-        <div><button type="button" disabled={refreshSuggestions.isPending} onClick={() => refreshSuggestions.mutate()}><RobotOutlined /> {refreshSuggestions.isPending ? "正在分析" : "AI分析新建议"}</button><button type="button" className="primary-button" onClick={() => { if (creating) closeEditor(); else { setEditingId(null); setCreating(true); } }}>{creating ? <CloseOutlined /> : <PlusOutlined />} {creating ? "取消" : "新建集合"}</button></div>
+      <header className="page-heading page-heading--inline-note page-heading--compact page-heading--divider">
+        <div className="readonly-note"><SafetyCertificateOutlined /> 虚拟集合只做智能分类，不复制或移动任何文件</div>
+        <div className="page-heading__actions">
+          <button type="button" className="secondary-gradient-button" disabled={refreshSuggestions.isPending} onClick={() => refreshSuggestions.mutate()}><RobotOutlined /> {refreshSuggestions.isPending ? "正在分析" : "AI分析新建议"}</button>
+          <button type="button" className={creating ? "text-button" : "primary-button"} onClick={() => { if (creating) closeEditor(); else { setEditingId(null); setCreating(true); } }}>{creating ? <CloseOutlined /> : <PlusOutlined />} {creating ? "取消" : "新建集合"}</button>
+        </div>
       </header>
-      <section className="knowledge-spaces">
-        <header><div><h2>知识空间</h2><p>把多个已授权目录和虚拟集合组合成一个检索范围，不复制或移动任何文件。</p></div><button type="button" onClick={() => spaceEditorOpen ? closeSpaceEditor() : setSpaceEditorOpen(true)}>{spaceEditorOpen ? <CloseOutlined /> : <PlusOutlined />} {spaceEditorOpen ? "取消" : "新建知识空间"}</button></header>
-        {spaceEditorOpen && <form className="collection-create" onSubmit={(event) => { event.preventDefault(); saveKnowledgeSpace.mutate(); }}>
-          <label>空间名称<input required maxLength={40} value={spaceName} onChange={(event) => setSpaceName(event.target.value)} placeholder="例如：毕业论文资料" /></label>
-          <label>说明<input maxLength={500} value={spaceDescription} onChange={(event) => setSpaceDescription(event.target.value)} placeholder="这个空间用于什么检索场景" /></label>
-          <fieldset><legend>授权资料位置</legend>{roots.data?.length ? roots.data.map((root) => <label key={root.root_id}><input type="checkbox" checked={spaceRootIds.includes(root.root_id)} onChange={() => setSpaceRootIds((current) => current.includes(root.root_id) ? current.filter((id) => id !== root.root_id) : [...current, root.root_id])} /> {root.label}</label>) : <small>尚未添加资料位置</small>}</fieldset>
-          <fieldset><legend>虚拟集合</legend>{collections.data?.length ? collections.data.map((collection) => <label key={collection.collection_id}><input type="checkbox" checked={spaceCollectionIds.includes(collection.collection_id)} onChange={() => setSpaceCollectionIds((current) => current.includes(collection.collection_id) ? current.filter((id) => id !== collection.collection_id) : [...current, collection.collection_id])} /> {collection.name}</label>) : <small>尚无可用集合</small>}</fieldset>
-          {saveKnowledgeSpace.isError && <p role="alert" className="inline-error">{saveKnowledgeSpace.error instanceof Error ? saveKnowledgeSpace.error.message : String(saveKnowledgeSpace.error)}</p>}
-          <button type="submit" className="primary-button" disabled={saveKnowledgeSpace.isPending || !spaceName.trim() || (spaceRootIds.length === 0 && spaceCollectionIds.length === 0)}>{saveKnowledgeSpace.isPending ? "正在保存" : spaceEditingId ? "保存知识空间" : "创建知识空间"}</button>
-        </form>}
-        <div className="collection-grid">{knowledgeSpaces.data?.map((space) => <article className="collection-card" key={space.space_id}><span className="collection-card__icon"><FolderAddOutlined /></span><h3>{space.name}</h3><p>{space.description ?? "自定义本地检索范围"}</p><strong>{space.file_count} 项</strong><small>{space.root_ids.length} 个位置 · {space.collection_ids.length} 个集合</small><div><button type="button" className="text-button" onClick={() => editKnowledgeSpace(space)}>编辑</button><button type="button" className="danger-button" disabled={deleteKnowledgeSpace.isPending} onClick={() => { if (window.confirm(`删除知识空间“${space.name}”？原文件和集合不会受到影响。`)) deleteKnowledgeSpace.mutate(space.space_id); }}>删除</button></div></article>)}</div>
-      </section>
-      {(refreshSuggestions.isError || suggestions.isError) && <p role="alert" className="inline-error">{refreshSuggestions.error instanceof Error ? refreshSuggestions.error.message : suggestions.error instanceof Error ? suggestions.error.message : "AI集合建议暂时不可用"}</p>}
+      {refreshSuggestions.isError && <p role="alert" className="page-heading__feedback inline-error">AI分析未完成：{errorMessage(refreshSuggestions.error)}</p>}
+      {(confirmSuggestion.isError || rejectSuggestion.isError || updateSuggestion.isError || deleteCollection.isError || removeFile.isError) && <p role="alert" className="page-heading__feedback inline-error">{errorMessage(confirmSuggestion.error ?? rejectSuggestion.error ?? updateSuggestion.error ?? deleteCollection.error ?? removeFile.error)}</p>}
+      {suggestions.isError && <p role="alert" className="inline-error">AI集合建议暂时无法读取：{errorMessage(suggestions.error)}</p>}
       {(suggestions.data?.items.length ?? 0) > 0 && <section className="ai-suggestions">
         <header><div><h2>AI 集合建议</h2><p>建议需确认后才会成为正式虚拟集合；你可以先改名或移除误判成员。</p></div><strong>{suggestions.data?.total} 条待确认</strong></header>
         {suggestions.data?.items.map((suggestion) => <article key={suggestion.suggestion_id}>
@@ -255,7 +230,7 @@ export function CollectionsPage() {
         <label>说明<input maxLength={120} value={description} onChange={(event) => setDescription(event.target.value)} placeholder="这个集合用来收集什么" /></label>
         <fieldset><legend>集合方式</legend><label><input type="radio" checked={kind === "manual"} onChange={() => setKind("manual")} /> 手动添加</label><label><input type="radio" checked={kind === "rule"} onChange={() => setKind("rule")} /> 按规则自动收集</label>{kind === "ai" && <label><input type="radio" checked readOnly /> AI虚拟集合</label>}</fieldset>
         {kind === "rule" && <div className="collection-create__rules">
-          <label>条件关系<select value={ruleOperator} onChange={(event) => { setRuleOperator(event.target.value as CollectionRule["operator"]); setPreviewCount(null); }}><option value="all">同时满足全部条件（AND）</option><option value="any">满足任一条件（OR）</option></select></label>
+          <label>条件关系<AppSelect ariaLabel="集合条件关系" value={ruleOperator} onChange={(value) => { setRuleOperator(value as CollectionRule["operator"]); setPreviewCount(null); }} options={[{ value: "all", label: "同时满足全部条件（AND）" }, { value: "any", label: "满足任一条件（OR）" }]} /></label>
           <label>文件类型<input value={extensions} onChange={(event) => { setExtensions(event.target.value); setPreviewCount(null); }} placeholder="pdf, docx, xlsx" /></label>
           <label>文件名关键词<input value={keywords} onChange={(event) => { setKeywords(event.target.value); setPreviewCount(null); }} placeholder="合同, 项目" /></label>
           <label>路径关键词<input value={pathKeywords} onChange={(event) => { setPathKeywords(event.target.value); setPreviewCount(null); }} placeholder="客户A, 2026" /></label>
@@ -272,7 +247,7 @@ export function CollectionsPage() {
           <button type="button" disabled={previewRule.isPending || !hasRuleCondition} onClick={() => previewRule.mutate()}>{previewRule.isPending ? "正在预览" : "预览匹配"}</button>
           {previewCount !== null && <small>当前规则至少匹配 {previewCount} 项{previewCount === 100 ? "（仅显示前100项）" : ""}</small>}
         </div>}
-        {(create.isError || update.isError) && <p role="alert" className="inline-error">{(create.error ?? update.error) instanceof Error ? (create.error ?? update.error as Error).message : String(create.error ?? update.error)}</p>}
+        {(create.isError || update.isError) && <p role="alert" className="inline-error">{errorMessage(create.error ?? update.error)}</p>}
         <button type="submit" className="primary-button" disabled={create.isPending || update.isPending || !name.trim() || (kind === "rule" && !hasRuleCondition)}>{create.isPending || update.isPending ? "正在保存" : editingId ? "保存修改" : "创建集合"}</button>
       </form>}
       {collections.isLoading && <div className="page-empty"><p>正在读取智能集合…</p></div>}
@@ -285,18 +260,15 @@ export function CollectionsPage() {
           </button>
         ))}
       </div>
-      {selectedId && <section className="collection-detail">
-        <header><h2>{selectedCollection?.name}</h2><div>{selectedCollection && !selectedCollection.built_in && <><button className="text-button" type="button" onClick={beginEdit}>编辑集合</button><button className="danger-button" type="button" disabled={deleteCollection.isPending} onClick={() => { if (window.confirm(`删除集合“${selectedCollection.name}”？原文件不会受到影响。`)) deleteCollection.mutate(); }}>删除集合</button></>}<button className="text-button" type="button" onClick={() => { setSelectedId(null); setAddFileId(""); clearCollectionSelection(); }}>关闭</button></div></header>
+      {selectedId && <section ref={collectionDetailRef} className="collection-detail" tabIndex={-1}>
+        <header><h2>{selectedCollection?.name}</h2><div>{selectedCollection && !selectedCollection.built_in && <><button className="text-button" type="button" onClick={beginEdit}>编辑集合</button><button className="danger-button" type="button" disabled={deleteCollection.isPending} onClick={() => void confirmAction({ actionKey: "collection_delete", title: `删除集合“${selectedCollection.name}”？`, description: "只删除应用内虚拟分类，原文件不会受到影响。", confirmLabel: "删除集合", danger: true }).then((confirmed) => { if (confirmed) deleteCollection.mutate(); })}>删除集合</button></>}<button className="text-button" type="button" onClick={() => { setSelectedId(null); setAddFileId(""); clearCollectionSelection(); }}>关闭</button></div></header>
         {(selectedCollection?.kind === "manual" || selectedCollection?.kind === "ai") && <div className="collection-add-file">
           <label><FolderAddOutlined /> 添加资料
             <input aria-label="搜索资料" value={filePickerQuery} onChange={(event) => { setFilePickerQuery(event.target.value); setAddFileId(""); }} placeholder="按文件名查找（最多显示200项）" />
-            <select aria-label="添加资料" value={addFileId} onChange={(event) => setAddFileId(event.target.value)}>
-              <option value="">选择已索引资料</option>
-          {allFiles.data?.items.filter((file) => file.parse_status === "parsed" && !collectionItems.some((current) => current.file_id === file.file_id)).map((file) => <option key={file.file_id} value={file.file_id}>{file.display_name} · {displayPath(file.display_path)}</option>)}
-            </select>
+            <AppSelect ariaLabel="添加资料" value={addFileId} onChange={setAddFileId} showSearch options={[{ value: "", label: "选择已索引资料" }, ...(allFiles.data?.items.filter((file) => file.parse_status === "parsed" && !collectionItems.some((current) => current.file_id === file.file_id)).map((file) => ({ value: file.file_id, label: `${file.display_name} · ${displayPath(file.display_path)}` })) ?? [])]} />
           </label>
           <button type="button" className="primary-button" disabled={!addFileId || addFile.isPending} onClick={() => addFile.mutate()}>{addFile.isPending ? "正在添加" : "添加到集合"}</button>
-          {addFile.isError && <p role="alert" className="inline-error">{addFile.error instanceof Error ? addFile.error.message : String(addFile.error)}</p>}
+          {addFile.isError && <p role="alert" className="inline-error">{errorMessage(addFile.error)}</p>}
         </div>}
         {files.isLoading && <p>正在计算集合内容…</p>}
         {collectionItems.length === 0 && <p>这个集合当前没有资料。</p>}

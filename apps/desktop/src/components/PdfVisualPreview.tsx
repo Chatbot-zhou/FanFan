@@ -1,6 +1,7 @@
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { FilePreview } from "../bridge";
+import { errorMessage } from "../utils/app-error";
 
 interface PdfVisualPreviewProps {
   preview: FilePreview;
@@ -39,7 +40,7 @@ export function PdfVisualPreview({ preview }: PdfVisualPreviewProps) {
           setPageNo((current) => Math.min(Math.max(1, current), loaded?.numPages ?? 1));
         }
       } catch (loadError) {
-        if (!disposed) setError(loadError instanceof Error ? loadError.message : String(loadError));
+        if (!disposed) setError(errorMessage(loadError));
       }
     })();
     return () => {
@@ -73,7 +74,7 @@ export function PdfVisualPreview({ preview }: PdfVisualPreviewProps) {
         await renderTask.promise;
       } catch (renderError) {
         if (!disposed && !(renderError instanceof Error && renderError.name === "RenderingCancelledException")) {
-          setError(renderError instanceof Error ? renderError.message : String(renderError));
+      setError(errorMessage(renderError));
         }
       }
     })();

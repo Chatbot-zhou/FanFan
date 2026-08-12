@@ -1,12 +1,14 @@
-import { FileExcelOutlined, FilePdfOutlined, FileWordOutlined, SearchOutlined } from "@ant-design/icons";
+import { CloseOutlined, FileExcelOutlined, FilePdfOutlined, FileWordOutlined, SearchOutlined } from "@ant-design/icons";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { bridge, type CollectionRecord, type FilePreview, type KnowledgeSpace, type SearchRequest, type SearchSession } from "../bridge";
+import { bridge, type CollectionRecord, type FilePreview, type SearchRequest, type SearchSession } from "../bridge";
 import { PdfVisualPreview } from "../components/PdfVisualPreview";
 import { ImageAssetGallery } from "../components/ImageAssetGallery";
+import { AppSelect } from "../components/AppSelect";
+import { errorMessage } from "../utils/app-error";
+import { highlightPlainTerms } from "../utils/query-terms";
 import { useAppStore } from "../state/app-store";
 
 const emptyScope = {
-  knowledge_space_ids: [],
   root_ids: [],
   collection_ids: [],
   file_ids: [],
@@ -15,56 +17,6 @@ const emptyScope = {
   modified_to: null,
   availability: "present" as const,
 };
-
-function mergeSearchSessions(
-  sessions: SearchSession[],
-  sort: SearchRequest["sort"],
-  running: boolean,
-  semanticExpected: boolean,
-): SearchSession {
-  const merged = new Map<string, SearchSession["results"][number]>();
-  for (const session of sessions) {
-    for (const result of session.results) {
-      const current = merged.get(result.file_id);
-      if (!current) {
-        merged.set(result.file_id, result);
-        continue;
-      }
-      merged.set(result.file_id, {
-        ...current,
-        snippet: result.scores.fulltext || result.scores.semantic ? result.snippet : current.snippet,
-        locator: result.locator ?? current.locator,
-        revision_id: result.revision_id ?? current.revision_id,
-        match_reasons: [...new Set([...current.match_reasons, ...result.match_reasons])],
-        scores: {
-          filename: Math.max(current.scores.filename ?? 0, result.scores.filename ?? 0) || null,
-          fulltext: Math.max(current.scores.fulltext ?? 0, result.scores.fulltext ?? 0) || null,
-          semantic: Math.max(current.scores.semantic ?? 0, result.scores.semantic ?? 0) || null,
-          fused: Math.max(current.scores.fused, result.scores.fused),
-        },
-      });
-    }
-  }
-  const results = [...merged.values()];
-  if (sort === "modified_desc") results.sort((left, right) => Date.parse(right.modified_at) - Date.parse(left.modified_at));
-  else if (sort === "name_asc") results.sort((left, right) => left.name.localeCompare(right.name, "zh-CN"));
-  else results.sort((left, right) => right.scores.fused - left.scores.fused);
-  const filenameCompleted = sessions.some((session) => session.channels.filename === "completed");
-  const fulltextCompleted = sessions.some((session) => session.channels.fulltext === "completed");
-  const semanticCompleted = sessions.some((session) => session.channels.semantic === "completed");
-  return {
-    search_id: sessions.at(-1)?.search_id ?? "pending",
-    status: running ? "running" : "completed",
-    channels: {
-      filename: filenameCompleted ? "completed" : running ? "pending" : "unavailable",
-      fulltext: fulltextCompleted ? "completed" : running ? "pending" : "unavailable",
-      semantic: semanticCompleted ? "completed" : semanticExpected && running ? "pending" : "unavailable",
-    },
-    results,
-    next_cursor: null,
-    elapsed_ms: Math.max(0, ...sessions.map((session) => session.elapsed_ms)),
-  };
-}
 
 export function SearchPage() {
   const initial = useAppStore((state) => state.search_query);
@@ -79,10 +31,8 @@ export function SearchPage() {
   const [extension, setExtension] = useState("");
   const [modifiedWindow, setModifiedWindow] = useState<"all" | "7" | "30" | "365">("all");
   const [sort, setSort] = useState<SearchRequest["sort"]>("relevance");
-  const [collectionId, setCollectionId] = useState("");
   const [collections, setCollections] = useState<CollectionRecord[]>([]);
-  const [knowledgeSpaceId, setKnowledgeSpaceId] = useState("");
-  const [knowledgeSpaces, setKnowledgeSpaces] = useState<KnowledgeSpace[]>([]);
+  const [scopeCollectionIds, setScopeCollectionIds] = useState<string[]>([]);
   const searchSerial = useRef(0);
   const lastSearchRequest = useRef<Omit<SearchRequest, "cursor"> | null>(null);
 
@@ -93,11 +43,6 @@ export function SearchPage() {
     }).catch(() => {
       if (active) setCollections([]);
     });
-    void bridge.knowledge_space_list().then((items) => {
-      if (active) setKnowledgeSpaces(items);
-    }).catch(() => {
-      if (active) setKnowledgeSpaces([]);
-    });
     return () => { active = false; };
   }, []);
 
@@ -107,12 +52,18 @@ export function SearchPage() {
       : new Date(Date.now() - Number(modifiedWindow) * 24 * 60 * 60 * 1000).toISOString();
     return {
       ...emptyScope,
-      knowledge_space_ids: knowledgeSpaceId ? [knowledgeSpaceId] : [],
-      collection_ids: collectionId ? [collectionId] : [],
+      collection_ids: scopeCollectionIds,
       extensions: extension ? [extension] : [],
       modified_from: modifiedFrom,
     };
-  }, [collectionId, extension, knowledgeSpaceId, modifiedWindow]);
+  }, [extension, modifiedWindow, scopeCollectionIds]);
+  const addScopeCollection = (value: string) => {
+    if (!value || scopeCollectionIds.includes(value)) return;
+    setScopeCollectionIds((current) => [...current, value]);
+  };
+  const removeScopeCollection = (collectionId: string) => {
+    setScopeCollectionIds((current) => current.filter((id) => id !== collectionId));
+  };
 
   const showPreview = async (fileId: string, offset = 0) => {
     setPreviewLoadingId(fileId);
@@ -123,7 +74,7 @@ export function SearchPage() {
         ? { ...page, nodes: [...current.nodes, ...page.nodes], offset: current.offset }
         : page);
     } catch (previewError) {
-      setError(previewError instanceof Error ? previewError.message : String(previewError));
+      setError(errorMessage(previewError));
     } finally {
       setPreviewLoadingId(null);
     }
@@ -134,7 +85,7 @@ export function SearchPage() {
     try {
       await (action === "open" ? bridge.file_open(fileId) : bridge.file_reveal(fileId));
     } catch (actionError) {
-      setError(actionError instanceof Error ? actionError.message : String(actionError));
+      setError(errorMessage(actionError));
     }
   };
 
@@ -148,50 +99,16 @@ export function SearchPage() {
     const baseRequest: Omit<SearchRequest, "cursor"> = { query: trimmed, scope, mode, sort, page_size: 30 };
     lastSearchRequest.current = baseRequest;
     try {
-      if (mode !== "hybrid") {
-        setSession(null);
-        const result = await bridge.search_start({ ...baseRequest, cursor: null });
-        if (serial === searchSerial.current) setSession(result);
-        return;
-      }
-      const modelState = await bridge.model_state_get().catch(() => null);
-      if (serial !== searchSerial.current) return;
-      const semanticExpected = modelState?.capabilities.embedding === true;
-      const phases: SearchRequest["mode"][] = ["filename", "fulltext"];
-      if (semanticExpected) phases.push("semantic");
-      const phaseResults: SearchSession[] = [];
-      const phaseErrors: string[] = [];
-      setSession(mergeSearchSessions([], sort, true, semanticExpected));
-      await Promise.all(phases.map(async (phase) => {
-        try {
-          const result = await bridge.search_start({ ...baseRequest, mode: phase, cursor: null });
-          if (serial !== searchSerial.current) return;
-          phaseResults.push(result);
-          setSession(mergeSearchSessions(phaseResults, sort, true, semanticExpected));
-        } catch (phaseError) {
-          phaseErrors.push(phaseError instanceof Error ? phaseError.message : String(phaseError));
-        }
-      }));
-      if (serial === searchSerial.current) {
-        const canonical = await bridge.search_start({ ...baseRequest, mode: "hybrid", cursor: null });
-        if (serial !== searchSerial.current) return;
-        lastSearchRequest.current = { ...baseRequest, mode: "hybrid" };
-        setSession(canonical);
-        if (phaseErrors.length > 0) setError(`部分搜索通道已降级：${phaseErrors[0]}`);
-      }
+      setSession(null);
+      const result = await bridge.search_start({ ...baseRequest, cursor: null });
+      if (serial === searchSerial.current) setSession(result);
     } catch (searchError) {
       if (serial !== searchSerial.current) return;
       setSession(null);
-      setError(searchError instanceof Error ? searchError.message : String(searchError));
+      setError(errorMessage(searchError));
     } finally {
       if (serial === searchSerial.current) setLoading(false);
     }
-  };
-
-  const cancelSearch = () => {
-    searchSerial.current += 1;
-    setLoading(false);
-    setSession((current) => current ? { ...current, status: "cancelled" } : current);
   };
 
   const loadMore = async () => {
@@ -207,7 +124,7 @@ export function SearchPage() {
         return { ...next, results: [...results.values()] };
       });
     } catch (searchError) {
-      setError(searchError instanceof Error ? searchError.message : String(searchError));
+      setError(errorMessage(searchError));
     } finally {
       setLoadingMore(false);
     }
@@ -219,45 +136,43 @@ export function SearchPage() {
 
   return (
     <section className="page page--search">
-      <header className="page-heading"><div><h1>找资料</h1><p>按文件名、正文和内容含义找到过去的资料。</p></div></header>
       <form className="search-page__form" onSubmit={(event) => { event.preventDefault(); void search(query); }}>
         <SearchOutlined />
         <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="例如：去年那个关于RAG召回率优化的文档" autoFocus />
-        <button type="submit" disabled={loading}>{loading ? "搜索中" : "搜索"}</button>
-        {loading && <button type="button" onClick={cancelSearch}>停止</button>}
+        <button type="submit" disabled={loading} aria-label="搜索"><SearchOutlined /></button>
       </form>
+      {loading && <div className="search-progress" role="progressbar"><div className="search-progress__bar" /></div>}
       <div className="search-filters">
         <label>方式
-          <select aria-label="搜索方式" value={mode} onChange={(event) => setMode(event.target.value as SearchRequest["mode"])}>
-            <option value="hybrid">混合搜索</option><option value="filename">文件名</option><option value="fulltext">全文</option><option value="semantic">语义</option>
-          </select>
+          <AppSelect ariaLabel="搜索方式" value={mode} onChange={(value) => setMode(value as SearchRequest["mode"])} options={[{ value: "hybrid", label: "混合搜索" }, { value: "filename", label: "文件名" }, { value: "fulltext", label: "全文" }, { value: "semantic", label: "语义" }]} />
         </label>
         <label>范围
-          <select aria-label="搜索范围" value={knowledgeSpaceId ? `space:${knowledgeSpaceId}` : collectionId ? `collection:${collectionId}` : ""} onChange={(event) => {
-            const [kind, id = ""] = event.target.value.split(":", 2);
-            setKnowledgeSpaceId(kind === "space" ? id : "");
-            setCollectionId(kind === "collection" ? id : "");
-          }}>
-            <option value="">全部资料</option>
-            {knowledgeSpaces.length > 0 && <optgroup label="知识空间">{knowledgeSpaces.map((item) => <option key={item.space_id} value={`space:${item.space_id}`}>{item.name}</option>)}</optgroup>}
-            <optgroup label="集合">{collections.map((item) => <option key={item.collection_id} value={`collection:${item.collection_id}`}>{item.name}</option>)}</optgroup>
-          </select>
+          <AppSelect ariaLabel="选择检索范围" value="" showSearch onChange={addScopeCollection} labelRender={() => (
+            scopeCollectionIds.length === 0
+              ? <span>全部资料</span>
+              : <span className="scope-select-trigger">选择范围</span>
+          )} options={[
+            ...collections.filter((item) => !scopeCollectionIds.includes(item.collection_id)).map((item) => ({ value: item.collection_id, label: item.name })),
+          ]} />
         </label>
         <label>类型
-          <select aria-label="资料类型" value={extension} onChange={(event) => setExtension(event.target.value)}>
-            <option value="">全部</option><option value="pdf">PDF</option><option value="docx">Word</option><option value="xlsx">Excel</option><option value="pptx">PPT</option><option value="md">Markdown</option><option value="txt">文本</option>
-          </select>
+          <AppSelect ariaLabel="资料类型" value={extension} onChange={setExtension} options={[{ value: "", label: "全部" }, { value: "pdf", label: "PDF" }, { value: "docx", label: "Word" }, { value: "xlsx", label: "Excel" }, { value: "pptx", label: "PPT" }, { value: "md", label: "Markdown" }, { value: "txt", label: "文本" }]} />
         </label>
         <label>时间
-          <select aria-label="修改时间" value={modifiedWindow} onChange={(event) => setModifiedWindow(event.target.value as typeof modifiedWindow)}>
-            <option value="all">不限</option><option value="7">最近7天</option><option value="30">最近30天</option><option value="365">最近一年</option>
-          </select>
+          <AppSelect ariaLabel="修改时间" value={modifiedWindow} onChange={(value) => setModifiedWindow(value as typeof modifiedWindow)} options={[{ value: "all", label: "不限" }, { value: "7", label: "最近7天" }, { value: "30", label: "最近30天" }, { value: "365", label: "最近一年" }]} />
         </label>
         <label>排序
-          <select aria-label="结果排序" value={sort} onChange={(event) => setSort(event.target.value as SearchRequest["sort"])}>
-            <option value="relevance">相关性</option><option value="modified_desc">最近修改</option><option value="name_asc">文件名</option>
-          </select>
+          <AppSelect ariaLabel="结果排序" value={sort} onChange={(value) => setSort(value as SearchRequest["sort"])} options={[{ value: "relevance", label: "相关性" }, { value: "modified_desc", label: "最近修改" }, { value: "name_asc", label: "文件名" }]} />
         </label>
+        {scopeCollectionIds.length > 0 && <div className="search-filters__tags">
+          {scopeCollectionIds.map((collectionId) => {
+            const collection = collections.find((item) => item.collection_id === collectionId);
+            return <span className="scope-tag" key={collectionId}>
+              {collection?.name ?? "已删除的集合"}
+              <button type="button" aria-label={`移除集合“${collection?.name ?? collectionId}”`} onClick={() => removeScopeCollection(collectionId)}><CloseOutlined /></button>
+            </span>;
+          })}
+        </div>}
       </div>
       {session && (
         <div className="search-status">
@@ -278,9 +193,9 @@ export function SearchPage() {
               {result.extension === "pdf" ? <FilePdfOutlined /> : result.extension === "xlsx" ? <FileExcelOutlined /> : <FileWordOutlined />}
             </div>
             <div className="search-result__body">
-              <div><h2>{result.name}</h2><time>{new Date(result.modified_at).toLocaleDateString("zh-CN")}</time></div>
+              <div><h2>{highlightPlainTerms(result.name, query)}</h2><time>{new Date(result.modified_at).toLocaleDateString("zh-CN")}</time></div>
                     <small>{result.display_path}</small>
-              <p>{result.snippet}</p>
+              <p>{highlightPlainTerms(result.snippet, query)}</p>
               {result.locator && (
                 <small className="source-locator">
                   {result.locator.page_no ? `第 ${result.locator.page_no} 页` :

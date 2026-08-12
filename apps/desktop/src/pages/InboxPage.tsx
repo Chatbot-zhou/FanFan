@@ -2,7 +2,9 @@ import { CheckOutlined, InboxOutlined, ReloadOutlined } from "@ant-design/icons"
 import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { bridge, type InboxItem, type InboxQuery } from "../bridge";
+import { recordDiagnosticEvent } from "../bridge/observed-bridge";
 import { useAppStore } from "../state/app-store";
+import { errorMessage } from "../utils/app-error";
 import { displayPath } from "../utils/display-path";
 
 type InboxTab = InboxQuery["status"];
@@ -37,7 +39,14 @@ export function InboxPage() {
   const todayRange = todayOnly ? localDayRange() : { date_from: null, date_to: null };
   const inbox = useInfiniteQuery({
     queryKey: ["inbox", status, todayOnly],
-    queryFn: ({ pageParam }) => bridge.inbox_query({ status, event_types: [], root_ids: [], ...todayRange, cursor: pageParam, page_size: 100 }),
+    queryFn: async ({ pageParam }) => {
+      recordDiagnosticEvent({ level: "info", component: "frontend.pagination", event_name: "inbox_page.requested", fields: { cursor_present: Boolean(pageParam), page_size: 100, status, today_only: todayOnly } });
+      const page = await bridge.inbox_query({ status, event_types: [], root_ids: [], ...todayRange, cursor: pageParam, page_size: 100 });
+      const advanced = !page.has_more || Boolean(page.next_cursor && page.next_cursor !== pageParam);
+      recordDiagnosticEvent({ level: advanced ? "info" : "error", component: "frontend.pagination", event_name: "inbox_page.completed", fields: { returned_count: page.items.length, has_more: page.has_more, cursor_advanced: advanced } });
+      if (!advanced) throw { code: "INBOX_CURSOR_INVALID", message: "收件箱分页游标没有推进，请刷新后重试。", retryable: false };
+      return page;
+    },
     initialPageParam: null as string | null,
     getNextPageParam: (lastPage) => lastPage.next_cursor ?? undefined,
   });
@@ -46,26 +55,25 @@ export function InboxPage() {
     mutationFn: ({ inboxId, nextStatus }: { inboxId: string; nextStatus: "reviewed" | "ignored" }) => bridge.inbox_update(inboxId, nextStatus),
     onSuccess: async () => queryClient.invalidateQueries({ queryKey: ["inbox"] }),
   });
-  const retryOcr = useMutation({
-    mutationFn: (fileId: string) => bridge.ocr_retry(fileId),
+  const retryProcessing = useMutation({
+    mutationFn: (inboxId: string) => bridge.inbox_retry(inboxId),
     onSuccess: async () => queryClient.invalidateQueries({ queryKey: ["inbox"] }),
   });
 
   return (
     <section className="page">
-      <header className="page-heading">
-        <div><h1>收件箱</h1><p>{todayOnly ? "正在显示今天发现的事项；源文件不会被改动。" : "新增、修改、OCR 和处理异常集中在这里，源文件不会被改动。"}</p></div>
+      <header className="page-heading page-heading--inbox">
+        <div className="inbox-tabs" role="tablist" aria-label="收件箱筛选">
+          {tabs.map((tab) => <button type="button" role="tab" aria-selected={status === tab.value} className={status === tab.value ? "active" : ""} key={tab.value} onClick={() => setStatus(tab.value)}>{tab.label}</button>)}
+        </div>
         <div className="page-heading__actions">
           {todayOnly && <button type="button" className="text-button" onClick={() => setTodayOnly(false)}>显示全部日期</button>}
           <button type="button" className="text-button" onClick={() => void inbox.refetch()} disabled={inbox.isFetching}><ReloadOutlined /> 刷新</button>
         </div>
       </header>
-      <div className="inbox-tabs" role="tablist" aria-label="收件箱筛选">
-        {tabs.map((tab) => <button type="button" role="tab" aria-selected={status === tab.value} className={status === tab.value ? "active" : ""} key={tab.value} onClick={() => setStatus(tab.value)}>{tab.label}</button>)}
-      </div>
       {inbox.isLoading && <div className="page-empty"><p>正在读取本地收件箱…</p></div>}
-      {inbox.isError && <div className="page-empty"><h2>收件箱暂时无法读取</h2><p>{inbox.error instanceof Error ? inbox.error.message : String(inbox.error)}</p><button className="primary-button" type="button" onClick={() => void inbox.refetch()}>重试</button></div>}
-      {retryOcr.isError && <p role="alert" className="inline-error">{retryOcr.error instanceof Error ? retryOcr.error.message : String(retryOcr.error)}</p>}
+      {inbox.isError && <div className="page-empty"><h2>收件箱暂时无法读取</h2><p>{errorMessage(inbox.error)}</p><button className="primary-button" type="button" onClick={() => void inbox.refetch()}>重试</button></div>}
+      {(update.isError || retryProcessing.isError) && <p role="alert" className="inline-error">{errorMessage(update.error ?? retryProcessing.error)}</p>}
       {!inbox.isLoading && !inbox.isError && items.length === 0 && <div className="page-empty"><InboxOutlined /><h2>{status === "new" ? "没有待处理资料" : "这里还没有记录"}</h2><p>拾忆会把扫描中发现的变化和异常自动放到这里。</p></div>}
       <div className="inbox-list">
         {items.map((item) => (
@@ -79,15 +87,19 @@ export function InboxPage() {
                 {item.duplicate_group_id && <span>发现完全重复项</span>}
                 {item.suggested_collection_ids.length > 0 && <span>匹配 {item.suggested_collection_ids.length} 个集合</span>}
                 {item.error_code && <span>{item.error_code}</span>}
+                {item.resolution_status === "resolved" && <span>故障已解决</span>}
+                {item.attempt_count > 0 && <span>已尝试 {item.attempt_count} 次</span>}
               </div>
             </div>
-            {item.triage_status === "new" || item.triage_status === "error" ? <div className="inbox-item__actions">
-              {item.event_type === "ocr_required" && <button type="button" disabled={retryOcr.isPending} onClick={() => retryOcr.mutate(item.file_id)}><ReloadOutlined /> {retryOcr.isPending && retryOcr.variables === item.file_id ? "正在重试" : "重试 OCR"}</button>}
+            <div className="inbox-item__actions">
+              {item.retry_action && <button type="button" disabled={retryProcessing.isPending || item.resolution_status === "retrying"} onClick={() => retryProcessing.mutate(item.inbox_id)}><ReloadOutlined /> {item.resolution_status === "retrying" || (retryProcessing.isPending && retryProcessing.variables === item.inbox_id) ? "正在重试" : item.retry_action === "retry_ocr" ? "重试 OCR" : "重新处理"}</button>}
               {item.event_type === "collection_suggested" && <button type="button" onClick={() => navigate("collections")}>审核集合建议</button>}
               {item.event_type === "relation_suggested" && <button type="button" onClick={() => navigate("library")}>复核资料关系</button>}
-              <button type="button" disabled={update.isPending} onClick={() => update.mutate({ inboxId: item.inbox_id, nextStatus: "reviewed" })}><CheckOutlined /> 已查看</button>
-              <button type="button" disabled={update.isPending} onClick={() => update.mutate({ inboxId: item.inbox_id, nextStatus: "ignored" })}>忽略</button>
-            </div> : <span className="inbox-item__state">{item.triage_status === "reviewed" ? "已查看" : "已忽略"}</span>}
+              {item.triage_status === "new" ? <>
+                <button type="button" disabled={update.isPending} onClick={() => update.mutate({ inboxId: item.inbox_id, nextStatus: "reviewed" })}><CheckOutlined /> {update.isPending && update.variables?.inboxId === item.inbox_id && update.variables.nextStatus === "reviewed" ? "正在更新" : "已查看"}</button>
+                <button type="button" disabled={update.isPending} onClick={() => update.mutate({ inboxId: item.inbox_id, nextStatus: "ignored" })}>{update.isPending && update.variables?.inboxId === item.inbox_id && update.variables.nextStatus === "ignored" ? "正在忽略" : "忽略"}</button>
+              </> : <span className="inbox-item__state">{item.triage_status === "reviewed" ? "已查看" : "已忽略"}</span>}
+            </div>
           </article>
         ))}
       </div>

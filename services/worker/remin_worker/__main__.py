@@ -23,6 +23,19 @@ def main() -> int:
                 result=None,
                 error=WorkerError("REQUEST_INVALID", str(error), False),
             )
+        except Exception as error:
+            # 兜底：任何未预料的异常都不能让整个 worker 进程退出，否则排队中的
+            # 所有任务都会以 WORKER_RESPONSE_INVALID 丢失并反复重试。
+            response = WorkerResponse(
+                request_id="unknown",
+                ok=False,
+                result=None,
+                error=WorkerError(
+                    "WORKER_INTERNAL_ERROR",
+                    f"{type(error).__name__}: {error}",
+                    True,
+                ),
+            )
         print(json.dumps(response.to_dict(), ensure_ascii=False), flush=True)
     return 0
 

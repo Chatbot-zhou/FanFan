@@ -13,7 +13,6 @@ export type AppRoute =
 export type Availability = "present" | "missing" | "unreadable";
 
 export interface ScopeFilter {
-  knowledge_space_ids: string[];
   root_ids: string[];
   collection_ids: string[];
   file_ids: string[];
@@ -50,8 +49,10 @@ export interface EvidenceRef {
 }
 
 export interface SystemNotice {
+  notice_key: string;
   level: "urgent" | "warning" | "info";
   message: string;
+  details: string | null;
   action_label: string | null;
   action_route: AppRoute | null;
 }
@@ -135,19 +136,6 @@ export interface ValidationCheckpoint {
   resume_token: string | null;
 }
 
-export interface ExplorationCandidate {
-  candidate_id: string;
-  job_id: string;
-  strategy: string;
-  status: "pending" | "running" | "valid" | "rejected" | "selected";
-  result_ref: string | null;
-  quality_score: number | null;
-  evidence_score: number | null;
-  latency_ms: number | null;
-  resource_cost: number | null;
-  rejection_reasons: string[];
-}
-
 export interface WelcomeState {
   welcome_version: string;
   welcome_completed: boolean;
@@ -180,7 +168,8 @@ export interface ModelRuntimeState {
   status: ModelStatus;
   active_profile_id: string | null;
   active_profile_name: string | null;
-  runtime_backend: "gpu" | "cpu" | null;
+  runtime_backend: InferenceRuntimeState["backend"] | null;
+  inference_runtime: InferenceRuntimeState;
   message: string;
   checked_at: UtcDateTime | null;
   capabilities: {
@@ -189,6 +178,8 @@ export interface ModelRuntimeState {
     vision: boolean;
     reranker: boolean;
     ocr: boolean;
+    tts: boolean;
+    asr: boolean;
   };
   rag_complete: boolean;
   semantic_index_coverage: number;
@@ -199,7 +190,48 @@ export interface ModelRuntimeState {
   } | null;
 }
 
-export type ModelRole = "generation" | "embedding" | "vision" | "reranker" | "ocr";
+export interface InferenceRuntimeState {
+  backend: "cuda" | "vulkan" | "metal" | "cpu" | "unavailable" | string;
+  device_names: string[];
+  gpu_available: boolean;
+  gpu_offload_layers: number | null;
+  gpu_offload_mode: "automatic" | "measured" | "disabled" | string;
+  thread_budget: number;
+  batch_thread_budget: number;
+  active: boolean;
+  pressure_reason: string | null;
+  hardware: HardwareProfile;
+  runtime_package: RuntimeBackendPackage;
+  budget: InferenceBudget;
+}
+
+export interface HardwareProfile {
+  physical_core_count: number;
+  logical_thread_count: number;
+  memory_total_bytes: number | null;
+  memory_available_bytes: number | null;
+  gpu_name: string | null;
+  gpu_memory_bytes: number | null;
+}
+
+export interface RuntimeBackendPackage {
+  backend: InferenceRuntimeState["backend"];
+  device_count: number;
+  gpu_capable: boolean;
+  cpu_fallback_available: boolean;
+  validated: boolean;
+}
+
+export interface InferenceBudget {
+  foreground_threads: number;
+  background_threads: number;
+  batch_size: number;
+  ubatch_size: number;
+  gpu_reserve_bytes: number;
+  system_memory_reserve_bytes: number;
+}
+
+export type ModelRole = "generation" | "embedding" | "vision" | "reranker" | "ocr" | "tts" | "asr";
 export type ModelFormat = "gguf" | "onnx";
 
 export interface ImportCandidate {
@@ -237,7 +269,7 @@ export interface ModelArtifact {
 }
 
 export interface ModelRoleConfig {
-  role: Exclude<ModelRole, "ocr">;
+  role: ModelRole;
   active_artifact_id: string | null;
   required_for: string;
   optional: boolean;
@@ -245,7 +277,7 @@ export interface ModelRoleConfig {
 }
 
 export interface ModelEdition {
-  edition_id: "light" | "standard";
+  edition_id: string;
   name: string;
   description: string;
   recommended_memory_gb: number;
@@ -273,6 +305,35 @@ export interface ModelEdition {
     query_prefix: string | null;
     max_length: number | null;
   }>;
+}
+
+export interface ModelCatalogEntry {
+  catalog_id: string;
+  role: ModelRole;
+  name: string;
+  model_id: string;
+  description: string;
+  strengths: string[];
+  limitations: string[];
+  download_size_bytes: number | null;
+  estimated_memory_gb: number;
+  estimated_vram_gb: number | null;
+  cpu_speed: string;
+  license_name: string;
+  recommended: boolean;
+  device_guidance: string;
+  verification_status: "verified" | "local_import_only";
+  install_edition_id: string | null;
+  supported_sources: Array<"huggingface" | "modelscope">;
+}
+
+export interface ModelPreset {
+  preset_id: string;
+  name: string;
+  description: string;
+  recommended_memory_gb: number;
+  role_catalog_ids: string[];
+  edition_id: string;
 }
 
 export type ModelDownloadStatus = "queued" | "running" | "paused" | "completed" | "failed" | "cancelled";
@@ -304,6 +365,8 @@ export interface ModelDownloadJob {
   installed_artifact_ids: string[];
   profile_id: string | null;
   error: AppError | null;
+  activation_status: "pending" | "active" | "failed" | null;
+  activation_error: AppError | null;
   created_at: UtcDateTime;
   updated_at: UtcDateTime;
 }
@@ -315,7 +378,9 @@ export interface EnvironmentCheck {
   gpu_name: string | null;
   gpu_memory_gb: number | null;
   recommended_edition: "light" | "standard" | null;
-  runtime_backend: "gpu" | "cpu" | null;
+  runtime_backend: InferenceRuntimeState["backend"] | null;
+  runtime_devices: string[];
+  gpu_runtime_available: boolean;
   checked_at: UtcDateTime | null;
   warnings: string[];
 }
@@ -479,7 +544,7 @@ export interface AnswerResult {
   source_files: AnswerSourceFile[];
   used_file_ids: string[];
   elapsed_ms: number;
-  answer_mode: "extractive" | "generated" | "rag_refusal";
+  answer_mode: "extractive" | "generated" | "rag_partial" | "rag_refusal" | "evidence_fallback";
   retrieval_channels: string[];
   index_coverage: number;
   degradation_reason: string | null;
@@ -487,7 +552,7 @@ export interface AnswerResult {
 
 export interface OperationHandle {
   operation_id: string;
-  kind: "ask";
+  kind: "ask" | "index_rebuild" | "background_cleanup";
   status: "queued" | "running" | "completed" | "failed" | "cancelled";
   created_at: UtcDateTime;
 }
@@ -496,6 +561,38 @@ export interface AskOperationSnapshot {
   handle: OperationHandle;
   result: AnswerResult | null;
   error: AppError | null;
+}
+
+export interface AskMessage {
+  message_id: string;
+  session_id: string;
+  role: "user" | "assistant";
+  content: string;
+  answer: AnswerResult | null;
+  error: AppError | null;
+  created_at: UtcDateTime;
+}
+
+export interface AskSessionSummary {
+  session_id: string;
+  title: string;
+  scope: ScopeFilter;
+  message_count: number;
+  created_at: UtcDateTime;
+  updated_at: UtcDateTime;
+  last_error: AppError | null;
+}
+
+export interface AskSessionPage {
+  items: AskSessionSummary[];
+  next_cursor: string | null;
+  has_more: boolean;
+}
+
+export interface AskMessagePage {
+  items: AskMessage[];
+  next_cursor: string | null;
+  has_more: boolean;
 }
 
 export interface InboxItem {
@@ -507,6 +604,10 @@ export interface InboxItem {
   observed_at: UtcDateTime;
   previous_display_path: string | null;
   triage_status: "new" | "reviewed" | "ignored" | "error";
+  resolution_status: "normal" | "pending_retry" | "retrying" | "resolved" | "abandoned";
+  attempt_count: number;
+  last_attempt_at: UtcDateTime | null;
+  retry_action: "retry_ocr" | "retry_parse" | "retry_processing" | null;
   suggested_collection_ids: string[];
   duplicate_group_id: string | null;
   summary: string | null;
@@ -526,6 +627,7 @@ export interface InboxQuery {
 export interface InboxPage {
   items: InboxItem[];
   next_cursor: string | null;
+  has_more: boolean;
 }
 
 export type TriageStatus = InboxItem["triage_status"];
@@ -555,20 +657,6 @@ export interface CreateCollectionRequest {
   color: string;
   kind: CollectionKind;
   rule: CollectionRule | null;
-}
-
-export interface KnowledgeSpaceRequest {
-  name: string;
-  description: string | null;
-  root_ids: string[];
-  collection_ids: string[];
-}
-
-export interface KnowledgeSpace extends KnowledgeSpaceRequest {
-  space_id: string;
-  file_count: number;
-  created_at: UtcDateTime;
-  updated_at: UtcDateTime;
 }
 
 export interface CollectionRecord {
@@ -627,7 +715,7 @@ export interface CollectionSuggestionUpdateRequest {
   member_file_ids: string[];
 }
 
-export type RelationType = "exact_duplicate" | "version_candidate" | "related";
+export type RelationType = "exact_duplicate" | "version_candidate" | "semantic_related" | "contains_or_summarizes" | "related";
 
 export interface FileRelation {
   relation_id: string;
@@ -643,6 +731,8 @@ export interface FileRelation {
 export interface RelationQuery {
   cursor: string | null;
   page_size: number;
+  relation_type?: RelationType | null;
+  review_status?: "suggested" | "accepted" | "rejected" | null;
 }
 
 export interface RelationPage {
@@ -655,6 +745,8 @@ export interface RelationRefreshResult {
   hashed_files: number;
   exact_duplicate_pairs: number;
   version_candidate_pairs: number;
+  semantic_related_pairs: number;
+  contains_or_summarizes_pairs: number;
 }
 
 export interface RootRecord {
@@ -721,7 +813,8 @@ export interface FileQuery {
 export interface FilePage {
   items: FileRecord[];
   next_cursor: string | null;
-  total: number;
+  has_more: boolean;
+  total: number | null;
 }
 
 export type ExclusionRuleType = "exact_path" | "path_name" | "path_glob" | "extension" | "hidden" | "system" | "reparse_point" | "cloud_placeholder";
@@ -791,46 +884,9 @@ export interface FilePreview {
   truncated: boolean;
 }
 
-export interface ExtractionField {
-  key: string;
-  label: string;
-  field_type: string;
-  description: string;
-  required: boolean;
-  multiple: boolean;
-  hints: string[];
-}
-
-export interface ExtractionPreset {
-  preset_id: string;
-  name: string;
-  description: string;
-  fields: ExtractionField[];
-}
-
-export interface ExtractedValue {
-  field_key: string;
-  raw_value: unknown;
-  normalized_value: unknown;
-  confidence: number;
-  method: string;
-  review_state: "auto" | "missing" | "needs_review" | "confirmed" | "rejected";
-  evidence: EvidenceRef[];
-  validation_errors: string[];
-}
-
-export interface ExtractionRunResult {
-  run_id: string;
-  preset: ExtractionPreset;
-  status: string;
-  rows: Array<{ file: FileRecord; values: ExtractedValue[] }>;
-  completed_at: UtcDateTime;
-  warnings: string[];
-}
-
 export interface ExportResult {
   target_path: string;
-  format: "csv" | "json" | "xlsx" | "docx";
+  format: "csv" | "json" | "xlsx" | "docx" | "md" | "txt";
   row_count: number;
   size_bytes: number;
   sha256: string;
@@ -858,6 +914,17 @@ export interface MaintenanceSnapshot {
   checked_at: UtcDateTime;
 }
 
+export interface AppStatusSnapshot {
+  local_only: true;
+  source_files_readonly: true;
+  roots: RootRecord[];
+  scan_progress: ScanProgress | null;
+  maintenance: MaintenanceSnapshot;
+  inference_runtime: InferenceRuntimeState;
+  recovery_actions: Array<"view_inbox" | "view_maintenance" | "view_models">;
+  checked_at: UtcDateTime;
+}
+
 export interface MaintenanceCheckResult {
   level: "quick" | "full";
   database_result: string;
@@ -880,11 +947,17 @@ export interface StorageUsageSnapshot {
   disk_capacity_bytes: number | null;
   disk_available_bytes: number | null;
   soft_quota_bytes: number;
-  soft_quota_is_custom: boolean;
   over_soft_quota: boolean;
   background_tasks_paused: boolean;
   notice: string | null;
   measured_at: UtcDateTime;
+}
+
+export interface StorageLocationStatus {
+  active_data_directory: string;
+  pending_target_directory: string | null;
+  restart_required: boolean;
+  last_error: string | null;
 }
 
 export interface CacheClearResult {
@@ -900,6 +973,14 @@ export interface AppLogRecord {
   event_name: string;
   fields: Record<string, unknown>;
   created_at: UtcDateTime;
+}
+
+export interface DiagnosticEventInput {
+  level: "debug" | "info" | "warning" | "error";
+  component: string;
+  event_name: string;
+  correlation_id?: string | null;
+  fields: Record<string, unknown>;
 }
 
 export interface LogQuery {
@@ -921,48 +1002,6 @@ export interface IndexRebuildResult {
   source_files_modified: false;
 }
 
-export interface SkillDefinition {
-  skill_id: string;
-  name: string;
-  description: string;
-  available: boolean;
-  unavailable_reason: string | null;
-  risk_level: "low" | "medium" | "high";
-  source_files_readonly: true;
-  export_required: boolean;
-}
-
-export interface TaskStep {
-  step_id: string;
-  ordinal: number;
-  step_type: string;
-  label: string;
-  inputs: Record<string, unknown>;
-  expected_outputs: Record<string, unknown>;
-  status: "pending" | "running" | "succeeded" | "failed" | "skipped";
-  attempt_count: number;
-  checkpoint: string;
-  error: AppError | null;
-}
-
-export interface TaskPlan {
-  task_id: string;
-  skill_id: string;
-  skill_version: string;
-  summary: string;
-  steps: TaskStep[];
-  estimated_file_count: number;
-  warnings: string[];
-}
-
-export interface TaskExecutionResult {
-  plan: TaskPlan;
-  job: JobRecord;
-  result: ExtractionRunResult;
-  checkpoints: ValidationCheckpoint[];
-  candidates: ExplorationCandidate[];
-}
-
 export interface ReminBridge {
   startup_get_state(): Promise<StartupState>;
   welcome_get_state(): Promise<WelcomeState>;
@@ -977,7 +1016,9 @@ export interface ReminBridge {
   model_import_confirm(selections: Array<{ source_path: string; role: ModelRole }>): Promise<ModelArtifact[]>;
   model_artifact_list(): Promise<ModelArtifact[]>;
   model_role_config_list(): Promise<ModelRoleConfig[]>;
-  model_catalog_list(): Promise<ModelEdition[]>;
+  model_catalog_list(source: "huggingface" | "modelscope"): Promise<ModelEdition[]>;
+  model_role_catalog_list(): Promise<ModelCatalogEntry[]>;
+  model_preset_list(): Promise<ModelPreset[]>;
   model_download_start(edition_id: ModelEdition["edition_id"], source: "huggingface" | "modelscope", confirmed: true): Promise<ModelDownloadJob>;
   model_download_list(): Promise<ModelDownloadJob[]>;
   model_download_get(job_id: string): Promise<ModelDownloadJob>;
@@ -985,25 +1026,28 @@ export interface ReminBridge {
   model_download_cancel(job_id: string): Promise<ModelDownloadJob>;
   model_download_retry(job_id: string, source?: "huggingface" | "modelscope"): Promise<ModelDownloadJob>;
   model_artifact_activate(artifact_id: string): Promise<ModelRuntimeState>;
+  model_role_disable(role: ModelRole): Promise<ModelRuntimeState>;
   home_get_summary(local_date: string): Promise<HomeSummary>;
   candidate_root_action(candidate_id: string, action: "add" | "ignore"): Promise<CandidateRoot>;
   search_start(request: SearchRequest): Promise<SearchSession>;
   rag_readiness_get(scope: ScopeFilter): Promise<RagReadiness>;
   ask_start(request: AskRequest): Promise<OperationHandle>;
+  ask_session_query(cursor?: string | null, page_size?: number): Promise<AskSessionPage>;
+  ask_message_query(session_id: string, cursor?: string | null, page_size?: number): Promise<AskMessagePage>;
+  ask_session_rename(session_id: string, title: string): Promise<void>;
+  ask_session_delete(session_id: string): Promise<void>;
   ask_operation_get(operation_id: string): Promise<AskOperationSnapshot>;
   ask_cancel(operation_id: string): Promise<AskOperationSnapshot>;
+  answer_export(message_id: string, target_path: string, format: "md" | "txt", confirmation: "EXPORT_NEW_FILE"): Promise<ExportResult>;
   preview_get(file_id: string, offset?: number, limit?: number, anchor_node_id?: string | null): Promise<FilePreview>;
   file_open(file_id: string): Promise<void>;
   file_reveal(file_id: string): Promise<void>;
   inbox_query(request: InboxQuery): Promise<InboxPage>;
   inbox_update(inbox_id: string, triage_status: TriageStatus): Promise<InboxItem>;
+  inbox_retry(inbox_id: string): Promise<InboxItem>;
   ocr_retry(file_id: string): Promise<boolean>;
   image_understanding_retry(asset_id: string): Promise<boolean>;
   image_deep_analyze(asset_id: string, question: string): Promise<ImageDeepAnalysis>;
-  knowledge_space_list(): Promise<KnowledgeSpace[]>;
-  knowledge_space_create(request: KnowledgeSpaceRequest): Promise<KnowledgeSpace>;
-  knowledge_space_update(space_id: string, request: KnowledgeSpaceRequest): Promise<KnowledgeSpace>;
-  knowledge_space_delete(space_id: string): Promise<void>;
   collection_list(): Promise<CollectionRecord[]>;
   collection_create(request: CreateCollectionRequest): Promise<CollectionRecord>;
   collection_update(collection_id: string, request: CreateCollectionRequest): Promise<CollectionRecord>;
@@ -1020,28 +1064,24 @@ export interface ReminBridge {
   relation_refresh(max_files: number): Promise<RelationRefreshResult>;
   relation_query(request: RelationQuery): Promise<RelationPage>;
   relation_review(relation_id: string, action: "accepted" | "rejected"): Promise<void>;
+  relation_batch_review(relation_ids: string[], action: "accepted" | "rejected"): Promise<number>;
   file_query(request: FileQuery): Promise<FilePage>;
   exclusion_rule_list(): Promise<ExclusionRule[]>;
   exclusion_rule_upsert(request: ExclusionRuleInput): Promise<ExclusionRule>;
   exclusion_rule_delete(rule_id: string): Promise<void>;
-  extraction_preset_list(): Promise<ExtractionPreset[]>;
-  extraction_run(file_ids: string[], preset_id: string): Promise<ExtractionRunResult>;
-  skill_list(): Promise<SkillDefinition[]>;
-  task_plan(skill_id: string, file_ids: string[], parameters: Record<string, unknown>, user_instruction?: string | null): Promise<TaskPlan>;
-  task_execute(skill_id: string, file_ids: string[], parameters: Record<string, unknown>, planned_task_id: string, user_instruction?: string | null): Promise<TaskExecutionResult>;
-  task_recoverable(): Promise<TaskPlan | null>;
-  task_resume(task_id: string): Promise<TaskExecutionResult>;
-  extraction_export(run: ExtractionRunResult, format: ExportResult["format"], target_path: string): Promise<ExportResult>;
+  app_status_get(): Promise<AppStatusSnapshot>;
   maintenance_get(): Promise<MaintenanceSnapshot>;
   maintenance_check(level: "quick" | "full"): Promise<MaintenanceCheckResult>;
   storage_usage_get(): Promise<StorageUsageSnapshot>;
-  storage_policy_set(quota_bytes: number, confirmation: "SET_STORAGE_QUOTA"): Promise<StorageUsageSnapshot>;
+  storage_location_get(): Promise<StorageLocationStatus>;
+  storage_migration_schedule(selected_directory: string, confirmation: "MIGRATE_APPLICATION_STORAGE"): Promise<StorageLocationStatus>;
   cache_clear(category: "temporary_cache" | "failed_downloads", confirmation: "CLEAR_CACHE"): Promise<CacheClearResult>;
   app_data_reset_schedule(confirmation: "RESET_APPLICATION_DATA"): Promise<void>;
   maintenance_log_query(request: LogQuery): Promise<LogPage>;
   maintenance_logs_clear(): Promise<number>;
+  diagnostic_event_append(request: DiagnosticEventInput): Promise<void>;
   diagnostic_export(target_path: string, confirmed: true): Promise<ExportResult>;
-  index_rebuild(confirmation: "REBUILD_INDEX"): Promise<IndexRebuildResult>;
+  index_rebuild(confirmation: "REBUILD_INDEX"): Promise<OperationHandle>;
   root_list(): Promise<RootRecord[]>;
   root_add(request: AddRootRequest): Promise<RootRecord>;
   root_disable(root_id: string): Promise<void>;

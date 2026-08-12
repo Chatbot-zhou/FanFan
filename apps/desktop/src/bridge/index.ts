@@ -1,7 +1,7 @@
 import type { ReminBridge } from "./contracts";
 import { browserBridge } from "./browser-bridge";
-import { tauriBridge } from "./tauri-bridge";
+import { observedTauriBridge } from "./observed-bridge";
 
-export const bridge: ReminBridge = window.__TAURI_INTERNALS__ ? tauriBridge : browserBridge;
+export const bridge: ReminBridge = window.__TAURI_INTERNALS__ ? observedTauriBridge : browserBridge;
 
 export * from "./contracts";

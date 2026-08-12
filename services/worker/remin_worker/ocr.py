@@ -64,7 +64,9 @@ def recognize_with_windows(
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=min(600, 30 + page_limit * 12),
+            # Budget must stay below the Rust side's document.parse timeout
+            # (worker.rs) so the worker is never killed mid-OCR.
+            timeout=min(270, 30 + page_limit * 8),
             creationflags=creation_flags,
             check=False,
         )
@@ -74,6 +76,13 @@ def recognize_with_windows(
         return None, WorkerError("OCR_RUNTIME_UNAVAILABLE", str(error), True)
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip()[-1000:]
+        stderr_text = completed.stderr or ""
+        if "OCR_LANGUAGE_PACK_MISSING" in stderr_text:
+            return None, WorkerError(
+                "OCR_RUNTIME_UNAVAILABLE",
+                "未安装Windows OCR语言包，请在系统设置中添加简体中文语言包后重试",
+                False,
+            )
         return None, WorkerError("OCR_RECOGNITION_FAILED", detail or "Windows OCR执行失败", True)
     after = source_path.stat()
     if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):

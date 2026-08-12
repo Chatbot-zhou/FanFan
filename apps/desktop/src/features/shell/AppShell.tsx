@@ -1,6 +1,7 @@
 import { useEffect, useMemo } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { bridge, type SystemNotice } from "../../bridge";
+import { recordDiagnosticEvent } from "../../bridge/observed-bridge";
 import { useAppStore } from "../../state/app-store";
 import { AskPage } from "../../pages/AskPage";
 import { CollectionsPage } from "../../pages/CollectionsPage";
@@ -32,6 +33,24 @@ export function AppShell({ startup_notice }: AppShellProps) {
   const eventNotice = useBackendEvents();
   const queryClient = useQueryClient();
   const route = useAppStore((state) => state.route);
+  useEffect(() => {
+    let timer: number | undefined;
+    const showScrollbars = () => {
+      document.documentElement.classList.add("is-scrolling");
+      if (timer !== undefined) window.clearTimeout(timer);
+      timer = window.setTimeout(() => document.documentElement.classList.remove("is-scrolling"), 800);
+    };
+    document.addEventListener("scroll", showScrollbars, true);
+    window.addEventListener("wheel", showScrollbars, { passive: true });
+    window.addEventListener("keydown", showScrollbars);
+    return () => {
+      document.removeEventListener("scroll", showScrollbars, true);
+      window.removeEventListener("wheel", showScrollbars);
+      window.removeEventListener("keydown", showScrollbars);
+      if (timer !== undefined) window.clearTimeout(timer);
+      document.documentElement.classList.remove("is-scrolling");
+    };
+  }, []);
   const startup = useQuery({
     queryKey: ["startup-state"],
     queryFn: () => bridge.startup_get_state(),
@@ -53,6 +72,7 @@ export function AppShell({ startup_notice }: AppShellProps) {
   const home = useQuery({
     queryKey: ["home-summary", new Date().toLocaleDateString("sv-SE")],
     queryFn: () => bridge.home_get_summary(new Date().toLocaleDateString("sv-SE")),
+    refetchInterval: (query) => query.state.data?.scan_progress ? 1500 : 10_000,
     enabled: backendReady,
   });
   const roots = useQuery({
@@ -70,12 +90,21 @@ export function AppShell({ startup_notice }: AppShellProps) {
     queryFn: async () => (await bridge.environment_get_latest()) ?? bridge.environment_detect(),
     enabled: backendReady,
   });
-  const maintenance = useQuery({
-    queryKey: ["maintenance"],
-    queryFn: () => bridge.maintenance_get(),
-    refetchInterval: 15_000,
+  const appStatus = useQuery({
+    queryKey: ["app-status"],
+    queryFn: () => bridge.app_status_get(),
+    refetchInterval: (query) => query.state.data?.maintenance.active_jobs ? 1500 : 15_000,
     enabled: backendReady,
   });
+
+  useEffect(() => {
+    recordDiagnosticEvent({
+      level: "info",
+      component: "frontend.navigation",
+      event_name: "route.changed",
+      fields: { route },
+    });
+  }, [route]);
 
   useEffect(() => {
     if (!backendReady) return;
@@ -97,12 +126,77 @@ export function AppShell({ startup_notice }: AppShellProps) {
       queryClient.invalidateQueries({ queryKey: ["welcome-state"] }),
       queryClient.invalidateQueries({ queryKey: ["roots"] }),
       queryClient.invalidateQueries({ queryKey: ["home-summary"] }),
+      queryClient.invalidateQueries({ queryKey: ["app-status"] }),
     ]);
   };
 
   const authorizationRequired = backendReady
     && welcome.data?.root_authorization_completed === false
     && roots.data?.length === 0;
+
+  // 汇集系统通知给 TitleBar
+  const notices = useMemo<SystemNotice[]>(() => {
+    const items: SystemNotice[] = [];
+    // 启动阻塞（最高优先级）
+    if (startup.data?.blocker) {
+      items.push({
+        notice_key: "startup-blocker",
+        level: "urgent",
+        message: startup.data.blocker.message,
+        details: startup.data.blocker.message,
+        action_label: null,
+        action_route: null,
+      });
+    }
+    // 后台事件通知（模型下载失败等）
+    if (eventNotice) {
+      items.push({
+        notice_key: "backend-event",
+        level: "warning",
+        message: eventNotice,
+        details: eventNotice,
+        action_label: null,
+        action_route: null,
+      });
+    }
+    // 欢迎页持久化失败
+    if (startup_notice) {
+      items.push({
+        notice_key: "startup-notice",
+        level: "warning",
+        message: startup_notice,
+        details: startup_notice,
+        action_label: null,
+        action_route: null,
+      });
+    }
+    // 后台维护通知（磁盘不足、降级等）
+    if (appStatus.data?.maintenance.background_notice) {
+      items.push({
+        notice_key: "background-notice",
+        level: "warning",
+        message: appStatus.data.maintenance.background_notice,
+        details: appStatus.data.maintenance.background_notice,
+        action_label: null,
+        action_route: null,
+      });
+    }
+    if (route === "collections" && currentModelState && (!currentModelState.capabilities.embedding || !currentModelState.capabilities.generation)) {
+      const missing = [
+        !currentModelState.capabilities.embedding ? "Embedding" : null,
+        !currentModelState.capabilities.generation ? "生成模型" : null,
+      ].filter(Boolean).join("、");
+      items.push({
+        notice_key: "collection-ai-unavailable",
+        level: "warning",
+        message: `AI集合分析暂不可用 · 缺少${missing}`,
+        details: "手动集合、规则集合和已有虚拟集合仍可使用。",
+        action_label: "配置模型",
+        action_route: "model_setup",
+      });
+    }
+    return items;
+  }, [startup.data?.blocker, eventNotice, startup_notice, appStatus.data?.maintenance.background_notice, route, currentModelState]);
 
   if (authorizationRequired) {
     return (
@@ -112,48 +206,6 @@ export function AppShell({ startup_notice }: AppShellProps) {
       </div>
     );
   }
-
-  // 汇集系统通知给 TitleBar
-  const notices = useMemo<SystemNotice[]>(() => {
-    const items: SystemNotice[] = [];
-    // 启动阻塞（最高优先级）
-    if (startup.data?.blocker) {
-      items.push({
-        level: "urgent",
-        message: startup.data.blocker.message,
-        action_label: null,
-        action_route: null,
-      });
-    }
-    // 后台事件通知（模型下载失败等）
-    if (eventNotice) {
-      items.push({
-        level: "warning",
-        message: eventNotice,
-        action_label: null,
-        action_route: null,
-      });
-    }
-    // 欢迎页持久化失败
-    if (startup_notice) {
-      items.push({
-        level: "warning",
-        message: startup_notice,
-        action_label: null,
-        action_route: null,
-      });
-    }
-    // 后台维护通知（磁盘不足、降级等）
-    if (maintenance.data?.background_notice) {
-      items.push({
-        level: "warning",
-        message: maintenance.data.background_notice,
-        action_label: null,
-        action_route: null,
-      });
-    }
-    return items;
-  }, [startup.data?.blocker, eventNotice, startup_notice, maintenance.data?.background_notice]);
 
   const page = {
     home: <HomePage summary={home.data ?? null} loading={home.isLoading} />,
@@ -176,7 +228,7 @@ export function AppShell({ startup_notice }: AppShellProps) {
           {page}
         </main>
       </div>
-      <StatusBar summary={home.data ?? null} roots={roots.data ?? null} maintenance={maintenance.data ?? null} />
+      <StatusBar snapshot={appStatus.data ?? null} />
     </div>
   );
 }

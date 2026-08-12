@@ -357,7 +357,9 @@ impl WorkerClient {
 
 fn operation_timeout(operation: &str) -> Duration {
     match operation {
-        "document.parse" => Duration::from_secs(300),
+        // Must stay above the worker-side OCR budget (ocr.py caps at 270s)
+        // so a long scan-heavy parse is never killed mid-OCR.
+        "document.parse" => Duration::from_secs(360),
         "embedding.encode" | "export.write" => Duration::from_secs(120),
         _ => Duration::from_secs(60),
     }

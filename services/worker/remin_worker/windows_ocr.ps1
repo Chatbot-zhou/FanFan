@@ -60,7 +60,13 @@ if ($null -eq $language) {
 if ($null -eq $language) {
     $language = $available | Select-Object -First 1
 }
-if ($null -eq $language) { throw 'No Windows OCR language pack is installed' }
+if ($null -eq $language) {
+    # Keep this file pure ASCII: Windows PowerShell 5.1 reads BOM-less scripts
+    # with the ANSI code page, and UTF-8 Chinese bytes would break parsing on
+    # zh-CN systems. The user-facing message lives in ocr.py (OCR_LANGUAGE_PACK_MISSING).
+    Write-Error -ErrorAction Continue 'OCR_LANGUAGE_PACK_MISSING: Windows OCR language pack is not installed. Add Simplified Chinese OCR in Settings > Time & Language > Language & region and retry.'
+    exit 3
+}
 $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($language)
 if ($null -eq $engine) { throw 'Windows OCR engine initialization failed' }
 

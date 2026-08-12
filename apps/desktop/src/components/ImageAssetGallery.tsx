@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { bridge, type ImageAsset } from "../bridge";
+import { errorMessage } from "../utils/app-error";
 
 export const imageAssetUrl = (assetId: string) => `http://remin-image.localhost/${encodeURIComponent(assetId)}`;
 
@@ -30,7 +31,7 @@ export function ImageAssetGallery({ assets }: { assets: ImageAsset[] }) {
             setRetryError(null);
             void bridge.image_understanding_retry(asset.asset_id)
               .then(() => setQueued((current) => [...current, asset.asset_id]))
-              .catch((error) => setRetryError(error instanceof Error ? error.message : String(error)))
+        .catch((error) => setRetryError(errorMessage(error)))
               .finally(() => setRetrying(null));
           }}>{retrying === asset.asset_id ? "正在重试" : "重试图片理解"}</button>}
         </figcaption>

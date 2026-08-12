@@ -49,11 +49,13 @@ describe("CollectionsPage", () => {
     vi.spyOn(bridge, "collection_file_query").mockResolvedValue({
       items: [],
       next_cursor: null,
+      has_more: false,
       total: 0,
     });
     vi.spyOn(bridge, "file_query").mockResolvedValue({
       items: [file],
       next_cursor: null,
+      has_more: false,
       total: 1,
     });
     const add = vi.spyOn(bridge, "collection_add_file").mockResolvedValue();
@@ -62,7 +64,11 @@ describe("CollectionsPage", () => {
     render(<QueryClientProvider client={client}><CollectionsPage /></QueryClientProvider>);
 
     expect((await screen.findAllByRole("heading", { name: "项目资料" })).length).toBe(2);
-    fireEvent.change(await screen.findByRole("combobox", { name: /添加资料/ }), { target: { value: "file-1" } });
+    const filePicker = await screen.findByRole("combobox", { name: /添加资料/ });
+    fireEvent.keyDown(filePicker, { key: "Enter", code: "Enter", keyCode: 13 });
+    await screen.findByRole("option", { name: /项目总结\.pdf/ });
+    fireEvent.keyDown(filePicker, { key: "ArrowDown", code: "ArrowDown", keyCode: 40 });
+    fireEvent.keyDown(filePicker, { key: "Enter", code: "Enter", keyCode: 13 });
     fireEvent.click(screen.getByRole("button", { name: "添加到集合" }));
 
     await waitFor(() => expect(add).toHaveBeenCalledWith("collection-1", "file-1"));

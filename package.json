@@ -28,5 +28,9 @@
     "rust:check": "cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked",
     "verify": "corepack pnpm contracts:check && corepack pnpm fixtures:check && corepack pnpm check && corepack pnpm worker:test && corepack pnpm worker:corpus && corepack pnpm rust:check && corepack pnpm search:baseline",
     "verify:release": "corepack pnpm verify && corepack pnpm worker:build && corepack pnpm worker:packaged-check && corepack pnpm runtime:check && corepack pnpm semantic:performance && corepack pnpm generation:smoke"
+  },
+  "dependencies": {
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
   }
 }

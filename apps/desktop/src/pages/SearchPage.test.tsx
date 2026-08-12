@@ -1,11 +1,13 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it } from "vitest";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { bridge } from "../bridge";
 import { useAppStore } from "../state/app-store";
 import { SearchPage } from "./SearchPage";
 
 
 describe("SearchPage", () => {
   beforeEach(() => {
+    vi.restoreAllMocks();
     useAppStore.setState({ search_query: "" });
   });
 
@@ -15,7 +17,7 @@ describe("SearchPage", () => {
     fireEvent.change(input, { target: { value: "RAG" } });
     fireEvent.click(screen.getByRole("button", { name: "搜索" }));
 
-    expect(await screen.findByText("RAG项目总结.docx")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "RAG项目总结.docx" })).toBeInTheDocument();
     expect(screen.getByText(/语义搜索未启用，已自动使用名称与全文/)).toBeInTheDocument();
     expect(screen.getByText("第 18 段")).toBeInTheDocument();
     expect(screen.getByText(/匹配：文件名 · 正文/)).toBeInTheDocument();
@@ -24,18 +26,34 @@ describe("SearchPage", () => {
   });
 
   it("passes the selected mode, type, time and sort to the search contract", async () => {
+    const originalSearch = bridge.search_start.bind(bridge);
+    const searchStart = vi.spyOn(bridge, "search_start").mockImplementation((request) => originalSearch(request));
     render(<SearchPage />);
-    fireEvent.change(screen.getByLabelText("搜索方式"), { target: { value: "filename" } });
-    fireEvent.change(screen.getByLabelText("资料类型"), { target: { value: "pdf" } });
-    fireEvent.change(screen.getByLabelText("修改时间"), { target: { value: "30" } });
-    fireEvent.change(screen.getByLabelText("结果排序"), { target: { value: "modified_desc" } });
+    const choose = async (selectLabel: string, optionLabel: string) => {
+      const select = screen.getByLabelText(selectLabel);
+      fireEvent.mouseDown(select);
+      const option = await waitFor(() => {
+        const match = [...document.querySelectorAll<HTMLElement>(".ant-select-item-option")]
+          .find((item) => item.textContent?.trim() === optionLabel);
+        expect(match).toBeDefined();
+        return match!;
+      });
+      fireEvent.mouseDown(option);
+      fireEvent.click(option);
+      await waitFor(() => expect(select).toHaveAttribute("aria-expanded", "false"));
+    };
+    await choose("搜索方式", "文件名");
+    await choose("资料类型", "PDF");
+    await choose("修改时间", "最近30天");
+    await choose("结果排序", "最近修改");
     fireEvent.change(screen.getByPlaceholderText("例如：去年那个关于RAG召回率优化的文档"), { target: { value: "设计" } });
     fireEvent.click(screen.getByRole("button", { name: "搜索" }));
 
     expect(await screen.findByText(/找到/)).toBeInTheDocument();
-    expect(screen.getByDisplayValue("文件名")).toBeInTheDocument();
-    expect(screen.getByDisplayValue("PDF")).toBeInTheDocument();
-    expect(screen.getByDisplayValue("最近30天")).toBeInTheDocument();
-    expect(screen.getByDisplayValue("最近修改")).toBeInTheDocument();
+    expect(searchStart).toHaveBeenCalledWith(expect.objectContaining({
+      mode: "filename",
+      sort: "modified_desc",
+      scope: expect.objectContaining({ extensions: ["pdf"], modified_from: expect.any(String) }),
+    }));
   });
 });

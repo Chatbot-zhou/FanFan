@@ -1,12 +1,12 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    fs,
-    io::Read,
+    fs::{self, OpenOptions},
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -14,26 +14,26 @@ use std::{
 
 use chrono::Utc;
 use remin_core::{
-    AddRootRequest, AnswerResult, AppError, AskMode, AskRequest, CandidateRoot, CatalogService,
-    ChunkEmbeddingInput, CollectionModelReview, CollectionRecord, CollectionRule,
-    CollectionSuggestion, CollectionSuggestionPage, CollectionSuggestionQuery,
-    CollectionSuggestionRefreshResult, CollectionSuggestionUpdateRequest, CreateCollectionRequest,
-    DegradationLevel, DownloadFile, DownloadedModelMetadata, EmbeddingRequest, ExclusionRule,
-    ExclusionRuleInput, ExportResult, ExportTableRequest, ExtractionPreset, ExtractionRunRequest,
-    ExtractionRunResult, FilePage, FilePreview, FileQuery, FileRecord, ImageUnderstandingResult,
-    ImportCandidate, InboxItem, InboxPage, InboxQuery, InboxUpdateRequest, IncrementalWatchManager,
-    IndexRebuildResult, JobRecord, KnowledgeSpace, KnowledgeSpaceRequest, LocalGenerationRuntime,
-    LogPage, LogQuery, MaintenanceSnapshot, ModelArtifact, ModelDownloadFileProgress,
-    ModelDownloadJob, ModelEdition, ModelFormat, ModelImportSelection, ModelManager, ModelRole,
-    ModelRoleConfig, ModelSource, ParseMetrics, ParseOutcome, ParseRequest, ParseResult,
-    PendingEmbeddingActivation, PlanSkillRequest, RagReadiness, RelationPage, RelationQuery,
-    RelationRefreshResult, RelationType, RerankRequest, RootRecord, ScopeFilter, SearchMode,
-    SearchRequest, SearchSession, SemanticQuery, SkillDefinition, TaskExecutionResult, TaskPlan,
-    TriageStatus, WorkerClient, is_natural_language_query, parse_query_intent,
+    AddRootRequest, AnswerClaim, AnswerResult, AppError, AskMessagePage, AskMode, AskRequest,
+    AskSessionPage, CandidateRoot, CatalogService, ChunkEmbeddingInput, CollectionModelReview,
+    CollectionRecord, CollectionRule, CollectionSuggestion, CollectionSuggestionPage,
+    CollectionSuggestionQuery, CollectionSuggestionRefreshResult,
+    CollectionSuggestionUpdateRequest, CreateCollectionRequest, DegradationLevel, DownloadFile,
+    DownloadedModelMetadata, EmbeddingRequest, ExclusionRule, ExclusionRuleInput, ExportResult,
+    FilePage, FilePreview, FileQuery, FileRecord, ImageUnderstandingResult, ImportCandidate,
+    InboxItem, InboxPage, InboxQuery, InboxUpdateRequest, IncrementalWatchManager, JobRecord,
+    LocalGenerationRuntime, LogPage, LogQuery, MaintenanceSnapshot, ModelArtifact,
+    ModelCatalogEntry, ModelDownloadFileProgress, ModelDownloadJob, ModelEdition, ModelFormat,
+    ModelImportSelection, ModelManager, ModelPreset, ModelRole, ModelRoleConfig, ModelSource,
+    ParseMetrics, ParseOutcome, ParseRequest, ParseResult, PendingEmbeddingActivation,
+    RagReadiness, RelationPage, RelationQuery, RelationRefreshResult, RelationType, RerankRequest,
+    RootRecord, RuntimeCapability, ScopeFilter, SearchMode, SearchRequest, SearchSession,
+    SemanticQuery, TriageStatus, WorkerClient, is_natural_language_query, parse_query_intent,
     query_understanding_prompt,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
@@ -44,7 +44,10 @@ use std::os::windows::ffi::OsStrExt;
 use windows::{
     Win32::{
         Storage::FileSystem::GetDiskFreeSpaceExW,
-        System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX},
+        System::SystemInformation::{
+            GetLogicalProcessorInformationEx, GlobalMemoryStatusEx, MEMORYSTATUSEX,
+            RelationProcessorCore, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+        },
         UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
     },
     core::PCWSTR,
@@ -109,6 +112,22 @@ pub struct WorkerServiceState {
     pub embedding_running: AtomicBool,
     pub embedding_reschedule: AtomicBool,
     pub vision_running: AtomicBool,
+    pub foreground_activity: AtomicU32,
+}
+
+struct ForegroundActivityGuard<'a>(&'a AtomicU32);
+
+impl ForegroundActivityGuard<'_> {
+    fn begin(counter: &AtomicU32) -> ForegroundActivityGuard<'_> {
+        counter.fetch_add(1, Ordering::AcqRel);
+        ForegroundActivityGuard(counter)
+    }
+}
+
+impl Drop for ForegroundActivityGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 pub struct GenerationServiceState(pub Arc<Mutex<LocalGenerationRuntime>>);
@@ -116,6 +135,11 @@ pub struct GenerationServiceState(pub Arc<Mutex<LocalGenerationRuntime>>);
 const DOWNLOAD_ACTION_RUN: u8 = 0;
 const DOWNLOAD_ACTION_PAUSE: u8 = 1;
 const DOWNLOAD_ACTION_CANCEL: u8 = 2;
+type DownloadLogCheckpoint = (String, String, u8);
+type DownloadLogCheckpoints = Mutex<HashMap<Uuid, DownloadLogCheckpoint>>;
+static DOWNLOAD_LOG_CHECKPOINTS: OnceLock<DownloadLogCheckpoints> = OnceLock::new();
+static PHYSICAL_CORE_COUNT: OnceLock<u32> = OnceLock::new();
+static MEMORY_PRESSURE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Default)]
 pub struct ModelDownloadCoordinatorState {
@@ -192,11 +216,37 @@ pub struct OperationHandle {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct AppStatusScanProgress {
+    scan_job_id: Uuid,
+    status: remin_core::JobStatus,
+    discovered_files: u64,
+    searchable_files: u64,
+    parsed_files: u64,
+    embedded_files: u64,
+    ocr_pages: u64,
+    progress: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AppStatusSnapshot {
+    local_only: bool,
+    source_files_readonly: bool,
+    roots: Vec<RootRecord>,
+    scan_progress: Option<AppStatusScanProgress>,
+    maintenance: MaintenanceSnapshot,
+    inference_runtime: InferenceRuntimeState,
+    recovery_actions: Vec<&'static str>,
+    checked_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct AskOperationSnapshot {
     handle: OperationHandle,
     result: Option<AnswerResult>,
     error: Option<AppError>,
 }
+
+type AskProgressCallbacks<'a> = (&'a dyn Fn(&str, f64), &'a dyn Fn(&AnswerClaim));
 
 #[derive(Debug)]
 struct AskOperationEntry {
@@ -233,6 +283,7 @@ impl ModelServiceState {
 
 pub struct EnvironmentServiceState {
     pub data_directory: PathBuf,
+    pub config_directory: PathBuf,
     pub latest: Mutex<Option<EnvironmentCheck>>,
 }
 
@@ -244,7 +295,9 @@ pub struct EnvironmentCheck {
     gpu_name: Option<String>,
     gpu_memory_gb: Option<u64>,
     recommended_edition: Option<&'static str>,
-    runtime_backend: Option<&'static str>,
+    runtime_backend: Option<String>,
+    runtime_devices: Vec<String>,
+    gpu_runtime_available: bool,
     checked_at: String,
     warnings: Vec<String>,
 }
@@ -254,13 +307,59 @@ pub struct ModelRuntimeState {
     status: &'static str,
     active_profile_id: Option<String>,
     active_profile_name: Option<String>,
-    runtime_backend: Option<&'static str>,
+    runtime_backend: Option<String>,
+    inference_runtime: InferenceRuntimeState,
     message: String,
     checked_at: String,
     capabilities: ModelCapabilities,
     rag_complete: bool,
     semantic_index_coverage: f64,
     embedding_migration: Option<EmbeddingMigrationState>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InferenceRuntimeState {
+    backend: String,
+    device_names: Vec<String>,
+    gpu_available: bool,
+    gpu_offload_layers: Option<u32>,
+    gpu_offload_mode: String,
+    thread_budget: u32,
+    batch_thread_budget: u32,
+    active: bool,
+    pressure_reason: Option<String>,
+    hardware: HardwareProfile,
+    runtime_package: RuntimeBackendPackage,
+    budget: InferenceBudget,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HardwareProfile {
+    physical_core_count: u32,
+    logical_thread_count: u32,
+    memory_total_bytes: Option<u64>,
+    memory_available_bytes: Option<u64>,
+    gpu_name: Option<String>,
+    gpu_memory_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeBackendPackage {
+    backend: String,
+    device_count: u32,
+    gpu_capable: bool,
+    cpu_fallback_available: bool,
+    validated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InferenceBudget {
+    foreground_threads: u32,
+    background_threads: u32,
+    batch_size: u32,
+    ubatch_size: u32,
+    gpu_reserve_bytes: u64,
+    system_memory_reserve_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -277,9 +376,14 @@ pub struct ModelCapabilities {
     vision: bool,
     reranker: bool,
     ocr: bool,
+    tts: bool,
+    asr: bool,
 }
 
-fn detect_environment(data_directory: &Path) -> EnvironmentCheck {
+fn detect_environment(
+    data_directory: &Path,
+    runtime_capability: Option<&RuntimeCapability>,
+) -> EnvironmentCheck {
     let memory_total_gb = memory_total_gb();
     let disk_available_gb = disk_available_gb(data_directory);
     let (gpu_name, gpu_memory_gb) = gpu_details();
@@ -291,9 +395,13 @@ fn detect_environment(data_directory: &Path) -> EnvironmentCheck {
         warnings.push("无法读取应用数据磁盘剩余空间".to_owned());
     }
     if let Some(name) = &gpu_name {
-        warnings.push(format!(
-            "检测到GPU：{name}；当前验收运行时继续使用已验证的CPU后端"
-        ));
+        if runtime_capability.is_some_and(|capability| capability.gpu_available) {
+            warnings.push(format!("检测到GPU：{name}；本地运行时已启用GPU后端"));
+        } else {
+            warnings.push(format!(
+                "检测到GPU：{name}；当前安装的llama.cpp运行时未识别GPU，将安全回退到CPU"
+            ));
+        }
     }
     let status = if memory_total_gb.is_none() && disk_available_gb.is_none() {
         "failed"
@@ -313,7 +421,12 @@ fn detect_environment(data_directory: &Path) -> EnvironmentCheck {
         gpu_memory_gb,
         recommended_edition: memory_total_gb
             .map(|value| if value >= 12 { "standard" } else { "light" }),
-        runtime_backend: Some("cpu"),
+        runtime_backend: runtime_capability.map(|capability| capability.backend.clone()),
+        runtime_devices: runtime_capability
+            .map(|capability| capability.devices.clone())
+            .unwrap_or_default(),
+        gpu_runtime_available: runtime_capability
+            .is_some_and(|capability| capability.gpu_available),
         checked_at: Utc::now().to_rfc3339(),
         warnings,
     }
@@ -321,17 +434,27 @@ fn detect_environment(data_directory: &Path) -> EnvironmentCheck {
 
 #[cfg(windows)]
 fn memory_total_gb() -> Option<u64> {
+    memory_status_bytes().map(|(total, _)| total / 1024 / 1024 / 1024)
+}
+
+#[cfg(windows)]
+fn memory_status_bytes() -> Option<(u64, u64)> {
     let mut status = MEMORYSTATUSEX {
         dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
         ..Default::default()
     };
     unsafe { GlobalMemoryStatusEx(&mut status) }
         .ok()
-        .map(|_| status.ullTotalPhys / 1024 / 1024 / 1024)
+        .map(|_| (status.ullTotalPhys, status.ullAvailPhys))
 }
 
 #[cfg(not(windows))]
 fn memory_total_gb() -> Option<u64> {
+    None
+}
+
+#[cfg(not(windows))]
+fn memory_status_bytes() -> Option<(u64, u64)> {
     None
 }
 
@@ -419,23 +542,83 @@ pub fn environment_get_latest(
 }
 
 #[tauri::command(async)]
-pub fn environment_detect(environment: State<'_, EnvironmentServiceState>) -> EnvironmentCheck {
-    let check = detect_environment(&environment.data_directory);
-    *environment
+pub fn environment_detect(
+    environment: State<'_, EnvironmentServiceState>,
+    catalog: State<'_, CatalogServiceState>,
+    generation: State<'_, GenerationServiceState>,
+) -> Result<EnvironmentCheck, AppError> {
+    let mut latest = environment
         .latest
         .lock()
-        .expect("environment state poisoned") = Some(check.clone());
-    check
+        .map_err(|_| AppError::new("ENVIRONMENT_STATE_UNAVAILABLE", "环境检测状态不可用", true))?;
+    if let Some(cached) = latest.as_ref()
+        && chrono::DateTime::parse_from_rfc3339(&cached.checked_at)
+            .ok()
+            .is_some_and(|checked_at| {
+                Utc::now()
+                    .signed_duration_since(checked_at.with_timezone(&Utc))
+                    .num_seconds()
+                    < 30
+            })
+    {
+        return Ok(cached.clone());
+    }
+    let runtime_capability = generation
+        .0
+        .lock()
+        .map_err(|_| {
+            AppError::new(
+                "GENERATION_RUNTIME_LOCK_FAILED",
+                "生成运行时状态已损坏",
+                true,
+            )
+        })?
+        .probe_capability();
+    let check = detect_environment(&environment.data_directory, Some(&runtime_capability));
+    crate::runtime_log::event(
+        if check.status == "ready" {
+            "info"
+        } else {
+            "warning"
+        },
+        "environment",
+        "environment.detected",
+        None,
+        &json!({
+            "status": check.status,
+            "memory_total_gb": check.memory_total_gb,
+            "disk_available_gb": check.disk_available_gb,
+            "gpu_name": check.gpu_name,
+            "gpu_memory_gb": check.gpu_memory_gb,
+            "runtime_backend": check.runtime_backend,
+            "warning_count": check.warnings.len(),
+        }),
+    );
+    *latest = Some(check.clone());
+    drop(latest);
+    if let Some((level, triggers)) = environment_degradation(&check) {
+        catalog
+            .get()?
+            .reconcile_degradation_state(level, triggers)?;
+    }
+    Ok(check)
 }
 
 #[tauri::command(async)]
 pub fn model_state_get(
     catalog: State<'_, CatalogServiceState>,
     models: State<'_, ModelServiceState>,
+    generation: State<'_, GenerationServiceState>,
+    worker: State<'_, WorkerServiceState>,
 ) -> Result<ModelRuntimeState, AppError> {
     let models = models.get()?;
     let catalog = catalog.get()?;
-    model_state_from_manager(&models, Some(&catalog))
+    let mut inference_runtime = inference_runtime_state(&generation)?;
+    if worker.foreground_activity.load(Ordering::Acquire) > 0 {
+        inference_runtime.pressure_reason =
+            Some("正在优先处理搜索或问答，后台模型任务已让出".into());
+    }
+    model_state_from_manager(&models, Some(&catalog), Some(inference_runtime))
 }
 
 #[derive(Debug, Deserialize)]
@@ -554,8 +737,44 @@ pub fn model_role_config_list(
 }
 
 #[tauri::command(async)]
-pub fn model_catalog_list() -> Vec<ModelEdition> {
-    remin_core::built_in_model_editions()
+pub fn model_catalog_list(source: String) -> Result<Vec<ModelEdition>, AppError> {
+    ["light", "standard"]
+        .into_iter()
+        .map(|edition_id| remin_core::model_edition_by_id(edition_id, &source))
+        .collect()
+}
+
+#[tauri::command(async)]
+pub fn model_role_catalog_list(
+    environment: State<'_, EnvironmentServiceState>,
+) -> Vec<ModelCatalogEntry> {
+    let mut catalog = remin_core::built_in_model_catalog();
+    let cached = environment
+        .latest
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    let check = match cached {
+        Some(check) => check,
+        None => {
+            let detected = detect_environment(&environment.data_directory, None);
+            if let Ok(mut latest) = environment.latest.lock() {
+                *latest = Some(detected.clone());
+            }
+            detected
+        }
+    };
+    let recommended =
+        remin_core::recommended_catalog_ids(&catalog, check.memory_total_gb, check.gpu_memory_gb);
+    for entry in &mut catalog {
+        entry.recommended = recommended.contains(&entry.catalog_id);
+    }
+    catalog
+}
+
+#[tauri::command(async)]
+pub fn model_preset_list() -> Vec<ModelPreset> {
+    remin_core::built_in_model_presets()
 }
 
 #[derive(Debug, Deserialize)]
@@ -853,7 +1072,7 @@ fn run_model_download(
     job_id: Uuid,
     control: &AtomicU8,
     worker: &WorkerClient,
-    generation: &Arc<Mutex<LocalGenerationRuntime>>,
+    generation: &Mutex<LocalGenerationRuntime>,
 ) {
     let result = (|| {
         let mut job = models.download_job(&job_id)?;
@@ -861,7 +1080,7 @@ fn run_model_download(
         job.phase = "downloading".into();
         job.error = None;
         persist_download_job(app, models, &mut job)?;
-        let _ = app.emit("model.download_started", &job);
+        let _ = app.emit("model:download_started", &job);
 
         for artifact in &edition.artifacts {
             let staging = models.download_artifact_staging_directory(
@@ -940,16 +1159,49 @@ fn run_model_download(
         persist_download_job(app, models, &mut job)?;
         let embedding = installed
             .iter()
-            .find(|artifact| artifact.role == ModelRole::Embedding)
-            .ok_or_else(|| {
-                AppError::new("MODEL_PROFILE_INCOMPLETE", "完整RAG缺少语义模型", false)
-            })?;
+            .find(|artifact| artifact.role == ModelRole::Embedding);
         let generation_artifact = installed
             .iter()
-            .find(|artifact| artifact.role == ModelRole::Generation)
-            .ok_or_else(|| {
-                AppError::new("MODEL_PROFILE_INCOMPLETE", "完整RAG缺少生成模型", false)
-            })?;
+            .find(|artifact| artifact.role == ModelRole::Generation);
+        if embedding.is_none() || generation_artifact.is_none() {
+            job.phase = "activating".into();
+            persist_download_job(app, models, &mut job)?;
+            let embedding_indexing = self_test_and_activate_downloaded_roles(
+                app, catalog, models, worker, generation, &installed, job.job_id,
+            )?;
+            for artifact in &edition.artifacts {
+                if let Ok(staging) = models.download_artifact_staging_directory(
+                    artifact.source,
+                    &edition.edition_id,
+                    artifact.role,
+                ) {
+                    let _ = fs::remove_dir_all(staging);
+                }
+            }
+            job.current_file = None;
+            job.bytes_per_second = 0;
+            job.eta_seconds = Some(0);
+            job.error = None;
+            for file in &mut job.files {
+                file.status = "completed".into();
+                file.downloaded_bytes = file.total_bytes;
+            }
+            if embedding_indexing {
+                job.status = "running".into();
+                job.phase = "indexing".into();
+                persist_download_job(app, models, &mut job)?;
+                spawn_embed_pending(app.clone(), Arc::clone(catalog));
+                let _ = app.emit("model:download_indexing", &job);
+            } else {
+                job.status = "completed".into();
+                job.phase = "completed".into();
+                persist_download_job(app, models, &mut job)?;
+                let _ = app.emit("model:download_completed", &job);
+            }
+            return Ok::<(), AppError>(());
+        }
+        let embedding = embedding.expect("checked embedding");
+        let generation_artifact = generation_artifact.expect("checked generation");
         let tokenizer = PathBuf::from(&embedding.local_path)
             .parent()
             .map(|parent| parent.join("tokenizer.json"))
@@ -976,10 +1228,7 @@ fn run_model_download(
                 true,
             ));
         }
-        let threads = std::thread::available_parallelism()
-            .map(|value| value.get() as u32)
-            .unwrap_or(2)
-            .clamp(1, 8);
+        let threads = interactive_inference_threads();
         {
             let mut runtime = generation.lock().map_err(|_| {
                 AppError::new(
@@ -1051,7 +1300,7 @@ fn run_model_download(
                 }
             }
             spawn_embed_pending(app.clone(), Arc::clone(catalog));
-            let _ = app.emit("model.download_indexing", &job);
+            let _ = app.emit("model:download_indexing", &job);
             return Ok::<(), AppError>(());
         }
         job.status = "completed".into();
@@ -1075,7 +1324,7 @@ fn run_model_download(
             }
         }
         spawn_embed_pending(app.clone(), Arc::clone(catalog));
-        let _ = app.emit("model.download_completed", &job);
+        let _ = app.emit("model:download_completed", &job);
         Ok::<(), AppError>(())
     })();
 
@@ -1107,9 +1356,152 @@ fn run_model_download(
             }
         }
         if action == DOWNLOAD_ACTION_RUN {
-            let _ = app.emit("model.download_failed", error);
+            let _ = app.emit("model:download_failed", error);
         }
     }
+}
+
+fn self_test_and_activate_downloaded_roles(
+    app: &AppHandle,
+    catalog: &Arc<CatalogService>,
+    models: &ModelManager,
+    worker: &WorkerClient,
+    generation: &Mutex<LocalGenerationRuntime>,
+    installed: &[ModelArtifact],
+    download_job_id: Uuid,
+) -> Result<bool, AppError> {
+    let mut embedding_indexing = false;
+    for artifact in installed {
+        match (artifact.role, artifact.format) {
+            (ModelRole::Generation, ModelFormat::Gguf) => {
+                let mut runtime = generation.lock().map_err(|_| {
+                    AppError::new(
+                        "GENERATION_RUNTIME_LOCK_FAILED",
+                        "生成运行时状态已损坏",
+                        true,
+                    )
+                })?;
+                runtime.activate(&artifact.local_path, 4096, interactive_inference_threads())?;
+                let generated = runtime.complete(
+                    "你正在执行本地模型健康检查。只需用一句简短中文确认可以回答。",
+                    "请回复：拾忆本地模型可以工作。",
+                    32,
+                )?;
+                if generated.trim().chars().count() < 4 {
+                    runtime.stop();
+                    return Err(AppError::new(
+                        "MODEL_SELF_TEST_FAILED",
+                        "生成模型没有通过最小本地推理自检，已回滚",
+                        true,
+                    ));
+                }
+                models.activate_artifact(&artifact.artifact_id, None)?;
+            }
+            (ModelRole::Embedding, ModelFormat::Onnx) => {
+                let tokenizer = PathBuf::from(&artifact.local_path)
+                    .parent()
+                    .map(|parent| parent.join("tokenizer.json"))
+                    .ok_or_else(|| {
+                        AppError::new("EMBEDDING_TOKENIZER_UNAVAILABLE", "语义模型目录无效", false)
+                    })?;
+                let response = worker.encode_embeddings(&EmbeddingRequest {
+                    model_path: artifact.local_path.clone(),
+                    tokenizer_path: Some(tokenizer.to_string_lossy().into_owned()),
+                    texts: vec!["拾起散落的信息，连接过去的自己".into()],
+                    max_length: artifact.max_length.unwrap_or(512),
+                    threads: background_inference_threads(),
+                })?;
+                if response.dimension == 0
+                    || response.vectors.len() != 1
+                    || response.vectors[0].len() != response.dimension as usize
+                    || response.vectors[0].iter().any(|value| !value.is_finite())
+                {
+                    return Err(AppError::new(
+                        "MODEL_SELF_TEST_FAILED",
+                        "语义模型自检返回了无效维度或向量",
+                        true,
+                    ));
+                }
+                models.begin_embedding_activation_with_job(
+                    &artifact.artifact_id,
+                    response.dimension,
+                    Some(download_job_id),
+                )?;
+                embedding_indexing = true;
+            }
+            (ModelRole::Vision, ModelFormat::Gguf) => {
+                let projector = models.vision_projector_path(artifact)?;
+                generation
+                    .lock()
+                    .map_err(|_| {
+                        AppError::new(
+                            "VISION_RUNTIME_LOCK_FAILED",
+                            "图片理解运行时状态已损坏",
+                            true,
+                        )
+                    })?
+                    .activate_multimodal(
+                        &artifact.local_path,
+                        &projector.to_string_lossy(),
+                        4096,
+                        interactive_inference_threads(),
+                    )?;
+                models.activate_artifact(&artifact.artifact_id, None)?;
+                spawn_image_understanding_pending(app.clone(), Arc::clone(catalog));
+            }
+            (ModelRole::Reranker, ModelFormat::Onnx) => {
+                let tokenizer = PathBuf::from(&artifact.local_path)
+                    .parent()
+                    .map(|parent| parent.join("tokenizer.json"))
+                    .ok_or_else(|| {
+                        AppError::new("RERANK_TOKENIZER_UNAVAILABLE", "模型目录无效", false)
+                    })?;
+                let response = worker.rerank(&RerankRequest {
+                    model_path: artifact.local_path.clone(),
+                    tokenizer_path: Some(tokenizer.to_string_lossy().into_owned()),
+                    query: "哪段资料描述了本地知识库？".into(),
+                    documents: vec![
+                        "拾忆在本地建立可检索的资料知识库。".into(),
+                        "今天窗外天气晴朗。".into(),
+                    ],
+                    max_length: artifact.max_length.unwrap_or(512),
+                    threads: background_inference_threads(),
+                })?;
+                if response.scores.len() != 2
+                    || response.scores.iter().any(|score| !score.is_finite())
+                    || response.scores[0] <= response.scores[1]
+                {
+                    return Err(AppError::new(
+                        "MODEL_SELF_TEST_FAILED",
+                        "重排模型自检返回了无效分数",
+                        true,
+                    ));
+                }
+                models.activate_artifact(&artifact.artifact_id, None)?;
+            }
+            // OCR artifacts install and activate like other roles, but the
+            // recognition pipeline still runs on Windows OCR (no worker
+            // self-test yet). File integrity is enforced by import/download
+            // SHA-256 verification before activation.
+            (ModelRole::Ocr, ModelFormat::Onnx) => {
+                models.activate_artifact(&artifact.artifact_id, None)?;
+            }
+            // TTS/ASR artifacts activate without a worker self-test too — the
+            // synthesis/recognition pipeline is not wired up yet (channel-only
+            // milestone). SHA-256 verification happened at import/download.
+            (ModelRole::Tts, ModelFormat::Onnx) | (ModelRole::Asr, ModelFormat::Onnx) => {
+                models.activate_artifact(&artifact.artifact_id, None)?;
+            }
+            _ => {
+                return Err(AppError::new(
+                    "MODEL_RUNTIME_UNSUPPORTED",
+                    "当前模型角色或格式尚未接入本地运行时",
+                    false,
+                ));
+            }
+        }
+    }
+    Ok(embedding_indexing)
 }
 
 fn download_model_file(
@@ -1308,9 +1700,9 @@ fn persist_download_job(
 }
 
 fn emit_download_state(app: &AppHandle, job: &ModelDownloadJob) {
-    let _ = app.emit("model.download_state", job);
+    let _ = app.emit("model:download_state", job);
     let _ = app.emit(
-        "model.download_progress",
+        "model:download_progress",
         json!({
             "job_id": job.job_id,
             "edition_id": job.edition_id,
@@ -1321,6 +1713,46 @@ fn emit_download_state(app: &AppHandle, job: &ModelDownloadJob) {
             "status": job.status,
         }),
     );
+    let progress_bucket = (job.progress.clamp(0.0, 1.0) * 20.0).floor() as u8;
+    let checkpoint = (job.phase.clone(), job.status.clone(), progress_bucket);
+    let should_log = DOWNLOAD_LOG_CHECKPOINTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map(|mut checkpoints| {
+            if checkpoints.get(&job.job_id) == Some(&checkpoint) {
+                false
+            } else {
+                checkpoints.insert(job.job_id, checkpoint);
+                true
+            }
+        })
+        .unwrap_or(true);
+    if should_log {
+        crate::runtime_log::event(
+            if job.status == "failed" {
+                "error"
+            } else {
+                "info"
+            },
+            "model.download",
+            "download.state_changed",
+            Some(&job.job_id.to_string()),
+            &json!({
+                "job_id": job.job_id,
+                "edition_id": job.edition_id,
+                "phase": job.phase,
+                "status": job.status,
+                "progress": job.progress,
+                "downloaded_bytes": job.downloaded_bytes,
+                "total_bytes": job.total_bytes,
+                "bytes_per_second": job.bytes_per_second,
+                "eta_seconds": job.eta_seconds,
+                "retry_count": job.retry_count,
+                "error_code": job.error.as_ref().map(|error| error.code.as_str()),
+                "retryable": job.error.as_ref().map(|error| error.retryable),
+            }),
+        );
+    }
 }
 
 fn check_download_control(control: &AtomicU8) -> Result<(), AppError> {
@@ -1369,6 +1801,52 @@ pub struct ModelArtifactActionRequest {
     artifact_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ModelRoleActionRequest {
+    role: ModelRole,
+}
+
+#[tauri::command(async)]
+pub fn model_role_disable(
+    request: ModelRoleActionRequest,
+    catalog: State<'_, CatalogServiceState>,
+    models: State<'_, ModelServiceState>,
+    generation: State<'_, GenerationServiceState>,
+) -> Result<ModelRuntimeState, AppError> {
+    let started = Instant::now();
+    let models = models.get()?;
+    let catalog = catalog.get()?;
+    if request.role == ModelRole::Generation {
+        generation
+            .0
+            .lock()
+            .map_err(|_| {
+                AppError::new(
+                    "GENERATION_RUNTIME_LOCK_FAILED",
+                    "生成运行时状态已损坏",
+                    true,
+                )
+            })?
+            .stop();
+    }
+    models.deactivate_role(request.role)?;
+    crate::runtime_log::event(
+        "info",
+        "model.runtime",
+        "model.role_disabled",
+        None,
+        &json!({
+            "role": request.role,
+            "duration_ms": started.elapsed().as_millis(),
+        }),
+    );
+    model_state_from_manager(
+        &models,
+        Some(&catalog),
+        Some(inference_runtime_state(&generation)?),
+    )
+}
+
 #[tauri::command(async)]
 pub fn model_artifact_activate(
     request: ModelArtifactActionRequest,
@@ -1383,6 +1861,18 @@ pub fn model_artifact_activate(
     let artifact_id = Uuid::parse_str(&request.artifact_id)
         .map_err(|error| AppError::new("MODEL_ACTIVATION_INVALID", error.to_string(), false))?;
     let artifact = models.artifact_by_id(&artifact_id)?;
+    let started = Instant::now();
+    crate::runtime_log::event(
+        "info",
+        "model.runtime",
+        "model.activation_started",
+        Some(&artifact_id.to_string()),
+        &json!({
+            "artifact_id": artifact_id,
+            "role": artifact.role,
+            "format": artifact.format,
+        }),
+    );
     match (artifact.role, artifact.format) {
         (ModelRole::Embedding, ModelFormat::Onnx) => {
             let tokenizer_path = PathBuf::from(&artifact.local_path)
@@ -1413,29 +1903,38 @@ pub fn model_artifact_activate(
             spawn_embed_pending(app.clone(), Arc::clone(&catalog));
         }
         (ModelRole::Generation, ModelFormat::Gguf) => {
-            let threads = std::thread::available_parallelism()
-                .map(|value| value.get() as u32)
-                .unwrap_or(2)
-                .clamp(1, 8);
-            generation
-                .0
-                .lock()
-                .map_err(|_| {
-                    AppError::new(
-                        "GENERATION_RUNTIME_LOCK_FAILED",
-                        "生成运行时状态已损坏",
-                        true,
-                    )
-                })?
-                .activate(&artifact.local_path, 4096, threads)?;
+            let threads = interactive_inference_threads();
+            let mut runtime = generation.0.lock().map_err(|_| {
+                AppError::new(
+                    "GENERATION_RUNTIME_LOCK_FAILED",
+                    "生成运行时状态已损坏",
+                    true,
+                )
+            })?;
+            runtime.activate(&artifact.local_path, 4096, threads)?;
+            let self_test = runtime.complete(
+                "你正在执行本地模型健康检查。只需用一句简短中文确认可以回答。",
+                "请回复：拾忆本地模型可以工作。",
+                32,
+            );
+            let self_test_failed = match &self_test {
+                Ok(value) => value.trim().chars().count() < 4,
+                Err(_) => true,
+            };
+            if self_test_failed {
+                runtime.stop();
+                return Err(AppError::new(
+                    "MODEL_SELF_TEST_FAILED",
+                    "生成模型没有通过最小本地推理自检，已回滚",
+                    true,
+                ));
+            }
+            drop(runtime);
             models.activate_artifact(&artifact_id, None)?;
         }
         (ModelRole::Vision, ModelFormat::Gguf) => {
             let projector = models.vision_projector_path(&artifact)?;
-            let threads = std::thread::available_parallelism()
-                .map(|value| value.get() as u32)
-                .unwrap_or(2)
-                .clamp(1, 8);
+            let threads = interactive_inference_threads();
             generation
                 .0
                 .lock()
@@ -1473,7 +1972,9 @@ pub fn model_artifact_activate(
                 max_length: artifact.max_length.unwrap_or(512),
                 threads: 2,
             })?;
-            if response.scores.len() != 2 || response.scores.iter().any(|score| !score.is_finite())
+            if response.scores.len() != 2
+                || response.scores.iter().any(|score| !score.is_finite())
+                || response.scores[0] <= response.scores[1]
             {
                 return Err(AppError::new(
                     "MODEL_SELF_TEST_FAILED",
@@ -1481,6 +1982,16 @@ pub fn model_artifact_activate(
                     true,
                 ));
             }
+            models.activate_artifact(&artifact_id, None)?;
+        }
+        // OCR artifacts activate without a worker self-test (pipeline still
+        // uses Windows OCR); SHA-256 verification happened at import/download.
+        (ModelRole::Ocr, ModelFormat::Onnx) => {
+            models.activate_artifact(&artifact_id, None)?;
+        }
+        // TTS/ASR artifacts activate without a worker self-test — synthesis/
+        // recognition is not wired up yet (channel-only milestone).
+        (ModelRole::Tts, ModelFormat::Onnx) | (ModelRole::Asr, ModelFormat::Onnx) => {
             models.activate_artifact(&artifact_id, None)?;
         }
         _ => {
@@ -1491,12 +2002,149 @@ pub fn model_artifact_activate(
             ));
         }
     }
-    model_state_from_manager(&models, Some(&catalog))
+    let state = model_state_from_manager(
+        &models,
+        Some(&catalog),
+        Some(inference_runtime_state(&generation)?),
+    )?;
+    crate::runtime_log::event(
+        "info",
+        "model.runtime",
+        "model.activation_completed",
+        Some(&artifact_id.to_string()),
+        &json!({
+            "artifact_id": artifact_id,
+            "role": artifact.role,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        }),
+    );
+    Ok(state)
+}
+
+fn default_inference_runtime_state() -> InferenceRuntimeState {
+    let hardware = current_hardware_profile(&[]);
+    let budget = current_inference_budget(hardware.memory_total_bytes);
+    InferenceRuntimeState {
+        backend: "unavailable".into(),
+        device_names: Vec::new(),
+        gpu_available: false,
+        gpu_offload_layers: Some(0),
+        gpu_offload_mode: "disabled".into(),
+        thread_budget: interactive_inference_threads(),
+        batch_thread_budget: background_inference_threads(),
+        active: false,
+        pressure_reason: None,
+        hardware,
+        runtime_package: RuntimeBackendPackage {
+            backend: "unavailable".into(),
+            device_count: 0,
+            gpu_capable: false,
+            cpu_fallback_available: false,
+            validated: false,
+        },
+        budget,
+    }
+}
+
+fn inference_runtime_state(
+    generation: &GenerationServiceState,
+) -> Result<InferenceRuntimeState, AppError> {
+    let mut runtime = generation.0.lock().map_err(|_| {
+        AppError::new(
+            "GENERATION_RUNTIME_LOCK_FAILED",
+            "生成运行时状态已损坏",
+            true,
+        )
+    })?;
+    let active = runtime.is_active();
+    let capability = runtime
+        .current_capability()
+        .cloned()
+        .unwrap_or_else(|| runtime.probe_capability());
+    let device_names = runtime
+        .active_device()
+        .map(|device| vec![device.to_owned()])
+        .unwrap_or_else(|| capability.devices.clone());
+    let backend = runtime
+        .active_backend()
+        .map(str::to_owned)
+        .unwrap_or_else(|| capability.backend.clone());
+    let hardware = current_hardware_profile(&device_names);
+    let budget = current_inference_budget(hardware.memory_total_bytes);
+    Ok(InferenceRuntimeState {
+        backend: backend.clone(),
+        device_names: device_names.clone(),
+        gpu_available: capability.gpu_available,
+        gpu_offload_layers: runtime.active_gpu_layers(),
+        gpu_offload_mode: if capability.gpu_available {
+            "automatic".into()
+        } else {
+            "disabled".into()
+        },
+        thread_budget: runtime
+            .active_threads()
+            .unwrap_or_else(interactive_inference_threads),
+        batch_thread_budget: background_inference_threads(),
+        active,
+        pressure_reason: None,
+        hardware,
+        runtime_package: RuntimeBackendPackage {
+            backend,
+            device_count: device_names.len() as u32,
+            gpu_capable: capability.gpu_available,
+            cpu_fallback_available: runtime.cpu_fallback_available(),
+            validated: capability.executable_available
+                && (!capability.gpu_available || !device_names.is_empty()),
+        },
+        budget,
+    })
+}
+
+fn current_hardware_profile(device_names: &[String]) -> HardwareProfile {
+    let (memory_total_bytes, memory_available_bytes) = memory_status_bytes()
+        .map(|(total, available)| (Some(total), Some(available)))
+        .unwrap_or((None, None));
+    let logical_thread_count = std::thread::available_parallelism()
+        .map(|value| value.get() as u32)
+        .unwrap_or(1);
+    let gpu_name = device_names.first().cloned();
+    let gpu_memory_bytes = device_names.first().and_then(|device| {
+        let marker = " MiB";
+        let end = device.find(marker)?;
+        let start = device[..end].rfind(|character: char| !character.is_ascii_digit())? + 1;
+        device[start..end]
+            .parse::<u64>()
+            .ok()
+            .map(|mib| mib * 1024 * 1024)
+    });
+    HardwareProfile {
+        physical_core_count: physical_core_count(),
+        logical_thread_count,
+        memory_total_bytes,
+        memory_available_bytes,
+        gpu_name,
+        gpu_memory_bytes,
+    }
+}
+
+fn current_inference_budget(memory_total_bytes: Option<u64>) -> InferenceBudget {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    InferenceBudget {
+        foreground_threads: interactive_inference_threads(),
+        background_threads: background_inference_threads(),
+        batch_size: 256,
+        ubatch_size: 128,
+        gpu_reserve_bytes: 512 * 1024 * 1024,
+        system_memory_reserve_bytes: memory_total_bytes
+            .map(|total| (total / 5).max(2 * GIB))
+            .unwrap_or(2 * GIB),
+    }
 }
 
 fn model_state_from_manager(
     models: &ModelManager,
     catalog: Option<&CatalogService>,
+    inference_runtime: Option<InferenceRuntimeState>,
 ) -> Result<ModelRuntimeState, AppError> {
     let artifacts = models.list_artifacts()?;
     let active_profile = models.active_profile()?;
@@ -1508,12 +2156,16 @@ fn model_state_from_manager(
         vision: models.active_artifact(ModelRole::Vision)?.is_some(),
         reranker: models.active_artifact(ModelRole::Reranker)?.is_some(),
         ocr: models.active_artifact(ModelRole::Ocr)?.is_some(),
+        tts: models.active_artifact(ModelRole::Tts)?.is_some(),
+        asr: models.active_artifact(ModelRole::Asr)?.is_some(),
     };
     let any_active = capabilities.generation
         || capabilities.embedding
         || capabilities.vision
         || capabilities.reranker
-        || capabilities.ocr;
+        || capabilities.ocr
+        || capabilities.tts
+        || capabilities.asr;
     let semantic_index_coverage = match (catalog, active_embedding.as_ref()) {
         (Some(catalog), Some(embedding)) => catalog
             .active_vector_generation(&embedding.artifact_id.to_string())?
@@ -1541,6 +2193,7 @@ fn model_state_from_manager(
         _ if artifacts.is_empty() => "未配置本地模型".into(),
         _ => "模型已导入，等待运行自检".into(),
     };
+    let inference_runtime = inference_runtime.unwrap_or_else(default_inference_runtime_state);
     Ok(ModelRuntimeState {
         status: if any_active {
             "ready"
@@ -1558,7 +2211,8 @@ fn model_state_from_manager(
             .as_ref()
             .map(|profile| profile.profile_id.to_string()),
         active_profile_name: active_profile.as_ref().map(|profile| profile.name.clone()),
-        runtime_backend: if any_active { Some("cpu") } else { None },
+        runtime_backend: any_active.then(|| inference_runtime.backend.clone()),
+        inference_runtime,
         message,
         checked_at: Utc::now().to_rfc3339(),
         capabilities,
@@ -1603,7 +2257,7 @@ pub fn home_get_summary(
 ) -> Result<Value, AppError> {
     let catalog = catalog.get()?;
     let (today_added, recent) = catalog.home_file_summary(&request.local_date)?;
-    let candidates = catalog.discover_candidate_roots()?;
+    let candidates = catalog.list_candidate_roots()?;
     let active_scan = catalog.latest_active_scan_job()?;
     let new_inbox = catalog.query_inbox(&InboxQuery {
         status: TriageStatus::New,
@@ -1702,7 +2356,7 @@ pub fn candidate_root_action(
             .with_mut(|watcher| watcher.watch_root(root))
             .and_then(|result| result)
     {
-        let _ = app.emit("catalog.watch_degraded", &error);
+        let _ = app.emit("catalog:watch_degraded", &error);
     }
     Ok(outcome.candidate)
 }
@@ -1725,7 +2379,7 @@ pub fn root_add(
         .with_mut(|watcher| watcher.watch_root(&root))
         .and_then(|result| result)
     {
-        let _ = app.emit("catalog.watch_degraded", &error);
+        let _ = app.emit("catalog:watch_degraded", &error);
     }
     let prepared = catalog.prepare_scan(&root.root_id, "user_authorized")?;
     if prepared.should_start {
@@ -1742,13 +2396,48 @@ pub struct RootDisableRequest {
 #[tauri::command(async)]
 pub fn root_disable(
     request: RootDisableRequest,
+    app: AppHandle,
     catalog: State<'_, CatalogServiceState>,
     watcher: State<'_, WatcherServiceState>,
 ) -> Result<(), AppError> {
     let root_id = Uuid::parse_str(&request.root_id)
         .map_err(|error| AppError::new("ROOT_ID_INVALID", error.to_string(), false))?;
-    catalog.get()?.disable_root(&root_id)?;
+    let catalog = catalog.get()?;
     watcher.with_mut(|watcher| watcher.unwatch_root(&root_id))?;
+    catalog.disable_root(&root_id)?;
+    crate::runtime_log::event(
+        "info",
+        "catalog",
+        "root.authorization_revoked",
+        None,
+        &json!({ "root_id": root_id }),
+    );
+    tauri::async_runtime::spawn_blocking(move || match catalog.cleanup_disabled_root(&root_id) {
+        Ok(removed) => {
+            crate::runtime_log::event(
+                "info",
+                "catalog",
+                "root.background_cleanup_completed",
+                None,
+                &json!({ "root_id": root_id, "removed_memberships": removed }),
+            );
+            let _ = app.emit("catalog:changed", root_id.to_string());
+        }
+        Err(error) => {
+            crate::runtime_log::event(
+                "error",
+                "catalog",
+                "root.background_cleanup_failed",
+                None,
+                &json!({
+                    "root_id": root_id,
+                    "error_code": error.code,
+                    "retryable": error.retryable,
+                }),
+            );
+            let _ = app.emit("index:failed", error);
+        }
+    });
     Ok(())
 }
 
@@ -1824,6 +2513,61 @@ pub fn inbox_update(
     catalog.get()?.update_inbox_item(&request)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct InboxRetryRequest {
+    inbox_id: Uuid,
+}
+
+#[tauri::command(async)]
+pub fn inbox_retry(
+    request: InboxRetryRequest,
+    app: AppHandle,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<InboxItem, AppError> {
+    let started = Instant::now();
+    crate::runtime_log::event(
+        "info",
+        "inbox",
+        "inbox.retry_started",
+        Some(&request.inbox_id.to_string()),
+        &json!({ "inbox_id": request.inbox_id }),
+    );
+    let catalog = catalog.get()?;
+    match catalog.retry_inbox_item(&request.inbox_id) {
+        Ok(item) => {
+            spawn_parse_pending(app, Arc::clone(&catalog));
+            crate::runtime_log::event(
+                "info",
+                "inbox",
+                "inbox.retry_scheduled",
+                Some(&request.inbox_id.to_string()),
+                &json!({
+                    "inbox_id": request.inbox_id,
+                    "file_id": item.file_id,
+                    "attempt_count": item.attempt_count,
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                }),
+            );
+            Ok(item)
+        }
+        Err(error) => {
+            crate::runtime_log::event(
+                "error",
+                "inbox",
+                "inbox.retry_failed",
+                Some(&request.inbox_id.to_string()),
+                &json!({
+                    "inbox_id": request.inbox_id,
+                    "error_code": error.code,
+                    "retryable": error.retryable,
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                }),
+            );
+            Err(error)
+        }
+    }
+}
+
 #[tauri::command(async)]
 pub fn ocr_retry(
     request: FileIdRequest,
@@ -1891,64 +2635,77 @@ pub async fn image_deep_analyze(
     let models = models.get()?;
     let generation = Arc::clone(&generation.0);
     tauri::async_runtime::spawn_blocking(move || {
-        let (image_path, mime_type, _) = catalog.authorized_image_asset_path(&asset_id)?;
-        let artifact = models
-            .active_artifact(ModelRole::Vision)?
-            .ok_or_else(|| {
-                AppError::new(
-                    "VISION_MODEL_INVALID",
-                    "原图深度分析需要先配置并自检本地多模态模型",
-                    true,
-                )
-            })?;
-        let projector = models.vision_projector_path(&artifact)?;
-        let threads = std::thread::available_parallelism()
-            .map(|value| value.get() as u32)
-            .unwrap_or(2)
-            .clamp(1, 8);
-        let mut runtime = generation.lock().map_err(|_| {
-            AppError::new(
-                "VISION_RUNTIME_LOCK_FAILED",
-                "图片理解运行时状态已损坏",
-                true,
-            )
-        })?;
-        let projector_path = projector.to_string_lossy();
-        if runtime.active_model_path() != Some(artifact.local_path.as_str())
-            || runtime.active_mmproj_path() != Some(projector_path.as_ref())
-            || !runtime.is_active()
-        {
-            runtime.activate_multimodal(
-                &artifact.local_path,
-                projector_path.as_ref(),
-                4096,
-                threads,
-            )?;
-        }
         let cancelled = AtomicBool::new(false);
-        let response = runtime.describe_image_cancellable(
-            "你是拾忆的本地图片证据分析器。只能根据当前图片中可验证的内容回答，不得补充外部知识；看不清或图片不支持的问题必须明确说明。",
-            &format!(
-                "用户问题：{question}\n只输出一个JSON对象，不要Markdown：{{\"answer\":\"基于图片的中文回答\",\"observations\":[\"支持回答的可见细节\"],\"uncertainties\":[\"看不清或无法确认的内容\"]}}。"
-            ),
-            &image_path,
-            &mime_type,
-            512,
-            &cancelled,
-        )?;
-        let payload = parse_vision_question_answer(&response)?;
-        Ok(ImageDeepAnalysis {
+        run_image_deep_analysis(
+            &catalog,
+            &models,
+            &generation,
             asset_id,
-            question,
-            answer: payload.answer,
-            observations: payload.observations,
-            uncertainties: payload.uncertainties,
-            model_artifact_id: artifact.artifact_id,
-            analyzed_at: Utc::now().to_rfc3339(),
-        })
+            &question,
+            &cancelled,
+        )
     })
     .await
     .map_err(|error| AppError::new("VISION_REQUEST_FAILED", error.to_string(), true))?
+}
+
+fn run_image_deep_analysis(
+    catalog: &CatalogService,
+    models: &ModelManager,
+    generation: &Mutex<LocalGenerationRuntime>,
+    asset_id: Uuid,
+    question: &str,
+    cancelled: &AtomicBool,
+) -> Result<ImageDeepAnalysis, AppError> {
+    let (image_path, mime_type, _) = catalog.authorized_image_asset_path(&asset_id)?;
+    let artifact = models.active_artifact(ModelRole::Vision)?.ok_or_else(|| {
+        AppError::new(
+            "VISION_MODEL_INVALID",
+            "原图深度分析需要先配置并自检本地多模态模型",
+            true,
+        )
+    })?;
+    let projector = models.vision_projector_path(&artifact)?;
+    let threads = interactive_inference_threads();
+    let mut runtime = generation.lock().map_err(|_| {
+        AppError::new(
+            "VISION_RUNTIME_LOCK_FAILED",
+            "图片理解运行时状态已损坏",
+            true,
+        )
+    })?;
+    let projector_path = projector.to_string_lossy();
+    if runtime.active_model_path() != Some(artifact.local_path.as_str())
+        || runtime.active_mmproj_path() != Some(projector_path.as_ref())
+        || !runtime.is_active()
+    {
+        runtime.activate_multimodal(
+            &artifact.local_path,
+            projector_path.as_ref(),
+            4096,
+            threads,
+        )?;
+    }
+    let response = runtime.describe_image_cancellable(
+        "你是拾忆的本地图片证据分析器。只能根据当前图片中可验证的内容回答，不得补充外部知识；看不清或图片不支持的问题必须明确说明。",
+        &format!(
+            "用户问题：{question}\n只输出一个JSON对象，不要Markdown：{{\"answer\":\"基于图片的中文回答\",\"observations\":[\"支持回答的可见细节\"],\"uncertainties\":[\"看不清或无法确认的内容\"]}}。"
+        ),
+        &image_path,
+        &mime_type,
+        512,
+        cancelled,
+    )?;
+    let payload = parse_vision_question_answer(&response)?;
+    Ok(ImageDeepAnalysis {
+        asset_id,
+        question: question.to_owned(),
+        answer: payload.answer,
+        observations: payload.observations,
+        uncertainties: payload.uncertainties,
+        model_artifact_id: artifact.artifact_id,
+        analyzed_at: Utc::now().to_rfc3339(),
+    })
 }
 
 #[tauri::command(async)]
@@ -1956,56 +2713,6 @@ pub fn collection_list(
     catalog: State<'_, CatalogServiceState>,
 ) -> Result<Vec<CollectionRecord>, AppError> {
     catalog.get()?.list_collections()
-}
-
-#[tauri::command(async)]
-pub fn knowledge_space_list(
-    catalog: State<'_, CatalogServiceState>,
-) -> Result<Vec<KnowledgeSpace>, AppError> {
-    catalog.get()?.list_knowledge_spaces()
-}
-
-#[tauri::command(async)]
-pub fn knowledge_space_create(
-    request: KnowledgeSpaceRequest,
-    catalog: State<'_, CatalogServiceState>,
-) -> Result<KnowledgeSpace, AppError> {
-    catalog.get()?.create_knowledge_space(&request)
-}
-
-#[derive(Debug, Deserialize)]
-pub struct KnowledgeSpaceUpdateRequest {
-    space_id: String,
-    space: KnowledgeSpaceRequest,
-}
-
-#[tauri::command(async)]
-pub fn knowledge_space_update(
-    request: KnowledgeSpaceUpdateRequest,
-    catalog: State<'_, CatalogServiceState>,
-) -> Result<KnowledgeSpace, AppError> {
-    let space_id = Uuid::parse_str(&request.space_id).map_err(|error| {
-        AppError::new("KNOWLEDGE_SPACE_REQUEST_INVALID", error.to_string(), false)
-    })?;
-    catalog
-        .get()?
-        .update_knowledge_space(&space_id, &request.space)
-}
-
-#[derive(Debug, Deserialize)]
-pub struct KnowledgeSpaceIdRequest {
-    space_id: String,
-}
-
-#[tauri::command(async)]
-pub fn knowledge_space_delete(
-    request: KnowledgeSpaceIdRequest,
-    catalog: State<'_, CatalogServiceState>,
-) -> Result<(), AppError> {
-    let space_id = Uuid::parse_str(&request.space_id).map_err(|error| {
-        AppError::new("KNOWLEDGE_SPACE_REQUEST_INVALID", error.to_string(), false)
-    })?;
-    catalog.get()?.delete_knowledge_space(&space_id)
 }
 
 #[tauri::command(async)]
@@ -2141,6 +2848,15 @@ pub fn collection_suggestion_refresh(
     models: State<'_, ModelServiceState>,
     generation: State<'_, GenerationServiceState>,
 ) -> Result<CollectionSuggestionRefreshResult, AppError> {
+    let correlation_id = Uuid::now_v7().to_string();
+    let started = Instant::now();
+    crate::runtime_log::event(
+        "info",
+        "collections.ai",
+        "suggestion.refresh_started",
+        Some(&correlation_id),
+        &json!({ "max_files": request.max_files }),
+    );
     let catalog = catalog.get()?;
     if catalog.maintenance_snapshot()?.degradation_level == "core" {
         return Err(AppError::new(
@@ -2188,7 +2904,7 @@ pub fn collection_suggestion_refresh(
             .filter(|item| new_ids.contains(&item.suggestion_id))
         {
             let _ = app.emit(
-                "collection.suggestion_phase",
+                "collection:suggestion_phase",
                 json!({"suggestion_id": suggestion.suggestion_id, "phase": "model_review"}),
             );
             let candidate_json = serde_json::to_string(
@@ -2212,7 +2928,7 @@ pub fn collection_suggestion_refresh(
             let reviewed = complete_with_model(
                 generation.0.as_ref(),
                 &generation_artifact,
-                "你是本地文档分类复核器。只复核给定候选，不得添加候选外文件。只输出JSON对象：{\"suggested_name\":\"不超过40字\",\"description\":\"说明共同主题和判断依据\",\"members\":[{\"file_id\":\"原UUID\",\"rationale\":\"该成员与主题的具体联系\"}]}。不相关成员应省略；少于2个相关成员也必须按原格式返回空members。",
+                "你是本地文档分类复核器。只复核给定候选，不得添加候选外文件。集合名称必须概括成员共同主题、文档类型和用途，禁止直接复制任一文件名，也禁止使用‘相关资料’‘文档集合’等空泛名称。只输出JSON对象：{\"suggested_name\":\"不超过40字\",\"description\":\"说明共同主题和判断依据\",\"members\":[{\"file_id\":\"原UUID\",\"rationale\":\"该成员与主题的具体联系\"}]}。不相关成员应省略；少于2个相关成员也必须按原格式返回空members。",
                 &format!("请结构化复核这个Embedding候选组：\n{candidate_json}"),
                 640,
                 &cancelled,
@@ -2239,7 +2955,19 @@ pub fn collection_suggestion_refresh(
         result.suggestion_ids = reviewed_ids;
         result.model_version = generation_artifact.artifact_id.to_string();
     }
-    let _ = app.emit("collection.suggestions_changed", &result);
+    let _ = app.emit("collection:suggestions_changed", &result);
+    crate::runtime_log::event(
+        "info",
+        "collections.ai",
+        "suggestion.refresh_completed",
+        Some(&correlation_id),
+        &json!({
+            "profiled_files": result.profiled_files,
+            "candidate_edges": result.candidate_edges,
+            "created_suggestions": result.created_suggestions,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        }),
+    );
     Ok(result)
 }
 
@@ -2309,8 +3037,8 @@ pub fn collection_suggestion_confirm(
     let collection = catalog
         .get()?
         .confirm_collection_suggestion(&request.suggestion_id)?;
-    let _ = app.emit("collection.suggestions_changed", &collection);
-    let _ = app.emit("catalog.changed", &collection);
+    let _ = app.emit("collection:suggestions_changed", &collection);
+    let _ = app.emit("catalog:changed", &collection);
     Ok(collection)
 }
 
@@ -2324,7 +3052,7 @@ pub fn collection_suggestion_reject(
         .get()?
         .reject_collection_suggestion(&request.suggestion_id)?;
     let _ = app.emit(
-        "collection.suggestions_changed",
+        "collection:suggestions_changed",
         json!({"suggestion_id": request.suggestion_id, "status": "rejected"}),
     );
     Ok(())
@@ -2339,8 +3067,42 @@ pub struct RelationRefreshRequest {
 pub fn relation_refresh(
     request: RelationRefreshRequest,
     catalog: State<'_, CatalogServiceState>,
+    models: State<'_, ModelServiceState>,
 ) -> Result<RelationRefreshResult, AppError> {
-    catalog.get()?.refresh_file_relations(request.max_files)
+    let correlation_id = Uuid::now_v7().to_string();
+    let started = Instant::now();
+    crate::runtime_log::event(
+        "info",
+        "relations",
+        "relation.refresh_started",
+        Some(&correlation_id),
+        &json!({ "max_files": request.max_files }),
+    );
+    let catalog = catalog.get()?;
+    let mut result = catalog.refresh_file_relations(request.max_files)?;
+    if let Some(embedding) = models.get()?.active_artifact(ModelRole::Embedding)? {
+        let (semantic, contains) = catalog.refresh_semantic_file_relations(
+            &embedding.artifact_id.to_string(),
+            request.max_files,
+        )?;
+        result.semantic_related_pairs = semantic;
+        result.contains_or_summarizes_pairs = contains;
+    }
+    crate::runtime_log::event(
+        "info",
+        "relations",
+        "relation.refresh_completed",
+        Some(&correlation_id),
+        &json!({
+            "hashed_files": result.hashed_files,
+            "exact_duplicate_pairs": result.exact_duplicate_pairs,
+            "version_candidate_pairs": result.version_candidate_pairs,
+            "semantic_related_pairs": result.semantic_related_pairs,
+            "contains_or_summarizes_pairs": result.contains_or_summarizes_pairs,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        }),
+    );
+    Ok(result)
 }
 
 #[tauri::command(async)]
@@ -2367,12 +3129,156 @@ pub fn relation_review(
         .review_file_relation(&request.relation_id, &request.action)
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RelationBatchReviewRequest {
+    relation_ids: Vec<Uuid>,
+    action: String,
+}
+
+#[tauri::command(async)]
+pub fn relation_batch_review(
+    request: RelationBatchReviewRequest,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<u64, AppError> {
+    catalog
+        .get()?
+        .review_file_relations(&request.relation_ids, &request.action)
+}
+
 #[tauri::command(async)]
 pub fn file_query(
     request: FileQuery,
     catalog: State<'_, CatalogServiceState>,
 ) -> Result<FilePage, AppError> {
     catalog.get()?.query_files(&request)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AnswerExportRequest {
+    message_id: Uuid,
+    target_path: String,
+    format: String,
+    confirmation: String,
+}
+
+#[tauri::command]
+pub async fn answer_export(
+    request: AnswerExportRequest,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<ExportResult, AppError> {
+    if request.confirmation != "EXPORT_NEW_FILE" {
+        return Err(AppError::new(
+            "EXPORT_CONFIRMATION_REQUIRED",
+            "导出需要用户明确确认只新建文件",
+            false,
+        ));
+    }
+    if !matches!(request.format.as_str(), "md" | "txt") {
+        return Err(AppError::new(
+            "EXPORT_FORMAT_UNSUPPORTED",
+            "问答结果只支持导出为Markdown或纯文本",
+            false,
+        ));
+    }
+    let target_path = PathBuf::from(request.target_path);
+    let expected_extension = request.format.as_str();
+    if !target_path.is_absolute()
+        || target_path.extension().and_then(|value| value.to_str()) != Some(expected_extension)
+    {
+        return Err(AppError::new(
+            "EXPORT_TARGET_INVALID",
+            "导出位置必须是带正确扩展名的绝对路径",
+            false,
+        ));
+    }
+    let catalog = catalog.get()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let answer = catalog.answer_result(&request.message_id)?;
+        catalog.validate_answer_evidence(&answer)?;
+        let content = render_answer_export(&answer, &request.format)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target_path)
+            .map_err(|error| {
+                let code = if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    "EXPORT_TARGET_EXISTS"
+                } else {
+                    "EXPORT_CREATE_FAILED"
+                };
+                AppError::new(
+                    code,
+                    if code == "EXPORT_TARGET_EXISTS" {
+                        "目标文件已存在，拾忆不会覆盖"
+                    } else {
+                        "无法在所选位置新建导出文件"
+                    },
+                    code != "EXPORT_TARGET_EXISTS",
+                )
+            })?;
+        if let Err(error) = file
+            .write_all(content.as_bytes())
+            .and_then(|_| file.sync_all())
+        {
+            drop(file);
+            let _ = fs::remove_file(&target_path);
+            return Err(AppError::new(
+                "EXPORT_WRITE_FAILED",
+                format!("导出写入失败：{error}"),
+                true,
+            ));
+        }
+        let mut digest = Sha256::new();
+        digest.update(content.as_bytes());
+        Ok(ExportResult {
+            target_path: target_path.to_string_lossy().into_owned(),
+            format: request.format,
+            row_count: answer.claims.len() as u64,
+            size_bytes: content.len() as u64,
+            sha256: format!("{:x}", digest.finalize()),
+        })
+    })
+    .await
+    .map_err(|error| AppError::new("EXPORT_WRITE_FAILED", error.to_string(), true))?
+}
+
+fn render_answer_export(answer: &AnswerResult, format: &str) -> Result<String, AppError> {
+    let mut output = String::new();
+    if format == "md" {
+        output.push_str("# 拾忆问答结果\n\n");
+    }
+    output.push_str(answer.answer.trim());
+    output.push_str(if format == "md" {
+        "\n\n## 引用依据\n"
+    } else {
+        "\n\n引用依据\n"
+    });
+    for (claim_index, claim) in answer.claims.iter().enumerate() {
+        output.push_str(&format!("\n{}. {}\n", claim_index + 1, claim.text.trim()));
+        for citation in &claim.citations {
+            let source_name = answer
+                .source_files
+                .iter()
+                .find(|source| source.file_id == citation.file_id)
+                .map(|source| source.display_name.as_str())
+                .unwrap_or("本地资料");
+            let locator = serde_json::to_string(&citation.locator)
+                .map_err(|error| AppError::new("EXPORT_DATA_INVALID", error.to_string(), false))?;
+            if format == "md" {
+                output.push_str(&format!(
+                    "   - **{source_name}** · `{locator}`\n     > {}\n",
+                    citation.quote.trim()
+                ));
+            } else {
+                output.push_str(&format!(
+                    "   - {source_name} · {locator}\n     {}\n",
+                    citation.quote.trim()
+                ));
+            }
+        }
+    }
+    output.push_str("\n由拾忆在本地依据已验证资料生成。\n");
+    Ok(output)
 }
 
 #[tauri::command(async)]
@@ -2404,174 +3310,64 @@ pub fn exclusion_rule_delete(
 }
 
 #[tauri::command(async)]
-pub fn extraction_preset_list() -> Vec<ExtractionPreset> {
-    remin_core::extraction_presets()
-}
-
-#[tauri::command(async)]
-pub fn extraction_run(
-    request: ExtractionRunRequest,
-    catalog: State<'_, CatalogServiceState>,
-) -> Result<ExtractionRunResult, AppError> {
-    catalog.get()?.run_extraction(&request)
-}
-
-#[tauri::command(async)]
-pub fn skill_list() -> Vec<SkillDefinition> {
-    remin_core::registered_skills()
-}
-
-#[tauri::command(async)]
-pub fn task_plan(request: PlanSkillRequest) -> Result<TaskPlan, AppError> {
-    remin_core::plan_skill(&request)
-}
-
-#[tauri::command(async)]
-pub fn task_execute(
-    request: PlanSkillRequest,
-    app: AppHandle,
-    catalog: State<'_, CatalogServiceState>,
-    worker: State<'_, WorkerServiceState>,
-) -> Result<TaskExecutionResult, AppError> {
-    if request.skill_id == "rerun_ocr" {
-        let files = catalog.get()?.authorized_files_by_ids(&request.file_ids)?;
-        let supported = ["pdf", "jpg", "jpeg", "png", "tif", "tiff", "bmp", "webp"];
-        let mut parsed = Vec::with_capacity(files.len());
-        for file in &files {
-            if !supported.contains(&file.extension.to_ascii_lowercase().as_str()) {
-                return Err(AppError::new(
-                    "OCR_FORMAT_UNSUPPORTED",
-                    format!("{}不是可重新OCR的图片或PDF", file.display_name),
-                    false,
-                ));
-            }
-            let revision_id = file
-                .current_revision_id
-                .ok_or_else(|| AppError::new("OCR_FILE_NOT_INDEXED", "文件缺少当前修订", true))?;
-            let parse_request = ParseRequest {
-                job_id: Uuid::now_v7(),
-                file_id: file.file_id,
-                revision_id,
-                source_path: file.canonical_path.clone(),
-                format: file.extension.clone(),
-                ocr_policy: "force".to_owned(),
-                language_hints: vec!["zh".to_owned(), "en".to_owned()],
-                max_pages: None,
-                asset_cache_dir: image_asset_cache_dir(&app, &revision_id),
-                parser_version: "0.1.0".to_owned(),
-            };
-            let result = worker.client.parse_document(&parse_request)?;
-            if matches!(
-                result.status,
-                ParseOutcome::Failed | ParseOutcome::Unsupported | ParseOutcome::Encrypted
-            ) || result.metrics.ocr_page_count == 0
-            {
-                return Err(result.error.clone().unwrap_or_else(|| {
-                    AppError::new(
-                        "OCR_RERUN_EMPTY",
-                        format!("{}没有产生可验证的OCR结果，原索引已保留", file.display_name),
-                        true,
-                    )
-                }));
-            }
-            parsed.push((file.file_id, result));
-        }
-        for (file_id, result) in &parsed {
-            catalog.get()?.commit_parse_result(file_id, result)?;
-        }
-    }
-    catalog.get()?.execute_task(&request)
-}
-
-#[tauri::command(async)]
-pub fn task_recoverable(
-    catalog: State<'_, CatalogServiceState>,
-) -> Result<Option<TaskPlan>, AppError> {
-    catalog.get()?.latest_recoverable_task_plan()
-}
-
-#[derive(Debug, Deserialize)]
-pub struct TaskResumeRequest {
-    task_id: String,
-}
-
-#[tauri::command(async)]
-pub fn task_resume(
-    request: TaskResumeRequest,
-    catalog: State<'_, CatalogServiceState>,
-) -> Result<TaskExecutionResult, AppError> {
-    let task_id = Uuid::parse_str(&request.task_id)
-        .map_err(|_| AppError::new("TASK_ID_INVALID", "任务标识无效", false))?;
-    catalog.get()?.resume_task_execution(&task_id)
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ExtractionExportRequest {
-    run: ExtractionRunResult,
-    format: String,
-    target_path: String,
-}
-
-#[tauri::command(async)]
-pub fn extraction_export(
-    request: ExtractionExportRequest,
-    worker: State<'_, WorkerServiceState>,
-) -> Result<ExportResult, AppError> {
-    let mut headers = vec!["文件名".to_owned(), "资料路径".to_owned()];
-    headers.extend(
-        request
-            .run
-            .preset
-            .fields
-            .iter()
-            .map(|field| field.label.clone()),
-    );
-    let rows = request
-        .run
-        .rows
-        .iter()
-        .map(|row| {
-            let mut values = vec![
-                json!(row.file.display_name),
-                json!(privacy_safe_display_path(&row.file.canonical_path)),
-            ];
-            for field in &request.run.preset.fields {
-                values.push(
-                    row.values
-                        .iter()
-                        .find(|value| value.field_key == field.key)
-                        .map(|value| value.normalized_value.clone())
-                        .unwrap_or(Value::Null),
-                );
-            }
-            values
-        })
-        .collect();
-    worker.client.export_table(&ExportTableRequest {
-        target_path: request.target_path,
-        format: request.format,
-        headers,
-        rows,
-    })
-}
-
-#[tauri::command(async)]
 pub fn maintenance_get(
     catalog: State<'_, CatalogServiceState>,
-    environment: State<'_, EnvironmentServiceState>,
 ) -> Result<MaintenanceSnapshot, AppError> {
-    if let Some(check) = environment
-        .latest
-        .lock()
-        .expect("environment state poisoned")
-        .clone()
-        && let Some((level, triggers)) = environment_degradation(&check)
-    {
-        catalog
-            .get()?
-            .reconcile_degradation_state(level, triggers)?;
+    let mut snapshot = catalog.get()?.maintenance_snapshot()?;
+    if let Ok(runtime_events) = crate::runtime_log::count() {
+        snapshot.log_events = runtime_events;
     }
-    catalog.get()?.maintenance_snapshot()
+    Ok(snapshot)
+}
+
+#[tauri::command(async)]
+pub fn app_status_get(
+    catalog: State<'_, CatalogServiceState>,
+    generation: State<'_, GenerationServiceState>,
+    worker: State<'_, WorkerServiceState>,
+) -> Result<AppStatusSnapshot, AppError> {
+    let catalog = catalog.get()?;
+    let roots = catalog.list_roots()?;
+    let active_scan = catalog.latest_active_scan_job()?;
+    let index_stats = catalog.index_activity_stats()?;
+    let mut maintenance = catalog.maintenance_snapshot()?;
+    if let Ok(runtime_events) = crate::runtime_log::count() {
+        maintenance.log_events = runtime_events;
+    }
+    let scan_progress = active_scan.map(|job| AppStatusScanProgress {
+        scan_job_id: job.job_id,
+        status: job.status,
+        discovered_files: index_stats.discovered_files,
+        searchable_files: index_stats.searchable_files,
+        parsed_files: index_stats.parsed_files,
+        embedded_files: index_stats.embedded_files,
+        ocr_pages: index_stats.ocr_pages,
+        progress: job.progress,
+    });
+    let mut recovery_actions = Vec::new();
+    if maintenance.failed_files > 0 {
+        recovery_actions.push("view_inbox");
+    }
+    if maintenance.pending_files > 0 || maintenance.active_jobs > 0 {
+        recovery_actions.push("view_maintenance");
+    }
+    recovery_actions.push("view_models");
+    let checked_at = maintenance.checked_at.to_rfc3339();
+    let mut inference_runtime = inference_runtime_state(&generation)?;
+    if worker.foreground_activity.load(Ordering::Acquire) > 0 {
+        inference_runtime.pressure_reason =
+            Some("正在优先处理搜索或问答，后台模型任务已让出".into());
+    }
+    Ok(AppStatusSnapshot {
+        local_only: true,
+        source_files_readonly: true,
+        roots,
+        scan_progress,
+        maintenance,
+        inference_runtime,
+        recovery_actions,
+        checked_at,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -2604,7 +3400,6 @@ pub struct StorageUsageSnapshot {
     disk_capacity_bytes: Option<u64>,
     disk_available_bytes: Option<u64>,
     soft_quota_bytes: u64,
-    soft_quota_is_custom: bool,
     over_soft_quota: bool,
     background_tasks_paused: bool,
     notice: Option<String>,
@@ -2627,36 +3422,56 @@ pub struct CacheClearResult {
 #[tauri::command(async)]
 pub fn storage_usage_get(
     environment: State<'_, EnvironmentServiceState>,
-    catalog: State<'_, CatalogServiceState>,
 ) -> Result<StorageUsageSnapshot, AppError> {
-    storage_usage_snapshot(
-        &environment.data_directory,
-        catalog.get()?.storage_quota_override()?,
-    )
-}
-
-#[derive(Debug, Deserialize)]
-pub struct StoragePolicySetRequest {
-    quota_bytes: u64,
-    confirmation: String,
+    storage_usage_snapshot(&environment.data_directory)
 }
 
 #[tauri::command(async)]
-pub fn storage_policy_set(
-    request: StoragePolicySetRequest,
+pub fn storage_location_get(
+    environment: State<'_, EnvironmentServiceState>,
+) -> crate::StorageLocationStatus {
+    crate::storage_location_status(&environment.config_directory, &environment.data_directory)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StorageMigrationScheduleRequest {
+    selected_directory: String,
+    confirmation: String,
+}
+
+#[tauri::command]
+pub async fn storage_migration_schedule(
+    request: StorageMigrationScheduleRequest,
     environment: State<'_, EnvironmentServiceState>,
     catalog: State<'_, CatalogServiceState>,
-) -> Result<StorageUsageSnapshot, AppError> {
-    if request.confirmation != "SET_STORAGE_QUOTA" {
+) -> Result<crate::StorageLocationStatus, AppError> {
+    if request.confirmation != "MIGRATE_APPLICATION_STORAGE" {
         return Err(AppError::new(
-            "STORAGE_POLICY_CONFIRMATION_REQUIRED",
-            "调整存储软配额前需要明确确认",
+            "STORAGE_MIGRATION_CONFIRMATION_REQUIRED",
+            "迁移应用数据需要再次明确确认",
             false,
         ));
     }
-    let catalog = catalog.get()?;
-    let quota = catalog.set_storage_quota_override(request.quota_bytes)?;
-    storage_usage_snapshot(&environment.data_directory, Some(quota))
+    let config_directory = environment.config_directory.clone();
+    let data_directory = environment.data_directory.clone();
+    let selected_directory = PathBuf::from(request.selected_directory);
+    let roots = catalog
+        .get()?
+        .list_roots()?
+        .into_iter()
+        .filter(|root| root.enabled)
+        .map(|root| PathBuf::from(root.canonical_path))
+        .collect::<Vec<_>>();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::schedule_storage_migration(
+            &config_directory,
+            &data_directory,
+            &selected_directory,
+            &roots,
+        )
+    })
+    .await
+    .map_err(|error| AppError::new("STORAGE_MIGRATION_SCHEDULE_FAILED", error.to_string(), true))?
 }
 
 #[tauri::command(async)]
@@ -2729,21 +3544,26 @@ pub fn app_data_reset_schedule(
     app.restart();
 }
 
-fn storage_usage_snapshot(
-    data_directory: &Path,
-    quota_override: Option<u64>,
-) -> Result<StorageUsageSnapshot, AppError> {
+fn storage_usage_snapshot(data_directory: &Path) -> Result<StorageUsageSnapshot, AppError> {
     let database_size = ["remin.db", "remin.db-wal", "remin.db-shm"]
         .iter()
         .try_fold(0_u64, |total, name| {
             Ok::<u64, AppError>(total + file_size(&data_directory.join(name))?)
         })?;
     let model_root = data_directory.join("models");
-    let installed_models = ["generation", "embedding", "vision", "reranker", "ocr"]
-        .iter()
-        .try_fold(0_u64, |total, name| {
-            Ok::<u64, AppError>(total + directory_size(&model_root.join(name))?)
-        })?;
+    let installed_models = [
+        "generation",
+        "embedding",
+        "vision",
+        "reranker",
+        "ocr",
+        "tts",
+        "asr",
+    ]
+    .iter()
+    .try_fold(0_u64, |total, name| {
+        Ok::<u64, AppError>(total + directory_size(&model_root.join(name))?)
+    })?;
     let downloads = model_root.join(".downloads");
     let failed_downloads = directory_size(&downloads.join("quarantine"))?;
     let download_staging = directory_size(&downloads)?.saturating_sub(failed_downloads);
@@ -2801,7 +3621,7 @@ fn storage_usage_snapshot(
     let default_quota = disk_capacity_bytes
         .map(|capacity| (capacity / 10).clamp(10 * GIB, 50 * GIB))
         .unwrap_or(10 * GIB);
-    let soft_quota_bytes = quota_override.unwrap_or(default_quota);
+    let soft_quota_bytes = default_quota;
     let over_soft_quota = total_bytes >= soft_quota_bytes;
     Ok(StorageUsageSnapshot {
         total_bytes,
@@ -2810,7 +3630,6 @@ fn storage_usage_snapshot(
         disk_capacity_bytes,
         disk_available_bytes,
         soft_quota_bytes,
-        soft_quota_is_custom: quota_override.is_some(),
         over_soft_quota,
         background_tasks_paused: over_soft_quota,
         notice: over_soft_quota
@@ -2819,19 +3638,58 @@ fn storage_usage_snapshot(
     })
 }
 
-fn background_storage_budget_allows(app: &AppHandle, catalog: &CatalogService) -> bool {
-    let environment = app.state::<EnvironmentServiceState>();
-    let quota = match catalog.storage_quota_override() {
-        Ok(value) => value,
-        Err(error) => {
-            let _ = app.emit("background.paused", error);
+fn background_storage_budget_allows(app: &AppHandle) -> bool {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if let Some((total, available)) = memory_status_bytes() {
+        let reserve = (total / 5).max(2 * GIB);
+        if available < reserve {
+            if !MEMORY_PRESSURE_ACTIVE.swap(true, Ordering::AcqRel) {
+                crate::runtime_log::event(
+                    "warning",
+                    "background",
+                    "memory_budget.paused",
+                    None,
+                    &json!({
+                        "available_bytes": available,
+                        "reserve_bytes": reserve,
+                    }),
+                );
+                let _ = app.emit(
+                    "background:paused",
+                    json!({
+                        "reason": "system_memory_reserve",
+                        "notice": "系统可用内存较低，已暂停新的后台模型任务",
+                    }),
+                );
+            }
             return false;
         }
-    };
-    match storage_usage_snapshot(&environment.data_directory, quota) {
+        if MEMORY_PRESSURE_ACTIVE.swap(false, Ordering::AcqRel) {
+            crate::runtime_log::event(
+                "info",
+                "background",
+                "memory_budget.resumed",
+                None,
+                &json!({ "available_bytes": available, "reserve_bytes": reserve }),
+            );
+        }
+    }
+    let environment = app.state::<EnvironmentServiceState>();
+    match storage_usage_snapshot(&environment.data_directory) {
         Ok(snapshot) if snapshot.background_tasks_paused => {
+            crate::runtime_log::event(
+                "warning",
+                "background",
+                "storage_budget.paused",
+                None,
+                &json!({
+                    "used_bytes": snapshot.total_bytes,
+                    "soft_quota_bytes": snapshot.soft_quota_bytes,
+                    "disk_available_bytes": snapshot.disk_available_bytes,
+                }),
+            );
             let _ = app.emit(
-                "background.paused",
+                "background:paused",
                 json!({
                     "reason": "storage_soft_quota",
                     "notice": snapshot.notice,
@@ -2843,7 +3701,14 @@ fn background_storage_budget_allows(app: &AppHandle, catalog: &CatalogService) -
         }
         Ok(_) => true,
         Err(error) => {
-            let _ = app.emit("background.paused", error);
+            crate::runtime_log::event(
+                "error",
+                "background",
+                "storage_budget.measure_failed",
+                None,
+                &json!({ "error_code": error.code, "retryable": error.retryable }),
+            );
+            let _ = app.emit("background:paused", error);
             false
         }
     }
@@ -2956,12 +3821,96 @@ pub fn maintenance_log_query(
     request: LogQuery,
     catalog: State<'_, CatalogServiceState>,
 ) -> Result<LogPage, AppError> {
+    let runtime_page = crate::runtime_log::query(&request)?;
+    if runtime_page.total > 0 {
+        return Ok(runtime_page);
+    }
     catalog.get()?.query_logs(&request)
 }
 
 #[tauri::command(async)]
 pub fn maintenance_logs_clear(catalog: State<'_, CatalogServiceState>) -> Result<u64, AppError> {
-    catalog.get()?.clear_logs()
+    let runtime_removed = crate::runtime_log::clear()?;
+    let database_removed = catalog.get()?.clear_logs()?;
+    Ok(runtime_removed.saturating_add(database_removed))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DiagnosticEventInput {
+    level: String,
+    component: String,
+    event_name: String,
+    #[serde(default)]
+    correlation_id: Option<String>,
+    #[serde(default = "empty_json_object")]
+    fields: Value,
+}
+
+fn empty_json_object() -> Value {
+    json!({})
+}
+
+#[tauri::command(async)]
+pub fn diagnostic_event_append(request: DiagnosticEventInput) -> Result<(), AppError> {
+    validate_diagnostic_identifier("component", &request.component, 80)?;
+    validate_diagnostic_identifier("event_name", &request.event_name, 120)?;
+    if let Some(correlation_id) = request.correlation_id.as_deref() {
+        validate_diagnostic_identifier("correlation_id", correlation_id, 128)?;
+    }
+    if !matches!(
+        request.level.as_str(),
+        "debug" | "info" | "warning" | "warn" | "error"
+    ) {
+        return Err(AppError::new(
+            "DIAGNOSTIC_LEVEL_INVALID",
+            "诊断事件级别无效",
+            false,
+        ));
+    }
+    if !request.fields.is_object() {
+        return Err(AppError::new(
+            "DIAGNOSTIC_FIELDS_INVALID",
+            "诊断事件字段必须是对象",
+            false,
+        ));
+    }
+    let field_bytes = serde_json::to_vec(&request.fields)
+        .map_err(|error| AppError::new("DIAGNOSTIC_SERIALIZE_FAILED", error.to_string(), false))?;
+    if field_bytes.len() > 16 * 1024 {
+        return Err(AppError::new(
+            "DIAGNOSTIC_FIELDS_TOO_LARGE",
+            "单条诊断事件不能超过16KB",
+            false,
+        ));
+    }
+    crate::runtime_log::event(
+        &request.level,
+        &request.component,
+        &request.event_name,
+        request.correlation_id.as_deref(),
+        &request.fields,
+    );
+    Ok(())
+}
+
+fn validate_diagnostic_identifier(
+    field: &str,
+    value: &str,
+    max_length: usize,
+) -> Result<(), AppError> {
+    if value.is_empty()
+        || value.len() > max_length
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+    {
+        return Err(AppError::new(
+            "DIAGNOSTIC_IDENTIFIER_INVALID",
+            format!("诊断事件字段 {field} 无效"),
+            false,
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -2975,7 +3924,8 @@ pub fn diagnostic_export(
     request: DiagnosticExportRequest,
     catalog: State<'_, CatalogServiceState>,
     environment: State<'_, EnvironmentServiceState>,
-    worker: State<'_, WorkerServiceState>,
+    models: State<'_, ModelServiceState>,
+    startup: State<'_, crate::commands::startup::StartupServiceState>,
 ) -> Result<ExportResult, AppError> {
     if !request.confirmed {
         return Err(AppError::new(
@@ -2984,37 +3934,83 @@ pub fn diagnostic_export(
             false,
         ));
     }
+    let target = PathBuf::from(request.target_path.trim());
+    if !target.is_absolute() || target.extension().and_then(|value| value.to_str()) != Some("json")
+    {
+        return Err(AppError::new(
+            "EXPORT_TARGET_INVALID",
+            "诊断包必须导出到绝对路径的JSON新文件",
+            false,
+        ));
+    }
     let catalog = catalog.get()?;
-    let snapshot = catalog.maintenance_snapshot()?;
-    let logs = catalog.list_logs(200)?;
+    let mut snapshot = catalog.maintenance_snapshot()?;
+    snapshot.log_events = crate::runtime_log::count().unwrap_or(snapshot.log_events);
+    let runtime_logs = crate::runtime_log::recent_values(2_000)?;
+    let database_logs = catalog.list_logs(500)?;
     let latest_environment = environment
         .latest
         .lock()
         .map_err(|_| AppError::new("ENVIRONMENT_STATE_UNAVAILABLE", "环境状态不可用", true))?
         .clone();
-    worker.client.export_table(&ExportTableRequest {
-        target_path: request.target_path,
+    let startup_state = startup
+        .0
+        .lock()
+        .map_err(|_| AppError::new("STARTUP_STATE_UNAVAILABLE", "启动状态不可用", true))?
+        .clone();
+    let model_downloads = models
+        .get()
+        .and_then(|manager| manager.list_download_jobs())
+        .unwrap_or_default();
+    let payload = remin_core::sanitize_log_value(
+        &json!({
+            "schema_version": 1,
+            "generated_at": Utc::now().to_rfc3339(),
+            "app_version": env!("CARGO_PKG_VERSION"),
+            "session_id": crate::runtime_log::session_id(),
+            "startup": startup_state,
+            "maintenance": snapshot,
+            "environment": latest_environment,
+            "model_downloads": model_downloads,
+            "runtime_logs": runtime_logs,
+            "catalog_logs": database_logs,
+        }),
+        None,
+    );
+    let bytes = serde_json::to_vec_pretty(&payload)
+        .map_err(|error| AppError::new("DIAGNOSTIC_SERIALIZE_FAILED", error.to_string(), false))?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| AppError::new("EXPORT_DIRECTORY_FAILED", error.to_string(), true))?;
+    }
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target)
+        .map_err(|error| {
+            let code = if error.kind() == std::io::ErrorKind::AlreadyExists {
+                "EXPORT_TARGET_EXISTS"
+            } else {
+                "EXPORT_CREATE_FAILED"
+            };
+            AppError::new(code, error.to_string(), true)
+        })?;
+    if let Err(error) = output.write_all(&bytes).and_then(|_| output.flush()) {
+        drop(output);
+        let _ = fs::remove_file(&target);
+        return Err(AppError::new(
+            "EXPORT_WRITE_FAILED",
+            error.to_string(),
+            true,
+        ));
+    }
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    Ok(ExportResult {
+        target_path: target.to_string_lossy().into_owned(),
         format: "json".to_owned(),
-        headers: vec![
-            "generated_at".to_owned(),
-            "app_version".to_owned(),
-            "maintenance".to_owned(),
-            "environment".to_owned(),
-            "recent_logs".to_owned(),
-        ],
-        rows: vec![vec![
-            json!(Utc::now().to_rfc3339()),
-            json!(env!("CARGO_PKG_VERSION")),
-            serde_json::to_value(snapshot).map_err(|error| {
-                AppError::new("DIAGNOSTIC_SERIALIZE_FAILED", error.to_string(), false)
-            })?,
-            serde_json::to_value(latest_environment).map_err(|error| {
-                AppError::new("DIAGNOSTIC_SERIALIZE_FAILED", error.to_string(), false)
-            })?,
-            serde_json::to_value(logs).map_err(|error| {
-                AppError::new("DIAGNOSTIC_SERIALIZE_FAILED", error.to_string(), false)
-            })?,
-        ]],
+        row_count: runtime_logs.len() as u64 + database_logs.len() as u64,
+        size_bytes: bytes.len() as u64,
+        sha256,
     })
 }
 
@@ -3028,11 +4024,49 @@ pub fn index_rebuild(
     request: IndexRebuildRequest,
     app: AppHandle,
     catalog: State<'_, CatalogServiceState>,
-) -> Result<IndexRebuildResult, AppError> {
+) -> Result<OperationHandle, AppError> {
+    remin_core::validate_rebuild_confirmation(&request.confirmation)?;
     let catalog = catalog.get()?;
-    let result = catalog.rebuild_index(&request.confirmation)?;
-    spawn_parse_pending(app, catalog);
-    Ok(result)
+    let operation_id = Uuid::now_v7();
+    let handle = OperationHandle {
+        operation_id,
+        kind: "index_rebuild",
+        status: "queued",
+        created_at: Utc::now().to_rfc3339(),
+    };
+    let completion_handle = handle.clone();
+    crate::runtime_log::event(
+        "info",
+        "index",
+        "index.rebuild_started",
+        Some(&operation_id.to_string()),
+        &json!({ "operation_id": operation_id }),
+    );
+    let _ = app.emit("index:rebuild_started", &handle);
+    thread::spawn(move || match catalog.rebuild_index("REBUILD_INDEX") {
+        Ok(result) => {
+            crate::runtime_log::event(
+                "info",
+                "index",
+                "index.rebuild_prepared",
+                Some(&operation_id.to_string()),
+                &json!({ "operation_id": operation_id, "reset_files": result.reset_files, "source_files_modified": false }),
+            );
+            let _ = app.emit("index:changed", json!({ "operation": { "operation_id": completion_handle.operation_id, "kind": completion_handle.kind, "status": "completed", "created_at": completion_handle.created_at }, "result": result }));
+            spawn_parse_pending(app, catalog);
+        }
+        Err(error) => {
+            crate::runtime_log::event(
+                "error",
+                "index",
+                "index.rebuild_failed",
+                Some(&operation_id.to_string()),
+                &json!({ "operation_id": operation_id, "error_code": error.code, "retryable": error.retryable }),
+            );
+            let _ = app.emit("index:failed", &error);
+        }
+    });
+    Ok(handle)
 }
 
 #[tauri::command(async)]
@@ -3043,19 +4077,35 @@ pub fn search_start(
     worker: State<'_, WorkerServiceState>,
     generation: State<'_, GenerationServiceState>,
 ) -> Result<SearchSession, AppError> {
+    let _foreground_guard = ForegroundActivityGuard::begin(&worker.foreground_activity);
+    let correlation_id = Uuid::now_v7().to_string();
+    let started = Instant::now();
+    crate::runtime_log::event(
+        "info",
+        "search",
+        "search.started",
+        Some(&correlation_id),
+        &json!({
+            "mode": request.mode,
+            "query_length": request.query.chars().count(),
+            "page_size": request.page_size,
+            "has_cursor": request.cursor.is_some(),
+            "root_scope_count": request.scope.root_ids.len(),
+            "collection_scope_count": request.scope.collection_ids.len(),
+            "file_scope_count": request.scope.file_ids.len(),
+        }),
+    );
     let catalog = catalog.get()?;
     let models = models.get()?;
     // 查询理解：将自然语言转换为结构化检索参数
     let intent: Option<remin_core::QueryIntent> = if is_natural_language_query(&request.query) {
-        models.active_artifact(ModelRole::Generation)
+        models
+            .active_artifact(ModelRole::Generation)
             .ok()
             .flatten()
             .and_then(|artifact| {
                 generation.0.lock().ok().and_then(|mut runtime| {
-                    let threads = std::thread::available_parallelism()
-                        .map(|v| v.get() as u32)
-                        .unwrap_or(2)
-                        .clamp(1, 8);
+                    let threads = background_inference_threads();
                     let _ = runtime
                         .activate(&artifact.local_path, 4096, threads)
                         .or_else(|_| runtime.activate(&artifact.local_path, 2048, threads));
@@ -3075,10 +4125,11 @@ pub fn search_start(
         request.query = intent.rewritten_query;
         if let Some(hint) = intent.time_hint {
             if request.scope.modified_from.is_none() {
-                request.scope.modified_from = chrono::NaiveDate::parse_from_str(&hint.from, "%Y-%m-%d")
-                    .ok()
-                    .and_then(|d| d.and_hms_opt(0, 0, 0))
-                    .map(|t| chrono::DateTime::<Utc>::from_naive_utc_and_offset(t, Utc));
+                request.scope.modified_from =
+                    chrono::NaiveDate::parse_from_str(&hint.from, "%Y-%m-%d")
+                        .ok()
+                        .and_then(|d| d.and_hms_opt(0, 0, 0))
+                        .map(|t| chrono::DateTime::<Utc>::from_naive_utc_and_offset(t, Utc));
             }
             if request.scope.modified_to.is_none() {
                 request.scope.modified_to = chrono::NaiveDate::parse_from_str(&hint.to, "%Y-%m-%d")
@@ -3111,31 +4162,81 @@ pub fn search_start(
             })
             && let Some(vector) = response.vectors.first()
         {
-            return catalog.search_with_semantic(
+            let result = catalog.search_with_semantic(
                 &request,
                 Some(SemanticQuery {
                     model_artifact_id: &artifact.artifact_id.to_string(),
                     vector,
                 }),
+            )?;
+            crate::runtime_log::event(
+                "info",
+                "search",
+                "search.completed",
+                Some(&correlation_id),
+                &json!({
+                    "search_id": result.search_id,
+                    "result_count": result.results.len(),
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                    "semantic_used": true,
+                    "has_more": result.next_cursor.is_some(),
+                }),
             );
+            return Ok(result);
         }
     }
-    catalog.search(&request)
+    let result = catalog.search(&request)?;
+    crate::runtime_log::event(
+        "info",
+        "search",
+        "search.completed",
+        Some(&correlation_id),
+        &json!({
+            "search_id": result.search_id,
+            "result_count": result.results.len(),
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "semantic_used": false,
+            "has_more": result.next_cursor.is_some(),
+        }),
+    );
+    Ok(result)
 }
 
 #[tauri::command(async)]
 pub fn ask_start(
-    request: AskRequest,
+    mut request: AskRequest,
     app: AppHandle,
     catalog: State<'_, CatalogServiceState>,
     models: State<'_, ModelServiceState>,
     worker: State<'_, WorkerServiceState>,
     generation: State<'_, GenerationServiceState>,
 ) -> Result<OperationHandle, AppError> {
+    if request.session_id.is_none() {
+        request.session_id = Some(Uuid::now_v7());
+    }
     request.validate()?;
     let catalog = catalog.get()?;
     let models = models.get()?;
     let operation_id = Uuid::now_v7();
+    crate::runtime_log::event(
+        "info",
+        "rag",
+        "ask.queued",
+        Some(&operation_id.to_string()),
+        &json!({
+            "operation_id": operation_id,
+            "session_id": request.session_id,
+            "mode": request.mode,
+            "question_length": request.question.chars().count(),
+            "strict_evidence": request.strict_evidence,
+            "allow_degraded_extractive": request.allow_degraded_extractive,
+            "retrieval_limit": request.retrieval_limit,
+            "max_source_files": request.max_source_files,
+            "root_scope_count": request.scope.root_ids.len(),
+            "collection_scope_count": request.scope.collection_ids.len(),
+            "file_scope_count": request.scope.file_ids.len(),
+        }),
+    );
     let cancelled = Arc::new(AtomicBool::new(false));
     let ask_worker = worker.client.isolated();
     let handle = OperationHandle {
@@ -3184,16 +4285,59 @@ pub fn ask_start(
     let worker = ask_worker;
     let generation = Arc::clone(&generation.0);
     tauri::async_runtime::spawn_blocking(move || {
+        let foreground_worker = app.state::<WorkerServiceState>();
+        let _foreground_guard =
+            ForegroundActivityGuard::begin(&foreground_worker.foreground_activity);
+        let operation_started = Instant::now();
         if let Ok(mut entries) = operations.0.lock()
             && let Some(entry) = entries.get_mut(&operation_id)
         {
             entry.handle.status = "running";
         }
         let phase_app = app.clone();
+        let claim_app = app.clone();
         let phase = |name: &str, progress: f64| {
+            crate::runtime_log::event(
+                "info",
+                "rag",
+                "ask.phase_changed",
+                Some(&operation_id.to_string()),
+                &json!({
+                    "operation_id": operation_id,
+                    "phase": name,
+                    "progress": progress,
+                }),
+            );
             let _ = phase_app.emit(
-                "ask.phase",
+                "ask:phase",
                 json!({"operation_id": operation_id, "phase": name, "progress": progress}),
+            );
+        };
+        let verified_claim = |claim: &AnswerClaim| {
+            crate::runtime_log::event(
+                "info",
+                "rag",
+                "ask.claim_verified",
+                Some(&operation_id.to_string()),
+                &json!({
+                    "operation_id": operation_id,
+                    "claim_id": claim.claim_id,
+                    "citation_count": claim.citations.len(),
+                }),
+            );
+            for citation in &claim.citations {
+                let _ = claim_app.emit(
+                    "ask:citation",
+                    json!({"operation_id": operation_id, "claim_id": claim.claim_id, "citation": citation}),
+                );
+            }
+            let _ = claim_app.emit(
+                "ask:claim",
+                json!({"operation_id": operation_id, "claim": claim}),
+            );
+            let _ = claim_app.emit(
+                "ask:token",
+                json!({"operation_id": operation_id, "token": format!("{}\n", claim.text), "verified": true}),
             );
         };
         let result = compute_answer(
@@ -3203,7 +4347,7 @@ pub fn ask_start(
             &worker,
             &generation,
             &cancelled,
-            &phase,
+            (&phase, &verified_claim),
         );
         if cancelled.load(Ordering::Acquire) {
             let error = AppError::new("OPERATION_CANCELLED", "问答已取消", false);
@@ -3214,34 +4358,23 @@ pub fn ask_start(
                 entry.error = Some(error.clone());
             }
             let _ = app.emit(
-                "ask.cancelled",
+                "ask:cancelled",
                 json!({"operation_id": operation_id, "error": error}),
+            );
+            crate::runtime_log::event(
+                "warning",
+                "rag",
+                "ask.cancelled",
+                Some(&operation_id.to_string()),
+                &json!({
+                    "operation_id": operation_id,
+                    "elapsed_ms": operation_started.elapsed().as_millis() as u64,
+                }),
             );
             return;
         }
         match result {
             Ok(answer) => {
-                for claim in &answer.claims {
-                    for citation in &claim.citations {
-                        let _ = app.emit(
-                            "ask.citation",
-                            json!({"operation_id": operation_id, "claim_id": claim.claim_id, "citation": citation}),
-                        );
-                    }
-                    let _ = app.emit(
-                        "ask.claim",
-                        json!({"operation_id": operation_id, "claim": claim}),
-                    );
-                }
-                for claim in &answer.claims {
-                    if cancelled.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let _ = app.emit(
-                        "ask.token",
-                        json!({"operation_id": operation_id, "token": format!("{}\n", claim.text), "verified": true}),
-                    );
-                }
                 if cancelled.load(Ordering::Acquire) {
                     let error = AppError::new("OPERATION_CANCELLED", "问答已取消", false);
                     if let Ok(mut entries) = operations.0.lock()
@@ -3251,8 +4384,18 @@ pub fn ask_start(
                         entry.error = Some(error.clone());
                     }
                     let _ = app.emit(
-                        "ask.cancelled",
+                        "ask:cancelled",
                         json!({"operation_id": operation_id, "error": error}),
+                    );
+                    crate::runtime_log::event(
+                        "warning",
+                        "rag",
+                        "ask.cancelled",
+                        Some(&operation_id.to_string()),
+                        &json!({
+                            "operation_id": operation_id,
+                            "elapsed_ms": operation_started.elapsed().as_millis() as u64,
+                        }),
                     );
                     return;
                 }
@@ -3263,11 +4406,32 @@ pub fn ask_start(
                     entry.result = Some(answer.clone());
                 }
                 let _ = app.emit(
-                    "ask.completed",
+                    "ask:completed",
                     json!({"operation_id": operation_id, "result": answer}),
+                );
+                crate::runtime_log::event(
+                    "info",
+                    "rag",
+                    "ask:completed",
+                    Some(&operation_id.to_string()),
+                    &json!({
+                        "operation_id": operation_id,
+                        "session_id": answer.session_id,
+                        "answer_mode": answer.answer_mode,
+                        "claim_count": answer.claims.len(),
+                        "source_file_count": answer.source_files.len(),
+                        "citation_count": answer.claims.iter().map(|claim| claim.citations.len()).sum::<usize>(),
+                        "insufficient_evidence": answer.insufficient_evidence,
+                        "index_coverage": answer.index_coverage,
+                        "retrieval_channels": answer.retrieval_channels,
+                        "elapsed_ms": operation_started.elapsed().as_millis() as u64,
+                    }),
                 );
             }
             Err(error) => {
+                if error.code != "OPERATION_CANCELLED" {
+                    let _ = catalog.record_ask_failure(&request, &error);
+                }
                 if let Ok(mut entries) = operations.0.lock()
                     && let Some(entry) = entries.get_mut(&operation_id)
                 {
@@ -3275,8 +4439,20 @@ pub fn ask_start(
                     entry.error = Some(error.clone());
                 }
                 let _ = app.emit(
-                    "ask.failed",
+                    "ask:failed",
                     json!({"operation_id": operation_id, "error": error}),
+                );
+                crate::runtime_log::event(
+                    "error",
+                    "rag",
+                    "ask:failed",
+                    Some(&operation_id.to_string()),
+                    &json!({
+                        "operation_id": operation_id,
+                        "error_code": error.code,
+                        "retryable": error.retryable,
+                        "elapsed_ms": operation_started.elapsed().as_millis() as u64,
+                    }),
                 );
             }
         }
@@ -3291,8 +4467,9 @@ fn compute_answer(
     worker: &WorkerClient,
     generation: &Mutex<LocalGenerationRuntime>,
     cancelled: &AtomicBool,
-    phase: &dyn Fn(&str, f64),
+    progress: AskProgressCallbacks<'_>,
 ) -> Result<AnswerResult, AppError> {
+    let (phase, verified_claim) = progress;
     if cancelled.load(Ordering::Acquire) {
         return Err(AppError::new("OPERATION_CANCELLED", "问答已取消", false));
     }
@@ -3319,16 +4496,6 @@ fn compute_answer(
         None
     };
     let explicit_extracts = request.mode == AskMode::EvidenceExtracts;
-    if !explicit_extracts && degradation_reason.is_some() && !request.allow_degraded_extractive {
-        return Err(AppError::new(
-            "RAG_DEGRADED_CONFIRMATION_REQUIRED",
-            format!(
-                "完整 RAG 暂不可用：{}。如需继续，请明确切换到证据摘录模式。",
-                degradation_reason.as_deref().unwrap_or("组件未就绪")
-            ),
-            true,
-        ));
-    }
     if explicit_extracts || degradation_reason.is_some() {
         phase("evidence_retrieval", 0.35);
         let mut result = catalog.answer_extractively(request, None)?;
@@ -3337,6 +4504,9 @@ fn compute_answer(
         result.index_coverage = index_coverage;
         result.retrieval_channels = vec!["filename".into(), "fts".into()];
         catalog.validate_answer_evidence(&result)?;
+        for claim in &result.claims {
+            verified_claim(claim);
+        }
         catalog.record_ask_exchange(request, &result)?;
         phase("completed", 1.0);
         return Ok(result);
@@ -3443,6 +4613,7 @@ fn compute_answer(
         phase("completed", 1.0);
         return Ok(extractive);
     }
+    let mut reranker_applied = false;
     if maintenance.degradation_level == "full"
         && let Some(reranker) = models.active_artifact(ModelRole::Reranker)?
         && reranker.format == ModelFormat::Onnx
@@ -3468,10 +4639,49 @@ fn compute_answer(
             }) && apply_rerank_scores(&mut extractive, &response.scores).is_ok()
             {
                 extractive.retrieval_channels.push("reranker".into());
+                reranker_applied = true;
             }
         }
     }
     phase("evidence_selection", 0.48);
+    let mut image_analysis_context = Vec::new();
+    if reranker_applied && models.active_artifact(ModelRole::Vision)?.is_some() {
+        let image_assets = extractive
+            .claims
+            .iter()
+            .flat_map(|claim| claim.citations.iter())
+            .filter_map(|citation| citation.image_asset_id)
+            .collect::<HashSet<_>>();
+        if !image_assets.is_empty() {
+            phase("image_reanalysis", 0.54);
+            for asset_id in image_assets.into_iter().take(3) {
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(AppError::new("OPERATION_CANCELLED", "问答已取消", false));
+                }
+                if let Ok(analysis) = run_image_deep_analysis(
+                    catalog,
+                    models,
+                    generation,
+                    asset_id,
+                    request.question.trim(),
+                    cancelled,
+                ) {
+                    image_analysis_context.push(format!(
+                        "图片资产 {} 的当前问题复核：{}；可见依据：{}；不确定项：{}",
+                        analysis.asset_id,
+                        analysis.answer,
+                        analysis.observations.join("；"),
+                        analysis.uncertainties.join("；")
+                    ));
+                }
+            }
+            if !image_analysis_context.is_empty() {
+                extractive
+                    .retrieval_channels
+                    .push("vision_question_reanalysis".into());
+            }
+        }
+    }
     let mut runtime = generation.lock().map_err(|_| {
         AppError::new(
             "GENERATION_RUNTIME_LOCK_FAILED",
@@ -3479,10 +4689,7 @@ fn compute_answer(
             true,
         )
     })?;
-    let threads = std::thread::available_parallelism()
-        .map(|value| value.get() as u32)
-        .unwrap_or(2)
-        .clamp(1, 8);
+    let threads = interactive_inference_threads();
     if (runtime.active_model_path() != Some(generation_artifact.local_path.as_str())
         || !runtime.is_active())
         && runtime
@@ -3496,7 +4703,13 @@ fn compute_answer(
         ));
     }
     phase("generating", 0.62);
-    let prompt = remin_core::generation_prompt(request, &extractive);
+    let mut prompt = remin_core::generation_prompt(request, &extractive, &history);
+    if !image_analysis_context.is_empty() {
+        prompt.push_str(
+            "\n\n以下是针对当前问题重新查看候选原图得到的辅助观察。它不能替代[S数字]原始引用；只有同时受到原始引用支持的事实才能写入答案：\n",
+        );
+        prompt.push_str(&image_analysis_context.join("\n"));
+    }
     let generated = runtime.complete_cancellable(
         "你是拾忆的本地资料回答器。只能使用用户提供的证据，严格保留[S数字]引用，不得补充外部知识。",
         &prompt,
@@ -3510,15 +4723,46 @@ fn compute_answer(
     })?;
     drop(runtime);
     phase("citation_validation", 0.88);
-    let mut grounded =
-        remin_core::apply_grounded_generation(&extractive, &generated).ok_or_else(|| {
-            AppError::new(
-                "RAG_CITATION_VALIDATION_FAILED",
-                "生成内容未通过逐句引用校验，回答已拒绝显示；不会回退为伪装的关键词答案",
-                true,
-            )
-        })?;
-    for claim in &grounded.claims {
+    let mut grounded = remin_core::apply_grounded_generation(&extractive, &generated);
+    if grounded.is_none() {
+        phase("citation_structure_repair", 0.9);
+        let repair_prompt = format!(
+            "下面的回答只需要修复Markdown引用格式，不得增加、删除或改写事实。每个事实段落、列表项和表格数据行必须以已有的[S数字]结束；标题和表格分隔行可无引用。只输出修复后的Markdown。\n\n原回答：\n{}",
+            compact_for_prompt(&generated, 12_000)
+        );
+        if let Ok(repaired) = complete_with_model(
+            generation,
+            &generation_artifact,
+            "你是引用格式修复器。不得引入新事实或新来源编号。",
+            &repair_prompt,
+            640,
+            cancelled,
+        ) {
+            grounded = remin_core::apply_grounded_generation(&extractive, &repaired);
+        }
+    }
+    let Some(mut grounded) = grounded else {
+        let mut fallback = extractive;
+        fallback.answer_mode = "evidence_fallback".into();
+        fallback.degradation_reason = Some(
+            "本次生成结果未通过引用核验（RAG_CITATION_VALIDATION_FAILED），已显示经过验证的原文摘录"
+                .into(),
+        );
+        catalog.validate_answer_evidence(&fallback)?;
+        for claim in &fallback.claims {
+            verified_claim(claim);
+        }
+        catalog.record_ask_exchange(request, &fallback)?;
+        phase("completed", 1.0);
+        return Ok(fallback);
+    };
+    let candidates = std::mem::take(&mut grounded.claims);
+    let candidate_count = candidates.len().max(1);
+    let mut rejected_claims = 0_usize;
+    for (index, claim) in candidates.into_iter().enumerate() {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(AppError::new("OPERATION_CANCELLED", "问答已取消", false));
+        }
         let evidence = claim
             .citations
             .iter()
@@ -3535,12 +4779,47 @@ fn compute_answer(
             cancelled,
         )?;
         if !claim_support_is_verified(&verification) {
-            return Err(AppError::new(
-                "RAG_CLAIM_UNSUPPORTED",
-                "至少一个事实句未通过原文支持性校验，整条回答已拒绝显示",
-                true,
-            ));
+            rejected_claims = rejected_claims.saturating_add(1);
+            continue;
         }
+        let mut single_claim_result = grounded.clone();
+        single_claim_result.claims = vec![claim.clone()];
+        catalog.validate_answer_evidence(&single_claim_result)?;
+        grounded.claims.push(claim);
+        verified_claim(grounded.claims.last().expect("verified claim appended"));
+        phase(
+            "citation_validation",
+            0.88 + 0.1 * ((index + 1) as f64 / candidate_count as f64),
+        );
+    }
+    if grounded.claims.is_empty() {
+        return Err(AppError::new(
+            "RAG_CLAIM_UNSUPPORTED",
+            "生成内容没有任何事实句通过原文支持性校验，回答已拒绝显示",
+            true,
+        ));
+    }
+    grounded.answer = grounded
+        .claims
+        .iter()
+        .map(|claim| claim.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let verified_file_ids = grounded
+        .claims
+        .iter()
+        .flat_map(|claim| claim.citations.iter().map(|citation| citation.file_id))
+        .collect::<HashSet<_>>();
+    grounded
+        .source_files
+        .retain(|source| verified_file_ids.contains(&source.file_id));
+    grounded.used_file_ids = verified_file_ids.into_iter().collect();
+    if rejected_claims > 0 {
+        grounded.grounding_status = remin_core::GroundingStatus::Partial;
+        grounded.answer_mode = "rag_partial".into();
+        grounded.degradation_reason = Some(format!(
+            "有{rejected_claims}个候选事实句未通过原文支持性校验，已自动隐藏"
+        ));
     }
     grounded.index_coverage = index_coverage;
     grounded.retrieval_channels = extractive.retrieval_channels;
@@ -3593,14 +4872,75 @@ fn complete_with_model(
             true,
         )
     })?;
-    let threads = std::thread::available_parallelism()
-        .map(|value| value.get() as u32)
-        .unwrap_or(2)
-        .clamp(1, 8);
+    let threads = interactive_inference_threads();
     if runtime.active_model_path() != Some(artifact.local_path.as_str()) || !runtime.is_active() {
         runtime.activate(&artifact.local_path, 4096, threads)?;
     }
     runtime.complete_cancellable(system_prompt, prompt, max_tokens, cancelled)
+}
+
+fn interactive_inference_threads() -> u32 {
+    (physical_core_count() / 2).clamp(1, 4)
+}
+
+fn background_inference_threads() -> u32 {
+    interactive_inference_threads().min(2)
+}
+
+fn physical_core_count() -> u32 {
+    *PHYSICAL_CORE_COUNT.get_or_init(detect_physical_core_count)
+}
+
+#[cfg(windows)]
+fn detect_physical_core_count() -> u32 {
+    let fallback = || {
+        std::thread::available_parallelism()
+            .map(|value| value.get() as u32)
+            .unwrap_or(2)
+    };
+    let mut returned_length = 0_u32;
+    let _ = unsafe {
+        GetLogicalProcessorInformationEx(RelationProcessorCore, None, &mut returned_length)
+    };
+    if returned_length == 0 {
+        return fallback();
+    }
+    let word_size = std::mem::size_of::<usize>();
+    let mut storage = vec![0_usize; (returned_length as usize).div_ceil(word_size)];
+    if unsafe {
+        GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            Some(storage.as_mut_ptr().cast()),
+            &mut returned_length,
+        )
+    }
+    .is_err()
+    {
+        return fallback();
+    }
+    let mut offset = 0_usize;
+    let mut cores = 0_u32;
+    while offset < returned_length as usize {
+        let information = unsafe {
+            &*(storage.as_ptr().cast::<u8>().add(offset)
+                as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)
+        };
+        if information.Size == 0 {
+            break;
+        }
+        if information.Relationship == RelationProcessorCore {
+            cores += 1;
+        }
+        offset += information.Size as usize;
+    }
+    if cores == 0 { fallback() } else { cores }
+}
+
+#[cfg(not(windows))]
+fn detect_physical_core_count() -> u32 {
+    std::thread::available_parallelism()
+        .map(|value| value.get() as u32)
+        .unwrap_or(2)
 }
 
 fn claim_support_is_verified(value: &str) -> bool {
@@ -3611,6 +4951,80 @@ fn claim_support_is_verified(value: &str) -> bool {
 #[derive(Debug, Deserialize)]
 pub struct OperationRequest {
     operation_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AskSessionQueryRequest {
+    cursor: Option<String>,
+    #[serde(default = "default_ask_session_page_size")]
+    page_size: u32,
+}
+
+fn default_ask_session_page_size() -> u32 {
+    30
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AskMessageQueryRequest {
+    session_id: Uuid,
+    cursor: Option<String>,
+    #[serde(default = "default_ask_message_page_size")]
+    page_size: u32,
+}
+
+fn default_ask_message_page_size() -> u32 {
+    100
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AskSessionRenameRequest {
+    session_id: Uuid,
+    title: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AskSessionIdRequest {
+    session_id: Uuid,
+}
+
+#[tauri::command(async)]
+pub fn ask_session_query(
+    request: AskSessionQueryRequest,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<AskSessionPage, AppError> {
+    catalog
+        .get()?
+        .list_ask_sessions(request.cursor.as_deref(), request.page_size)
+}
+
+#[tauri::command(async)]
+pub fn ask_message_query(
+    request: AskMessageQueryRequest,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<AskMessagePage, AppError> {
+    catalog.get()?.list_ask_messages(
+        &request.session_id,
+        request.cursor.as_deref(),
+        request.page_size,
+    )
+}
+
+#[tauri::command(async)]
+pub fn ask_session_rename(
+    request: AskSessionRenameRequest,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<(), AppError> {
+    catalog
+        .get()?
+        .rename_ask_session(&request.session_id, &request.title)
+}
+
+#[tauri::command(async)]
+pub fn ask_session_delete(
+    request: AskSessionIdRequest,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<(), AppError> {
+    catalog.get()?.delete_ask_session(&request.session_id)
 }
 
 #[tauri::command(async)]
@@ -3691,7 +5105,9 @@ fn parse_file_id(request: &FileIdRequest) -> Result<Uuid, AppError> {
 pub fn preview_get(
     request: PreviewRequest,
     catalog: State<'_, CatalogServiceState>,
+    worker: State<'_, WorkerServiceState>,
 ) -> Result<FilePreview, AppError> {
+    let _foreground_guard = ForegroundActivityGuard::begin(&worker.foreground_activity);
     let file_id = Uuid::parse_str(&request.file_id)
         .map_err(|_| AppError::new("FILE_ID_INVALID", "文件标识无效", false))?;
     let anchor_node_id = request
@@ -3801,6 +5217,8 @@ fn enqueue_scans(
     catalog: Arc<CatalogService>,
     scans: impl IntoIterator<Item = (Uuid, Uuid)>,
 ) {
+    let scans = scans.into_iter().collect::<Vec<_>>();
+    let requested_count = scans.len();
     let state = app.state::<ScanCoordinatorState>();
     if let Ok(mut queue) = state.queue.lock() {
         for scan in scans {
@@ -3808,9 +5226,27 @@ fn enqueue_scans(
                 queue.push_back(scan);
             }
         }
+        crate::runtime_log::event(
+            "info",
+            "scanner",
+            "scan.queue_updated",
+            None,
+            &json!({
+                "requested_count": requested_count,
+                "queued_count": queue.len(),
+                "worker_already_running": state.running.load(Ordering::Acquire),
+            }),
+        );
     } else {
+        crate::runtime_log::event(
+            "error",
+            "scanner",
+            "scan.queue_failed",
+            None,
+            &json!({ "error_code": "SCAN_QUEUE_UNAVAILABLE", "retryable": true }),
+        );
         let _ = app.emit(
-            "catalog.watch_degraded",
+            "catalog:watch_degraded",
             AppError::new("SCAN_QUEUE_UNAVAILABLE", "扫描调度队列暂时不可用", true),
         );
         return;
@@ -3846,10 +5282,40 @@ fn enqueue_scans(
 }
 
 fn run_scan(app: &AppHandle, catalog: &Arc<CatalogService>, root_id: Uuid, job_id: Uuid) {
+    let started = Instant::now();
+    crate::runtime_log::event(
+        "info",
+        "scanner",
+        "scan.started",
+        Some(&job_id.to_string()),
+        &json!({ "job_id": job_id, "root_id": root_id }),
+    );
     match catalog.execute_scan(root_id, job_id) {
         Ok(job) => {
-            let _ = app.emit("job.progress", &job);
-            let _ = app.emit("catalog.changed", root_id.to_string());
+            crate::runtime_log::event(
+                if matches!(job.status, remin_core::JobStatus::Failed) {
+                    "error"
+                } else {
+                    "info"
+                },
+                "scanner",
+                "scan.completed",
+                Some(&job_id.to_string()),
+                &json!({
+                    "job_id": job.job_id,
+                    "root_id": root_id,
+                    "status": job.status,
+                    "stage": job.stage,
+                    "progress": job.progress,
+                    "processed_items": job.processed_items,
+                    "total_items": job.total_items,
+                    "error_code": job.error.as_ref().map(|error| error.code.as_str()),
+                    "retryable": job.error.as_ref().map(|error| error.retryable),
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                }),
+            );
+            let _ = app.emit("job:progress", &job);
+            let _ = app.emit("catalog:changed", root_id.to_string());
             if matches!(
                 job.status,
                 remin_core::JobStatus::Succeeded | remin_core::JobStatus::Partial
@@ -3858,7 +5324,20 @@ fn run_scan(app: &AppHandle, catalog: &Arc<CatalogService>, root_id: Uuid, job_i
             }
         }
         Err(error) => {
-            let _ = app.emit("job.progress", &error);
+            crate::runtime_log::event(
+                "error",
+                "scanner",
+                "scan.failed",
+                Some(&job_id.to_string()),
+                &json!({
+                    "job_id": job_id,
+                    "root_id": root_id,
+                    "error_code": error.code,
+                    "retryable": error.retryable,
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                }),
+            );
+            let _ = app.emit("job:progress", &error);
         }
     }
 }
@@ -3876,7 +5355,24 @@ pub(crate) fn spawn_parse_pending(app: AppHandle, catalog: Arc<CatalogService>) 
             return;
         }
         let _running_reset = RunningReset(&worker.running);
+        let cycle_id = Uuid::now_v7().to_string();
+        let cycle_started = Instant::now();
+        let mut completed_files = 0_u64;
+        let mut failed_files = 0_u64;
+        let mut parsed_nodes = 0_u64;
+        let mut extracted_images = 0_u64;
+        crate::runtime_log::event(
+            "info",
+            "parser",
+            "parse.cycle_started",
+            Some(&cycle_id),
+            &json!({}),
+        );
         loop {
+            if worker.foreground_activity.load(Ordering::Acquire) > 0 {
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            }
             let degradation = catalog
                 .maintenance_snapshot()
                 .map(|snapshot| snapshot.degradation_level)
@@ -3887,24 +5383,42 @@ pub(crate) fn spawn_parse_pending(app: AppHandle, catalog: Arc<CatalogService>) 
                 _ => 16,
             };
             if batch_size == 0 {
+                crate::runtime_log::event(
+                    "warning",
+                    "parser",
+                    "parse.paused_for_resources",
+                    Some(&cycle_id),
+                    &json!({}),
+                );
                 break;
             }
             let pending = match catalog.list_pending_parse_files(batch_size) {
                 Ok(files) => files,
                 Err(error) => {
-                    let _ = app.emit("index.failed", error);
+                    crate::runtime_log::event(
+                        "error",
+                        "parser",
+                        "parse.pending_query_failed",
+                        Some(&cycle_id),
+                        &json!({ "error_code": error.code, "retryable": error.retryable }),
+                    );
+                    let _ = app.emit("index:failed", error);
                     break;
                 }
             };
             if pending.is_empty() {
                 break;
             }
+            let batch_count = pending.len();
             for file in pending {
+                while worker.foreground_activity.load(Ordering::Acquire) > 0 {
+                    thread::sleep(Duration::from_millis(250));
+                }
                 let Some(revision_id) = file.current_revision_id else {
                     continue;
                 };
                 if let Err(error) = catalog.mark_file_parsing(&file.file_id, &revision_id) {
-                    let _ = app.emit("index.failed", error);
+                    let _ = app.emit("index:failed", error);
                     continue;
                 }
                 let request = ParseRequest {
@@ -3941,15 +5455,77 @@ pub(crate) fn spawn_parse_pending(app: AppHandle, catalog: Arc<CatalogService>) 
                     });
                 match catalog.commit_parse_result(&file.file_id, &result) {
                     Ok(()) => {
-                        let _ = app.emit("index.changed", file.file_id.to_string());
+                        if matches!(result.status, ParseOutcome::Failed) {
+                            failed_files = failed_files.saturating_add(1);
+                            crate::runtime_log::event(
+                                "error",
+                                "parser",
+                                "parse.document_failed",
+                                Some(&cycle_id),
+                                &json!({
+                                    "file_id": file.file_id,
+                                    "revision_id": revision_id,
+                                    "format": file.extension,
+                                    "error_code": result.error.as_ref().map(|error| error.code.as_str()),
+                                    "retryable": result.error.as_ref().map(|error| error.retryable),
+                                    "elapsed_ms": result.metrics.elapsed_ms,
+                                }),
+                            );
+                        } else {
+                            completed_files = completed_files.saturating_add(1);
+                        }
+                        parsed_nodes = parsed_nodes.saturating_add(result.nodes.len() as u64);
+                        extracted_images =
+                            extracted_images.saturating_add(result.image_assets.len() as u64);
+                        let _ = app.emit("index:changed", file.file_id.to_string());
                     }
                     Err(error) => {
-                        let _ = app.emit("index.failed", error);
+                        failed_files = failed_files.saturating_add(1);
+                        crate::runtime_log::event(
+                            "error",
+                            "parser",
+                            "parse.commit_failed",
+                            Some(&cycle_id),
+                            &json!({
+                                "file_id": file.file_id,
+                                "revision_id": revision_id,
+                                "format": file.extension,
+                                "error_code": error.code,
+                                "retryable": error.retryable,
+                            }),
+                        );
+                        let _ = app.emit("index:failed", error);
                     }
                 }
             }
+            crate::runtime_log::event(
+                "info",
+                "parser",
+                "parse.batch_completed",
+                Some(&cycle_id),
+                &json!({
+                    "batch_size": batch_count,
+                    "completed_files_total": completed_files,
+                    "failed_files_total": failed_files,
+                    "parsed_nodes_total": parsed_nodes,
+                    "extracted_images_total": extracted_images,
+                }),
+            );
             thread::yield_now();
         }
+        crate::runtime_log::event(
+            if failed_files > 0 { "warning" } else { "info" },
+            "parser",
+            "parse.cycle_completed",
+            Some(&cycle_id),
+            &json!({
+                "completed_files": completed_files,
+                "failed_files": failed_files,
+                "parsed_nodes": parsed_nodes,
+                "extracted_images": extracted_images,
+                "elapsed_ms": cycle_started.elapsed().as_millis() as u64,
+            }),
+        );
         drop(_running_reset);
         spawn_image_understanding_pending(app.clone(), Arc::clone(&catalog));
         spawn_embed_pending(app, catalog);
@@ -4097,7 +5673,7 @@ pub(crate) fn spawn_image_understanding_pending(app: AppHandle, catalog: Arc<Cat
             }
         }
 
-        if !background_storage_budget_allows(&app, &catalog) {
+        if !background_storage_budget_allows(&app) {
             return;
         }
         let models = app.state::<ModelServiceState>();
@@ -4109,14 +5685,28 @@ pub(crate) fn spawn_image_understanding_pending(app: AppHandle, catalog: Arc<Cat
             Ok(Some(artifact)) => artifact,
             Ok(None) => return,
             Err(error) => {
-                let _ = app.emit("vision.failed", error);
+                crate::runtime_log::event(
+                    "error",
+                    "vision",
+                    "vision.model_lookup_failed",
+                    None,
+                    &json!({ "error_code": error.code, "retryable": error.retryable }),
+                );
+                let _ = app.emit("vision:failed", error);
                 return;
             }
         };
         let projector = match models.vision_projector_path(&artifact) {
             Ok(path) => path,
             Err(error) => {
-                let _ = app.emit("vision.failed", error);
+                crate::runtime_log::event(
+                    "error",
+                    "vision",
+                    "vision.projector_lookup_failed",
+                    None,
+                    &json!({ "error_code": error.code, "retryable": error.retryable }),
+                );
+                let _ = app.emit("vision:failed", error);
                 return;
             }
         };
@@ -4127,13 +5717,24 @@ pub(crate) fn spawn_image_understanding_pending(app: AppHandle, catalog: Arc<Cat
         let _running_reset = RunningReset(&worker.vision_running);
         let generation = app.state::<GenerationServiceState>();
         let model_artifact_id = artifact.artifact_id.to_string();
+        let cycle_id = Uuid::now_v7().to_string();
+        let cycle_started = Instant::now();
+        crate::runtime_log::event(
+            "info",
+            "vision",
+            "vision.cycle_started",
+            Some(&cycle_id),
+            &json!({ "model_artifact_id": model_artifact_id }),
+        );
         let projector_path = projector.to_string_lossy().into_owned();
-        let threads = std::thread::available_parallelism()
-            .map(|value| value.get() as u32)
-            .unwrap_or(2)
-            .clamp(1, 8);
+        let threads = background_inference_threads();
         let mut committed = 0_u64;
+        let mut failed = 0_u64;
         loop {
+            if worker.foreground_activity.load(Ordering::Acquire) > 0 {
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            }
             let degradation = catalog
                 .maintenance_snapshot()
                 .map(|snapshot| snapshot.degradation_level)
@@ -4151,12 +5752,19 @@ pub(crate) fn spawn_image_understanding_pending(app: AppHandle, catalog: Arc<Cat
                     _ => break,
                 },
                 Err(error) => {
-                    let _ = app.emit("vision.failed", error);
+                    crate::runtime_log::event(
+                        "error",
+                        "vision",
+                        "vision.pending_claim_failed",
+                        Some(&cycle_id),
+                        &json!({ "error_code": error.code, "retryable": error.retryable }),
+                    );
+                    let _ = app.emit("vision:failed", error);
                     break;
                 }
             };
             let _ = app.emit(
-                "vision.progress",
+                "vision:progress",
                 json!({
                     "asset_id": pending.asset_id,
                     "revision_id": pending.revision_id,
@@ -4220,18 +5828,39 @@ pub(crate) fn spawn_image_understanding_pending(app: AppHandle, catalog: Arc<Cat
                 Ok(()) => {
                     committed = committed.saturating_add(1);
                     let _ = app.emit(
-                        "vision.completed",
+                        "vision:completed",
                         json!({"asset_id": pending.asset_id, "revision_id": pending.revision_id}),
                     );
-                    let _ = app.emit("index.changed", pending.file_id.to_string());
+                    let _ = app.emit("index:changed", pending.file_id.to_string());
                     if committed.is_multiple_of(8) {
+                        crate::runtime_log::event(
+                            "info",
+                            "vision",
+                            "vision.batch_completed",
+                            Some(&cycle_id),
+                            &json!({ "completed_assets": committed, "failed_assets": failed }),
+                        );
                         spawn_embed_pending(app.clone(), Arc::clone(&catalog));
                     }
                 }
                 Err(error) => {
+                    failed = failed.saturating_add(1);
+                    crate::runtime_log::event(
+                        "error",
+                        "vision",
+                        "vision.asset_failed",
+                        Some(&cycle_id),
+                        &json!({
+                            "asset_id": pending.asset_id,
+                            "revision_id": pending.revision_id,
+                            "attempt": pending.attempt_count,
+                            "error_code": error.code,
+                            "retryable": error.retryable,
+                        }),
+                    );
                     let _ = catalog.fail_image_understanding(&pending.asset_id, &error);
                     let _ = app.emit(
-                        "vision.failed",
+                        "vision:failed",
                         json!({"asset_id": pending.asset_id, "error": error}),
                     );
                 }
@@ -4244,6 +5873,17 @@ pub(crate) fn spawn_image_understanding_pending(app: AppHandle, catalog: Arc<Cat
         {
             runtime.stop();
         }
+        crate::runtime_log::event(
+            if failed > 0 { "warning" } else { "info" },
+            "vision",
+            "vision.cycle_completed",
+            Some(&cycle_id),
+            &json!({
+                "completed_assets": committed,
+                "failed_assets": failed,
+                "elapsed_ms": cycle_started.elapsed().as_millis() as u64,
+            }),
+        );
         drop(_running_reset);
         if committed > 0 {
             spawn_embed_pending(app, catalog);
@@ -4277,14 +5917,14 @@ pub(crate) fn spawn_embed_pending(app: AppHandle, catalog: Arc<CatalogService>) 
 }
 
 fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &WorkerServiceState) {
-    if !background_storage_budget_allows(app, catalog) {
+    if !background_storage_budget_allows(app) {
         return;
     }
     let models_state = app.state::<ModelServiceState>();
     let models = match models_state.get() {
         Ok(models) => models,
         Err(error) => {
-            let _ = app.emit("embedding.failed", error);
+            let _ = app.emit("embedding:failed", error);
             return;
         }
     };
@@ -4292,7 +5932,7 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
         Ok(Some(pending)) if pending.status == "indexing" => Some(pending),
         Ok(_) => None,
         Err(error) => {
-            let _ = app.emit("embedding.failed", error);
+            let _ = app.emit("embedding:failed", error);
             return;
         }
     };
@@ -4342,6 +5982,18 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
         }
     };
     let model_artifact_id = artifact.artifact_id.to_string();
+    let cycle_id = Uuid::now_v7().to_string();
+    let cycle_started = Instant::now();
+    crate::runtime_log::event(
+        "info",
+        "embedding",
+        "embedding.cycle_started",
+        Some(&cycle_id),
+        &json!({
+            "model_artifact_id": model_artifact_id,
+            "is_index_migration": pending.is_some(),
+        }),
+    );
     let expected_dimension = pending
         .as_ref()
         .map(|pending| pending.dimension)
@@ -4350,6 +6002,10 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
     let mut completed_dimension = expected_dimension;
     let result = (|| -> Result<bool, AppError> {
         loop {
+            if worker.foreground_activity.load(Ordering::Acquire) > 0 {
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            }
             if let Some(expected) = pending.as_ref() {
                 let still_current = models
                     .pending_embedding_activation()?
@@ -4409,7 +6065,19 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
             }
             committed_total = committed_total.saturating_add(committed);
             completed_dimension = Some(response.dimension);
-            let _ = app.emit("embedding.changed", committed);
+            let _ = app.emit("embedding:changed", committed);
+            if committed_total == committed || committed_total.is_multiple_of(1_024) {
+                crate::runtime_log::event(
+                    "info",
+                    "embedding",
+                    "embedding.progress_checkpoint",
+                    Some(&cycle_id),
+                    &json!({
+                        "committed_chunks": committed_total,
+                        "dimension": response.dimension,
+                    }),
+                );
+            }
             thread::yield_now();
         }
 
@@ -4431,7 +6099,18 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
                     .as_ref()
                     .is_none_or(|generation| generation.dimension != dimension));
         if needs_rebuild {
-            let _ = app.emit("embedding.index_phase", "building");
+            crate::runtime_log::event(
+                "info",
+                "embedding",
+                "vector_index.build_started",
+                Some(&cycle_id),
+                &json!({
+                    "model_artifact_id": model_artifact_id,
+                    "dimension": dimension,
+                    "searchable_chunks": searchable_chunks,
+                }),
+            );
+            let _ = app.emit("embedding:index_phase", "building");
             let generation = catalog.rebuild_vector_generation(&model_artifact_id, dimension)?;
             if generation.status != "active"
                 || generation.dimension != dimension
@@ -4444,8 +6123,20 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
                     true,
                 ));
             }
-            let _ = app.emit("embedding.index_phase", "active");
-            let _ = app.emit("embedding.index_changed", generation);
+            let _ = app.emit("embedding:index_phase", "active");
+            let _ = app.emit("embedding:index_changed", &generation);
+            crate::runtime_log::event(
+                "info",
+                "embedding",
+                "vector_index.activated",
+                Some(&cycle_id),
+                &json!({
+                    "generation_id": generation.generation_id,
+                    "dimension": generation.dimension,
+                    "item_count": generation.item_count,
+                    "coverage": generation.coverage,
+                }),
+            );
         } else if searchable_chunks > 0 {
             let generation = existing_generation.ok_or_else(|| {
                 AppError::new(
@@ -4475,8 +6166,12 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
                 {
                     Ok(completed) => {
                         finalize_embedding_download(app, &models, &completed);
-                        if let Ok(state) = model_state_from_manager(&models, Some(catalog)) {
-                            let _ = app.emit("model.state", state);
+                        let generation = app.state::<GenerationServiceState>();
+                        let runtime_state = inference_runtime_state(&generation).ok();
+                        if let Ok(state) =
+                            model_state_from_manager(&models, Some(catalog), runtime_state)
+                        {
+                            let _ = app.emit("model:state", state);
                         }
                     }
                     Err(error) => {
@@ -4490,10 +6185,44 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
                     }
                 }
             }
+            crate::runtime_log::event(
+                "info",
+                "embedding",
+                "embedding.cycle_completed",
+                Some(&cycle_id),
+                &json!({
+                    "committed_chunks": committed_total,
+                    "dimension": completed_dimension,
+                    "elapsed_ms": cycle_started.elapsed().as_millis() as u64,
+                }),
+            );
         }
-        Ok(false) => {}
+        Ok(false) => {
+            crate::runtime_log::event(
+                "warning",
+                "embedding",
+                "embedding.cycle_deferred",
+                Some(&cycle_id),
+                &json!({
+                    "committed_chunks": committed_total,
+                    "elapsed_ms": cycle_started.elapsed().as_millis() as u64,
+                }),
+            );
+        }
         Err(error) => {
-            let _ = app.emit("embedding.index_phase", "fallback");
+            crate::runtime_log::event(
+                "error",
+                "embedding",
+                "embedding.cycle_failed",
+                Some(&cycle_id),
+                &json!({
+                    "committed_chunks": committed_total,
+                    "error_code": error.code,
+                    "retryable": error.retryable,
+                    "elapsed_ms": cycle_started.elapsed().as_millis() as u64,
+                }),
+            );
+            let _ = app.emit("embedding:index_phase", "fallback");
             record_embedding_activation_failure(app, catalog, &models, pending.as_ref(), &error);
         }
     }
@@ -4506,29 +6235,44 @@ fn record_embedding_activation_failure(
     pending: Option<&PendingEmbeddingActivation>,
     error: &AppError,
 ) {
-    let mut download_failed = false;
+    crate::runtime_log::event(
+        "error",
+        "embedding",
+        "embedding.activation_failed",
+        pending
+            .and_then(|item| item.download_job_id)
+            .as_ref()
+            .map(|job_id| job_id.to_string())
+            .as_deref(),
+        &json!({
+            "artifact_id": pending.map(|item| item.artifact_id),
+            "download_job_id": pending.and_then(|item| item.download_job_id),
+            "error_code": error.code,
+            "retryable": error.retryable,
+        }),
+    );
     if let Some(pending) = pending {
         let _ = models.fail_embedding_activation(&pending.artifact_id, error);
         if let Some(job_id) = pending.download_job_id
             && let Ok(mut job) = models.download_job(&job_id)
         {
-            download_failed = true;
-            job.status = "failed".into();
-            job.phase = "failed".into();
+            job.status = "completed".into();
+            job.phase = "completed".into();
             job.bytes_per_second = 0;
-            job.eta_seconds = None;
-            job.error = Some(error.clone());
+            job.eta_seconds = Some(0);
+            job.error = None;
+            job.activation_status = Some("failed".into());
+            job.activation_error = Some(error.clone());
             if let Ok(job) = models.update_download_job(&job) {
                 emit_download_state(app, &job);
             }
         }
     }
-    let _ = app.emit("embedding.failed", error.clone());
-    if download_failed {
-        let _ = app.emit("model.download_failed", error.clone());
-    }
-    if let Ok(state) = model_state_from_manager(models, Some(catalog)) {
-        let _ = app.emit("model.state", state);
+    let _ = app.emit("embedding:failed", error.clone());
+    let generation = app.state::<GenerationServiceState>();
+    let runtime_state = inference_runtime_state(&generation).ok();
+    if let Ok(state) = model_state_from_manager(models, Some(catalog), runtime_state) {
+        let _ = app.emit("model:state", state);
     }
 }
 
@@ -4546,13 +6290,15 @@ fn finalize_embedding_download(
         job.bytes_per_second = 0;
         job.eta_seconds = Some(0);
         job.error = None;
+        job.activation_status = Some("active".into());
+        job.activation_error = None;
         for file in &mut job.files {
             file.status = "completed".into();
             file.downloaded_bytes = file.total_bytes;
         }
         if let Ok(job) = models.update_download_job(&job) {
             emit_download_state(app, &job);
-            let _ = app.emit("model.download_completed", &job);
+            let _ = app.emit("model:download_completed", &job);
         }
     }
 }
@@ -4567,7 +6313,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn environment_detection_reads_real_memory_and_disk() {
-        let check = detect_environment(Path::new("."));
+        let check = detect_environment(Path::new("."), None);
 
         assert!(check.memory_total_gb.is_some_and(|value| value > 0));
         assert!(check.disk_available_gb.is_some());
@@ -4584,7 +6330,9 @@ mod tests {
             gpu_name: None,
             gpu_memory_gb: None,
             recommended_edition: Some("light"),
-            runtime_backend: Some("cpu"),
+            runtime_backend: Some("cpu".into()),
+            runtime_devices: Vec::new(),
+            gpu_runtime_available: false,
             checked_at: Utc::now().to_rfc3339(),
             warnings: vec!["内存低于推荐值".to_owned()],
         };
@@ -4602,6 +6350,23 @@ mod tests {
         assert_eq!(
             environment_degradation(&core).map(|value| value.0),
             Some(DegradationLevel::Core)
+        );
+    }
+
+    #[test]
+    fn diagnostic_identifiers_reject_injection_and_oversized_values() {
+        assert!(validate_diagnostic_identifier("component", "frontend.bridge", 80).is_ok());
+        assert_eq!(
+            validate_diagnostic_identifier("event_name", "action\nforged", 120)
+                .expect_err("newlines must not enter the JSONL envelope")
+                .code,
+            "DIAGNOSTIC_IDENTIFIER_INVALID"
+        );
+        assert_eq!(
+            validate_diagnostic_identifier("component", &"a".repeat(81), 80)
+                .expect_err("oversized component must fail")
+                .code,
+            "DIAGNOSTIC_IDENTIFIER_INVALID"
         );
     }
 
@@ -4698,5 +6463,52 @@ mod tests {
                 .code,
             "RERANK_OUTPUT_INVALID"
         );
+    }
+
+    #[test]
+    fn answer_export_contains_verified_evidence_without_source_absolute_path() {
+        let file_id = Uuid::now_v7();
+        let answer = AnswerResult {
+            session_id: Uuid::now_v7(),
+            message_id: Uuid::now_v7(),
+            answer: "项目采用混合召回。[S1]".into(),
+            grounding_status: GroundingStatus::Grounded,
+            insufficient_evidence: false,
+            claims: vec![AnswerClaim {
+                claim_id: Uuid::now_v7(),
+                text: "项目采用混合召回。[S1]".into(),
+                support_status: SupportStatus::Supported,
+                citations: vec![EvidenceRef {
+                    evidence_id: Uuid::now_v7(),
+                    file_id,
+                    revision_id: Uuid::now_v7(),
+                    node_id: Uuid::now_v7(),
+                    chunk_id: Uuid::now_v7(),
+                    image_asset_id: None,
+                    quote: "采用混合召回".into(),
+                    locator: SourceLocator {
+                        paragraph_no: Some(3),
+                        ..Default::default()
+                    },
+                    retrieval_score: 1.0,
+                }],
+            }],
+            source_files: vec![AnswerSourceFile {
+                file_id,
+                display_name: "项目说明.md".into(),
+                canonical_path: "E:\\敏感目录\\项目说明.md".into(),
+            }],
+            used_file_ids: vec![file_id],
+            elapsed_ms: 10,
+            answer_mode: "generated".into(),
+            retrieval_channels: vec!["fts".into()],
+            index_coverage: 1.0,
+            degradation_reason: None,
+        };
+
+        let markdown = render_answer_export(&answer, "md").expect("render export");
+        assert!(markdown.contains("项目说明.md"));
+        assert!(markdown.contains("采用混合召回"));
+        assert!(!markdown.contains("敏感目录"));
     }
 }

@@ -15,6 +15,10 @@ function item(inboxId: string, name: string): InboxItem {
     observed_at: "2026-08-08T00:00:00Z",
   previous_display_path: null,
     triage_status: "new",
+    resolution_status: "normal",
+    attempt_count: 0,
+    last_attempt_at: null,
+    retry_action: null,
     suggested_collection_ids: [],
     duplicate_group_id: null,
     summary: null,
@@ -30,8 +34,8 @@ describe("InboxPage", () => {
 
   it("keeps the home date filter and loads the next cursor page", async () => {
     const query = vi.spyOn(bridge, "inbox_query")
-      .mockResolvedValueOnce({ items: [item("1", "今天新增.pdf")], next_cursor: "cursor-2" })
-      .mockResolvedValueOnce({ items: [item("2", "第二页.docx")], next_cursor: null });
+      .mockResolvedValueOnce({ items: [item("1", "今天新增.pdf")], next_cursor: "cursor-2", has_more: true })
+      .mockResolvedValueOnce({ items: [item("2", "第二页.docx")], next_cursor: null, has_more: false });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
 
     render(<QueryClientProvider client={client}><InboxPage /></QueryClientProvider>);
@@ -44,5 +48,21 @@ describe("InboxPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "加载更多" }));
     expect(await screen.findByText("第二页.docx")).toBeInTheDocument();
     await waitFor(() => expect(query.mock.calls[1]?.[0].cursor).toBe("cursor-2"));
+  });
+
+  it("updates reviewed state and renders a structured failure as readable text", async () => {
+    vi.spyOn(bridge, "inbox_query").mockResolvedValue({ items: [item("1", "待查看.pdf")], next_cursor: null, has_more: false });
+    const update = vi.spyOn(bridge, "inbox_update")
+      .mockResolvedValueOnce({ ...item("1", "待查看.pdf"), triage_status: "reviewed" })
+      .mockRejectedValueOnce({ code: "INBOX_UPDATE_FAILED", message: "资料库暂时繁忙", retryable: true });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    render(<QueryClientProvider client={client}><InboxPage /></QueryClientProvider>);
+
+    expect(await screen.findByText("待查看.pdf")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /已查看/ }));
+    await waitFor(() => expect(update).toHaveBeenCalledWith("1", "reviewed"));
+    fireEvent.click(screen.getByRole("button", { name: "忽略" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("资料库暂时繁忙");
+    expect(screen.getByRole("alert")).not.toHaveTextContent("[object Object]");
   });
 });

@@ -18,6 +18,8 @@ CODE_PATTERN = re.compile(
     r"[\"']((?:ASK|CANDIDATE|COLLECTION|COMPATIBILITY|DATABASE|DEGRADATION|DOCUMENT|EMBEDDING|EXCLUSION|EXPORT|EXTRACTION|FILE|FORMAT|GENERATION|IMAGE|INBOX|INCREMENTAL|INDEX|JOB|KNOWN_FOLDER|LOCAL_CONFIG|LOG|MEMBERSHIP|MODEL|NOT_A_FILE|OCR|OPERATION|PARSER|PATH|PDF|PREVIEW|RAG|RELATION|REQUEST|REVISION|ROOT|SCAN|SCHEMA|SEARCH|TASK|VISION|WATCHER|WELCOME|WORKER)_[A-Z0-9_]+|NOT_A_FILE)[\"']"
 )
 VALID_CODE = re.compile(r"^[A-Z][A-Z0-9_]+$")
+RUNTIME_EVENT_PATTERN = re.compile(r"(?:\.emit|listen(?:<[^>]+>)?)\s*\(\s*[\"']([^\"']+)[\"']")
+VALID_RUNTIME_EVENT = re.compile(r"^[A-Za-z0-9_:/-]+$")
 
 
 def main() -> None:
@@ -54,6 +56,18 @@ def main() -> None:
     missing = sorted(emitted - set(catalog_codes))
     if missing:
         raise SystemExit(f"源码使用了未登记错误码: {', '.join(missing)}")
+
+    invalid_events: list[str] = []
+    for source_root in SOURCE_ROOTS:
+        for path in source_root.rglob("*"):
+            if path.is_file() and path.suffix in SOURCE_SUFFIXES and "__pycache__" not in path.parts:
+                source = path.read_text(encoding="utf-8")
+                invalid_events.extend(
+                    event for event in RUNTIME_EVENT_PATTERN.findall(source)
+                    if not VALID_RUNTIME_EVENT.fullmatch(event)
+                )
+    if invalid_events:
+        raise SystemExit(f"桌面运行事件名包含非法字符: {', '.join(sorted(set(invalid_events)))}")
 
     print(f"公共错误码检查通过: catalog={len(catalog_codes)}, emitted={len(emitted)}")
 

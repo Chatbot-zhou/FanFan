@@ -1,6 +1,8 @@
 import type {
   AnswerResult,
+  AskMessage,
   AskOperationSnapshot,
+  AskSessionSummary,
   CandidateRoot,
   CollectionRecord,
   CollectionSuggestion,
@@ -9,10 +11,12 @@ import type {
   FileRecord,
   HomeSummary,
   InboxPage,
-  KnowledgeSpace,
+  ModelCatalogEntry,
   ModelEdition,
   ModelDownloadJob,
+  ModelPreset,
   ModelRuntimeState,
+  InferenceRuntimeState,
   ModelArtifact,
   ReminBridge,
   RootRecord,
@@ -47,6 +51,8 @@ const initialCandidates: CandidateRoot[] = [
 
 let candidates = structuredClone(initialCandidates);
 const browserAskOperations = new Map<string, AskOperationSnapshot>();
+const browserAskSessions = new Map<string, AskSessionSummary>();
+const browserAskMessages = new Map<string, AskMessage[]>();
 
 const recentFiles = [
   {
@@ -112,8 +118,45 @@ const defaultEnvironment: EnvironmentCheck = {
   gpu_memory_gb: null,
   recommended_edition: "light",
   runtime_backend: "cpu",
+  runtime_devices: [],
+  gpu_runtime_available: false,
   checked_at: now(),
   warnings: [],
+};
+
+const defaultInferenceRuntime: InferenceRuntimeState = {
+  backend: "cpu",
+  device_names: [],
+  gpu_available: false,
+  gpu_offload_layers: 0,
+  gpu_offload_mode: "disabled",
+  thread_budget: 4,
+  batch_thread_budget: 2,
+  active: false,
+  pressure_reason: null,
+  hardware: {
+    physical_core_count: 4,
+    logical_thread_count: 8,
+    memory_total_bytes: 8 * 1024 * 1024 * 1024,
+    memory_available_bytes: 4 * 1024 * 1024 * 1024,
+    gpu_name: null,
+    gpu_memory_bytes: null,
+  },
+  runtime_package: {
+    backend: "cpu",
+    device_count: 0,
+    gpu_capable: false,
+    cpu_fallback_available: false,
+    validated: true,
+  },
+  budget: {
+    foreground_threads: 4,
+    background_threads: 2,
+    batch_size: 256,
+    ubatch_size: 128,
+    gpu_reserve_bytes: 512 * 1024 * 1024,
+    system_memory_reserve_bytes: 2 * 1024 * 1024 * 1024,
+  },
 };
 
 const defaultModelState: ModelRuntimeState = {
@@ -121,9 +164,10 @@ const defaultModelState: ModelRuntimeState = {
   active_profile_id: null,
   active_profile_name: null,
   runtime_backend: null,
+  inference_runtime: defaultInferenceRuntime,
   message: "未配置本地模型",
   checked_at: now(),
-  capabilities: { generation: false, embedding: false, vision: false, reranker: false, ocr: false },
+  capabilities: { generation: false, embedding: false, vision: false, reranker: false, ocr: false, tts: false, asr: false },
   rag_complete: false,
   semantic_index_coverage: 0,
   embedding_migration: null,
@@ -155,6 +199,38 @@ const demoModelEditions: ModelEdition[] = [
   { edition_id: "light", name: "轻量版", description: "0.6B 本地生成模型与中文语义检索组件", recommended_memory_gb: 8, download_size_bytes: 663_751_501, capabilities: ["generation", "embedding", "rag"], artifacts: [{ model_id: "Qwen3-0.6B-Q8_0", role: "generation", format: "gguf", source: "huggingface", repository_id: "Qwen/Qwen3-0.6B-GGUF", revision: "1eaf4d9657fe65ad10a51eab76a8db5b363bddaa", file_name: "Qwen3-0.6B-Q8_0.gguf", url: "https://huggingface.co/", sha256: "9465e63e7ce6826db57337865524b63eb4cda2ed96645ea2961819577e8c2031", size_bytes: 639_446_688, companion_files: [], license_name: "Apache-2.0", query_prefix: null, max_length: null }, demoEmbeddingArtifact] },
   { edition_id: "standard", name: "标准版", description: "4B 本地生成模型与中文语义检索组件", recommended_memory_gb: 12, download_size_bytes: 2_521_585_069, capabilities: ["generation", "embedding", "rag"], artifacts: [{ model_id: "Qwen3-4B-Q4_K_M", role: "generation", format: "gguf", source: "huggingface", repository_id: "Qwen/Qwen3-4B-GGUF", revision: "a9a60d009fa7ff9606305047c2bf77ac25dbec49", file_name: "Qwen3-4B-Q4_K_M.gguf", url: "https://huggingface.co/", sha256: "7485fe1dba41cf264d151854608429340702f1f212eaec0ad44391f06366bdf5", size_bytes: 2_497_280_256, companion_files: [], license_name: "Apache-2.0", query_prefix: null, max_length: null }, demoEmbeddingArtifact] },
 ];
+const demoModelPresets: ModelPreset[] = [
+  { preset_id: "light", name: "推荐省内存组合", description: "Qwen3 0.6B + BGE-small", recommended_memory_gb: 8, role_catalog_ids: ["qwen3-0.6b-q8", "bge-small-zh-int8"], edition_id: "light" },
+  { preset_id: "standard", name: "推荐质量组合", description: "Qwen3 4B + BGE-small", recommended_memory_gb: 12, role_catalog_ids: ["qwen3-4b-q4", "bge-small-zh-int8"], edition_id: "standard" },
+];
+const demoRoleCatalog: ModelCatalogEntry[] = [
+  ["qwen3-0.6b-q8", "generation", "Qwen3 0.6B · 省内存", "Qwen3-0.6B-Q8_0", "低资源设备上的基础中文证据问答。", 639_446_688, 2, 1.2, "较快", true, "8GB 内存可用", "generation_qwen3_0_6b", ["huggingface", "modelscope"]],
+  ["qwen3-1.7b-q8", "generation", "Qwen3 1.7B · 均衡", "Qwen3-1.7B-Q8_0", "回答质量与资源占用之间更均衡。", 1_834_426_016, 4, 2.4, "中等", true, "当前设备优先推荐", "generation_qwen3_1_7b", ["huggingface"]],
+  ["qwen3-4b-q4", "generation", "Qwen3 4B · 质量优先", "Qwen3-4B-Q4_K_M", "更擅长跨文件综合和复杂追问。", 2_497_280_256, 7, 4.5, "较慢", false, "建议 12GB 以上内存", "generation_qwen3_4b", ["huggingface", "modelscope"]],
+  ["bge-small-zh-int8", "embedding", "BGE-small-zh-v1.5 · 默认", "bge-small-zh-v1.5-onnx-int8", "中文资料检索的轻量向量模型。", 24_304_813, 1, null, "快", true, "所有受支持设备均推荐", "embedding_bge_small", ["huggingface", "modelscope"]],
+  ["bge-base-zh", "embedding", "BGE-base-zh-v1.5 · 精度优先", "bge-base-zh-v1.5-onnx", "更大的中文向量模型。", null, 2.5, null, "中等", false, "远程构建完成基准前仅支持本地导入", null, []],
+  ["qwen3-vl-2b-q4", "vision", "Qwen3-VL 2B · 省显存", "Qwen3VL-2B-Instruct-Q4_K_M", "理解图片、图表和文档内嵌图片。", 1_552_463_168, 5, 3.2, "较慢", true, "4GB 显存优先选择", "vision_qwen3_vl_2b_q4", ["huggingface"]],
+  ["qwen3-vl-2b-q8", "vision", "Qwen3-VL 2B · 质量优先", "Qwen3VL-2B-Instruct-Q8_0", "保留更多视觉细节。", 2_279_480_640, 7, 5, "慢", false, "建议显存高于 6GB", "vision_qwen3_vl_2b_q8", ["huggingface"]],
+  ["bge-reranker-base-int8", "reranker", "BGE Reranker Base · 可选", "bge-reranker-base-onnx-int8", "对少量混合召回候选做相关性复核。", 296_335_457, 2, null, "中等", false, "更重视速度时可不配置", "reranker_bge_base_int8", ["huggingface"]],
+].map(([catalog_id, role, name, model_id, description, download_size_bytes, estimated_memory_gb, estimated_vram_gb, cpu_speed, recommended, device_guidance, install_edition_id, supported_sources]) => ({
+  catalog_id: catalog_id as string,
+  role: role as ModelCatalogEntry["role"],
+  name: name as string,
+  model_id: model_id as string,
+  description: description as string,
+  strengths: recommended ? ["已通过兼容性检查", "适合作为推荐起点"] : ["适合更高质量或专项需求"],
+  limitations: role === "reranker" ? ["会增加问答延迟"] : ["资源占用随模型规模增加"],
+  download_size_bytes: download_size_bytes as number | null,
+  estimated_memory_gb: estimated_memory_gb as number,
+  estimated_vram_gb: estimated_vram_gb as number | null,
+  cpu_speed: cpu_speed as string,
+  license_name: role === "embedding" || role === "reranker" ? "MIT" : "Apache-2.0",
+  recommended: recommended as boolean,
+  device_guidance: device_guidance as string,
+  verification_status: install_edition_id ? "verified" : "local_import_only",
+  install_edition_id: install_edition_id as string | null,
+  supported_sources: supported_sources as ModelCatalogEntry["supported_sources"],
+}));
 
 const roots: RootRecord[] = [];
 
@@ -166,11 +242,12 @@ const searchCatalog = [
 
 const inbox: InboxPage = {
   items: [
-    { inbox_id: "i1", file_id: "s1", display_name: "RAG项目总结.docx", display_path: "文档\\项目资料\\RAG项目总结.docx", event_type: "discovered", observed_at: now(), previous_display_path: null, triage_status: "new", suggested_collection_ids: [], duplicate_group_id: null, summary: "新增资料，已完成正文提取，可以全文搜索", error_code: null },
-    { inbox_id: "i2", file_id: "s2", display_name: "检索效果评估.xlsx", display_path: "文档\\大模型学习\\检索效果评估.xlsx", event_type: "modified", observed_at: now(), previous_display_path: null, triage_status: "new", suggested_collection_ids: [], duplicate_group_id: "duplicate-demo-1", summary: "资料有新版本，并发现一份字节完全相同的副本", error_code: null },
-    { inbox_id: "i3", file_id: "s3", display_name: "产品设计规范.pdf", display_path: "桌面\\拾忆\\产品设计规范.pdf", event_type: "ocr_required", observed_at: now(), previous_display_path: null, triage_status: "error", suggested_collection_ids: [], duplicate_group_id: null, summary: "当前未安装 OCR 模型，已保留文件名索引", error_code: "OCR_REQUIRED" },
+    { inbox_id: "i1", file_id: "s1", display_name: "RAG项目总结.docx", display_path: "文档\\项目资料\\RAG项目总结.docx", event_type: "discovered", observed_at: now(), previous_display_path: null, triage_status: "new", resolution_status: "normal", attempt_count: 0, last_attempt_at: null, retry_action: null, suggested_collection_ids: [], duplicate_group_id: null, summary: "新增资料，已完成正文提取，可以全文搜索", error_code: null },
+    { inbox_id: "i2", file_id: "s2", display_name: "检索效果评估.xlsx", display_path: "文档\\大模型学习\\检索效果评估.xlsx", event_type: "modified", observed_at: now(), previous_display_path: null, triage_status: "new", resolution_status: "normal", attempt_count: 0, last_attempt_at: null, retry_action: null, suggested_collection_ids: [], duplicate_group_id: "duplicate-demo-1", summary: "资料有新版本，并发现一份字节完全相同的副本", error_code: null },
+    { inbox_id: "i3", file_id: "s3", display_name: "产品设计规范.pdf", display_path: "桌面\\拾忆\\产品设计规范.pdf", event_type: "ocr_required", observed_at: now(), previous_display_path: null, triage_status: "new", resolution_status: "pending_retry", attempt_count: 0, last_attempt_at: null, retry_action: "retry_ocr", suggested_collection_ids: [], duplicate_group_id: null, summary: "当前未安装 OCR 模型，已保留文件名索引", error_code: "OCR_REQUIRED" },
   ],
   next_cursor: null,
+  has_more: false,
 };
 
 let collectionRecords: CollectionRecord[] = [
@@ -198,7 +275,6 @@ const demoFileRecords = (): FileRecord[] => searchCatalog.map((file) => ({
   last_seen_at: file.modified_at,
 }));
 let demoSuggestions: CollectionSuggestion[] = [];
-let demoKnowledgeSpaces: KnowledgeSpace[] = [];
 let demoExclusionRules: ExclusionRule[] = [
   { rule_id: "018f0000-0000-7000-8000-000000009001", root_id: null, rule_class: "hard", rule_type: "path_name", value: "windows", enabled: true, overridable: false },
   { rule_id: "018f0000-0000-7000-8000-000000009002", root_id: null, rule_class: "default", rule_type: "path_name", value: "node_modules", enabled: true, overridable: true },
@@ -288,8 +364,14 @@ export const browserBridge: ReminBridge = {
       active_artifact_id: demoArtifacts.find((artifact) => artifact.role === role && demoActiveRoles.has(role))?.artifact_id ?? null,
     }));
   },
-  async model_catalog_list() {
+  async model_catalog_list(_source) {
     return structuredClone(demoModelEditions);
+  },
+  async model_role_catalog_list() {
+    return structuredClone(demoRoleCatalog);
+  },
+  async model_preset_list() {
+    return structuredClone(demoModelPresets);
   },
   async model_download_start(edition_id, source) {
     const edition = demoModelEditions.find((item) => item.edition_id === edition_id);
@@ -297,7 +379,7 @@ export const browserBridge: ReminBridge = {
     const installed = edition.artifacts.map<ModelArtifact>((artifact) => ({ artifact_id: crypto.randomUUID(), role: artifact.role, format: artifact.format, model_id: artifact.model_id, model_version: null, source, repository_id: artifact.repository_id, revision: artifact.revision, sha256: artifact.sha256, size_bytes: artifact.size_bytes, local_path: `C:\\Users\\你\\AppData\\Roaming\\com.remin.desktop\\models\\${artifact.file_name}`, quantization: artifact.role === "generation" ? (edition_id === "standard" ? "Q4_K_M" : "Q8_0") : null, context_length: null, embedding_dimension: artifact.role === "embedding" ? 512 : null, query_prefix: artifact.query_prefix, max_length: artifact.max_length, license_name: artifact.license_name, status: "ready", imported_at: now() }));
     demoArtifacts = [...demoArtifacts, ...installed];
     installed.forEach((artifact) => demoActiveRoles.add(artifact.role));
-    const job: ModelDownloadJob = { job_id: crypto.randomUUID(), edition_id, edition_name: edition.name, source, status: "completed", phase: "completed", downloaded_bytes: edition.download_size_bytes, total_bytes: edition.download_size_bytes, progress: 1, bytes_per_second: 0, eta_seconds: null, retry_count: 0, current_file: null, files: edition.artifacts.flatMap((artifact) => [{ role: artifact.role, file_name: artifact.file_name, downloaded_bytes: artifact.size_bytes, total_bytes: artifact.size_bytes, status: "completed" }, ...artifact.companion_files.map((file) => ({ role: artifact.role, file_name: file.file_name, downloaded_bytes: file.size_bytes, total_bytes: file.size_bytes, status: "completed" }))]), installed_artifact_ids: installed.map((artifact) => artifact.artifact_id), profile_id: crypto.randomUUID(), error: null, created_at: now(), updated_at: now() };
+    const job: ModelDownloadJob = { job_id: crypto.randomUUID(), edition_id, edition_name: edition.name, source, status: "completed", phase: "completed", downloaded_bytes: edition.download_size_bytes, total_bytes: edition.download_size_bytes, progress: 1, bytes_per_second: 0, eta_seconds: null, retry_count: 0, current_file: null, files: edition.artifacts.flatMap((artifact) => [{ role: artifact.role, file_name: artifact.file_name, downloaded_bytes: artifact.size_bytes, total_bytes: artifact.size_bytes, status: "completed" }, ...artifact.companion_files.map((file) => ({ role: artifact.role, file_name: file.file_name, downloaded_bytes: file.size_bytes, total_bytes: file.size_bytes, status: "completed" }))]), installed_artifact_ids: installed.map((artifact) => artifact.artifact_id), profile_id: crypto.randomUUID(), error: null, activation_status: "active", activation_error: null, created_at: now(), updated_at: now() };
     demoDownloadJobs = [job, ...demoDownloadJobs];
     return structuredClone(job);
   },
@@ -335,6 +417,10 @@ export const browserBridge: ReminBridge = {
     if (!artifact) throw new Error("模型组件不存在");
     demoActiveRoles.add(artifact.role);
     return { ...defaultModelState, status: "ready", message: artifact.role === "generation" ? "本地生成模型已配置" : "语义检索已就绪", runtime_backend: "cpu", capabilities: { ...defaultModelState.capabilities, [artifact.role]: true } };
+  },
+  async model_role_disable(role) {
+    demoActiveRoles.delete(role);
+    return { ...defaultModelState, message: `${role} 已停用，模型文件仍保留在本机` };
   },
   async home_get_summary(local_date) {
     return makeSummary(local_date);
@@ -458,7 +544,39 @@ export const browserBridge: ReminBridge = {
       error: null,
     };
     browserAskOperations.set(operation_id, snapshot);
+    const updated_at = now();
+    browserAskSessions.set(session_id, {
+      session_id,
+      title: browserAskSessions.get(session_id)?.title ?? `${request.question.trim().slice(0, 28)}${request.question.trim().length > 28 ? "…" : ""}`,
+      scope: request.scope,
+      message_count: (browserAskMessages.get(session_id)?.length ?? 0) + 2,
+      created_at: browserAskSessions.get(session_id)?.created_at ?? updated_at,
+      updated_at,
+      last_error: null,
+    });
+    browserAskMessages.set(session_id, [
+      ...(browserAskMessages.get(session_id) ?? []),
+      { message_id: crypto.randomUUID(), session_id, role: "user", content: request.question, answer: null, error: null, created_at: updated_at },
+      { message_id: result.message_id, session_id, role: "assistant", content: result.answer, answer: result, error: null, created_at: now() },
+    ]);
     return snapshot.handle;
+  },
+  async ask_session_query() {
+    const items = [...browserAskSessions.values()].sort((left, right) => right.updated_at.localeCompare(left.updated_at));
+    return { items: structuredClone(items), next_cursor: null, has_more: false };
+  },
+  async ask_message_query(session_id) {
+    return { items: structuredClone(browserAskMessages.get(session_id) ?? []), next_cursor: null, has_more: false };
+  },
+  async ask_session_rename(session_id, title) {
+    const session = browserAskSessions.get(session_id);
+    if (!session) throw new Error("问答会话不存在");
+    session.title = title.trim();
+    session.updated_at = now();
+  },
+  async ask_session_delete(session_id) {
+    browserAskSessions.delete(session_id);
+    browserAskMessages.delete(session_id);
   },
   async ask_operation_get(operation_id) {
     const snapshot = browserAskOperations.get(operation_id);
@@ -476,6 +594,9 @@ export const browserBridge: ReminBridge = {
     };
     browserAskOperations.set(operation_id, cancelled);
     return cancelled;
+  },
+  async answer_export(_message_id, target_path, format) {
+    return { target_path, format, row_count: 0, size_bytes: 0, sha256: "0".repeat(64) };
   },
   async preview_get(file_id, offset = 0, _limit = 80, anchor_node_id = null) {
     const file = searchCatalog.find((item) => item.file_id === file_id);
@@ -524,13 +645,22 @@ export const browserBridge: ReminBridge = {
     throw new Error("浏览器预览不打开资源管理器，请在拾忆桌面程序中使用此操作。");
   },
   async inbox_query(request) {
-    const items = inbox.items.filter((item) => request.status === "all" || item.triage_status === request.status);
-    return { items: structuredClone(items), next_cursor: null };
+    const items = inbox.items.filter((item) => request.status === "all"
+      || (request.status === "error" ? ["pending_retry", "retrying"].includes(item.resolution_status) : item.triage_status === request.status));
+    return { items: structuredClone(items), next_cursor: null, has_more: false };
   },
   async inbox_update(inbox_id, triage_status) {
     const item = inbox.items.find((candidate) => candidate.inbox_id === inbox_id);
     if (!item) throw new Error("收件箱项目不存在");
     item.triage_status = triage_status;
+    return structuredClone(item);
+  },
+  async inbox_retry(inbox_id) {
+    const item = inbox.items.find((candidate) => candidate.inbox_id === inbox_id);
+    if (!item || !item.retry_action) throw new Error("该项目当前没有可重试的处理任务");
+    item.resolution_status = "retrying";
+    item.attempt_count += 1;
+    item.last_attempt_at = now();
     return structuredClone(item);
   },
   async ocr_retry() {
@@ -549,32 +679,6 @@ export const browserBridge: ReminBridge = {
       model_artifact_id: "018f0000-0000-7000-8000-000000000999",
       analyzed_at: now(),
     };
-  },
-  async knowledge_space_list() {
-    return structuredClone(demoKnowledgeSpaces);
-  },
-  async knowledge_space_create(request) {
-    const space: KnowledgeSpace = {
-      space_id: crypto.randomUUID(),
-      ...request,
-      file_count: 0,
-      created_at: now(),
-      updated_at: now(),
-    };
-    demoKnowledgeSpaces = [space, ...demoKnowledgeSpaces];
-    return structuredClone(space);
-  },
-  async knowledge_space_update(space_id, request) {
-    const index = demoKnowledgeSpaces.findIndex((space) => space.space_id === space_id);
-    if (index < 0) throw new Error("知识空间不存在");
-    const updated: KnowledgeSpace = { ...demoKnowledgeSpaces[index]!, ...request, updated_at: now() };
-    demoKnowledgeSpaces[index] = updated;
-    return structuredClone(updated);
-  },
-  async knowledge_space_delete(space_id) {
-    const before = demoKnowledgeSpaces.length;
-    demoKnowledgeSpaces = demoKnowledgeSpaces.filter((space) => space.space_id !== space_id);
-    if (before === demoKnowledgeSpaces.length) throw new Error("知识空间不存在");
   },
   async collection_list() {
     return structuredClone(collectionRecords);
@@ -605,7 +709,7 @@ export const browserBridge: ReminBridge = {
     const pageSize = Math.min(200, Math.max(1, request.page_size));
     const pageItems = items.slice(offset, offset + pageSize);
     const nextOffset = offset + pageItems.length;
-    return { items: pageItems, next_cursor: nextOffset < items.length ? String(nextOffset) : null, total: items.length };
+    return { items: pageItems, next_cursor: nextOffset < items.length ? String(nextOffset) : null, has_more: nextOffset < items.length, total: items.length };
   },
   async collection_add_file() {
     return undefined;
@@ -616,9 +720,9 @@ export const browserBridge: ReminBridge = {
   async collection_suggestion_refresh() {
     if (demoSuggestions.length === 0) {
       const members = demoFileRecords().slice(0, 2).map((file, index) => ({ file, revision_id: file.current_revision_id!, confidence: index === 0 ? 1 : 0.86, rationale: index === 0 ? "该文档是本组语义质心候选" : "与组内核心文档的语义相似度为 86%", state: "suggested" }));
-      demoSuggestions = [{ suggestion_id: crypto.randomUUID(), suggested_name: "RAG 检索优化资料", description: "这些资料的语义画像都在讨论混合召回与检索效果。确认后只在拾忆中形成虚拟分类。", confidence: 0.86, status: "suggested", model_version: "demo-bge-small-zh-v1.5", algorithm_version: "semantic_lsh_v1", members, created_at: now(), updated_at: now() }];
+      demoSuggestions = [{ suggestion_id: crypto.randomUUID(), suggested_name: "RAG 检索优化资料", description: "这些资料的语义画像都在讨论混合召回与检索效果。确认后只在拾忆中形成虚拟分类。", confidence: 0.86, status: "suggested", model_version: "demo-bge-small-zh-v1.5", algorithm_version: "semantic_lsh_v2", members, created_at: now(), updated_at: now() }];
     }
-    return { profiled_files: 2, candidate_edges: 1, created_suggestions: demoSuggestions.length, suggestion_ids: demoSuggestions.map((item) => item.suggestion_id), algorithm_version: "semantic_lsh_v1", model_version: "demo-bge-small-zh-v1.5" };
+    return { profiled_files: 2, candidate_edges: 1, created_suggestions: demoSuggestions.length, suggestion_ids: demoSuggestions.map((item) => item.suggestion_id), algorithm_version: "semantic_lsh_v2", model_version: "demo-bge-small-zh-v1.5" };
   },
   async collection_suggestion_query(cursor, page_size, status = "suggested") {
     const filtered = demoSuggestions.filter((item) => item.status === status);
@@ -652,13 +756,16 @@ export const browserBridge: ReminBridge = {
     current.updated_at = now();
   },
   async relation_refresh() {
-    return { hashed_files: 2, exact_duplicate_pairs: 1, version_candidate_pairs: 1 };
+    return { hashed_files: 2, exact_duplicate_pairs: 1, version_candidate_pairs: 1, semantic_related_pairs: 2, contains_or_summarizes_pairs: 1 };
   },
   async relation_query() {
     return { items: [], next_cursor: null, total: 0 };
   },
   async relation_review() {
     return undefined;
+  },
+  async relation_batch_review(relation_ids) {
+    return relation_ids.length;
   },
   async file_query(request) {
     const normalizedQuery = request.query?.trim().toLocaleLowerCase("zh-CN") ?? "";
@@ -675,6 +782,7 @@ export const browserBridge: ReminBridge = {
     return {
       items: pageItems,
       next_cursor: nextOffset < items.length ? String(nextOffset) : null,
+      has_more: nextOffset < items.length,
       total: items.length,
     };
   },
@@ -685,107 +793,12 @@ export const browserBridge: ReminBridge = {
     return structuredClone(rule);
   },
   async exclusion_rule_delete(rule_id) { demoExclusionRules = demoExclusionRules.filter((item) => item.rule_id !== rule_id); },
-  async extraction_preset_list() {
-    return [
-      { preset_id: "file_catalog", name: "资料目录", description: "抽取文件名、类型、修改时间、大小和路径，用于生成资料清单。", fields: [
-        { key: "file_name", label: "文件名", field_type: "string", description: "文件名", required: true, multiple: false, hints: [] },
-        { key: "extension", label: "类型", field_type: "string", description: "类型", required: true, multiple: false, hints: [] },
-      ] },
-      { preset_id: "contact_clues", name: "联系方式", description: "从正文中查找电子邮箱和手机号码。", fields: [
-        { key: "emails", label: "电子邮箱", field_type: "list", description: "电子邮箱", required: false, multiple: true, hints: [] },
-        { key: "phones", label: "手机号码", field_type: "list", description: "手机号码", required: false, multiple: true, hints: [] },
-      ] },
-      { preset_id: "extractive_summary", name: "保守摘录摘要", description: "提取每份资料开头的关键段落并保留来源。", fields: [
-        { key: "summary", label: "摘要", field_type: "string", description: "带来源的保守摘录", required: false, multiple: false, hints: [] },
-      ] },
-      { preset_id: "filename_suggestions", name: "文件名建议", description: "根据正文标题生成建议，不直接重命名。", fields: [
-        { key: "suggested_name", label: "建议文件名", field_type: "string", description: "建议名称", required: false, multiple: false, hints: [] },
-      ] },
-      { preset_id: "folder_suggestions", name: "目录建议", description: "根据内容和类型生成虚拟集合建议。", fields: [
-        { key: "suggested_collection", label: "建议集合", field_type: "string", description: "建议虚拟集合", required: false, multiple: false, hints: [] },
-      ] },
-      { preset_id: "duplicate_review", name: "重复文件审查", description: "按字节数与SHA-256列出完全重复候选。", fields: [
-        { key: "file_name", label: "文件名", field_type: "string", description: "文件名", required: true, multiple: false, hints: [] },
-        { key: "content_sha256", label: "SHA-256", field_type: "string", description: "内容哈希", required: false, multiple: false, hints: [] },
-      ] },
-      { preset_id: "version_compare", name: "多版本内容对比", description: "比较带来源的正文块增删。", fields: [
-        { key: "file_name", label: "文件名", field_type: "string", description: "文件名", required: true, multiple: false, hints: [] },
-        { key: "version_diff", label: "相对基准的内容变化", field_type: "object", description: "内容变化", required: true, multiple: false, hints: [] },
-      ] },
-      { preset_id: "merge_tables", name: "合并表格", description: "按表头对齐Word与Excel表格行。", fields: [
-        { key: "source_file", label: "来源文件", field_type: "string", description: "来源文件", required: true, multiple: false, hints: [] },
-        { key: "row_data", label: "按表头对齐的数据", field_type: "object", description: "行数据", required: true, multiple: false, hints: [] },
-      ] },
-      { preset_id: "ocr_report", name: "重新 OCR", description: "强制重新识别图片或PDF。", fields: [
-        { key: "file_name", label: "文件名", field_type: "string", description: "文件名", required: true, multiple: false, hints: [] },
-        { key: "ocr_status", label: "OCR状态", field_type: "string", description: "OCR状态", required: true, multiple: false, hints: [] },
-      ] },
-    ];
-  },
-  async extraction_run(file_ids, preset_id) {
-    const files = demoFileRecords().filter((file) => file_ids.includes(file.file_id));
-    const preset = (await browserBridge.extraction_preset_list()).find((item) => item.preset_id === preset_id);
-    if (!preset) throw new Error("抽取模板不存在");
-    return {
-      run_id: crypto.randomUUID(), preset, status: "completed", completed_at: now(), warnings: ["浏览器预览使用演示数据。"],
-      rows: files.map((file) => ({ file, values: preset.fields.map((field) => ({ field_key: field.key, raw_value: field.key === "file_name" ? file.display_name : field.key === "extension" ? file.extension : null, normalized_value: field.key === "file_name" ? file.display_name : field.key === "extension" ? file.extension : null, confidence: field.key === "file_name" || field.key === "extension" ? 1 : 0, method: "metadata", review_state: field.key === "file_name" || field.key === "extension" ? "auto" as const : "missing" as const, evidence: [], validation_errors: [] })) })),
-    };
-  },
-  async skill_list() {
-    const registered: Array<[string, string, string]> = [
-      ["batch_field_extraction", "批量字段抽取", "使用固定规则模板逐字段抽取，并保留来源。"],
-      ["generate_catalog", "生成资料目录", "从文件元数据生成可复核目录，并显式导出新文件。"],
-      ["duplicate_review", "重复文件审查", "对选中且同大小的资料计算SHA-256，生成待人工确认的重复候选。"],
-      ["multi_document_summary", "多文档摘要", "从每份资料提取带逐段来源的保守摘要，不补充外部知识。"],
-      ["version_compare", "多版本内容对比", "以最早修改版本为基准比较正文块增删，并保留双侧来源。"],
-      ["recommend_filename", "推荐文件名", "比较正文标题和保守回退路径，只输出建议。"],
-      ["recommend_folders", "推荐目录结构", "比较元数据、正文关键词和保守回退路径，只输出虚拟集合建议。"],
-      ["merge_tables", "合并表格并导出", "按首行表头对齐Word与Excel表格，保留原始值与来源。"],
-      ["rerun_ocr", "重新 OCR", "使用Windows本地OCR强制重新识别选中的图片或PDF。"],
-      ["export_index", "导出知识库索引", "导出经过复核的文件元数据索引。"],
-    ];
-    return registered.map(([skill_id, name, description]) => ({ skill_id, name, description, available: true, unavailable_reason: null, risk_level: "low" as const, source_files_readonly: true as const, export_required: true }));
-  },
-  async task_plan(skill_id, file_ids, parameters) {
-    return { task_id: crypto.randomUUID(), skill_id, skill_version: "1.0.0", summary: `对${file_ids.length}份资料执行“批量字段抽取”`, estimated_file_count: file_ids.length, warnings: ["任务只读取源文件；产生的结果先在应用内复核，导出需要再次由你选择保存位置。"], steps: ["验证资料权限与当前修订", "固定本次处理输入快照", "逐文件执行规则抽取", "生成应用内复核表"].map((label, index) => ({ step_id: crypto.randomUUID(), ordinal: index + 1, step_type: ["scope.validate", "input.snapshot", "extraction.rules_first", "result.review"][index]!, label, inputs: index === 2 ? parameters : {}, expected_outputs: {}, status: "pending" as const, attempt_count: 0, checkpoint: ["permission.source_readonly", "invariant.revision_current", "evidence.field_level", "schema.extraction_result"][index]!, error: null })) };
-  },
-  async task_execute(skill_id, file_ids, parameters, planned_task_id) {
-    const generated = await browserBridge.task_plan(skill_id, file_ids, parameters);
-    const plan = { ...generated, task_id: planned_task_id };
-    const presetId = skill_id === "generate_catalog" || skill_id === "export_index" ? "file_catalog"
-      : skill_id === "multi_document_summary" ? "extractive_summary"
-      : skill_id === "recommend_filename" ? "filename_suggestions"
-      : skill_id === "recommend_folders" ? "folder_suggestions"
-      : skill_id === "duplicate_review" ? "duplicate_review"
-      : skill_id === "version_compare" ? "version_compare"
-      : skill_id === "merge_tables" ? "merge_tables"
-      : skill_id === "rerun_ocr" ? "ocr_report"
-      : String(parameters.preset_id ?? "file_catalog");
-    const result = await browserBridge.extraction_run(file_ids, presetId);
-    const completedAt = now();
-    const completedPlan = { ...plan, steps: plan.steps.map((step) => ({ ...step, status: "succeeded" as const, attempt_count: 1 })) };
-    const strategies = skill_id === "multi_document_summary" ? ["extractive_first", "metadata_outline", "conservative_fallback"]
-      : skill_id === "recommend_filename" ? ["content_heading", "existing_name_normalized", "conservative_keep_current"]
-      : skill_id === "recommend_folders" ? ["content_keywords", "path_and_type", "conservative_virtual_inbox"] : [];
-    return {
-      plan: completedPlan,
-      job: { job_id: plan.task_id, job_type: `task.${skill_id}`, status: "succeeded" as const, stage: "completed", progress: 1, processed_items: plan.steps.length, total_items: plan.steps.length, error: null, created_at: completedAt, started_at: completedAt, finished_at: completedAt },
-      result,
-      checkpoints: plan.steps.map((step) => ({ checkpoint_id: crypto.randomUUID(), job_id: plan.task_id, unit_id: step.step_id, checkpoint_type: step.ordinal === 1 ? "permission" as const : step.ordinal === 2 ? "invariant" as const : step.ordinal === 3 ? "evidence" as const : "schema" as const, status: "passed" as const, rules_version: "1.0.0", metrics: {}, error: null, created_at: completedAt, resume_token: null })),
-      candidates: strategies.map((strategy, index) => ({ candidate_id: crypto.randomUUID(), job_id: plan.task_id, strategy, status: index === 0 ? "selected" as const : "valid" as const, result_ref: index === 0 ? `remin://extraction/${result.run_id}` : null, quality_score: index === 0 ? 0.9 : index === 1 ? 0.72 : 0.6, evidence_score: 1, latency_ms: null, resource_cost: index === 0 ? 0.5 : index === 1 ? 0.2 : 0.05, rejection_reasons: [] })),
-    };
-  },
-  async task_recoverable() {
-    return null;
-  },
-  async task_resume() {
-    throw new Error("浏览器预览没有可恢复的本地任务");
-  },
-  async extraction_export() {
-    throw new Error("浏览器预览不写入电脑文件，请在拾忆桌面程序中导出。");
+  async app_status_get() {
+    const maintenance = { schema_version: 17, database_size_bytes: 12_582_912, indexed_files: 3, searchable_chunks: 18, embedded_chunks: 0, pending_files: 0, failed_files: 0, active_jobs: 0, log_events: 3, background_notice: null, checks: [{ key: "database", label: "本地数据库", status: "passed" as const, detail: "ok" }, { key: "schema", label: "数据结构", status: "passed" as const, detail: "版本 17" }, { key: "source_readonly", label: "源文件保护", status: "passed" as const, detail: "维护操作只作用于拾忆索引与日志" }], checked_at: now() };
+    return { local_only: true as const, source_files_readonly: true as const, roots: [...roots], scan_progress: null, maintenance, inference_runtime: defaultInferenceRuntime, recovery_actions: ["view_models" as const], checked_at: now() };
   },
   async maintenance_get() {
-    return { schema_version: 6, database_size_bytes: 12_582_912, indexed_files: 3, searchable_chunks: 18, embedded_chunks: 0, pending_files: 0, failed_files: 0, active_jobs: 0, log_events: 3, background_notice: null, checks: [{ key: "database", label: "本地数据库", status: "passed" as const, detail: "ok" }, { key: "schema", label: "数据结构", status: "passed" as const, detail: "版本 6" }, { key: "source_readonly", label: "源文件保护", status: "passed" as const, detail: "维护操作只作用于拾忆索引与日志" }], checked_at: now() };
+    return { schema_version: 17, database_size_bytes: 12_582_912, indexed_files: 3, searchable_chunks: 18, embedded_chunks: 0, pending_files: 0, failed_files: 0, active_jobs: 0, log_events: 3, background_notice: null, checks: [{ key: "database", label: "本地数据库", status: "passed" as const, detail: "ok" }, { key: "schema", label: "数据结构", status: "passed" as const, detail: "版本 17" }, { key: "source_readonly", label: "源文件保护", status: "passed" as const, detail: "维护操作只作用于拾忆索引与日志" }], checked_at: now() };
   },
   async maintenance_check(level) {
     return { level, database_result: "ok", elapsed_ms: 1, source_files_modified: false };
@@ -800,11 +813,13 @@ export const browserBridge: ReminBridge = {
       { key: "failed_downloads" as const, label: "失败下载隔离区", size_bytes: 0, clearable: true, detail: "大小或哈希异常的下载副本，不用于续传" },
     ];
     const total_bytes = categories.reduce((total, item) => total + item.size_bytes, 0);
-    return { categories, total_bytes, data_directory: "应用管理目录", disk_capacity_bytes: 512 * 1024 ** 3, disk_available_bytes: 128 * 1024 ** 3, soft_quota_bytes: 50 * 1024 ** 3, soft_quota_is_custom: false, over_soft_quota: false, background_tasks_paused: false, notice: null, measured_at: now() };
+    return { categories, total_bytes, data_directory: "应用管理目录", disk_capacity_bytes: 512 * 1024 ** 3, disk_available_bytes: 128 * 1024 ** 3, soft_quota_bytes: 50 * 1024 ** 3, over_soft_quota: false, background_tasks_paused: false, notice: null, measured_at: now() };
   },
-  async storage_policy_set(quota_bytes) {
-    const snapshot = await browserBridge.storage_usage_get();
-    return { ...snapshot, soft_quota_bytes: quota_bytes, soft_quota_is_custom: true, over_soft_quota: snapshot.total_bytes >= quota_bytes, background_tasks_paused: snapshot.total_bytes >= quota_bytes, notice: snapshot.total_bytes >= quota_bytes ? "存储已达到软配额，暂停图片缓存、OCR和语义索引；搜索与预览继续可用" : null };
+  async storage_location_get() {
+    return { active_data_directory: "应用管理目录", pending_target_directory: null, restart_required: false, last_error: null };
+  },
+  async storage_migration_schedule(selected_directory) {
+    return { active_data_directory: "应用管理目录", pending_target_directory: `${selected_directory}\\ReminData`, restart_required: true, last_error: null };
   },
   async cache_clear(category) {
     return { category, removed_entries: 1, freed_bytes: category === "temporary_cache" ? 1_048_576 : 0 };
@@ -818,14 +833,15 @@ export const browserBridge: ReminBridge = {
   async maintenance_logs_clear() {
     return 1;
   },
+  async diagnostic_event_append() {},
   async diagnostic_export() {
     throw new Error("浏览器预览不写入电脑文件，请在拾忆桌面程序中导出。");
   },
   async index_rebuild() {
-    return { reset_files: 3, removed_nodes: 18, removed_chunks: 18, removed_embeddings: 0, source_files_modified: false as const };
+    return { operation_id: crypto.randomUUID(), kind: "index_rebuild" as const, status: "queued" as const, created_at: now() };
   },
   async root_list() {
-    return roots;
+    return [...roots];
   },
   async root_add(request) {
     const root: RootRecord = { root_id: "018f0000-0000-7000-8000-000000000405", path: request.path, canonical_path: request.path, path_key: request.path.toLocaleLowerCase("zh-CN"), root_file_id: null, volume_id: "vol-demo", volume_type: "fixed", authorization_source: request.authorization_source, root_kind: request.full_volume_confirmed ? "volume_root" : "folder", label: request.label || request.path, enabled: true, status: "ready", watch_mode: request.watch_mode, coverage_parent_root_id: null, file_count: 0, permission_error_count: 0, last_scan_at: null };

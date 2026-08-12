@@ -1,72 +1,87 @@
-import { ApartmentOutlined, FolderAddOutlined, MoreOutlined, ReloadOutlined, SafetyCertificateOutlined } from "@ant-design/icons";
+import { ApartmentOutlined, FileOutlined, FolderAddOutlined, MoreOutlined, ReloadOutlined, SafetyCertificateOutlined, SearchOutlined } from "@ant-design/icons";
 import { isTauri } from "@tauri-apps/api/core";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { open } from "@tauri-apps/plugin-dialog";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { useRef, useState } from "react";
-import { bridge, type ExportResult, type ExtractionRunResult, type SkillDefinition, type TaskExecutionResult, type TaskPlan } from "../bridge";
+import { useMemo, useRef, useState } from "react";
+import { bridge, type RelationType, type RootRecord } from "../bridge";
+import { recordDiagnosticEvent } from "../bridge/observed-bridge";
+import { confirmAction } from "../components/AppConfirm";
+import { AppSelect } from "../components/AppSelect";
 import { useAppStore } from "../state/app-store";
+import { errorMessage } from "../utils/app-error";
 import { displayPath } from "../utils/display-path";
 
-function presetForSkill(skillId: string, selectedPreset: string) {
-  if (skillId === "generate_catalog" || skillId === "export_index") return "file_catalog";
-  if (skillId === "multi_document_summary") return "extractive_summary";
-  if (skillId === "recommend_filename") return "filename_suggestions";
-  if (skillId === "recommend_folders") return "folder_suggestions";
-  if (skillId === "duplicate_review") return "duplicate_review";
-  if (skillId === "version_compare") return "version_compare";
-  if (skillId === "merge_tables") return "merge_tables";
-  if (skillId === "rerun_ocr") return "ocr_report";
-  return selectedPreset;
-}
+const ROOT_STATUS_LABELS: Record<RootRecord["status"], string> = {
+  discovering: "正在发现", ready: "就绪", scanning: "扫描中", partial_denied: "部分受限",
+  permission_denied: "无权限", paused: "已暂停", offline: "离线", failed: "异常", removing: "正在移除",
+};
 
 export function LibraryPage() {
   const navigate = useAppStore((state) => state.navigate);
   const queryClient = useQueryClient();
   const roots = useQuery({ queryKey: ["roots"], queryFn: () => bridge.root_list() });
+  const summary = useQuery({
+    queryKey: ["home-summary", new Date().toLocaleDateString("sv-SE")],
+    queryFn: () => bridge.home_get_summary(new Date().toLocaleDateString("sv-SE")),
+    refetchInterval: (query) => query.state.data?.scan_progress ? 1500 : 10_000,
+  });
+  const [fileQuery, setFileQuery] = useState("");
+  const [fileExtension, setFileExtension] = useState("");
+  const [fileStatus, setFileStatus] = useState("");
   const files = useInfiniteQuery({
-    queryKey: ["files"],
+    queryKey: ["files", fileQuery.trim(), fileExtension, fileStatus],
     initialPageParam: null as string | null,
-    queryFn: ({ pageParam }) => bridge.file_query({ cursor: pageParam, page_size: 100 }),
+    queryFn: async ({ pageParam }) => {
+      recordDiagnosticEvent({ level: "info", component: "frontend.pagination", event_name: "file_page.requested", fields: { cursor_present: Boolean(pageParam), page_size: 100, filtered: Boolean(fileQuery.trim() || fileExtension || fileStatus) } });
+      const page = await bridge.file_query({ cursor: pageParam, page_size: 100, query: fileQuery.trim() || null, extensions: fileExtension ? [fileExtension] : [], parse_statuses: fileStatus ? [fileStatus] : [], availability: "present" });
+      const advanced = !page.has_more || Boolean(page.next_cursor && page.next_cursor !== pageParam);
+      recordDiagnosticEvent({ level: advanced ? "info" : "error", component: "frontend.pagination", event_name: "file_page.completed", fields: { returned_count: page.items.length, has_more: page.has_more, cursor_advanced: advanced } });
+      if (!advanced) throw { code: "FILE_CURSOR_INVALID", message: "资料分页游标没有推进，请刷新后重试。", retryable: false };
+      return page;
+    },
     getNextPageParam: (page) => page.next_cursor,
   });
-  const fileItems = files.data?.pages.flatMap((page) => page.items) ?? [];
-  const fileTotal = files.data?.pages[0]?.total ?? 0;
-  const presets = useQuery({ queryKey: ["extraction-presets"], queryFn: () => bridge.extraction_preset_list() });
-  const skills = useQuery({ queryKey: ["registered-skills"], queryFn: () => bridge.skill_list() });
-  const recoverableTask = useQuery({ queryKey: ["recoverable-task"], queryFn: () => bridge.task_recoverable() });
+  const fileItems = useMemo(() => files.data?.pages.flatMap((page) => page.items) ?? [], [files.data]);
+  const fileTotal = files.data?.pages[0]?.total ?? null;
+  const fileListRef = useRef<HTMLDivElement>(null);
+  const fileVirtualizer = useVirtualizer({
+    count: fileItems.length,
+    getScrollElement: () => fileListRef.current,
+    estimateSize: () => 64,
+    overscan: 10,
+  });
+  const [relationType, setRelationType] = useState<RelationType | "">("");
+  const [relationReview, setRelationReview] = useState<"suggested" | "accepted" | "rejected" | "">("");
   const relations = useInfiniteQuery({
-    queryKey: ["file-relations"],
+    queryKey: ["file-relations", relationType, relationReview],
     initialPageParam: null as string | null,
-    queryFn: ({ pageParam }) => bridge.relation_query({ cursor: pageParam, page_size: 100 }),
+    queryFn: ({ pageParam }) => bridge.relation_query({ cursor: pageParam, page_size: 100, relation_type: relationType || null, review_status: relationReview || null }),
     getNextPageParam: (page) => page.next_cursor,
   });
   const relationItems = relations.data?.pages.flatMap((page) => page.items) ?? [];
   const relationTotal = relations.data?.pages[0]?.total ?? 0;
+  const relationGroups = useMemo(() => (["exact_duplicate", "version_candidate", "semantic_related", "contains_or_summarizes", "related"] as RelationType[]).map((type) => ({ type, items: relationItems.filter((relation) => relation.relation_type === type) })).filter((group) => group.items.length > 0), [relationItems]);
   const refreshRelations = useMutation({ mutationFn: () => bridge.relation_refresh(5000), onSuccess: async () => queryClient.invalidateQueries({ queryKey: ["file-relations"] }) });
   const reviewRelation = useMutation({
     mutationFn: ({ relationId, action }: { relationId: string; action: "accepted" | "rejected" }) => bridge.relation_review(relationId, action),
     onSuccess: async () => queryClient.invalidateQueries({ queryKey: ["file-relations"] }),
   });
+  const [selectedRelations, setSelectedRelations] = useState<Set<string>>(new Set());
+  const batchReviewRelations = useMutation({
+    mutationFn: (action: "accepted" | "rejected") => bridge.relation_batch_review([...selectedRelations], action),
+    onSuccess: async (count, action) => {
+      setMessage(`已${action === "accepted" ? "确认" : "排除"} ${count} 条文件关系。`);
+      setSelectedRelations(new Set());
+      await queryClient.invalidateQueries({ queryKey: ["file-relations"] });
+    },
+    onError: (actionError) => setError(errorMessage(actionError)),
+  });
   const [adding, setAdding] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [presetId, setPresetId] = useState("file_catalog");
-  const [skillId, setSkillId] = useState("batch_field_extraction");
-  const [processing, setProcessing] = useState(false);
-  const [run, setRun] = useState<ExtractionRunResult | null>(null);
-  const [plan, setPlan] = useState<TaskPlan | null>(null);
-  const [execution, setExecution] = useState<TaskExecutionResult | null>(null);
-  const [exportFormat, setExportFormat] = useState<ExportResult["format"]>("xlsx");
-  const [exporting, setExporting] = useState(false);
-  const [exportResult, setExportResult] = useState<ExportResult | null>(null);
-  const fileListRef = useRef<HTMLDivElement>(null);
-  const fileVirtualizer = useVirtualizer({
-    count: fileItems.length,
-    getScrollElement: () => fileListRef.current,
-    estimateSize: () => 58,
-    overscan: 10,
-  });
+  const [message, setMessage] = useState<string | null>(null);
+  const [menuRootId, setMenuRootId] = useState<string | null>(null);
+  const [actionRootId, setActionRootId] = useState<string | null>(null);
 
   const addRoot = async () => {
     setError(null);
@@ -76,121 +91,97 @@ export function LibraryPage() {
       const selectedPath = await open({ directory: true, multiple: false, title: "添加资料位置" });
       if (typeof selectedPath !== "string") return;
       const fullVolume = /^[a-zA-Z]:\\?$/.test(selectedPath);
-      if (fullVolume && !window.confirm("扫描整个磁盘可能耗时较长，并会自动排除系统和凭据目录。确认继续吗？")) return;
+      if (fullVolume && !await confirmAction({ actionKey: "library_add_full_volume", title: "添加整个磁盘？", description: "扫描可能耗时较长，并会自动排除系统、程序、凭据和拾忆自身目录。", confirmLabel: "确认添加" })) return;
       await bridge.root_add({ path: selectedPath, label: null, watch_mode: "realtime", authorization_source: "user_selected", full_volume_confirmed: fullVolume });
       await roots.refetch();
-    } catch (actionError) { setError(actionError instanceof Error ? actionError.message : String(actionError)); }
+    } catch (actionError) { setError(errorMessage(actionError)); }
     finally { setAdding(false); }
   };
 
-  const toggleFile = (fileId: string) => { setPlan(null); setRun(null); setExecution(null); setSelected((current) => {
-    const next = new Set(current);
-    if (next.has(fileId)) next.delete(fileId); else next.add(fileId);
-    return next;
-  }); };
-
-  const previewPlan = async () => {
-    if (selected.size === 0) return;
-    setProcessing(true); setError(null); setRun(null);
-    const effectivePreset = presetForSkill(skillId, presetId);
-    try { setPlan(await bridge.task_plan(skillId, [...selected], { preset_id: effectivePreset })); }
-    catch (actionError) { setError(actionError instanceof Error ? actionError.message : String(actionError)); }
-    finally { setProcessing(false); }
-  };
-
-  const runExtraction = async () => {
-    if (selected.size === 0 || !plan) return;
-    setProcessing(true); setError(null); setExportResult(null);
-    const effectivePreset = presetForSkill(skillId, presetId);
+  const rescanRoot = async (root: RootRecord) => {
+    setMenuRootId(null); setError(null); setMessage(null);
+    setActionRootId(root.root_id);
     try {
-      const completed = await bridge.task_execute(skillId, [...selected], { preset_id: effectivePreset }, plan.task_id);
-      setExecution(completed);
-      setPlan(completed.plan);
-      setRun(completed.result);
-    }
-    catch (actionError) { setError(actionError instanceof Error ? actionError.message : String(actionError)); }
-    finally { setProcessing(false); }
+      await bridge.scan_start(root.root_id, "user_requested");
+      setMessage(`已开始重新扫描“${root.label}”，进度会在状态列实时更新。`);
+      await Promise.all([roots.refetch(), summary.refetch()]);
+    } catch (actionError) { setError(errorMessage(actionError)); }
+    finally { setActionRootId(null); }
   };
 
-  const resumeTask = async () => {
-    if (!recoverableTask.data) return;
-    setProcessing(true); setError(null); setExportResult(null);
+  const removeRoot = async (root: RootRecord) => {
+    if (!await confirmAction({ actionKey: "library_remove_root", title: `从拾忆移除“${root.label}”？`, description: "拾忆会立即停止读取并撤销该位置的授权，派生索引在后台清理；不会删除、移动或修改任何源文件。", confirmLabel: "从拾忆移除", danger: true })) return;
+    setMenuRootId(null); setError(null); setMessage(null);
+    setActionRootId(root.root_id);
     try {
-      const completed = await bridge.task_resume(recoverableTask.data.task_id);
-      setExecution(completed);
-      setPlan(completed.plan);
-      setRun(completed.result);
-      await recoverableTask.refetch();
+      await bridge.root_disable(root.root_id);
+      setMessage(`已从拾忆移除“${root.label}”。原文件没有变化；以后仍可重新添加。`);
+      await roots.refetch();
+    } catch (actionError) { setError(errorMessage(actionError)); }
+    finally { setActionRootId(null); }
+  };
+
+  const openFile = async (fileId: string) => {
+    setError(null);
+    try { await bridge.file_open(fileId); }
+    catch (actionError) { setError(errorMessage(actionError)); }
+  };
+
+  const loadMoreFiles = async () => {
+    const previousCount = fileItems.length;
+    setError(null);
+    try {
+      const result = await files.fetchNextPage();
+      const loadedCount = (result.data?.pages.flatMap((page) => page.items).length ?? previousCount) - previousCount;
+      setMessage(loadedCount > 0 ? `已加载 ${loadedCount} 份资料。` : "没有更多资料可加载。");
+      if (loadedCount > 0) requestAnimationFrame(() => fileVirtualizer.scrollToIndex(previousCount, { align: "start" }));
+    } catch (actionError) {
+      setError(errorMessage(actionError));
     }
-    catch (actionError) { setError(actionError instanceof Error ? actionError.message : String(actionError)); }
-    finally { setProcessing(false); }
   };
-
-  const exportRun = async () => {
-    if (!run) return;
-    if (!isTauri()) { setError("浏览器预览不会写入电脑文件，请在拾忆桌面程序中导出。"); return; }
-    const target = await save({ title: "导出拾忆处理结果", defaultPath: `拾忆-${run.preset.name}.${exportFormat}`, filters: [{ name: exportFormat.toUpperCase(), extensions: [exportFormat] }] });
-    if (typeof target !== "string") return;
-    setExporting(true); setError(null);
-    try { setExportResult(await bridge.extraction_export(run, exportFormat, target)); }
-    catch (actionError) { setError(actionError instanceof Error ? actionError.message : String(actionError)); }
-    finally { setExporting(false); }
-  };
-
-  const valueText = (value: unknown) => value == null ? "—" : Array.isArray(value) ? value.join("、") : typeof value === "object" ? JSON.stringify(value) : String(value);
 
   return (
     <section className="page">
-      <header className="page-heading"><div><h1>全部资料</h1><p>查看资料位置，选择文件并执行受限的本地处理。</p></div><button type="button" className="primary-button" disabled={adding} onClick={() => void addRoot()}><FolderAddOutlined /> {adding ? "正在添加" : "添加资料位置"}</button></header>
-      {error && <p role="alert" className="inline-error">{error}</p>}
-      <div className="readonly-note"><SafetyCertificateOutlined /> 拾忆只读取资料，不移动、重命名、删除或覆盖源文件。</div>
-      {recoverableTask.data && <div className="readonly-note"><span>发现未完成任务：{recoverableTask.data.summary}，已通过的检查站不会重复执行。</span><button type="button" className="text-button" disabled={processing} onClick={() => void resumeTask()}>{processing ? "正在恢复" : "从检查点继续"}</button></div>}
+      <header className="page-heading page-heading--inline-note page-heading--divider">
+        <div className="readonly-note"><SafetyCertificateOutlined /> 拾忆只读取资料，不移动、重命名、删除或覆盖源文件</div>
+        <button type="button" className="primary-button" disabled={adding} onClick={() => void addRoot()}><FolderAddOutlined /> {adding ? "正在添加" : "添加资料位置"}</button>
+      </header>
+      {error && <p role="alert" className="inline-error">{error}</p>}{message && <p className="inline-success">{message}</p>}
       <div className="root-table">
         <div className="root-table__head"><span>资料位置</span><span>状态</span><span>文件</span><span>最近扫描</span><span /></div>
-        {roots.data?.map((root) => <div className="root-table__row" key={root.root_id}><span><strong>{root.label}</strong><small>{root.path}</small></span><span><i className={`status-dot status-dot--${root.status}`} />{root.status === "scanning" ? "扫描中" : "已完成"}</span><span>{root.file_count}</span><span>{root.last_scan_at ? new Date(root.last_scan_at).toLocaleString("zh-CN") : "—"}</span><button type="button" aria-label={`管理${root.label}`} title="前往设置管理" onClick={() => navigate("settings")}><MoreOutlined /></button></div>)}
+        {roots.data?.map((root) => { const scan = summary.data?.scan_progress; const scanning = root.status === "scanning" && scan; return <div className="root-table__row" key={root.root_id}><span><strong>{root.label}</strong><small>{root.path}</small></span><span className="root-status-cell"><span><i className={`status-dot status-dot--${root.status}`} />{root.status === "scanning" ? "扫描中" : ROOT_STATUS_LABELS[root.status] ?? root.status}</span>{scanning && <><small>{Math.round(scan.progress * 100)}% · 已解析 {scan.parsed_files} 个</small><span className="root-progress"><i style={{ width: `${Math.round(scan.progress * 100)}%` }} /></span></>}</span><span>{root.file_count}</span><span>{root.last_scan_at ? new Date(root.last_scan_at).toLocaleString("zh-CN") : "—"}</span><span className="root-menu-wrap"><button type="button" aria-label={`操作${root.label}`} title="操作" onClick={() => setMenuRootId((current) => current === root.root_id ? null : root.root_id)}><MoreOutlined /></button>{menuRootId === root.root_id && <div className="root-menu" role="menu"><button type="button" role="menuitem" disabled={actionRootId !== null} onClick={() => void rescanRoot(root)}>{actionRootId === root.root_id ? "正在扫描…" : "重新扫描"}</button><button type="button" role="menuitem" disabled={actionRootId !== null} onClick={() => void removeRoot(root)}>{actionRootId === root.root_id ? "正在撤销授权…" : "从拾忆移除"}</button><button type="button" role="menuitem" onClick={() => { setMenuRootId(null); navigate("settings"); }}>前往设置管理</button></div>}</span></div>; })}
+        {menuRootId && <div className="menu-backdrop" onClick={() => setMenuRootId(null)} />}
       </div>
 
       <section className="library-files">
-        <header><div><h2>资料文件</h2><p>选择已完成索引的文件后，通过上下文操作栏进入批量处理。</p></div><span>{selected.size > 0 ? `已选择 ${selected.size} 项` : `共 ${fileTotal} 项`}</span></header>
-        {files.isLoading && <p>正在读取资料目录…</p>}
-        {files.isError && <p role="alert" className="inline-error">{files.error instanceof Error ? files.error.message : String(files.error)}</p>}
-        <div ref={fileListRef} className="file-select-table file-select-table--virtual">
-          <div style={{ height: `${fileVirtualizer.getTotalSize()}px`, position: "relative" }}>
-          {fileVirtualizer.getVirtualItems().map((virtualRow) => {
-            const file = fileItems[virtualRow.index]!;
-            const ready = file.parse_status === "parsed" && Boolean(file.current_revision_id);
-            return <label key={file.file_id} className={!ready ? "is-disabled" : ""} style={{ position: "absolute", transform: `translateY(${virtualRow.start}px)`, width: "100%", height: `${virtualRow.size}px` }}><input type="checkbox" disabled={!ready} checked={selected.has(file.file_id)} onChange={() => toggleFile(file.file_id)} /><span><strong>{file.display_name}</strong><small>{displayPath(file.display_path)}</small></span><em>{ready ? "可处理" : file.parse_status === "ocr_pending" ? "等待OCR" : "尚未索引"}</em></label>;
-          })}
-          </div>
-          {!files.isLoading && fileTotal === 0 && <div className="relation-empty"><p>扫描到的资料会显示在这里。</p></div>}
+        <header><div><h2><FileOutlined /> 资料文件</h2><p>这里用于定位和管理已入库文件，不搜索正文；正文和内容含义请到“找资料”。</p></div><span>{fileTotal == null ? `已加载 ${fileItems.length} 项` : `已显示 ${fileItems.length} / ${fileTotal}`}</span></header>
+        <div className="library-file-filters">
+          <label><SearchOutlined /><input aria-label="筛选当前资料列表" value={fileQuery} onChange={(event) => setFileQuery(event.target.value)} placeholder="筛选当前资料列表：文件名、显示路径" /></label>
+          <AppSelect ariaLabel="按文件类型筛选" value={fileExtension} onChange={setFileExtension} options={[{ value: "", label: "全部类型" }, { value: "pdf", label: "PDF" }, { value: "docx", label: "Word" }, { value: "xlsx", label: "Excel" }, { value: "pptx", label: "PPT" }, { value: "txt", label: "文本" }, { value: "md", label: "Markdown" }, { value: "png", label: "PNG 图片" }, { value: "jpg", label: "JPG 图片" }, { value: "zip", label: "ZIP" }]} />
+          <AppSelect ariaLabel="按索引状态筛选" value={fileStatus} onChange={setFileStatus} options={[{ value: "", label: "全部状态" }, { value: "parsed", label: "已索引" }, { value: "pending", label: "等待处理" }, { value: "parsing", label: "处理中" }, { value: "ocr_pending", label: "等待图片识别" }, { value: "unsupported", label: "仅元数据" }, { value: "encrypted", label: "已加密" }, { value: "failed", label: "处理失败" }]} />
         </div>
-        {files.hasNextPage && <button type="button" className="load-more-button" disabled={files.isFetchingNextPage} onClick={() => void files.fetchNextPage()}>{files.isFetchingNextPage ? "正在加载" : `加载更多（还剩 ${Math.max(0, fileTotal - fileItems.length)} 项）`}</button>}
-        <div className="processing-bar">
-          <select aria-label="处理能力" value={skillId} onChange={(event) => { setSkillId(event.target.value); setPlan(null); setRun(null); }}>
-            {skills.data?.filter((skill: SkillDefinition) => skill.available).map((skill) => <option key={skill.skill_id} value={skill.skill_id}>{skill.name}</option>)}
-          </select>
-          {skillId === "batch_field_extraction" && <select aria-label="处理模板" value={presetId} onChange={(event) => { setPresetId(event.target.value); setPlan(null); setRun(null); }}>{presets.data?.map((preset) => <option key={preset.preset_id} value={preset.preset_id}>{preset.name}</option>)}</select>}
-          <small>{skillId === "batch_field_extraction" ? presets.data?.find((preset) => preset.preset_id === presetId)?.description : skills.data?.find((skill) => skill.skill_id === skillId)?.description}</small>
-          <button type="button" className="primary-button" disabled={selected.size === 0 || processing} onClick={() => void previewPlan()}>{processing ? "正在生成计划" : "预览任务计划"}</button>
-        </div>
+        {files.isLoading && <p>正在读取资料文件…</p>}
+        {files.isError && <p role="alert" className="inline-error">{errorMessage(files.error)}</p>}
+        {!files.isLoading && fileItems.length === 0 && <div className="relation-empty"><p>当前筛选条件下没有资料文件。</p></div>}
+        {fileItems.length > 0 && <div ref={fileListRef} className="file-browser--virtual"><div style={{ height: `${fileVirtualizer.getTotalSize()}px`, position: "relative" }}>
+          {fileVirtualizer.getVirtualItems().map((virtualRow) => { const file = fileItems[virtualRow.index]!; const stateLabel = file.parse_status === "parsed" ? "已索引" : file.parse_status === "parsing" ? "处理中" : file.parse_status === "ocr_pending" ? "等待图片识别" : file.parse_status === "unsupported" ? "仅元数据" : file.parse_status === "encrypted" ? "已加密" : file.parse_status === "failed" ? "处理失败" : "等待处理"; return <article key={file.file_id} style={{ position: "absolute", transform: `translateY(${virtualRow.start}px)`, width: "100%", height: `${virtualRow.size}px` }}><FileOutlined /><div><strong>{file.display_name}</strong><small>{displayPath(file.display_path)}</small></div><span>{file.extension ? file.extension.toUpperCase() : "文件"}</span><em>{stateLabel}</em><button type="button" onClick={() => void openFile(file.file_id)}>打开原文件</button></article>; })}
+        </div></div>}
+        {files.hasNextPage && <button type="button" className="load-more-button" disabled={files.isFetchingNextPage} onClick={() => void loadMoreFiles()}>{files.isFetchingNextPage ? "正在加载" : fileTotal == null ? "加载更多资料" : `加载更多（还剩 ${Math.max(0, fileTotal - fileItems.length)} 项）`}</button>}
       </section>
 
-      {plan && !run && <section className="task-plan-card"><header><div><h2>{plan.summary}</h2><p>版本 {plan.skill_version} · {plan.estimated_file_count} 份资料</p></div><span>等待确认</span></header><ol>{plan.steps.map((step) => <li key={step.step_id}><i>{step.ordinal}</i><div><strong>{step.label}</strong><small>检查站：{step.checkpoint}</small></div><em>{step.status === "pending" ? "待执行" : step.status}</em></li>)}</ol>{plan.warnings.map((warning) => <p className="readonly-note" key={warning}>{warning}</p>)}<div className="plan-confirm"><button type="button" onClick={() => setPlan(null)}>返回调整</button><button type="button" className="primary-button" disabled={processing} onClick={() => void runExtraction()}>{processing ? "正在分析" : "确认并开始分析"}</button></div></section>}
-
-      {run && <section className="extraction-result">
-        <header><div><h2>{run.preset.name} · 结果复核</h2><p>{run.rows.length} 个文件；每个非空正文值都可以查看独立来源。</p></div>{execution && <span>{execution.checkpoints.filter((checkpoint) => checkpoint.status === "passed").length}/{execution.checkpoints.length} 检查站通过</span>}</header>
-        {execution && execution.candidates.length > 0 && <div className="readonly-note"><span>已比较 {execution.candidates.length} 条处理路径，采用 <strong>{execution.candidates.find((candidate) => candidate.status === "selected")?.strategy ?? "证据最完整路径"}</strong>；其他候选保留在本地任务记录中。</span></div>}
-        {run.warnings.map((warning) => <p className="readonly-note" key={warning}>{warning}</p>)}
-        <div className="extraction-table-wrap"><table><thead><tr><th>文件</th>{run.preset.fields.map((field) => <th key={field.key}>{field.label}</th>)}</tr></thead><tbody>{run.rows.map((row, rowIndex) => <tr key={`${row.file.file_id}-${rowIndex}`}><th>{row.file.display_name}</th>{run.preset.fields.map((field) => { const value = row.values.find((item) => item.field_key === field.key); return <td key={field.key} className={value?.review_state === "needs_review" ? "needs-review" : ""}><span>{valueText(value?.normalized_value)}</span>{value && value.evidence.length > 0 && <details><summary>{value.method === "metadata" ? "元数据来源" : `${value.evidence.length} 处原文`}</summary>{value.evidence.map((evidence) => <p key={evidence.evidence_id}>{evidence.quote}</p>)}</details>}</td>; })}</tr>)}</tbody></table></div>
-        <div className="export-bar"><label>导出格式 <select value={exportFormat} onChange={(event) => setExportFormat(event.target.value as ExportResult["format"])}><option value="xlsx">Excel (.xlsx)</option><option value="csv">CSV</option><option value="json">JSON</option><option value="docx">Word (.docx)</option></select></label><button type="button" className="primary-button" disabled={exporting} onClick={() => void exportRun()}>{exporting ? "正在校验并导出" : "选择位置并导出"}</button>{exportResult && <small>已新建 {exportResult.target_path} · {exportResult.row_count} 行 · SHA-256 {exportResult.sha256.slice(0, 12)}…</small>}</div>
-      </section>}
-
-      <section className="relation-panel"><header><div><h2><ApartmentOutlined /> 重复与版本关系</h2><p>只读取文件计算特征，不会删除、合并或改名；结果需要你确认后再处理。</p></div><button type="button" className="text-button" disabled={refreshRelations.isPending} onClick={() => refreshRelations.mutate()}><ReloadOutlined /> {refreshRelations.isPending ? "正在分析" : "重新分析"}</button></header>
-        {refreshRelations.data && <p className="relation-summary">本次读取 {refreshRelations.data.hashed_files} 个同大小候选，发现 {refreshRelations.data.exact_duplicate_pairs} 组完全重复、{refreshRelations.data.version_candidate_pairs} 组版本候选。</p>}
-        {refreshRelations.isError && <p role="alert" className="inline-error">{refreshRelations.error instanceof Error ? refreshRelations.error.message : String(refreshRelations.error)}</p>}
+      <section className="relation-panel"><header><div><h2><ApartmentOutlined /> 资料关系分析</h2><p>同时分析完全重复、版本、同主题/同用途和包含或摘要关系；不会修改源文件。</p></div><button type="button" className="text-button" disabled={refreshRelations.isPending} onClick={() => refreshRelations.mutate()}><ReloadOutlined /> {refreshRelations.isPending ? "正在分析" : "重新分析"}</button></header>
+        <div className="relation-filters">
+          <AppSelect ariaLabel="关系类型" value={relationType} onChange={(value) => { setRelationType(value as RelationType | ""); setSelectedRelations(new Set()); }} options={[{ value: "", label: "全部关系类型" }, { value: "exact_duplicate", label: "完全重复" }, { value: "version_candidate", label: "版本候选" }, { value: "semantic_related", label: "同主题或同用途" }, { value: "contains_or_summarizes", label: "包含、摘要或派生" }, { value: "related", label: "历史内容关系" }]} />
+          <AppSelect ariaLabel="关系复核状态" value={relationReview} onChange={(value) => { setRelationReview(value as typeof relationReview); setSelectedRelations(new Set()); }} options={[{ value: "", label: "待处理与已确认" }, { value: "suggested", label: "仅待处理" }, { value: "accepted", label: "仅已确认" }, { value: "rejected", label: "已排除" }]} />
+          <button type="button" disabled={relationItems.length === 0} onClick={() => setSelectedRelations(new Set(relationItems.map((relation) => relation.relation_id)))}>选择当前页</button>
+          <button type="button" disabled={selectedRelations.size === 0 || batchReviewRelations.isPending} onClick={() => batchReviewRelations.mutate("accepted")}>批量确认</button>
+          <button type="button" disabled={selectedRelations.size === 0 || batchReviewRelations.isPending} onClick={() => batchReviewRelations.mutate("rejected")}>批量排除</button>
+        </div>
+        {refreshRelations.data && <p className="relation-summary">本次发现 {refreshRelations.data.exact_duplicate_pairs} 组完全重复、{refreshRelations.data.version_candidate_pairs} 组版本候选、{refreshRelations.data.semantic_related_pairs} 组同主题/同用途关系、{refreshRelations.data.contains_or_summarizes_pairs} 组包含/摘要关系。</p>}
+        {refreshRelations.isError && <p role="alert" className="inline-error">{errorMessage(refreshRelations.error)}</p>}
         {relations.isLoading && <p>正在读取文件关系…</p>}
-        {!relations.isLoading && relationItems.length === 0 && <div className="relation-empty"><p>还没有分析结果。需要时点击“重新分析”，拾忆只会对同大小文件计算哈希。</p></div>}
-        <div className="relation-list">{relationItems.map((relation) => <article key={relation.relation_id}><span>{relation.relation_type === "exact_duplicate" ? "完全重复" : relation.relation_type === "version_candidate" ? "版本候选" : "相关资料"}</span><div><strong>{relation.left_file.display_name}</strong><small>{displayPath(relation.left_file.display_path)}</small></div><i>↔</i><div><strong>{relation.right_file.display_name}</strong><small>{displayPath(relation.right_file.display_path)}</small></div><em>{relation.review_status === "accepted" ? "已确认" : `${Math.round(relation.confidence * 100)}%`}</em><div className="relation-actions"><button type="button" disabled={reviewRelation.isPending || relation.review_status === "accepted"} onClick={() => reviewRelation.mutate({ relationId: relation.relation_id, action: "accepted" })}>确认</button><button type="button" disabled={reviewRelation.isPending} onClick={() => reviewRelation.mutate({ relationId: relation.relation_id, action: "rejected" })}>排除</button></div></article>)}</div>
+        {!relations.isLoading && relationItems.length === 0 && <div className="relation-empty"><p>还没有分析结果。配置 Embedding 后重新分析可发现语义关系；未配置时仍会检查重复和版本候选。</p></div>}
+        <div className="relation-list">{relationGroups.map((group) => <section className="relation-group" key={group.type}><h3>{group.type === "exact_duplicate" ? "完全重复" : group.type === "version_candidate" ? "版本候选" : group.type === "contains_or_summarizes" ? "包含、摘要或派生" : group.type === "semantic_related" ? "同主题或同用途" : "历史内容关系"}<small>{group.items.length} 条已加载</small></h3>{group.items.map((relation) => <article key={relation.relation_id}><label className="relation-select"><input type="checkbox" aria-label={`选择${relation.left_file.display_name}与${relation.right_file.display_name}的关系`} checked={selectedRelations.has(relation.relation_id)} onChange={() => setSelectedRelations((current) => { const next = new Set(current); if (next.has(relation.relation_id)) next.delete(relation.relation_id); else next.add(relation.relation_id); return next; })} /></label><div><strong>{relation.left_file.display_name}</strong><small>{displayPath(relation.left_file.display_path)}</small></div><i>{relation.relation_type === "contains_or_summarizes" ? "→" : "↔"}</i><div><strong>{relation.right_file.display_name}</strong><small>{displayPath(relation.right_file.display_path)}</small></div><em>{relation.review_status === "accepted" ? "已确认" : relation.review_status === "rejected" ? "已排除" : `${Math.round(relation.confidence * 100)}%`}</em><p className="relation-reasons">{relation.reasons.join("；")}</p><div className="relation-actions"><button type="button" disabled={reviewRelation.isPending || relation.review_status === "accepted"} onClick={() => reviewRelation.mutate({ relationId: relation.relation_id, action: "accepted" })}>确认</button><button type="button" disabled={reviewRelation.isPending || relation.review_status === "rejected"} onClick={() => reviewRelation.mutate({ relationId: relation.relation_id, action: "rejected" })}>排除</button></div></article>)}</section>)}</div>
         {relations.hasNextPage && <button type="button" className="load-more-button" disabled={relations.isFetchingNextPage} onClick={() => void relations.fetchNextPage()}>{relations.isFetchingNextPage ? "正在加载" : `加载更多关系（还剩 ${Math.max(0, relationTotal - relationItems.length)} 项）`}</button>}
       </section>
     </section>

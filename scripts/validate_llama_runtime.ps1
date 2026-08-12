@@ -18,7 +18,7 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
     throw '缺少llama.cpp运行时清单；请先执行 scripts/prepare_llama_runtime.ps1'
 }
 $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
-if ($manifest.platform -ne 'windows-x64-cpu' -or $manifest.release -ne 'b10326') {
+if ($manifest.platform -notin @('windows-x64-cpu', 'windows-x64-cuda', 'windows-x64-vulkan') -or $manifest.release -ne 'b10326') {
     throw "运行时清单版本不受支持：$($manifest.release) / $($manifest.platform)"
 }
 foreach ($file in $manifest.files) {
@@ -49,4 +49,12 @@ $process.WaitForExit()
 if ($process.ExitCode -ne 0 -or $versionOutput -notmatch [regex]::Escape([string]$manifest.commit)) {
     throw "llama-server不可执行或版本错误：$versionOutput"
 }
-Write-Output "llama.cpp运行时验证通过：release=$($manifest.release) commit=$($manifest.commit) files=$($manifest.files.Count)"
+$deviceInfo = & $server --list-devices 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) {
+    throw "llama-server设备探测失败：$deviceInfo"
+}
+if ($manifest.backend -in @('cuda', 'vulkan') -and ($deviceInfo -match '\(none\)' -or $deviceInfo -notmatch 'CUDA|Vulkan|NVIDIA|AMD|Intel')) {
+    throw "$($manifest.backend)运行时没有识别到GPU设备：$deviceInfo"
+}
+Write-Output "llama.cpp运行时验证通过：release=$($manifest.release) commit=$($manifest.commit) backend=$($manifest.backend) files=$($manifest.files.Count)"
+Write-Output $deviceInfo.Trim()

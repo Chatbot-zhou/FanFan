@@ -4,62 +4,6 @@ use uuid::Uuid;
 
 use crate::{AppError, FileRecord, ParseStatus};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct KnowledgeSpaceRequest {
-    pub name: String,
-    pub description: Option<String>,
-    #[serde(default)]
-    pub root_ids: Vec<Uuid>,
-    #[serde(default)]
-    pub collection_ids: Vec<Uuid>,
-}
-
-impl KnowledgeSpaceRequest {
-    pub fn validate(&self) -> Result<(), AppError> {
-        let name_length = self.name.trim().chars().count();
-        if !(1..=40).contains(&name_length) {
-            return Err(AppError::new(
-                "KNOWLEDGE_SPACE_REQUEST_INVALID",
-                "知识空间名称长度必须在1到40个字符之间",
-                false,
-            ));
-        }
-        if self
-            .description
-            .as_ref()
-            .is_some_and(|value| value.chars().count() > 500)
-            || self.root_ids.len() > 128
-            || self.collection_ids.len() > 128
-        {
-            return Err(AppError::new(
-                "KNOWLEDGE_SPACE_REQUEST_INVALID",
-                "知识空间说明或成员数量超出限制",
-                false,
-            ));
-        }
-        if self.root_ids.is_empty() && self.collection_ids.is_empty() {
-            return Err(AppError::new(
-                "KNOWLEDGE_SPACE_SCOPE_REQUIRED",
-                "知识空间至少需要包含一个资料位置或集合",
-                false,
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct KnowledgeSpace {
-    pub space_id: Uuid,
-    pub name: String,
-    pub description: Option<String>,
-    pub root_ids: Vec<Uuid>,
-    pub collection_ids: Vec<Uuid>,
-    pub file_count: u64,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InboxEventType {
@@ -112,6 +56,28 @@ pub enum TriageStatus {
     Ignored,
     Error,
     All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionStatus {
+    Normal,
+    PendingRetry,
+    Retrying,
+    Resolved,
+    Abandoned,
+}
+
+impl ResolutionStatus {
+    pub(crate) fn from_storage(value: &str) -> Self {
+        match value {
+            "pending_retry" => Self::PendingRetry,
+            "retrying" => Self::Retrying,
+            "resolved" => Self::Resolved,
+            "abandoned" => Self::Abandoned,
+            _ => Self::Normal,
+        }
+    }
 }
 
 impl TriageStatus {
@@ -198,6 +164,10 @@ pub struct InboxItem {
     )]
     pub previous_path: Option<String>,
     pub triage_status: TriageStatus,
+    pub resolution_status: ResolutionStatus,
+    pub attempt_count: u32,
+    pub last_attempt_at: Option<DateTime<Utc>>,
+    pub retry_action: Option<String>,
     pub suggested_collection_ids: Vec<Uuid>,
     pub duplicate_group_id: Option<Uuid>,
     pub summary: Option<String>,
@@ -208,6 +178,7 @@ pub struct InboxItem {
 pub struct InboxPage {
     pub items: Vec<InboxItem>,
     pub next_cursor: Option<String>,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -543,6 +514,9 @@ pub struct CollectionModelReview {
 pub enum RelationType {
     ExactDuplicate,
     VersionCandidate,
+    SemanticRelated,
+    ContainsOrSummarizes,
+    /// Legacy rows written before semantic relation types were split.
     Related,
 }
 
@@ -551,6 +525,8 @@ impl RelationType {
         match self {
             Self::ExactDuplicate => "exact_duplicate",
             Self::VersionCandidate => "version_candidate",
+            Self::SemanticRelated => "semantic_related",
+            Self::ContainsOrSummarizes => "contains_or_summarizes",
             Self::Related => "related",
         }
     }
@@ -558,6 +534,8 @@ impl RelationType {
     pub(crate) fn from_storage(value: &str) -> Self {
         match value {
             "version_candidate" => Self::VersionCandidate,
+            "semantic_related" => Self::SemanticRelated,
+            "contains_or_summarizes" => Self::ContainsOrSummarizes,
             "related" => Self::Related,
             _ => Self::ExactDuplicate,
         }
@@ -580,6 +558,10 @@ pub struct FileRelation {
 pub struct RelationQuery {
     pub cursor: Option<String>,
     pub page_size: u32,
+    #[serde(default)]
+    pub relation_type: Option<RelationType>,
+    #[serde(default)]
+    pub review_status: Option<String>,
 }
 
 impl RelationQuery {
@@ -588,6 +570,17 @@ impl RelationQuery {
             return Err(AppError::new(
                 "RELATION_QUERY_INVALID",
                 "关系查询数量必须在1到500之间",
+                false,
+            ));
+        }
+        if self
+            .review_status
+            .as_deref()
+            .is_some_and(|status| !matches!(status, "suggested" | "accepted" | "rejected"))
+        {
+            return Err(AppError::new(
+                "RELATION_QUERY_INVALID",
+                "关系复核状态筛选无效",
                 false,
             ));
         }
@@ -615,6 +608,10 @@ pub struct RelationRefreshResult {
     pub hashed_files: u64,
     pub exact_duplicate_pairs: u64,
     pub version_candidate_pairs: u64,
+    #[serde(default)]
+    pub semantic_related_pairs: u64,
+    #[serde(default)]
+    pub contains_or_summarizes_pairs: u64,
 }
 
 pub(crate) fn normalized_version_key(name: &str) -> String {

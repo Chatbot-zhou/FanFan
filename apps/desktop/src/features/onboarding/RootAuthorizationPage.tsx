@@ -3,6 +3,8 @@ import { isTauri } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useState } from "react";
 import { bridge } from "../../bridge";
+import { confirmAction } from "../../components/AppConfirm";
+import { errorMessage } from "../../utils/app-error";
 
 export function RootAuthorizationPage({ onCompleted }: { onCompleted: () => Promise<void> }) {
   const [busy, setBusy] = useState(false);
@@ -25,7 +27,7 @@ export function RootAuthorizationPage({ onCompleted }: { onCompleted: () => Prom
       setError("添加整个磁盘时请选择盘符根目录，例如 D:\\。");
       return;
     }
-    if (fullVolume && !window.confirm("扫描整个磁盘可能持续较长时间。系统、程序、凭据、应用数据和拾忆自身目录会被强制排除。确认授权吗？")) return;
+    if (fullVolume && !await confirmAction({ actionKey: "authorize_full_volume", title: "授权扫描整个磁盘？", description: "扫描可能持续较长时间。系统、程序、凭据、应用数据和拾忆自身目录会被强制排除。", confirmLabel: "确认授权" })) return;
     setBusy(true);
     try {
       await bridge.root_add({
@@ -37,7 +39,7 @@ export function RootAuthorizationPage({ onCompleted }: { onCompleted: () => Prom
       });
       await onCompleted();
     } catch (actionError) {
-      setError(actionError instanceof Error ? actionError.message : String(actionError));
+      setError(errorMessage(actionError));
     } finally {
       setBusy(false);
     }
@@ -49,7 +51,7 @@ export function RootAuthorizationPage({ onCompleted }: { onCompleted: () => Prom
     try {
       await onCompleted();
     } catch (actionError) {
-      setError(actionError instanceof Error ? actionError.message : String(actionError));
+      setError(errorMessage(actionError));
     } finally {
       setBusy(false);
     }

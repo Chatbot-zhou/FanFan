@@ -26,7 +26,8 @@ pub struct TimeHint {
 
 /// 构建查询改写 prompt。只输出 JSON，不输出其他内容。
 pub fn query_understanding_prompt(query: &str, today: &str) -> (String, String) {
-    let system = "你是查询理解助手。只输出JSON，不要输出其他任何文字、解释或 markdown 标记。".into();
+    let system =
+        "你是查询理解助手。只输出JSON，不要输出其他任何文字、解释或 markdown 标记。".into();
     let user = format!(
         r#"将自然语言问题转换为结构化检索参数。只输出JSON：
 {{"rewritten_query":"核心关键词","time_hint":null或{{"from":"YYYY-MM-DD","to":"YYYY-MM-DD"}},"extension_hints":["docx","pdf"]}}
@@ -50,7 +51,12 @@ pub fn parse_query_intent(raw: &str, fallback_query: &str) -> QueryIntent {
         .strip_prefix("```json")
         .and_then(|s| s.strip_suffix("```"))
         .map(str::trim)
-        .or_else(|| trimmed.strip_prefix("```").and_then(|s| s.strip_suffix("```")).map(str::trim))
+        .or_else(|| {
+            trimmed
+                .strip_prefix("```")
+                .and_then(|s| s.strip_suffix("```"))
+                .map(str::trim)
+        })
         .unwrap_or(trimmed);
     let mut intent: QueryIntent = serde_json::from_str(json).unwrap_or_else(|_| QueryIntent {
         rewritten_query: String::new(),
@@ -61,10 +67,10 @@ pub fn parse_query_intent(raw: &str, fallback_query: &str) -> QueryIntent {
         intent.rewritten_query = fallback_query.to_owned();
     }
     // 校验时间格式基本合法
-    if let Some(ref hint) = intent.time_hint {
-        if hint.from.len() != 10 || hint.to.len() != 10 {
-            intent.time_hint = None;
-        }
+    if let Some(ref hint) = intent.time_hint
+        && (hint.from.len() != 10 || hint.to.len() != 10)
+    {
+        intent.time_hint = None;
     }
     intent
 }
@@ -231,7 +237,33 @@ pub struct AskMessage {
     pub role: String,
     pub content: String,
     pub answer: Option<AnswerResult>,
+    pub error: Option<AppError>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AskSessionSummary {
+    pub session_id: Uuid,
+    pub title: String,
+    pub scope: ScopeFilter,
+    pub message_count: u64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub last_error: Option<AppError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AskSessionPage {
+    pub items: Vec<AskSessionSummary>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AskMessagePage {
+    pub items: Vec<AskMessage>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
 }
 
 pub fn assemble_extractive_answer(
@@ -319,7 +351,11 @@ fn compact_quote(text: &str, limit: usize) -> String {
     format!("{}…", normalized.chars().take(limit).collect::<String>())
 }
 
-pub fn generation_prompt(request: &AskRequest, extractive: &AnswerResult) -> String {
+pub fn generation_prompt(
+    request: &AskRequest,
+    extractive: &AnswerResult,
+    history: &[AskMessage],
+) -> String {
     let sources = extractive
         .claims
         .iter()
@@ -328,11 +364,56 @@ pub fn generation_prompt(request: &AskRequest, extractive: &AnswerResult) -> Str
         .map(|(index, evidence)| format!("[S{}] {}", index + 1, evidence.quote))
         .collect::<Vec<_>>()
         .join("\n");
-    format!(
-        "问题：{}\n\n可用证据：\n{}\n\n只根据以上证据回答。每个事实句末尾必须包含一个或多个来源编号，例如[S1]；不得使用不存在的编号；证据不足时只回复‘当前资料中未找到足够依据’。",
+    let mut prompt = String::new();
+    if !history.is_empty() {
+        let lines = history
+            .iter()
+            .map(|message| {
+                let who = if message.role == "user" {
+                    "用户"
+                } else {
+                    "拾忆"
+                };
+                let content = message
+                    .content
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("{who}：{}", content.chars().take(400).collect::<String>())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        prompt.push_str(&format!(
+            "对话历史（仅作理解前文，不能作为新证据；回答中出现的来源编号只对应当前问题的可用证据）：\n{lines}\n\n"
+        ));
+    }
+    prompt.push_str(&format!(
+        "问题：{}\n\n可用证据：\n{}\n\n只根据以上证据回答。每个包含事实的Markdown段落、列表项和表格数据行都必须在行末包含一个或多个来源编号，例如[S1]；不得使用不存在的编号。标题和表格分隔行可以不带引用；证据不足时只回复‘当前资料中未找到足够依据’。\n回答格式要求：使用Markdown组织内容；回答中涉及的关键概念或术语用**加粗**标出（每段不超过5处）；来源编号必须位于该事实行末尾，表格行可在编号后保留末尾竖线。不要输出代码块。",
         request.question.trim(),
         sources
-    )
+    ));
+    prompt
+}
+
+/// 严格证据校验中允许出现的非事实行：空行、Markdown 标题、分隔线和表格分隔行。
+fn is_decorative_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') || matches!(trimmed, "---" | "***" | "___") {
+        return true;
+    }
+    if trimmed.starts_with('|') && trimmed.ends_with('|') {
+        let cells = trimmed
+            .trim_matches('|')
+            .split('|')
+            .map(str::trim)
+            .collect::<Vec<_>>();
+        return !cells.is_empty()
+            && cells.iter().all(|cell| {
+                let value = cell.trim_matches(':');
+                value.len() >= 3 && value.chars().all(|character| character == '-')
+            });
+    }
+    false
 }
 
 pub fn apply_grounded_generation(
@@ -348,19 +429,34 @@ pub fn apply_grounded_generation(
         .flat_map(|claim| claim.citations.iter().cloned())
         .collect::<Vec<_>>();
     let marker = Regex::new(r"\[S(\d+)\]").expect("static citation pattern");
-    let grounded_sentence = Regex::new(r"(?m)([^。！？\n]+?[。！？]?\s*(?:\[S\d+\])+\s*[。！？]?)")
-        .expect("static grounded sentence pattern");
     let mut claims = Vec::new();
-    let mut covered_until = 0;
-    for matched_sentence in grounded_sentence.find_iter(generated) {
-        if !generated[covered_until..matched_sentence.start()]
-            .trim()
-            .is_empty()
+    let lines = generated.lines().collect::<Vec<_>>();
+    for (line_index, line) in lines.iter().enumerate() {
+        let sentence = line.trim();
+        if is_decorative_line(sentence) {
+            continue;
+        }
+        if sentence.starts_with('|')
+            && sentence.ends_with('|')
+            && lines
+                .iter()
+                .skip(line_index + 1)
+                .find(|candidate| !candidate.trim().is_empty())
+                .is_some_and(|candidate| is_decorative_line(candidate))
+        {
+            continue;
+        }
+        if sentence.starts_with("```") {
+            return None;
+        }
+        let last_marker = marker.find_iter(sentence).last()?;
+        let suffix = sentence[last_marker.end()..].trim();
+        if !suffix
+            .chars()
+            .all(|character| matches!(character, '。' | '！' | '？' | '.' | '!' | '?' | '|'))
         {
             return None;
         }
-        covered_until = matched_sentence.end();
-        let sentence = matched_sentence.as_str().trim();
         let mut citations = Vec::new();
         for capture in marker.captures_iter(sentence) {
             let index = capture.get(1)?.as_str().parse::<usize>().ok()?;
@@ -382,7 +478,7 @@ pub fn apply_grounded_generation(
             citations,
         });
     }
-    if claims.is_empty() || !generated[covered_until..].trim().is_empty() {
+    if claims.is_empty() {
         return None;
     }
     let used = claims
@@ -414,7 +510,6 @@ mod tests {
             question: "项目如何优化召回率？".into(),
             session_id: None,
             scope: ScopeFilter {
-                knowledge_space_ids: vec![],
                 root_ids: vec![],
                 collection_ids: vec![],
                 file_ids: vec![],
@@ -509,7 +604,13 @@ mod tests {
             canonical_path: "D:\\资料.md".into(),
         }];
         assert!(apply_grounded_generation(&base, "项目采用混合召回。[S1]").is_some());
+        assert!(apply_grounded_generation(
+            &base,
+            "## 结论\n\n- 项目采用混合召回。[S1]\n\n| 项目 | 说明 |\n| --- | --- |\n| 检索 | 采用混合召回。[S1] |"
+        )
+        .is_some());
         assert!(apply_grounded_generation(&base, "项目采用混合召回。没有引用。").is_none());
+        assert!(apply_grounded_generation(&base, "- 缺少引用").is_none());
         assert!(apply_grounded_generation(&base, "不存在的来源。[S2]").is_none());
     }
 }
