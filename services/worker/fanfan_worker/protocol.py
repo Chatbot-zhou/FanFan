@@ -31,6 +31,15 @@ class WorkerRequest:
         "document.parse",
         "embedding.encode",
         "rerank.score",
+        "runtime.backend_probe",
+        "runtime.cache_status",
+        "runtime.cache_clear",
+        "speech.asr_self_test",
+        "speech.recognize",
+        "speech.tts_self_test",
+        "speech.synthesize",
+        "ocr.self_test",
+        "ocr.recognize",
         "export.write",
     ]
     payload: dict[str, Any] = field(default_factory=dict)
@@ -44,6 +53,15 @@ class WorkerRequest:
             "document.parse",
             "embedding.encode",
             "rerank.score",
+            "runtime.backend_probe",
+            "runtime.cache_status",
+            "runtime.cache_clear",
+            "speech.asr_self_test",
+            "speech.recognize",
+            "speech.tts_self_test",
+            "speech.synthesize",
+            "ocr.self_test",
+            "ocr.recognize",
             "export.write",
         }:
             raise ValueError("operation不受支持")
@@ -63,6 +81,15 @@ class WorkerRequest:
             "document.parse",
             "embedding.encode",
             "rerank.score",
+            "runtime.backend_probe",
+            "runtime.cache_status",
+            "runtime.cache_clear",
+            "speech.asr_self_test",
+            "speech.recognize",
+            "speech.tts_self_test",
+            "speech.synthesize",
+            "ocr.self_test",
+            "ocr.recognize",
             "export.write",
         }:
             raise ValueError("operation 不受支持")

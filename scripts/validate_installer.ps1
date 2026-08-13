@@ -144,8 +144,8 @@ try {
     }
     $installed = $true
 
-    $desktopExecutable = Join-Path $installRoot "remin-desktop.exe"
-    $workerExecutable = Join-Path $installRoot "worker\remin-worker.exe"
+    $desktopExecutable = Join-Path $installRoot "fanfan-desktop.exe"
+    $workerExecutable = Join-Path $installRoot "worker\fanfan-worker.exe"
     $llamaRuntime = Join-Path $installRoot "runtime\llama"
     $llamaExecutable = Join-Path $llamaRuntime "llama-server.exe"
     $llamaManifest = Join-Path $llamaRuntime "MANIFEST.json"

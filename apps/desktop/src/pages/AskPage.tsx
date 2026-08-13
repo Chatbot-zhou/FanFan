@@ -1,4 +1,4 @@
-import { CloseOutlined, DownloadOutlined, EllipsisOutlined, FileSearchOutlined, QuestionCircleOutlined, SendOutlined, UserOutlined, WarningOutlined } from "@ant-design/icons";
+import { AudioOutlined, CaretRightOutlined, CloseOutlined, DownloadOutlined, EllipsisOutlined, FileSearchOutlined, PauseOutlined, QuestionCircleOutlined, SendOutlined, SoundOutlined, StopOutlined, UserOutlined, WarningOutlined } from "@ant-design/icons";
 import { Dropdown, Input, Modal } from "antd";
 import { isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -11,11 +11,12 @@ import { RUNTIME_EVENTS } from "../bridge/runtime-events";
 import { displayPath } from "../utils/display-path";
 import { extractQuestionTerms, highlightPlainTerms } from "../utils/query-terms";
 import { PdfVisualPreview } from "../components/PdfVisualPreview";
+import { OcrAttemptChain } from "../components/OcrAttemptChain";
 import { ImageAssetGallery, imageAssetUrl } from "../components/ImageAssetGallery";
 import { confirmAction } from "../components/AppConfirm";
 import { AppSelect } from "../components/AppSelect";
 import { errorMessage } from "../utils/app-error";
-import reminLogo from "../assets/remin-logo.svg";
+import fanfanLogo from "../assets/fanfan-logo.png";
 
 const locatorLabel = (locator: AnswerResult["claims"][number]["citations"][number]["locator"]) => {
   if (locator.page_no) return `第 ${locator.page_no} 页`;
@@ -59,6 +60,27 @@ const ASK_PHASE_LABELS: Record<string, string> = {
   completed: "回答已完成",
 };
 
+const resampleMono = (chunks: Float32Array[], sourceRate: number, targetRate = 16_000): number[] => {
+  const sourceLength = chunks.reduce((total, chunk) => total + chunk.length, 0);
+  const source = new Float32Array(sourceLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    source.set(chunk, offset);
+    offset += chunk.length;
+  }
+  if (sourceRate === targetRate) return Array.from(source);
+  const ratio = sourceRate / targetRate;
+  const output = new Array<number>(Math.max(1, Math.floor(source.length / ratio)));
+  for (let index = 0; index < output.length; index += 1) {
+    const position = index * ratio;
+    const left = Math.floor(position);
+    const right = Math.min(source.length - 1, left + 1);
+    const fraction = position - left;
+    output[index] = (source[left] ?? 0) * (1 - fraction) + (source[right] ?? 0) * fraction;
+  }
+  return output;
+};
+
 /** 用户消息气泡：虚拟小人头像 + 名字"我" */
 const UserMessage = ({ text }: { text: string }) => (
   <div className="chat-message chat-message--user">
@@ -70,18 +92,18 @@ const UserMessage = ({ text }: { text: string }) => (
   </div>
 );
 
-/** 拾忆消息气泡容器：应用 logo 头像 + 名字"拾忆" */
+/** 翻翻消息气泡容器：应用 logo 头像 + 名字"翻翻" */
 const AssistantMessage = ({ children }: { children: ReactNode }) => (
   <div className="chat-message chat-message--assistant">
-    <div className="chat-avatar chat-avatar--assistant"><img src={reminLogo} alt="拾忆" /></div>
+    <div className="chat-avatar chat-avatar--assistant"><img src={fanfanLogo} alt="翻翻" /></div>
     <div className="chat-message__main">
-      <span className="chat-message__name">拾忆</span>
+      <span className="chat-message__name">翻翻</span>
       {children}
     </div>
   </div>
 );
 
-export function AskPage({ model_state: _model_state }: { model_state: ModelRuntimeState | null }) {
+export function AskPage({ model_state }: { model_state: ModelRuntimeState | null }) {
   const [question, setQuestion] = useState("");
   const [turns, setTurns] = useState<Array<{ question: string; answer: AnswerResult }>>([]);
   const [pendingQuestion, setPendingQuestion] = useState<string | null>(null);
@@ -104,6 +126,18 @@ export function AskPage({ model_state: _model_state }: { model_state: ModelRunti
   const [deepAnalysisLoading, setDeepAnalysisLoading] = useState<string | null>(null);
   const [exportingMessageId, setExportingMessageId] = useState<string | null>(null);
   const [exportMessage, setExportMessage] = useState<string | null>(null);
+  const [recording, setRecording] = useState(false);
+  const [recognizing, setRecognizing] = useState(false);
+  const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
+  const [speechLoadingMessageId, setSpeechLoadingMessageId] = useState<string | null>(null);
+  const [speechPaused, setSpeechPaused] = useState(false);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const recordingStreamRef = useRef<MediaStream | null>(null);
+  const recordingProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const recordingSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const recordingChunksRef = useRef<Float32Array[]>([]);
+  const recordingTimerRef = useRef<number | null>(null);
+  const playbackRef = useRef<HTMLAudioElement | null>(null);
   const scope = useMemo(() => ({ root_ids: [], collection_ids: scopeCollectionIds, file_ids: [], extensions: [], modified_from: null, modified_to: null, availability: "present" as const }), [scopeCollectionIds]);
   const addScopeCollection = (value: string) => {
     if (!value || scopeCollectionIds.includes(value)) return;
@@ -254,6 +288,11 @@ export function AskPage({ model_state: _model_state }: { model_state: ModelRunti
   const submit = async (questionOverride?: string) => {
     const trimmed = (questionOverride ?? question).trim();
     if (!trimmed || loading) return;
+    if (readiness && !readiness.ready) {
+      setError(readiness.blockers.map((blocker) => blocker.message).join("；") || "完整 RAG 尚未就绪，请先配置生成模型、Embedding 并完成当前范围的语义索引。");
+      setLastFailedQuestion(trimmed);
+      return;
+    }
     setLoading(true);
     setError(null);
     setLastFailedQuestion(null);
@@ -270,8 +309,6 @@ export function AskPage({ model_state: _model_state }: { model_state: ModelRunti
         retrieval_limit: 12,
         max_source_files: 8,
         strict_evidence: true,
-        mode: "rag",
-        allow_degraded_extractive: true,
       });
       activeOperationRef.current = result.operation_id;
       setActivePhase("understanding");
@@ -334,8 +371,8 @@ export function AskPage({ model_state: _model_state }: { model_state: ModelRunti
 
   const exportAnswer = async (answer: AnswerResult) => {
     setError(null); setExportMessage(null);
-    if (!isTauri()) { setError("浏览器预览不会写入电脑文件，请在拾忆桌面程序中导出。"); return; }
-    const target = await save({ title: "导出拾忆问答结果（只新建，不覆盖）", defaultPath: "拾忆问答结果.md", filters: [{ name: "Markdown", extensions: ["md"] }, { name: "纯文本", extensions: ["txt"] }] });
+    if (!isTauri()) { setError("浏览器预览不会写入电脑文件，请在翻翻桌面程序中导出。"); return; }
+    const target = await save({ title: "导出翻翻问答结果（只新建，不覆盖）", defaultPath: "翻翻问答结果.md", filters: [{ name: "Markdown", extensions: ["md"] }, { name: "纯文本", extensions: ["txt"] }] });
     if (typeof target !== "string") return;
     if (!await confirmAction({ actionKey: "answer_export", title: "导出当前回答？", description: "只会新建一个包含已验证回答与引用的文件；目标已存在时会拒绝覆盖，源文件不会发生任何变化。", confirmLabel: "新建导出文件" })) return;
     const format = target.toLocaleLowerCase().endsWith(".txt") ? "txt" : "md";
@@ -346,6 +383,142 @@ export function AskPage({ model_state: _model_state }: { model_state: ModelRunti
     } catch (actionError) { setError(errorMessage(actionError)); }
     finally { setExportingMessageId(null); }
   };
+
+  const releaseRecordingResources = async () => {
+    if (recordingTimerRef.current !== null) window.clearTimeout(recordingTimerRef.current);
+    recordingTimerRef.current = null;
+    recordingProcessorRef.current?.disconnect();
+    recordingSourceRef.current?.disconnect();
+    recordingProcessorRef.current = null;
+    recordingSourceRef.current = null;
+    recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
+    recordingStreamRef.current = null;
+    const context = audioContextRef.current;
+    audioContextRef.current = null;
+    if (context && context.state !== "closed") await context.close().catch(() => undefined);
+  };
+
+  const stopRecording = async (cancelled = false) => {
+    const context = audioContextRef.current;
+    const chunks = recordingChunksRef.current;
+    recordingChunksRef.current = [];
+    setRecording(false);
+    await releaseRecordingResources();
+    if (cancelled) return;
+    if (!context || chunks.reduce((total, chunk) => total + chunk.length, 0) < context.sampleRate / 4) {
+      setError("录音时间太短，请至少说话约一秒后再结束。");
+      return;
+    }
+    setRecognizing(true);
+    setError(null);
+    try {
+      const result = await bridge.speech_recognize({
+        samples: resampleMono(chunks, context.sampleRate),
+        sample_rate: 16_000,
+      });
+      if (!result.result.text.trim()) {
+        setError("没有识别到清晰语音，你可以重新录音或直接输入文字。");
+      } else {
+        setQuestion(result.result.text);
+        composerRef.current?.focus();
+      }
+    } catch (actionError) {
+      setError(errorMessage(actionError));
+    } finally {
+      setRecognizing(false);
+    }
+  };
+
+  const startRecording = async () => {
+    if (recording || recognizing) return;
+    if (!model_state?.capabilities.asr) {
+      setError("尚未配置可用的语音识别模型，请先到本地模型中配置 ASR。");
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setError("当前系统没有提供麦克风录音接口。");
+      return;
+    }
+    setError(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }, video: false });
+      const context = new AudioContext({ latencyHint: "interactive" });
+      const source = context.createMediaStreamSource(stream);
+      const processor = context.createScriptProcessor(4096, 1, 1);
+      const chunks: Float32Array[] = [];
+      processor.onaudioprocess = (event) => chunks.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+      source.connect(processor);
+      processor.connect(context.destination);
+      audioContextRef.current = context;
+      recordingStreamRef.current = stream;
+      recordingSourceRef.current = source;
+      recordingProcessorRef.current = processor;
+      recordingChunksRef.current = chunks;
+      setRecording(true);
+      recordingTimerRef.current = window.setTimeout(() => void stopRecording(false), 60_000);
+    } catch (actionError) {
+      await releaseRecordingResources();
+      setError(`无法开始录音：${errorMessage(actionError)}`);
+    }
+  };
+
+  const stopPlayback = () => {
+    const playback = playbackRef.current;
+    if (playback) {
+      playback.pause();
+      playback.currentTime = 0;
+    }
+    playbackRef.current = null;
+    setSpeakingMessageId(null);
+    setSpeechPaused(false);
+    setSpeechLoadingMessageId(null);
+  };
+
+  const readAnswer = async (answer: AnswerResult) => {
+    if (speakingMessageId === answer.message_id && playbackRef.current) {
+      if (playbackRef.current.paused) {
+        await playbackRef.current.play();
+        setSpeechPaused(false);
+      } else {
+        playbackRef.current.pause();
+        setSpeechPaused(true);
+      }
+      return;
+    }
+    if (!model_state?.capabilities.tts) {
+      setError("尚未配置可用的语音合成模型，请先到本地模型中配置 TTS。");
+      return;
+    }
+    stopPlayback();
+    setError(null);
+    setSpeakingMessageId(answer.message_id);
+    setSpeechLoadingMessageId(answer.message_id);
+    try {
+      const session = await bridge.speech_synthesize_answer(answer.message_id, 1.0, 0);
+      const playback = new Audio(`data:audio/wav;base64,${session.result.audio_base64}`);
+      playback.onended = stopPlayback;
+      playback.onerror = () => {
+        stopPlayback();
+        setError("生成的语音无法播放，请重试。");
+      };
+      playbackRef.current = playback;
+      await playback.play();
+      setSpeechLoadingMessageId(null);
+    } catch (actionError) {
+      stopPlayback();
+      setSpeechLoadingMessageId(null);
+      setError(errorMessage(actionError));
+    }
+  };
+
+  useEffect(() => () => {
+    if (recordingTimerRef.current !== null) window.clearTimeout(recordingTimerRef.current);
+    recordingProcessorRef.current?.disconnect();
+    recordingSourceRef.current?.disconnect();
+    recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
+    void audioContextRef.current?.close();
+    playbackRef.current?.pause();
+  }, []);
 
   const openRename = (session: AskSessionSummary) => {
     setRenameValue(session.title);
@@ -369,7 +542,7 @@ export function AskPage({ model_state: _model_state }: { model_state: ModelRunti
     const confirmed = await confirmAction({
       actionKey: `ask_session_delete_${session.session_id.slice(0, 8)}`,
       title: "删除这段问答记录？",
-      description: "只删除拾忆数据库中的会话与回答记录，不会修改任何源文件或知识库内容。",
+      description: "只删除翻翻数据库中的会话与回答记录，不会修改任何源文件或知识库内容。",
       confirmLabel: "删除会话",
       danger: true,
     });
@@ -414,7 +587,7 @@ export function AskPage({ model_state: _model_state }: { model_state: ModelRunti
             </span>;
           })}
         </div>
-        {readiness && !readiness.ready && <small className="rag-status-inline">当前自动使用原文摘录 · 语义覆盖 {Math.round(readiness.scope_index_coverage * 100)}%</small>}
+        {readiness && !readiness.ready && <small className="rag-status-inline">完整 RAG 尚未就绪 · 语义覆盖 {Math.round(readiness.scope_index_coverage * 100)}% · 配置完成后才能发送</small>}
         <AppSelect className="ask-scope-select" ariaLabel="选择检索范围" value="" showSearch onChange={addScopeCollection} labelRender={() => (
           scopeCollectionIds.length === 0
             ? <span>全部资料</span>
@@ -450,7 +623,13 @@ export function AskPage({ model_state: _model_state }: { model_state: ModelRunti
             <AssistantMessage>
               <div className="chat-bubble chat-bubble--assistant">
                 <div className="markdown-body"><MarkdownAnswer text={turn.answer.answer} question={turn.question} /></div>
-                <div className="answer-actions"><button type="button" disabled={exportingMessageId !== null} onClick={() => void exportAnswer(turn.answer)}><DownloadOutlined /> {exportingMessageId === turn.answer.message_id ? "正在导出" : "导出当前回答"}</button></div>
+                <div className="answer-actions">
+                  <button type="button" disabled={exportingMessageId !== null} onClick={() => void exportAnswer(turn.answer)}><DownloadOutlined /> {exportingMessageId === turn.answer.message_id ? "正在导出" : "导出当前回答"}</button>
+                  <button type="button" disabled={speechLoadingMessageId === turn.answer.message_id} onClick={() => void readAnswer(turn.answer)}>
+                    {speechLoadingMessageId === turn.answer.message_id ? <><SoundOutlined /> 正在生成语音</> : speakingMessageId === turn.answer.message_id ? speechPaused ? <><CaretRightOutlined /> 继续朗读</> : <><PauseOutlined /> 暂停朗读</> : <><SoundOutlined /> 朗读</>}
+                  </button>
+                  {speakingMessageId === turn.answer.message_id && <button type="button" onClick={stopPlayback}><StopOutlined /> 停止</button>}
+                </div>
                 {isLast && turn.answer.claims.length > 0 && <div className="answer-claims">
                   <h2>引用依据</h2>
                   {turn.answer.claims.map((claim) => <section key={claim.claim_id}>
@@ -477,6 +656,7 @@ export function AskPage({ model_state: _model_state }: { model_state: ModelRunti
                 {isLast && preview && <div className="answer-preview" aria-label={`${preview.file.display_name}原文预览`}>
                   <header><strong>{preview.file.display_name}</strong><small>{displayPath(preview.file.display_path)}</small></header>
                   {preview.file.extension.toLowerCase() === "pdf" && <PdfVisualPreview preview={preview} />}
+                  <OcrAttemptChain attempts={preview.ocr_attempts} />
                   <ImageAssetGallery assets={preview.image_assets} />
                   {preview.nodes.map((node) => <p key={node.node_id} className={node.node_id === preview.anchor_node_id ? "preview-node--anchor" : undefined}><small>{locatorLabel(node.locator)}</small>{highlightPlainTerms(node.text ?? (node.table_data ? JSON.stringify(node.table_data) : ""), turn.question)}</p>)}
                   {preview.next_offset !== null && <button type="button" className="text-button" disabled={previewLoading === preview.file.file_id} onClick={() => void showPreview(preview.file.file_id, null, preview.next_offset ?? 0)}>继续载入</button>}
@@ -503,8 +683,16 @@ export function AskPage({ model_state: _model_state }: { model_state: ModelRunti
             event.preventDefault();
             void submit();
           }
-        }} placeholder="基于我的资料提问…" />
-        <button type="submit" aria-label="发送" disabled={loading || !question.trim()}><SendOutlined /></button>
+        }} placeholder={recording ? "正在录音，再次点击麦克风结束…" : recognizing ? "正在本地识别语音…" : "基于我的资料提问…"} disabled={recording || recognizing} />
+        {recording && <button type="button" className="ask-composer__cancel-recording" onClick={() => void stopRecording(true)}>取消</button>}
+        <button
+          type="button"
+          className={recording ? "ask-composer__voice ask-composer__voice--recording" : "ask-composer__voice"}
+          aria-label={recording ? "结束录音" : "开始录音"}
+          disabled={recognizing || loading}
+          onClick={() => recording ? void stopRecording(false) : void startRecording()}
+        >{recording ? <StopOutlined /> : <AudioOutlined />}</button>
+        <button type="submit" aria-label="发送" disabled={loading || !question.trim() || readiness?.ready === false}><SendOutlined /></button>
       </form>
     </section>
   );

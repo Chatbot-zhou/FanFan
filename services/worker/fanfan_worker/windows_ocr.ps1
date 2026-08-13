@@ -4,7 +4,8 @@ param(
     [int]$MaxPages = 50,
     [string]$LanguageTag = 'zh-Hans-CN',
     [string]$PageNumbers = '',
-    [string]$AssetCacheDir = ''
+    [string]$AssetCacheDir = '',
+    [switch]$RenderOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -52,23 +53,29 @@ function Await-Action($Action) {
 [void][Windows.Data.Pdf.PdfDocument, Windows.Data.Pdf, ContentType = WindowsRuntime]
 [void][Windows.Data.Pdf.PdfPageRenderOptions, Windows.Data.Pdf, ContentType = WindowsRuntime]
 
-$available = [Windows.Media.Ocr.OcrEngine]::AvailableRecognizerLanguages
-$language = $available | Where-Object { $_.LanguageTag -eq $LanguageTag } | Select-Object -First 1
-if ($null -eq $language) {
-    $language = $available | Where-Object { $_.LanguageTag -like 'zh-Hans*' } | Select-Object -First 1
+$language = $null
+$engine = $null
+if (-not $RenderOnly) {
+    $available = [Windows.Media.Ocr.OcrEngine]::AvailableRecognizerLanguages
+    $language = $available | Where-Object { $_.LanguageTag -eq $LanguageTag } | Select-Object -First 1
+    if ($null -eq $language) {
+        $language = $available | Where-Object { $_.LanguageTag -like 'zh-Hans*' } | Select-Object -First 1
+    }
+    if ($null -eq $language) {
+        $language = $available | Select-Object -First 1
+    }
 }
-if ($null -eq $language) {
-    $language = $available | Select-Object -First 1
-}
-if ($null -eq $language) {
+if (-not $RenderOnly -and $null -eq $language) {
     # Keep this file pure ASCII: Windows PowerShell 5.1 reads BOM-less scripts
     # with the ANSI code page, and UTF-8 Chinese bytes would break parsing on
     # zh-CN systems. The user-facing message lives in ocr.py (OCR_LANGUAGE_PACK_MISSING).
     Write-Error -ErrorAction Continue 'OCR_LANGUAGE_PACK_MISSING: Windows OCR language pack is not installed. Add Simplified Chinese OCR in Settings > Time & Language > Language & region and retry.'
     exit 3
 }
-$engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($language)
-if ($null -eq $engine) { throw 'Windows OCR engine initialization failed' }
+if (-not $RenderOnly) {
+    $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage($language)
+    if ($null -eq $engine) { throw 'Windows OCR engine initialization failed' }
+}
 
 function Read-Bitmap($Bitmap, [int]$PageNumber) {
     $result = Await-Operation ($engine.RecognizeAsync($Bitmap)) ([Windows.Media.Ocr.OcrResult])
@@ -140,10 +147,12 @@ if ($SourceKind -eq 'image') {
                     $input.Dispose()
                 }
             }
-            $memory.Seek(0)
-            $decoder = Await-Operation ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($memory)) ([Windows.Graphics.Imaging.BitmapDecoder])
-            $bitmap = Await-Operation ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
-            try { $allLines += @(Read-Bitmap $bitmap ($index + 1)) } finally { $bitmap.Dispose() }
+            if (-not $RenderOnly) {
+                $memory.Seek(0)
+                $decoder = Await-Operation ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($memory)) ([Windows.Graphics.Imaging.BitmapDecoder])
+                $bitmap = Await-Operation ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+                try { $allLines += @(Read-Bitmap $bitmap ($index + 1)) } finally { $bitmap.Dispose() }
+            }
         } finally {
             $memory.Dispose()
             $page.Dispose()
@@ -152,7 +161,7 @@ if ($SourceKind -eq 'image') {
 }
 
 [ordered]@{
-    language = $language.LanguageTag
+    language = $(if ($RenderOnly) { $null } else { $language.LanguageTag })
     page_count = $pageCount
     lines = $allLines
     rendered_pages = $renderedPages

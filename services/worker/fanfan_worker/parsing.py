@@ -21,10 +21,25 @@ from xml.etree import ElementTree
 
 from .protocol import WorkerError, is_uuid_v7
 from .ocr import recognize_with_windows
+from .paddle_ocr import recognize_image
 
 
 PARSER_VERSION = "0.1.0"
-SUPPORTED_TEXT = {"txt", "md", "csv", "tsv", "html", "htm"}
+
+
+def _strip_long_path_prefix(value: str) -> str:
+    """Strip a Windows \\\\?\\ (and \\\\?\\UNC\\) prefix so WinRT and PowerShell
+    components can open the path. pypdf tolerates the prefix, but
+    Windows.Data.Pdf rejects it, which surfaced as PDF_RENDER_FAILED."""
+    if value[:8].lower() == "\\\\?\\unc\\":
+        return "\\\\" + value[8:]
+    if value.startswith("\\\\?\\"):
+        return value[4:]
+    return value
+SUPPORTED_TEXT = {
+    "txt", "text", "md", "csv", "tsv", "html", "htm", "ini", "iml",
+    "log", "conf", "cfg", "properties",
+}
 SUPPORTED_CODE = {
     "rs", "py", "js", "jsx", "mjs", "cjs", "ts", "tsx", "java", "kt", "kts", "go",
     "c", "cc", "cpp", "h", "hpp", "cs", "rb", "php", "swift", "scala", "sh", "ps1",
@@ -47,6 +62,44 @@ def uuid7() -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class OcrRuntimeConfig:
+    model_path: str
+    det_model_path: str
+    cls_model_path: str
+    dictionary_path: str
+    threads: int = 1
+    confidence_threshold: float = 0.45
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "OcrRuntimeConfig | None":
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise ValueError("ocr_runtime must be an object or null")
+        paths = [value.get(key) for key in ("model_path", "det_model_path", "cls_model_path", "dictionary_path")]
+        if not all(isinstance(path, str) and path.strip() for path in paths):
+            raise ValueError("ocr_runtime model package is incomplete")
+        threads = value.get("threads", 1)
+        if not isinstance(threads, int) or isinstance(threads, bool) or threads < 1 or threads > 4:
+            raise ValueError("ocr_runtime threads must be between 1 and 4")
+        confidence_threshold = value.get("confidence_threshold", 0.45)
+        if not isinstance(confidence_threshold, (int, float)) or isinstance(confidence_threshold, bool) or not 0.0 <= float(confidence_threshold) <= 1.0:
+            raise ValueError("ocr_runtime confidence_threshold must be between 0 and 1")
+        return cls(paths[0], paths[1], paths[2], paths[3], threads, float(confidence_threshold))
+
+    def payload(self, image_path: Path, page_no: int) -> dict[str, Any]:
+        return {
+            "model_path": self.model_path,
+            "det_model_path": self.det_model_path,
+            "cls_model_path": self.cls_model_path,
+            "dictionary_path": self.dictionary_path,
+            "threads": self.threads,
+            "image_path": str(image_path),
+            "page_no": page_no,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ParseRequest:
     job_id: str
     file_id: str
@@ -57,6 +110,7 @@ class ParseRequest:
     language_hints: tuple[str, ...] = ("zh",)
     max_pages: int | None = None
     asset_cache_dir: str | None = None
+    ocr_runtime: OcrRuntimeConfig | None = None
     parser_version: str = PARSER_VERSION
 
     @classmethod
@@ -86,12 +140,13 @@ class ParseRequest:
             job_id=required_ids[0],
             file_id=required_ids[1],
             revision_id=required_ids[2],
-            source_path=source_path,
+            source_path=_strip_long_path_prefix(source_path),
             format=source_format.lower().lstrip("."),
             ocr_policy=ocr_policy,
             language_hints=tuple(hints),
             max_pages=max_pages,
-            asset_cache_dir=asset_cache_dir,
+            asset_cache_dir=_strip_long_path_prefix(asset_cache_dir) if asset_cache_dir is not None else None,
+            ocr_runtime=OcrRuntimeConfig.from_dict(value.get("ocr_runtime")),
             parser_version=str(value.get("parser_version") or PARSER_VERSION),
         )
 
@@ -101,6 +156,18 @@ class ParseWarning:
     code: str
     message: str
     locator: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OcrAttempt:
+    engine: str
+    model_version: str | None
+    status: Literal["completed", "failed", "no_text"]
+    page_no: int | None = None
+    confidence: float | None = None
+    fallback_reason: str | None = None
+    elapsed_ms: int = 0
+    error: WorkerError | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +206,7 @@ class ParseResult:
     parser_version: str
     nodes: tuple[DocumentNode, ...]
     image_assets: tuple[ImageAsset, ...]
+    ocr_attempts: tuple[OcrAttempt, ...]
     warnings: tuple[ParseWarning, ...]
     metrics: dict[str, int]
     error: WorkerError | None = None
@@ -495,6 +563,110 @@ def _ocr_nodes(result: dict[str, Any], kind: str, start_ordinal: int = 0) -> lis
     return nodes
 
 
+def _recognize_pdf_pages(
+    request: ParseRequest,
+    path: Path,
+    page_numbers: list[int],
+    render_directory: Path | None,
+) -> tuple[dict[str, Any] | None, WorkerError | None, str, list[ParseWarning], list[OcrAttempt]]:
+    attempts: list[OcrAttempt] = []
+    if request.ocr_runtime is None or render_directory is None:
+        started_at = time.monotonic()
+        result, error = recognize_with_windows(
+            path, "pdf", request.max_pages, request.language_hints, page_numbers, render_directory
+        )
+        attempts.append(_ocr_attempt("windows-ocr", "Windows.Media.Ocr", result, error, None, started_at))
+        return result, error, "windows-ocr", [], attempts
+
+    primary_started_at = time.monotonic()
+    rendered, render_error = recognize_with_windows(
+        path,
+        "pdf",
+        request.max_pages,
+        request.language_hints,
+        page_numbers,
+        render_directory,
+        render_only=True,
+    )
+    primary_error = render_error
+    primary_fallback_reason = render_error.code if render_error else None
+    if render_error is not None:
+        attempts.append(
+            _ocr_attempt(
+                "windows-pdf-renderer",
+                "Windows.Data.Pdf",
+                None,
+                render_error,
+                render_error.code,
+                primary_started_at,
+            )
+        )
+    if rendered is not None and primary_error is None:
+        lines: list[dict[str, Any]] = []
+        for item in rendered.get("rendered_pages", []):
+            page_number = int(item["page_no"])
+            page_result, page_error = recognize_image(
+                request.ocr_runtime.payload(Path(str(item["path"])), page_number)
+            )
+            if page_error is not None:
+                primary_error = page_error
+                break
+            lines.extend((page_result or {}).get("lines", []))
+        if primary_error is None:
+            rendered["lines"] = lines
+            rendered["engine"] = "rapidocr-onnxruntime"
+            rendered["model_version"] = "PP-OCRv5-mobile"
+            primary_fallback_reason = _ocr_fallback_reason(rendered, None, request.ocr_runtime.confidence_threshold)
+            attempts.append(_ocr_attempt("rapidocr-onnxruntime", "PP-OCRv5-mobile", rendered, None, primary_fallback_reason, primary_started_at))
+            if primary_fallback_reason is None:
+                return rendered, None, "rapidocr-ppocrv5", [], attempts
+        if primary_error is not None:
+            attempts.append(_ocr_attempt("rapidocr-onnxruntime", "PP-OCRv5-mobile", None, primary_error, primary_error.code, primary_started_at))
+
+    # Keep indexing recoverable on systems where the optional model runtime is
+    # temporarily unavailable. The fallback is explicit in warnings and parser
+    # metadata instead of silently claiming that PaddleOCR ran.
+    fallback_warning = ParseWarning(
+        "OCR_ENGINE_FALLBACK",
+        f"PP-OCRv5 unavailable or below threshold ({primary_error.code if primary_error else primary_fallback_reason or 'OCR_RENDER_FAILED'}); Windows OCR compatibility fallback was used",
+    )
+    fallback_started_at = time.monotonic()
+    result, error = recognize_with_windows(
+        path, "pdf", request.max_pages, request.language_hints, page_numbers, render_directory
+    )
+    attempts.append(_ocr_attempt("windows-ocr", "Windows.Media.Ocr", result, error, primary_error.code if primary_error else primary_fallback_reason or "OCR_RENDER_FAILED", fallback_started_at))
+    return result, error, "windows-ocr-fallback", [fallback_warning], attempts
+
+
+def _ocr_attempt(
+    engine: str,
+    model_version: str | None,
+    result: dict[str, Any] | None,
+    error: WorkerError | None,
+    fallback_reason: str | None,
+    started_at: float,
+) -> OcrAttempt:
+    lines = (result or {}).get("lines", [])
+    confidence_values = [float(line["confidence"]) for line in lines if isinstance(line, dict) and isinstance(line.get("confidence"), (int, float))]
+    confidence = sum(confidence_values) / len(confidence_values) if confidence_values else None
+    status: Literal["completed", "failed", "no_text"] = "failed" if error else "completed" if lines else "no_text"
+    return OcrAttempt(engine, model_version, status, None, confidence, fallback_reason, int((time.monotonic() - started_at) * 1000), error)
+
+
+def _ocr_fallback_reason(result: dict[str, Any] | None, error: WorkerError | None, confidence_threshold: float) -> str | None:
+    if error is not None:
+        return error.code
+    lines = (result or {}).get("lines", [])
+    if not lines:
+        return "OCR_NO_TEXT"
+    confidence_values = [float(line["confidence"]) for line in lines if isinstance(line, dict) and isinstance(line.get("confidence"), (int, float))]
+    if not confidence_values:
+        return "OCR_CONFIDENCE_MISSING"
+    if sum(confidence_values) / len(confidence_values) < confidence_threshold:
+        return "OCR_LOW_CONFIDENCE"
+    return None
+
+
 def _pdf_result(request: ParseRequest, path: Path, started_at: float) -> ParseResult:
     try:
         from pypdf import PdfReader
@@ -538,14 +710,10 @@ def _pdf_result(request: ParseRequest, path: Path, started_at: float) -> ParseRe
             if request.asset_cache_dir:
                 render_directory = Path(request.asset_cache_dir) / f".ocr-render-{uuid7()}"
             try:
-                ocr_result, ocr_error = recognize_with_windows(
-                    path,
-                    "pdf",
-                    request.max_pages,
-                    request.language_hints,
-                    ocr_pages,
-                    render_directory,
+                ocr_result, ocr_error, ocr_engine, ocr_warnings, ocr_attempts = _recognize_pdf_pages(
+                    request, path, ocr_pages, render_directory
                 )
+                warnings.extend(ocr_warnings)
                 if ocr_error:
                     for page_number in ocr_pages:
                         warnings.append(ParseWarning(ocr_error.code, ocr_error.message, locator("pdf", page_no=page_number)))
@@ -561,7 +729,7 @@ def _pdf_result(request: ParseRequest, path: Path, started_at: float) -> ParseRe
                             for ordinal, node in enumerate(nodes, 1)
                         ]
                         ocr_page_count = len(recognized_pages)
-                        parser_name = "pypdf+windows-ocr"
+                        parser_name = f"pypdf+{ocr_engine}"
                     ocr_text_by_page: dict[int, str] = {}
                     for page_number in ocr_pages:
                         page_text = "\n".join(
@@ -594,7 +762,7 @@ def _pdf_result(request: ParseRequest, path: Path, started_at: float) -> ParseRe
                 if render_directory is not None:
                     shutil.rmtree(render_directory, ignore_errors=True)
         status: Literal["parsed", "partial"] = "partial" if warnings else "parsed"
-        return _result(request, status, parser_name, nodes, warnings, len(pages), started_at, ocr_page_count, image_assets)
+        return _result(request, status, parser_name, nodes, warnings, len(pages), started_at, ocr_page_count, image_assets, ocr_attempts if ocr_pages else [])
     except Exception as error:
         # pypdf 内部还会抛出 PdfStreamError/TypeError/struct.error 等不在
         # (PdfReadError, OSError, ValueError) 里的异常；宽捕获避免 worker 进程死亡。
@@ -611,6 +779,7 @@ def _result(
     started_at: float | None = None,
     ocr_page_count: int = 0,
     image_assets: list[ImageAsset] | None = None,
+    ocr_attempts: list[OcrAttempt] | None = None,
 ) -> ParseResult:
     return ParseResult(
         revision_id=request.revision_id,
@@ -619,6 +788,7 @@ def _result(
         parser_version=request.parser_version,
         nodes=tuple(nodes),
         image_assets=tuple(image_assets or ()),
+        ocr_attempts=tuple(ocr_attempts or ()),
         warnings=tuple(warnings),
         metrics={
             "page_count": page_count,
@@ -638,6 +808,7 @@ def _failure(request: ParseRequest, code: str, message: str, retryable: bool) ->
         parser_version=request.parser_version,
         nodes=(),
         image_assets=(),
+        ocr_attempts=(),
         warnings=(),
         metrics={"page_count": 0, "node_count": 0, "character_count": 0, "ocr_page_count": 0, "elapsed_ms": 0},
         error=WorkerError(code, message, retryable),
@@ -645,7 +816,7 @@ def _failure(request: ParseRequest, code: str, message: str, retryable: bool) ->
 
 
 def _find_libreoffice() -> Path | None:
-    explicit = os.environ.get("REMIN_LIBREOFFICE_EXE")
+    explicit = os.environ.get("FANFAN_LIBREOFFICE_EXE")
     candidates = [
         Path(explicit) if explicit else None,
         Path(r"C:\Program Files\LibreOffice\program\soffice.exe"),
@@ -662,7 +833,7 @@ def _legacy_office_result(request: ParseRequest, path: Path, source_format: str,
     if executable is None:
         return _result(request, "unsupported", "none", [], [ParseWarning("COMPATIBILITY_PACK_REQUIRED", "旧Office格式需要可选LibreOffice离线兼容包")], 0, started_at)
     target_format = {"doc": "docx", "xls": "xlsx", "ppt": "pptx"}[source_format]
-    with tempfile.TemporaryDirectory(prefix="remin-legacy-office-") as temporary_raw:
+    with tempfile.TemporaryDirectory(prefix="fanfan-legacy-office-") as temporary_raw:
         temporary = Path(temporary_raw)
         output_directory = temporary / "converted"
         profile_directory = temporary / "profile"
@@ -742,9 +913,30 @@ def parse_document(request: ParseRequest) -> ParseResult:
             image_assets = [standalone_asset] if standalone_asset is not None else []
             if request.ocr_policy == "disabled":
                 return _result(request, "partial", "image-metadata", [], [ParseWarning("OCR_REQUIRED", "图片需要OCR后才能建立全文索引")], 1, started_at, image_assets=image_assets)
-            ocr_result, ocr_error = recognize_with_windows(path, "image", 1, request.language_hints)
+            ocr_warnings: list[ParseWarning] = []
+            ocr_attempts: list[OcrAttempt] = []
+            ocr_engine = "rapidocr-ppocrv5"
+            if request.ocr_runtime is not None:
+                ocr_started_at = time.monotonic()
+                ocr_result, ocr_error = recognize_image(request.ocr_runtime.payload(path, 1))
+                fallback_reason = _ocr_fallback_reason(ocr_result, ocr_error, request.ocr_runtime.confidence_threshold)
+                ocr_attempts.append(_ocr_attempt("rapidocr-onnxruntime", "PP-OCRv5-mobile", ocr_result, ocr_error, fallback_reason, ocr_started_at))
+                if fallback_reason is not None:
+                    ocr_warnings.append(ParseWarning(
+                        "OCR_ENGINE_FALLBACK",
+                        f"PP-OCRv5 unavailable or below threshold ({fallback_reason}); Windows OCR compatibility fallback was used",
+                    ))
+                    fallback_started_at = time.monotonic()
+                    ocr_result, ocr_error = recognize_with_windows(path, "image", 1, request.language_hints)
+                    ocr_attempts.append(_ocr_attempt("windows-ocr", "Windows.Media.Ocr", ocr_result, ocr_error, fallback_reason, fallback_started_at))
+                    ocr_engine = "windows-ocr-fallback"
+            else:
+                ocr_started_at = time.monotonic()
+                ocr_result, ocr_error = recognize_with_windows(path, "image", 1, request.language_hints)
+                ocr_attempts.append(_ocr_attempt("windows-ocr", "Windows.Media.Ocr", ocr_result, ocr_error, None, ocr_started_at))
+                ocr_engine = "windows-ocr"
             if ocr_error:
-                return _result(request, "partial", "image-metadata", [], [ParseWarning(ocr_error.code, ocr_error.message), ParseWarning("OCR_REQUIRED", "图片尚未完成OCR")], 1, started_at, image_assets=image_assets)
+                return _result(request, "partial", "image-metadata", [], ocr_warnings + [ParseWarning(ocr_error.code, ocr_error.message), ParseWarning("OCR_REQUIRED", "图片尚未完成OCR")], 1, started_at, image_assets=image_assets, ocr_attempts=ocr_attempts)
             nodes = _ocr_nodes(ocr_result or {}, "image")
             ocr_text = "\n".join(node.text or "" for node in nodes).strip() or None
             if standalone_asset is not None:
@@ -760,8 +952,8 @@ def parse_document(request: ParseRequest) -> ParseResult:
                     ocr_text,
                 )]
             if not nodes:
-                return _result(request, "partial", "windows-ocr", [], [ParseWarning("OCR_NO_TEXT", "图片OCR后没有识别到文字"), ParseWarning("OCR_REQUIRED", "图片尚未获得可索引文字")], 1, started_at, image_assets=image_assets)
-            return _result(request, "parsed", "windows-ocr", nodes, [], 1, started_at, 1, image_assets)
+                return _result(request, "partial", ocr_engine, [], ocr_warnings + [ParseWarning("OCR_NO_TEXT", "图片OCR后没有识别到文字"), ParseWarning("OCR_REQUIRED", "图片尚未获得可索引文字")], 1, started_at, image_assets=image_assets, ocr_attempts=ocr_attempts)
+            return _result(request, "partial" if ocr_warnings else "parsed", ocr_engine, nodes, ocr_warnings, 1, started_at, 1, image_assets, ocr_attempts)
         if source_format in LEGACY_OFFICE:
             return _legacy_office_result(request, path, source_format, started_at)
         return _result(request, "unsupported", "none", [], [ParseWarning("FORMAT_UNSUPPORTED", f"暂不支持{source_format}格式")], 0, started_at)

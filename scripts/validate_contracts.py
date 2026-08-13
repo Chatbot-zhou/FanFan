@@ -11,7 +11,7 @@ SOURCE_ROOTS = (
     REPO_ROOT / "crates" / "core" / "src",
     REPO_ROOT / "apps" / "desktop" / "src",
     REPO_ROOT / "apps" / "desktop" / "src-tauri" / "src",
-    REPO_ROOT / "services" / "worker" / "remin_worker",
+    REPO_ROOT / "services" / "worker" / "fanfan_worker",
 )
 SOURCE_SUFFIXES = {".rs", ".py", ".ts", ".tsx"}
 CODE_PATTERN = re.compile(

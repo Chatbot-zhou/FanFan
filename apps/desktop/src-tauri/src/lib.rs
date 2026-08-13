@@ -6,7 +6,8 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, atomic::AtomicBool},
-    time::Instant,
+    thread,
+    time::{Duration, Instant},
 };
 
 use chrono::Utc;
@@ -14,13 +15,14 @@ use commands::{
     app_data::{
         self, AskCoordinatorState, CatalogServiceState, EnvironmentServiceState,
         GenerationServiceState, ModelDownloadCoordinatorState, ModelServiceState,
-        ScanCoordinatorState, WatcherServiceState, WorkerServiceState,
+        RuntimeManagerState, ScanCoordinatorState, SpeechWorkerState, WatcherServiceState,
+        WorkerServiceState,
     },
     startup::{StartupServiceState, StartupState},
     theme::ThemeServiceState,
     welcome::WelcomeServiceState,
 };
-use remin_core::{
+use fanfan_core::{
     CatalogService, IncrementalWatchManager, LocalGenerationRuntime, ModelManager,
     RuntimeCapability, ThemeService, WelcomeService, WorkerClient,
 };
@@ -31,10 +33,10 @@ use tauri::{Emitter, Manager};
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .register_uri_scheme_protocol("remin-pdf", |context, request| {
+        .register_uri_scheme_protocol("fanfan-pdf", |context, request| {
             pdf_protocol_response(context.app_handle(), context.webview_label(), &request)
         })
-        .register_uri_scheme_protocol("remin-image", |context, request| {
+        .register_uri_scheme_protocol("fanfan-image", |context, request| {
             image_protocol_response(context.app_handle(), context.webview_label(), &request)
         })
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -67,6 +69,10 @@ pub fn run() {
                     .pause_all();
                 let worker = window.app_handle().state::<WorkerServiceState>();
                 worker.client.cancel_active();
+                let speech_worker = window.app_handle().state::<SpeechWorkerState>();
+                speech_worker.0.cancel_active();
+                let runtime_manager = window.app_handle().state::<RuntimeManagerState>();
+                let _ = runtime_manager.0.cancel_all();
                 if let Ok(mut generation) = window
                     .app_handle()
                     .state::<GenerationServiceState>()
@@ -81,8 +87,16 @@ pub fn run() {
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;
             let local_data_dir = app.path().app_local_data_dir()?;
-            apply_pending_data_reset(&config_dir, &local_data_dir)?;
             let default_data_dir = app.path().app_data_dir()?;
+            let pre_reset_data_dir =
+                resolve_application_data_directory(&config_dir, &default_data_dir);
+            let durable_model_store = durable_model_store_directory(&local_data_dir)?;
+            let legacy_model_roots = unique_paths([
+                pre_reset_data_dir.join("models"),
+                config_dir.join("models"),
+                local_data_dir.join("models"),
+            ]);
+            apply_pending_data_reset(&config_dir, &local_data_dir)?;
             let data_dir = resolve_application_data_directory(&config_dir, &default_data_dir);
             let (log_initialization, log_fallback_error) =
                 match runtime_log::initialize(data_dir.join("logs")) {
@@ -141,7 +155,7 @@ pub fn run() {
                 .path()
                 .resource_dir()?
                 .join("worker")
-                .join("remin-worker.exe");
+                .join("fanfan-worker.exe");
             let worker_client = if packaged_worker.is_file() {
                 WorkerClient::from_executable(packaged_worker)
             } else {
@@ -149,6 +163,7 @@ pub fn run() {
                     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../services/worker");
                 WorkerClient::from_environment(worker_root)
             };
+            let speech_worker = worker_client.isolated();
             app.manage(WorkerServiceState {
                 client: worker_client,
                 running: AtomicBool::new(false),
@@ -156,6 +171,24 @@ pub fn run() {
                 embedding_reschedule: AtomicBool::new(false),
                 vision_running: AtomicBool::new(false),
                 foreground_activity: std::sync::atomic::AtomicU32::new(0),
+            });
+            app.manage(SpeechWorkerState(speech_worker));
+            let runtime_manager: RuntimeManagerState = app_data::create_runtime_manager_state();
+            let runtime_event_manager = runtime_manager.0.clone();
+            app.manage(runtime_manager);
+            let runtime_event_app = app.handle().clone();
+            thread::spawn(move || {
+                let mut previous = String::new();
+                loop {
+                    if let Ok(snapshot) = runtime_event_manager.snapshot()
+                        && let Ok(serialized) = serde_json::to_string(&snapshot)
+                        && serialized != previous
+                    {
+                        previous = serialized;
+                        let _ = runtime_event_app.emit("runtime:state", snapshot);
+                    }
+                    thread::sleep(Duration::from_millis(750));
+                }
             });
             let packaged_runtime_root = app.path().resource_dir()?.join("runtime");
             let development_runtime_root =
@@ -206,7 +239,15 @@ pub fn run() {
 
             let startup_app = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {
-                initialize_background_services(startup_app, data_dir, catalog, models, startup);
+                initialize_background_services(
+                    startup_app,
+                    data_dir,
+                    durable_model_store,
+                    legacy_model_roots,
+                    catalog,
+                    models,
+                    startup,
+                );
             });
             runtime_log::event(
                 "info",
@@ -237,10 +278,14 @@ pub fn run() {
             app_data::model_preset_list,
             app_data::model_download_start,
             app_data::model_download_list,
+            app_data::model_store_status_get,
             app_data::model_download_get,
             app_data::model_download_pause,
             app_data::model_download_cancel,
+            app_data::model_download_resume,
             app_data::model_download_retry,
+            app_data::model_download_switch_source,
+            app_data::model_download_remove,
             app_data::model_artifact_activate,
             app_data::model_role_disable,
             app_data::home_get_summary,
@@ -253,6 +298,8 @@ pub fn run() {
             app_data::ask_session_delete,
             app_data::ask_operation_get,
             app_data::ask_cancel,
+            app_data::speech_recognize,
+            app_data::speech_synthesize_answer,
             app_data::preview_get,
             app_data::file_open,
             app_data::file_reveal,
@@ -285,6 +332,7 @@ pub fn run() {
             app_data::exclusion_rule_upsert,
             app_data::exclusion_rule_delete,
             app_data::app_status_get,
+            app_data::runtime_state_get,
             app_data::maintenance_get,
             app_data::maintenance_check,
             app_data::storage_usage_get,
@@ -306,11 +354,11 @@ pub fn run() {
             app_data::scan_cancel,
         ])
         .run(tauri::generate_context!())
-        .expect("拾忆桌面应用启动失败");
+        .expect("翻翻桌面应用启动失败");
 }
 
 const STORAGE_LOCATION_FILE: &str = "storage-location.json";
-const MANAGED_STORAGE_MARKER: &str = ".remin-managed-data-v1";
+const MANAGED_STORAGE_MARKER: &str = ".fanfan-managed-data-v1";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct StorageLocationConfig {
@@ -356,16 +404,16 @@ pub(crate) fn schedule_storage_migration(
     current_data_dir: &Path,
     selected_parent: &Path,
     authorized_roots: &[PathBuf],
-) -> Result<StorageLocationStatus, remin_core::AppError> {
+) -> Result<StorageLocationStatus, fanfan_core::AppError> {
     if !selected_parent.is_absolute() || !selected_parent.is_dir() {
-        return Err(remin_core::AppError::new(
+        return Err(fanfan_core::AppError::new(
             "STORAGE_MIGRATION_TARGET_INVALID",
             "请选择一个已存在的本地文件夹作为新存储位置",
             false,
         ));
     }
     let selected_parent = selected_parent.canonicalize().map_err(|_| {
-        remin_core::AppError::new(
+        fanfan_core::AppError::new(
             "STORAGE_MIGRATION_TARGET_INVALID",
             "无法读取所选存储位置",
             true,
@@ -378,15 +426,15 @@ pub(crate) fn schedule_storage_migration(
                 .to_ascii_lowercase()
                 .starts_with("\\\\?\\unc\\"));
     if is_unc {
-        return Err(remin_core::AppError::new(
+        return Err(fanfan_core::AppError::new(
             "STORAGE_MIGRATION_TARGET_INVALID",
             "应用数据只能迁移到本地磁盘，不能使用网络位置",
             false,
         ));
     }
-    let target = selected_parent.join("ReminData");
+    let target = selected_parent.join("FanFanData");
     if path_contains(current_data_dir, &target) || path_contains(&target, current_data_dir) {
-        return Err(remin_core::AppError::new(
+        return Err(fanfan_core::AppError::new(
             "STORAGE_MIGRATION_TARGET_INVALID",
             "新存储位置不能位于当前应用数据目录内部或包含当前目录",
             false,
@@ -396,7 +444,7 @@ pub(crate) fn schedule_storage_migration(
         .iter()
         .any(|root| path_contains(root, &target))
     {
-        return Err(remin_core::AppError::new(
+        return Err(fanfan_core::AppError::new(
             "STORAGE_MIGRATION_TARGET_AUTHORIZED_SOURCE",
             "索引和模型目录不能放在已授权的资料源目录中",
             false,
@@ -406,7 +454,7 @@ pub(crate) fn schedule_storage_migration(
         && target
             .read_dir()
             .map_err(|_| {
-                remin_core::AppError::new(
+                fanfan_core::AppError::new(
                     "STORAGE_MIGRATION_TARGET_INVALID",
                     "无法检查新存储目录",
                     true,
@@ -415,9 +463,9 @@ pub(crate) fn schedule_storage_migration(
             .next()
             .is_some()
     {
-        return Err(remin_core::AppError::new(
+        return Err(fanfan_core::AppError::new(
             "STORAGE_MIGRATION_TARGET_NOT_EMPTY",
-            "所选位置中的ReminData目录不是空目录，请选择其他位置",
+            "所选位置中的FanFanData目录不是空目录，请选择其他位置",
             false,
         ));
     }
@@ -431,7 +479,7 @@ pub(crate) fn schedule_storage_migration(
     config.last_error = None;
     config.updated_at = Some(Utc::now().to_rfc3339());
     write_storage_location_config(config_dir, &config).map_err(|_| {
-        remin_core::AppError::new(
+        fanfan_core::AppError::new(
             "STORAGE_MIGRATION_SCHEDULE_FAILED",
             "无法保存存储迁移计划",
             true,
@@ -468,7 +516,7 @@ fn resolve_application_data_directory(config_dir: &Path, default_data_dir: &Path
         }
         Err(_) => {
             config.last_error = Some(
-                "存储迁移未完成，拾忆已继续使用原位置；请检查目标磁盘空间和写入权限后重试".into(),
+                "存储迁移未完成，翻翻已继续使用原位置；请检查目标磁盘空间和写入权限后重试".into(),
             );
             config.updated_at = Some(Utc::now().to_rfc3339());
             let _ = write_storage_location_config(config_dir, &config);
@@ -534,7 +582,7 @@ fn copy_tree_verified(source: &Path, target: &Path) -> std::io::Result<()> {
     verify_directory_entries(source, target)?;
     let marker = target.join(MANAGED_STORAGE_MARKER);
     let mut marker_file = File::create(marker)?;
-    marker_file.write_all(b"REMIN_MANAGED_DATA_V1")?;
+    marker_file.write_all(b"FANFAN_MANAGED_DATA_V1")?;
     marker_file.sync_all()
 }
 
@@ -559,7 +607,7 @@ fn copy_directory_entries(source: &Path, target: &Path) -> std::io::Result<()> {
             {
                 continue;
             }
-            let temporary = destination.with_extension("remin-copying");
+            let temporary = destination.with_extension("fanfan-copying");
             if temporary.exists() {
                 fs::remove_file(&temporary)?;
             }
@@ -633,6 +681,147 @@ fn path_contains(parent: &Path, child: &Path) -> bool {
     child == parent || child.starts_with(&format!("{}\\", parent.trim_end_matches('\\')))
 }
 
+const MODEL_STORE_READY_MARKER: &str = ".fanfan-model-store-v1";
+
+fn durable_model_store_directory(local_data_dir: &Path) -> std::io::Result<PathBuf> {
+    let local_app_data = local_data_dir.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "application local data directory has no parent",
+        )
+    })?;
+    Ok(local_app_data.join("FanFan").join("ModelStore").join("v1"))
+}
+
+fn unique_paths<const N: usize>(paths: [PathBuf; N]) -> Vec<PathBuf> {
+    let mut unique = Vec::new();
+    for path in paths {
+        if !unique.iter().any(|existing| existing == &path) {
+            unique.push(path);
+        }
+    }
+    unique
+}
+
+fn prepare_durable_model_store(
+    durable_store: &Path,
+    legacy_roots: &[PathBuf],
+) -> (PathBuf, Option<std::io::Error>) {
+    match try_prepare_durable_model_store(durable_store, legacy_roots) {
+        Ok(()) => (durable_store.to_path_buf(), None),
+        Err(error) => {
+            let fallback = legacy_roots
+                .iter()
+                .find(|path| model_store_has_content(path))
+                .cloned()
+                .unwrap_or_else(|| durable_store.to_path_buf());
+            (fallback, Some(error))
+        }
+    }
+}
+
+fn try_prepare_durable_model_store(
+    durable_store: &Path,
+    legacy_roots: &[PathBuf],
+) -> std::io::Result<()> {
+    if durable_store.join(MODEL_STORE_READY_MARKER).is_file() {
+        return Ok(());
+    }
+    if model_store_has_content(durable_store) && durable_store.join("registry.json").is_file() {
+        ModelManager::open_store(durable_store.to_path_buf())
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        fs::write(
+            durable_store.join(MODEL_STORE_READY_MARKER),
+            "FANFAN_MODEL_STORE_V1",
+        )?;
+        return Ok(());
+    }
+    let source = legacy_roots
+        .iter()
+        .find(|path| *path != durable_store && model_store_has_content(path));
+    let Some(source) = source else {
+        fs::create_dir_all(durable_store)?;
+        fs::write(
+            durable_store.join(MODEL_STORE_READY_MARKER),
+            "FANFAN_MODEL_STORE_V1",
+        )?;
+        return Ok(());
+    };
+    let parent = durable_store.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "model store has no parent",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+    let staging = parent.join("v1.migrating");
+    if staging.exists() {
+        let interrupted = parent.join(format!(
+            "v1.migrating-interrupted-{}",
+            Utc::now().format("%Y%m%d-%H%M%S")
+        ));
+        fs::rename(&staging, interrupted)?;
+    }
+    copy_directory_verified(source, &staging)?;
+    let staging_manager = ModelManager::open_store(staging.clone())
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    staging_manager
+        .rebase_store_paths(source)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    fs::write(
+        staging.join(MODEL_STORE_READY_MARKER),
+        "FANFAN_MODEL_STORE_V1",
+    )?;
+    if durable_store.exists() {
+        let displaced = parent.join(format!(
+            "v1.incomplete-{}",
+            Utc::now().format("%Y%m%d-%H%M%S")
+        ));
+        fs::rename(durable_store, displaced)?;
+    }
+    fs::rename(&staging, durable_store)?;
+    let manager = ModelManager::open_store(durable_store.to_path_buf())
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    manager
+        .rebase_store_paths(&staging)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    Ok(())
+}
+
+fn model_store_has_content(path: &Path) -> bool {
+    path.is_dir() && fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some())
+}
+
+fn copy_directory_verified(source: &Path, target: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(target)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "model store migration refuses symbolic links",
+            ));
+        }
+        let target_path = target.join(entry.file_name());
+        if metadata.is_dir() {
+            copy_directory_verified(&entry.path(), &target_path)?;
+        } else if metadata.is_file() {
+            fs::copy(entry.path(), &target_path)?;
+            let target_metadata = fs::metadata(&target_path)?;
+            if target_metadata.len() != metadata.len()
+                || sha256_path(&entry.path())? != sha256_path(&target_path)?
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "model store migration hash verification failed",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn apply_pending_data_reset(config_dir: &Path, local_data_dir: &Path) -> std::io::Result<()> {
     let parent = config_dir.parent().ok_or_else(|| {
         std::io::Error::new(
@@ -640,7 +829,7 @@ fn apply_pending_data_reset(config_dir: &Path, local_data_dir: &Path) -> std::io
             "application config directory has no parent",
         )
     })?;
-    let reset_marker = parent.join(".com.remin.desktop-reset-request");
+    let reset_marker = parent.join(".com.fanfan.desktop-reset-request");
     if !reset_marker.is_file() {
         return Ok(());
     }
@@ -668,13 +857,13 @@ fn apply_pending_data_reset(config_dir: &Path, local_data_dir: &Path) -> std::io
             continue;
         }
         let expected_name = if kind == "migrated" {
-            "ReminData"
+            "FanFanData"
         } else {
-            "com.remin.desktop"
+            "com.fanfan.desktop"
         };
         let managed_marker_valid = kind != "migrated"
             || fs::read_to_string(target.join(MANAGED_STORAGE_MARKER))
-                .is_ok_and(|value| value.trim() == "REMIN_MANAGED_DATA_V1");
+                .is_ok_and(|value| value.trim() == "FANFAN_MANAGED_DATA_V1");
         if !target.is_absolute()
             || target.file_name().and_then(|name| name.to_str()) != Some(expected_name)
             || !managed_marker_valid
@@ -697,7 +886,9 @@ fn apply_pending_data_reset(config_dir: &Path, local_data_dir: &Path) -> std::io
                 "application reset quarantine already exists",
             ));
         }
-        if let Err(error) = fs::rename(&target, &quarantine) {
+        if target.join("models").is_dir() {
+            quarantine_data_preserving_models(&target, &quarantine, kind == "local")?;
+        } else if let Err(error) = fs::rename(&target, &quarantine) {
             // The setup hook runs after the main window's WebView2 has already
             // started, so the local data directory's EBWebView profile folder
             // is held open and renaming it fails with ERROR_ACCESS_DENIED —
@@ -732,6 +923,25 @@ fn quarantine_local_data_skipping_webview(target: &Path, quarantine: &Path) -> s
         fs::rename(entry.path(), quarantine.join(entry.file_name()))?;
     }
     clear_webview_profile_cache(&target.join("EBWebView"));
+    Ok(())
+}
+
+fn quarantine_data_preserving_models(
+    target: &Path,
+    quarantine: &Path,
+    preserve_webview: bool,
+) -> std::io::Result<()> {
+    fs::create_dir(quarantine)?;
+    for entry in fs::read_dir(target)? {
+        let entry = entry?;
+        if entry.file_name() == "models" || (preserve_webview && entry.file_name() == "EBWebView") {
+            continue;
+        }
+        fs::rename(entry.path(), quarantine.join(entry.file_name()))?;
+    }
+    if preserve_webview {
+        clear_webview_profile_cache(&target.join("EBWebView"));
+    }
     Ok(())
 }
 
@@ -951,6 +1161,8 @@ fn is_pdf(path: &Path) -> bool {
 fn initialize_background_services(
     app: tauri::AppHandle,
     data_dir: PathBuf,
+    durable_model_store: PathBuf,
+    legacy_model_roots: Vec<PathBuf>,
     catalog_state: CatalogServiceState,
     model_state: ModelServiceState,
     startup: StartupServiceState,
@@ -988,7 +1200,42 @@ fn initialize_background_services(
                 recovery_actions: Vec::new(),
             },
         );
-        model_state.initialize(Arc::new(ModelManager::open(data_dir)?))?;
+        let (active_model_store, migration_error) =
+            prepare_durable_model_store(&durable_model_store, &legacy_model_roots);
+        if let Some(error) = migration_error {
+            runtime_log::event(
+                "warning",
+                "model_store",
+                "model_store.migration_deferred",
+                None,
+                &serde_json::json!({ "error_code": format!("{:?}", error.kind()) }),
+            );
+        }
+        let model_manager = Arc::new(ModelManager::open_store(active_model_store)?);
+        match model_manager.restore_locked_companions_from(&legacy_model_roots) {
+            Ok(restored) if restored > 0 => runtime_log::event(
+                "info",
+                "model_store",
+                "model_store.companions_restored",
+                None,
+                &serde_json::json!({ "restored_files": restored }),
+            ),
+            Ok(_) => {}
+            Err(error) => runtime_log::event(
+                "warning",
+                "model_store",
+                "model_store.companion_restore_failed",
+                None,
+                &serde_json::json!({
+                    "error_code": error.code,
+                    "retryable": error.retryable,
+                }),
+            ),
+        }
+        let ocr_runtime_available = model_manager
+            .active_artifact(fanfan_core::ModelRole::Ocr)?
+            .is_some();
+        model_state.initialize(model_manager)?;
         startup.publish(
             &app,
             StartupState {
@@ -1002,6 +1249,48 @@ fn initialize_background_services(
         );
         catalog.recover_interrupted_parses()?;
         catalog.recover_interrupted_image_understanding()?;
+        match catalog.sanitize_existing_ocr_attempt_errors() {
+            Ok(sanitized) if sanitized > 0 => runtime_log::event(
+                "info",
+                "privacy",
+                "ocr.attempt_errors_sanitized",
+                None,
+                &serde_json::json!({ "sanitized_attempts": sanitized }),
+            ),
+            Ok(_) => {}
+            Err(error) => runtime_log::event(
+                "warning",
+                "privacy",
+                "ocr.attempt_error_sanitize_failed",
+                None,
+                &serde_json::json!({
+                    "error_code": error.code,
+                    "retryable": error.retryable,
+                }),
+            ),
+        }
+        if ocr_runtime_available {
+            match catalog.requeue_ocr_pending_for_available_runtime(2_000) {
+                Ok(requeued) if requeued > 0 => runtime_log::event(
+                    "info",
+                    "ocr",
+                    "ocr.pending_requeued",
+                    None,
+                    &serde_json::json!({ "requeued_files": requeued }),
+                ),
+                Ok(_) => {}
+                Err(error) => runtime_log::event(
+                    "warning",
+                    "ocr",
+                    "ocr.pending_requeue_failed",
+                    None,
+                    &serde_json::json!({
+                        "error_code": error.code,
+                        "retryable": error.retryable,
+                    }),
+                ),
+            }
+        }
         let recovered = catalog.recover_interrupted_scans()?;
         let roots = catalog.list_roots()?;
         if let Err(error) = catalog.discover_candidate_roots() {
@@ -1029,11 +1318,11 @@ fn initialize_background_services(
         let event_app = app.clone();
         let event_catalog = Arc::clone(&catalog);
         let handler = Arc::new(
-            move |result: Result<remin_core::JobRecord, remin_core::AppError>| match result {
+            move |result: Result<fanfan_core::JobRecord, fanfan_core::AppError>| match result {
                 Ok(job) => {
                     let should_parse = matches!(
                         job.status,
-                        remin_core::JobStatus::Succeeded | remin_core::JobStatus::Partial
+                        fanfan_core::JobStatus::Succeeded | fanfan_core::JobStatus::Partial
                     );
                     let _ = event_app.emit("job:progress", &job);
                     runtime_log::event(
@@ -1123,7 +1412,49 @@ fn initialize_background_services(
         app_data::spawn_parse_pending(app.clone(), Arc::clone(&catalog));
         app_data::spawn_image_understanding_pending(app.clone(), Arc::clone(&catalog));
         app_data::spawn_embed_pending(app.clone(), Arc::clone(&catalog));
-        Ok::<_, remin_core::AppError>(pending_files)
+        #[cfg(debug_assertions)]
+        if let Ok(specifications) = std::env::var("FANFAN_EVALUATION_DOWNLOAD_EDITIONS") {
+            for specification in specifications
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                let (edition_id, source) = specification
+                    .split_once('@')
+                    .unwrap_or((specification, "huggingface"));
+                match app_data::queue_evaluation_model_download(
+                    &app,
+                    Arc::clone(&catalog),
+                    edition_id,
+                    source,
+                ) {
+                    Ok(job) => runtime_log::event(
+                        "info",
+                        "evaluation",
+                        "evaluation.model_download_queued",
+                        Some(&job.job_id.to_string()),
+                        &serde_json::json!({
+                            "job_id": job.job_id,
+                            "edition_id": edition_id,
+                            "source": source,
+                        }),
+                    ),
+                    Err(error) => runtime_log::event(
+                        "warning",
+                        "evaluation",
+                        "evaluation.model_download_queue_failed",
+                        None,
+                        &serde_json::json!({
+                            "edition_id": edition_id,
+                            "source": source,
+                            "error_code": error.code,
+                            "retryable": error.retryable,
+                        }),
+                    ),
+                }
+            }
+        }
+        Ok::<_, fanfan_core::AppError>(pending_files)
     })();
 
     match initialized {
@@ -1224,17 +1555,17 @@ mod reset_tests {
 
     #[test]
     fn pending_reset_moves_only_exact_application_directories_to_quarantine() {
-        let base = std::env::temp_dir().join(format!("remin-reset-test-{}", uuid::Uuid::now_v7()));
+        let base = std::env::temp_dir().join(format!("fanfan-reset-test-{}", uuid::Uuid::now_v7()));
         let roaming_parent = base.join("roaming");
         let local_parent = base.join("local");
-        let config_dir = roaming_parent.join("com.remin.desktop");
-        let local_data_dir = local_parent.join("com.remin.desktop");
+        let config_dir = roaming_parent.join("com.fanfan.desktop");
+        let local_data_dir = local_parent.join("com.fanfan.desktop");
         fs::create_dir_all(&config_dir).expect("create roaming data");
         fs::create_dir_all(&local_data_dir).expect("create local data");
-        fs::write(config_dir.join("remin.db"), b"database").expect("write database");
+        fs::write(config_dir.join("fanfan.db"), b"database").expect("write database");
         fs::write(local_data_dir.join("cache.bin"), b"cache").expect("write cache");
         fs::write(
-            roaming_parent.join(".com.remin.desktop-reset-request"),
+            roaming_parent.join(".com.fanfan.desktop-reset-request"),
             "RESET_APPLICATION_DATA",
         )
         .expect("write reset marker");
@@ -1250,7 +1581,7 @@ mod reset_tests {
                     .expect("roaming entry")
                     .file_name()
                     .to_string_lossy()
-                    .starts_with("com.remin.desktop.reset-"))
+                    .starts_with("com.fanfan.desktop.reset-"))
         );
         assert!(
             fs::read_dir(&local_parent)
@@ -1259,15 +1590,86 @@ mod reset_tests {
                     .expect("local entry")
                     .file_name()
                     .to_string_lossy()
-                    .starts_with("com.remin.desktop.reset-"))
+                    .starts_with("com.fanfan.desktop.reset-"))
         );
         fs::remove_dir_all(base).expect("clean exact reset test directory");
     }
 
     #[test]
+    fn pending_reset_preserves_legacy_models_until_durable_migration_finishes() {
+        let base = std::env::temp_dir().join(format!(
+            "fanfan-reset-model-preservation-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let roaming_parent = base.join("roaming");
+        let config_dir = roaming_parent.join("com.fanfan.desktop");
+        let local_data_dir = base.join("local").join("com.fanfan.desktop");
+        fs::create_dir_all(config_dir.join("models")).expect("create legacy models");
+        fs::create_dir_all(&local_data_dir).expect("create local data");
+        fs::write(
+            config_dir.join("models").join("model.gguf"),
+            b"protected model",
+        )
+        .expect("write protected model");
+        fs::write(config_dir.join("fanfan.db"), b"database").expect("write database");
+        fs::write(
+            roaming_parent.join(".com.fanfan.desktop-reset-request"),
+            "RESET_APPLICATION_DATA",
+        )
+        .expect("write reset marker");
+
+        apply_pending_data_reset(&config_dir, &local_data_dir).expect("apply reset");
+
+        assert_eq!(
+            fs::read(config_dir.join("models").join("model.gguf")).expect("read model"),
+            b"protected model"
+        );
+        assert!(!config_dir.join("fanfan.db").exists());
+        fs::remove_dir_all(base).expect("clean model preservation test directory");
+    }
+
+    #[test]
+    fn durable_model_store_migration_verifies_files_and_keeps_legacy_copy() {
+        let base = std::env::temp_dir().join(format!(
+            "fanfan-model-store-migration-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let legacy_data = base.join("legacy-data");
+        let legacy_store = legacy_data.join("models");
+        let durable_store = base.join("FanFan").join("ModelStore").join("v1");
+        let source = base.join("source-model.gguf");
+        fs::create_dir_all(&legacy_data).expect("create legacy data");
+        fs::write(&source, b"verified model bytes").expect("write model source");
+        let legacy = ModelManager::open(&legacy_data).expect("open legacy model manager");
+        let artifact = legacy
+            .import_artifacts(&[fanfan_core::ModelImportSelection {
+                source_path: source.to_string_lossy().into_owned(),
+                role: fanfan_core::ModelRole::Generation,
+            }])
+            .expect("import legacy artifact")
+            .remove(0);
+        let legacy_hash = sha256_path(Path::new(&artifact.local_path)).expect("legacy hash");
+
+        try_prepare_durable_model_store(&durable_store, std::slice::from_ref(&legacy_store))
+            .expect("migrate durable model store");
+        let durable = ModelManager::open_store(&durable_store).expect("open durable store");
+        let migrated = durable.list_artifacts().expect("list migrated artifacts");
+
+        assert_eq!(migrated.len(), 1);
+        assert!(Path::new(&migrated[0].local_path).starts_with(&durable_store));
+        assert_eq!(
+            sha256_path(Path::new(&migrated[0].local_path)).expect("durable hash"),
+            legacy_hash
+        );
+        assert!(Path::new(&artifact.local_path).is_file());
+        assert!(durable_store.join(MODEL_STORE_READY_MARKER).is_file());
+        fs::remove_dir_all(base).expect("clean model migration test directory");
+    }
+
+    #[test]
     fn pending_storage_migration_copies_verifies_and_switches_without_removing_source() {
         let base = std::env::temp_dir().join(format!(
-            "remin-storage-migration-test-{}",
+            "fanfan-storage-migration-test-{}",
             uuid::Uuid::now_v7()
         ));
         let config_dir = base.join("config");
@@ -1275,7 +1677,7 @@ mod reset_tests {
         let destination_parent = base.join("destination");
         fs::create_dir_all(source.join("indexes")).expect("create source");
         fs::create_dir_all(&destination_parent).expect("create destination parent");
-        fs::write(source.join("remin.db"), b"database-v14").expect("write database");
+        fs::write(source.join("fanfan.db"), b"database-v14").expect("write database");
         fs::write(
             source.join("indexes").join("active.usearch"),
             b"vector-index",
@@ -1289,18 +1691,18 @@ mod reset_tests {
         let expected_target = destination_parent
             .canonicalize()
             .expect("canonical destination")
-            .join("ReminData");
+            .join("FanFanData");
         let active = resolve_application_data_directory(&config_dir, &source);
         assert_eq!(active, expected_target);
         assert_eq!(
-            fs::read(active.join("remin.db")).expect("read migrated database"),
+            fs::read(active.join("fanfan.db")).expect("read migrated database"),
             b"database-v14"
         );
         assert_eq!(
             sha256_path(&source.join("indexes").join("active.usearch")).expect("source hash"),
             sha256_path(&active.join("indexes").join("active.usearch")).expect("target hash")
         );
-        assert!(source.join("remin.db").is_file());
+        assert!(source.join("fanfan.db").is_file());
         assert!(!storage_location_status(&config_dir, &active).restart_required);
         fs::remove_dir_all(base).expect("clean storage migration test directory");
     }
@@ -1308,7 +1710,7 @@ mod reset_tests {
     #[test]
     fn storage_migration_rejects_an_authorized_source_directory() {
         let base = std::env::temp_dir().join(format!(
-            "remin-storage-safety-test-{}",
+            "fanfan-storage-safety-test-{}",
             uuid::Uuid::now_v7()
         ));
         let config_dir = base.join("config");
@@ -1330,11 +1732,11 @@ mod reset_tests {
     #[test]
     fn reset_fallback_quarantines_local_entries_except_the_webview_profile() {
         let base = std::env::temp_dir().join(format!(
-            "remin-reset-fallback-test-{}",
+            "fanfan-reset-fallback-test-{}",
             uuid::Uuid::now_v7()
         ));
-        let local = base.join("local").join("com.remin.desktop");
-        let quarantine = base.join("local").join("com.remin.desktop.reset-fallback");
+        let local = base.join("local").join("com.fanfan.desktop");
+        let quarantine = base.join("local").join("com.fanfan.desktop.reset-fallback");
         fs::create_dir_all(local.join("EBWebView").join("Cache")).expect("create profile cache");
         fs::write(local.join("EBWebView").join("Preferences"), b"profile")
             .expect("write profile file");
@@ -1354,21 +1756,21 @@ mod reset_tests {
     #[test]
     fn reset_quarantines_an_activated_migrated_data_directory() {
         let base = std::env::temp_dir().join(format!(
-            "remin-migrated-reset-test-{}",
+            "fanfan-migrated-reset-test-{}",
             uuid::Uuid::now_v7()
         ));
         let roaming_parent = base.join("roaming");
-        let config_dir = roaming_parent.join("com.remin.desktop");
+        let config_dir = roaming_parent.join("com.fanfan.desktop");
         let destination_parent = base.join("other-disk");
         fs::create_dir_all(&config_dir).expect("create config data");
         fs::create_dir_all(&destination_parent).expect("create destination");
-        fs::write(config_dir.join("remin.db"), b"database").expect("write database");
+        fs::write(config_dir.join("fanfan.db"), b"database").expect("write database");
         schedule_storage_migration(&config_dir, &config_dir, &destination_parent, &[])
             .expect("schedule migration");
         let active = resolve_application_data_directory(&config_dir, &config_dir);
         assert!(active.join(MANAGED_STORAGE_MARKER).is_file());
         fs::write(
-            roaming_parent.join(".com.remin.desktop-reset-request"),
+            roaming_parent.join(".com.fanfan.desktop-reset-request"),
             "RESET_APPLICATION_DATA",
         )
         .expect("write reset request");
@@ -1384,7 +1786,7 @@ mod reset_tests {
                     .expect("destination entry")
                     .file_name()
                     .to_string_lossy()
-                    .starts_with("ReminData.reset-"))
+                    .starts_with("FanFanData.reset-"))
         );
         fs::remove_dir_all(base).expect("clean migrated reset test directory");
     }

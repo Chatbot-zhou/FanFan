@@ -1,4 +1,4 @@
-"""拾忆本地文档处理 Worker。"""
+"""翻翻本地文档处理 Worker。"""
 
 from .protocol import WorkerError, WorkerRequest, WorkerResponse
 from .parsing import DocumentNode, ImageAsset, ParseRequest, ParseResult, ParseWarning, parse_document

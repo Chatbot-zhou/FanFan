@@ -26,11 +26,11 @@ if ($model.Length -ne 639446688 -or $modelHash -ne '9465E63A22ADD5354D9BB4B99E90
 }
 $env:PATH = (Join-Path $env:USERPROFILE '.cargo\bin') + ';' + $env:PATH
 $env:CARGO_TARGET_DIR = Join-Path $RepositoryRoot '.artifacts\cargo-target'
-$env:REMIN_LLAMA_SERVER = $server
-$env:REMIN_TEST_GGUF = $ModelPath
+$env:FANFAN_LLAMA_SERVER = $server
+$env:FANFAN_TEST_GGUF = $ModelPath
 Push-Location $RepositoryRoot
 try {
-    & cargo test -p remin-core --locked real_llama_cpp_runtime_generates_locally -- --ignored --nocapture
+    & cargo test -p fanfan-core --locked real_llama_cpp_runtime_generates_locally -- --ignored --nocapture
     if ($LASTEXITCODE -ne 0) { throw "本地生成E2E失败：exit=$LASTEXITCODE" }
 }
 finally {

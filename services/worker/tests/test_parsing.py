@@ -7,7 +7,9 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 
 WORKER_ROOT = Path(__file__).resolve().parents[1]
@@ -15,8 +17,15 @@ REPO_ROOT = WORKER_ROOT.parents[1]
 CORPUS_ROOT = REPO_ROOT / "tests" / "fixtures" / "corpus"
 sys.path.insert(0, str(WORKER_ROOT))
 
-from remin_worker import ParseRequest, parse_document  # noqa: E402
-from remin_worker.ocr import _validated_rendered_pages  # noqa: E402
+from fanfan_worker import ParseRequest, parse_document  # noqa: E402
+from fanfan_worker.ocr import _validated_rendered_pages  # noqa: E402
+from fanfan_worker.parsing import (  # noqa: E402
+    OcrRuntimeConfig,
+    _ocr_attempt,
+    _ocr_fallback_reason,
+    _recognize_pdf_pages,
+)
+from fanfan_worker.protocol import WorkerError  # noqa: E402
 
 
 IDS = [
@@ -49,6 +58,44 @@ def node_text(result: object) -> str:
 
 
 class DocumentParsingTests(unittest.TestCase):
+    def test_pdf_render_failure_is_visible_before_windows_ocr_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "scan.pdf"
+            source.write_bytes(b"%PDF-1.4")
+            parse_request = request(source, "pdf")
+            parse_request = replace(
+                parse_request,
+                asset_cache_dir=str(root / "cache"),
+                ocr_runtime=OcrRuntimeConfig("rec", "det", "cls", "dict"),
+            )
+            render_error = WorkerError("PDF_RENDER_FAILED", "扫描页渲染失败", False)
+            fallback_error = WorkerError("OCR_RECOGNITION_FAILED", "Windows OCR执行失败", True)
+            with patch(
+                "fanfan_worker.parsing.recognize_with_windows",
+                side_effect=[(None, render_error), (None, fallback_error)],
+            ):
+                _, error, _, _, attempts = _recognize_pdf_pages(
+                    parse_request, source, [1], root / "cache"
+                )
+
+        self.assertEqual(error.code if error else None, "OCR_RECOGNITION_FAILED")
+        self.assertEqual(
+            [attempt.engine for attempt in attempts],
+            ["windows-pdf-renderer", "windows-ocr"],
+        )
+        self.assertEqual(attempts[0].error.code if attempts[0].error else None, "PDF_RENDER_FAILED")
+
+    def test_ppocr_low_confidence_requests_observable_windows_fallback(self) -> None:
+        result = {"lines": [{"text": "模糊", "confidence": 0.21}]}
+        reason = _ocr_fallback_reason(result, None, 0.45)
+        attempt = _ocr_attempt("rapidocr-onnxruntime", "PP-OCRv5-mobile", result, None, reason, 0.0)
+
+        self.assertEqual(reason, "OCR_LOW_CONFIDENCE")
+        self.assertEqual(attempt.status, "completed")
+        self.assertEqual(attempt.fallback_reason, "OCR_LOW_CONFIDENCE")
+        self.assertAlmostEqual(attempt.confidence or 0.0, 0.21)
+
     def test_text_parse_is_read_only_and_located(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "过去的资料.txt"
@@ -61,6 +108,18 @@ class DocumentParsingTests(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertEqual(result.nodes[1].locator["line_start"], 2)
         self.assertIn("GH-2025-017", node_text(result))
+
+    def test_safe_configuration_text_extensions_use_generic_text_parser(self) -> None:
+        for extension in ("text", "ini", "iml", "log", "conf", "cfg", "properties"):
+            with self.subTest(extension=extension), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / f"settings.{extension}"
+                path.write_text("feature.enabled=true\n本地模式=启用", encoding="utf-8")
+                before = hashlib.sha256(path.read_bytes()).hexdigest()
+                result = parse_document(request(path, extension))
+
+                self.assertEqual(result.status, "parsed")
+                self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), before)
+                self.assertIn("本地模式=启用", node_text(result))
 
     def test_code_parse_groups_symbols_and_keeps_exact_line_ranges(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

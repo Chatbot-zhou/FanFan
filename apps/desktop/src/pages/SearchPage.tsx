@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { bridge, type CollectionRecord, type FilePreview, type SearchRequest, type SearchSession } from "../bridge";
 import { PdfVisualPreview } from "../components/PdfVisualPreview";
 import { ImageAssetGallery } from "../components/ImageAssetGallery";
+import { OcrAttemptChain } from "../components/OcrAttemptChain";
 import { AppSelect } from "../components/AppSelect";
 import { errorMessage } from "../utils/app-error";
 import { highlightPlainTerms } from "../utils/query-terms";
@@ -214,6 +215,7 @@ export function SearchPage() {
               {preview?.file.file_id === result.file_id && (
                 <div className="search-result__preview" aria-label={`${result.name}内容预览`}>
               {preview.file.extension.toLowerCase() === "pdf" && <PdfVisualPreview preview={preview} />}
+              <OcrAttemptChain attempts={preview.ocr_attempts} />
               <ImageAssetGallery assets={preview.image_assets} />
                   {preview.nodes.length === 0 ? <p>此文件当前只有名称和元数据，正文尚未就绪。</p> : preview.nodes.map((node) => (
                     <p key={node.node_id}>{node.text ?? (node.table_data ? JSON.stringify(node.table_data) : "")}</p>

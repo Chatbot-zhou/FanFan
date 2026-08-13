@@ -1,6 +1,6 @@
 import { render } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import appIconUrl from "../../src-tauri/icons/icon.svg";
+import appIconUrl from "../assets/fanfan-logo.png";
 import { BrandMark } from "./BrandMark";
 
 describe("BrandMark", () => {

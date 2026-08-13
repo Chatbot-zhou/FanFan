@@ -25,7 +25,7 @@ if (-not $installer.Equals($releaseInstaller, [StringComparison]::OrdinalIgnoreC
     $installer = $releaseInstaller
 }
 $runtimeManifestPath = Join-Path $RepositoryRoot '.artifacts\runtime\llama\MANIFEST.json'
-$workerPath = Join-Path $RepositoryRoot '.artifacts\worker\remin-worker\remin-worker.exe'
+$workerPath = Join-Path $RepositoryRoot '.artifacts\worker\fanfan-worker\fanfan-worker.exe'
 foreach ($required in @($runtimeManifestPath, $workerPath)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
         throw "Release payload missing: $required"
@@ -71,7 +71,7 @@ $manifest = [ordered]@{
         license = $runtime.license
     }
     worker = [ordered]@{
-        file_name = 'worker/remin-worker.exe'
+        file_name = 'worker/fanfan-worker.exe'
         sha256 = (Get-FileHash -LiteralPath $workerPath -Algorithm SHA256).Hash.ToLowerInvariant()
     }
     verification = $verification
@@ -122,8 +122,8 @@ $components += [ordered]@{
     name = 'llama.cpp'
     version = $runtime.release
     properties = @(
-        @{ name = 'remin:commit'; value = $runtime.commit },
-        @{ name = 'remin:archive_sha256'; value = $runtime.archive_sha256 }
+        @{ name = 'fanfan:commit'; value = $runtime.commit },
+        @{ name = 'fanfan:archive_sha256'; value = $runtime.archive_sha256 }
     )
     licenses = @(@{ license = @{ id = 'MIT' } })
 }
@@ -139,7 +139,7 @@ $bom = [ordered]@{
     }
     components = @($components)
 }
-$sbomPath = Join-Path $releaseRoot 'remin-sbom.cdx.json'
+$sbomPath = Join-Path $releaseRoot 'fanfan-sbom.cdx.json'
 $bom | ConvertTo-Json -Depth 9 | Set-Content -LiteralPath $sbomPath -Encoding UTF8
 
 Write-Output "Release manifest generated: $manifestPath"

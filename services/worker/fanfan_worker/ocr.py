@@ -16,6 +16,7 @@ def recognize_with_windows(
     language_hints: tuple[str, ...],
     page_numbers: list[int] | None = None,
     render_pages_dir: Path | None = None,
+    render_only: bool = False,
 ) -> tuple[dict[str, Any] | None, WorkerError | None]:
     if os.name != "nt":
         return None, WorkerError("OCR_RUNTIME_UNAVAILABLE", "Windows OCR只在Windows桌面版可用", False)
@@ -56,6 +57,10 @@ def recognize_with_windows(
             return None, WorkerError("OCR_INPUT_INVALID", "只有PDF OCR可以请求页面渲染缓存", False)
         render_pages_dir.mkdir(parents=True, exist_ok=True)
         command.extend(["-AssetCacheDir", str(render_pages_dir)])
+    if render_only:
+        if source_kind != "pdf" or render_pages_dir is None:
+            return None, WorkerError("OCR_INPUT_INVALID", "Render-only mode requires PDF pages and a cache directory", False)
+        command.append("-RenderOnly")
     try:
         completed = subprocess.run(
             command,
@@ -75,7 +80,6 @@ def recognize_with_windows(
     except OSError as error:
         return None, WorkerError("OCR_RUNTIME_UNAVAILABLE", str(error), True)
     if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout).strip()[-1000:]
         stderr_text = completed.stderr or ""
         if "OCR_LANGUAGE_PACK_MISSING" in stderr_text:
             return None, WorkerError(
@@ -83,7 +87,19 @@ def recognize_with_windows(
                 "未安装Windows OCR语言包，请在系统设置中添加简体中文语言包后重试",
                 False,
             )
-        return None, WorkerError("OCR_RECOGNITION_FAILED", detail or "Windows OCR执行失败", True)
+        if render_only:
+            return None, WorkerError(
+                "PDF_RENDER_FAILED",
+                "扫描页渲染失败，文件可能损坏或与系统PDF运行时不兼容",
+                False,
+                details={"stage": "pdf_render", "process_exit_code": completed.returncode},
+            )
+        return None, WorkerError(
+            "OCR_RECOGNITION_FAILED",
+            "Windows OCR执行失败",
+            True,
+            details={"stage": "recognition", "process_exit_code": completed.returncode},
+        )
     after = source_path.stat()
     if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
         return None, WorkerError("FILE_CHANGED_DURING_PARSE", "OCR期间源文件发生变化，请稍后重试", True)

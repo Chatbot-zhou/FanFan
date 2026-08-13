@@ -13,23 +13,26 @@ use std::{
 };
 
 use chrono::Utc;
-use remin_core::{
-    AddRootRequest, AnswerClaim, AnswerResult, AppError, AskMessagePage, AskMode, AskRequest,
-    AskSessionPage, CandidateRoot, CatalogService, ChunkEmbeddingInput, CollectionModelReview,
-    CollectionRecord, CollectionRule, CollectionSuggestion, CollectionSuggestionPage,
-    CollectionSuggestionQuery, CollectionSuggestionRefreshResult,
+use fanfan_core::{
+    AddRootRequest, AiRuntimeSnapshot, AnswerClaim, AnswerResult, AppError, AskMessagePage,
+    AskRequest, AskSessionPage, CandidateRoot, CatalogService, ChunkEmbeddingInput,
+    CollectionModelReview, CollectionRecord, CollectionRule, CollectionSuggestion,
+    CollectionSuggestionPage, CollectionSuggestionQuery, CollectionSuggestionRefreshResult,
     CollectionSuggestionUpdateRequest, CreateCollectionRequest, DegradationLevel, DownloadFile,
     DownloadedModelMetadata, EmbeddingRequest, ExclusionRule, ExclusionRuleInput, ExportResult,
     FilePage, FilePreview, FileQuery, FileRecord, ImageUnderstandingResult, ImportCandidate,
     InboxItem, InboxPage, InboxQuery, InboxUpdateRequest, IncrementalWatchManager, JobRecord,
     LocalGenerationRuntime, LogPage, LogQuery, MaintenanceSnapshot, ModelArtifact,
-    ModelCatalogEntry, ModelDownloadFileProgress, ModelDownloadJob, ModelEdition, ModelFormat,
-    ModelImportSelection, ModelManager, ModelPreset, ModelRole, ModelRoleConfig, ModelSource,
-    ParseMetrics, ParseOutcome, ParseRequest, ParseResult, PendingEmbeddingActivation,
-    RagReadiness, RelationPage, RelationQuery, RelationRefreshResult, RelationType, RerankRequest,
-    RootRecord, RuntimeCapability, ScopeFilter, SearchMode, SearchRequest, SearchSession,
-    SemanticQuery, TriageStatus, WorkerClient, is_natural_language_query, parse_query_intent,
-    query_understanding_prompt,
+    ModelCatalogEntry, ModelDownloadFileProgress, ModelDownloadJob, ModelDownloadRemoval,
+    ModelEdition, ModelFormat, ModelImportSelection, ModelManager, ModelPreset, ModelRole,
+    ModelRoleConfig, ModelSource, ModelStoreStatus, OcrRuntimeConfig, ParseMetrics, ParseOutcome,
+    ParseRequest, ParseResult, PendingEmbeddingActivation, RagReadiness, RelationPage,
+    RelationQuery, RelationRefreshResult, RelationType, RerankRequest, RootRecord,
+    RuntimeBackendKind, RuntimeCapability, RuntimeManager, RuntimeResourceBudget, RuntimeTaskKind,
+    RuntimeTaskRequest, ScopeFilter, SearchMode, SearchRequest, SearchSession, SemanticQuery,
+    SpeechRecognitionRequest, SpeechRecognitionResult, SpeechSynthesisRequest,
+    SpeechSynthesisResult, TriageStatus, WorkerClient, is_natural_language_query,
+    parse_query_intent, query_understanding_prompt, strip_long_path_prefix,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -115,6 +118,40 @@ pub struct WorkerServiceState {
     pub foreground_activity: AtomicU32,
 }
 
+#[derive(Clone)]
+pub struct SpeechWorkerState(pub WorkerClient);
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SpeechRecognitionSession {
+    session_id: Uuid,
+    status: &'static str,
+    result: SpeechRecognitionResult,
+    completed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SpeechSynthesisSession {
+    session_id: Uuid,
+    status: &'static str,
+    message_id: Uuid,
+    result: SpeechSynthesisResult,
+    completed_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SpeechRecognitionInput {
+    samples: Vec<f32>,
+    sample_rate: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SpeechSynthesisInput {
+    message_id: Uuid,
+    #[serde(default)]
+    speaker_id: u32,
+    speed: f32,
+}
+
 struct ForegroundActivityGuard<'a>(&'a AtomicU32);
 
 impl ForegroundActivityGuard<'_> {
@@ -131,6 +168,19 @@ impl Drop for ForegroundActivityGuard<'_> {
 }
 
 pub struct GenerationServiceState(pub Arc<Mutex<LocalGenerationRuntime>>);
+
+#[derive(Clone)]
+pub struct RuntimeManagerState(pub RuntimeManager);
+
+pub fn create_runtime_manager_state() -> RuntimeManagerState {
+    let total_memory = memory_status_bytes()
+        .map(|(total, _)| total)
+        .unwrap_or(8 * 1024 * 1024 * 1024);
+    RuntimeManagerState(RuntimeManager::new(RuntimeResourceBudget::conservative(
+        physical_core_count(),
+        total_memory,
+    )))
+}
 
 const DOWNLOAD_ACTION_RUN: u8 = 0;
 const DOWNLOAD_ACTION_PAUSE: u8 = 1;
@@ -205,6 +255,12 @@ impl ModelDownloadCoordinatorState {
             running.remove(job_id);
         }
     }
+
+    fn is_running(&self, job_id: &Uuid) -> bool {
+        self.running
+            .lock()
+            .is_ok_and(|running| running.contains(job_id))
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -218,7 +274,7 @@ pub struct OperationHandle {
 #[derive(Debug, Clone, Serialize)]
 pub struct AppStatusScanProgress {
     scan_job_id: Uuid,
-    status: remin_core::JobStatus,
+    status: fanfan_core::JobStatus,
     discovered_files: u64,
     searchable_files: u64,
     parsed_files: u64,
@@ -235,6 +291,7 @@ pub struct AppStatusSnapshot {
     scan_progress: Option<AppStatusScanProgress>,
     maintenance: MaintenanceSnapshot,
     inference_runtime: InferenceRuntimeState,
+    ai_runtime: AiRuntimeSnapshot,
     recovery_actions: Vec<&'static str>,
     checked_at: String,
 }
@@ -309,7 +366,6 @@ pub struct ModelRuntimeState {
     active_profile_name: Option<String>,
     runtime_backend: Option<String>,
     inference_runtime: InferenceRuntimeState,
-    message: String,
     checked_at: String,
     capabilities: ModelCapabilities,
     rag_complete: bool,
@@ -740,7 +796,7 @@ pub fn model_role_config_list(
 pub fn model_catalog_list(source: String) -> Result<Vec<ModelEdition>, AppError> {
     ["light", "standard"]
         .into_iter()
-        .map(|edition_id| remin_core::model_edition_by_id(edition_id, &source))
+        .map(|edition_id| fanfan_core::model_edition_by_id(edition_id, &source))
         .collect()
 }
 
@@ -748,7 +804,7 @@ pub fn model_catalog_list(source: String) -> Result<Vec<ModelEdition>, AppError>
 pub fn model_role_catalog_list(
     environment: State<'_, EnvironmentServiceState>,
 ) -> Vec<ModelCatalogEntry> {
-    let mut catalog = remin_core::built_in_model_catalog();
+    let mut catalog = fanfan_core::built_in_model_catalog();
     let cached = environment
         .latest
         .lock()
@@ -765,7 +821,7 @@ pub fn model_role_catalog_list(
         }
     };
     let recommended =
-        remin_core::recommended_catalog_ids(&catalog, check.memory_total_gb, check.gpu_memory_gb);
+        fanfan_core::recommended_catalog_ids(&catalog, check.memory_total_gb, check.gpu_memory_gb);
     for entry in &mut catalog {
         entry.recommended = recommended.contains(&entry.catalog_id);
     }
@@ -774,7 +830,7 @@ pub fn model_role_catalog_list(
 
 #[tauri::command(async)]
 pub fn model_preset_list() -> Vec<ModelPreset> {
-    remin_core::built_in_model_presets()
+    fanfan_core::built_in_model_presets()
 }
 
 #[derive(Debug, Deserialize)]
@@ -801,8 +857,29 @@ pub async fn model_download_start(
             false,
         ));
     }
-    let edition = remin_core::model_edition_by_id(&request.edition_id, &request.source)?;
-    let manager = models.get()?;
+    begin_model_download(
+        app,
+        catalog.get()?,
+        models.get()?,
+        downloads.inner().clone(),
+        worker.client.isolated(),
+        Arc::clone(&generation.0),
+        &request.edition_id,
+        &request.source,
+    )
+}
+
+fn begin_model_download(
+    app: AppHandle,
+    catalog: Arc<CatalogService>,
+    manager: Arc<ModelManager>,
+    downloads: ModelDownloadCoordinatorState,
+    worker: WorkerClient,
+    generation: Arc<Mutex<LocalGenerationRuntime>>,
+    edition_id: &str,
+    source: &str,
+) -> Result<ModelDownloadJob, AppError> {
+    let edition = fanfan_core::model_edition_by_id(edition_id, source)?;
     let files = download_file_progress(&edition);
     let job = manager.create_download_job(
         &edition.edition_id,
@@ -821,20 +898,45 @@ pub async fn model_download_start(
             .pending_embedding_activation()?
             .is_some_and(|pending| pending.download_job_id == Some(job.job_id))
     {
-        spawn_embed_pending(app, catalog.get()?);
+        spawn_embed_pending(app, catalog);
         return Ok(job);
     }
     spawn_model_download(
-        app,
-        catalog.get()?,
+        app.clone(),
+        catalog,
         Arc::clone(&manager),
         edition,
         job.job_id,
-        downloads.inner().clone(),
-        worker.client.isolated(),
-        Arc::clone(&generation.0),
+        downloads,
+        worker,
+        generation,
     )?;
-    manager_download_job(&models, &job.job_id)
+    let updated = manager.download_job(&job.job_id)?;
+    emit_download_state(&app, &updated);
+    Ok(updated)
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn queue_evaluation_model_download(
+    app: &AppHandle,
+    catalog: Arc<CatalogService>,
+    edition_id: &str,
+    source: &str,
+) -> Result<ModelDownloadJob, AppError> {
+    let manager = app.state::<ModelServiceState>().get()?;
+    let downloads = app.state::<ModelDownloadCoordinatorState>().inner().clone();
+    let worker = app.state::<WorkerServiceState>().client.isolated();
+    let generation = Arc::clone(&app.state::<GenerationServiceState>().0);
+    begin_model_download(
+        app.clone(),
+        catalog,
+        manager,
+        downloads,
+        worker,
+        generation,
+        edition_id,
+        source,
+    )
 }
 
 #[tauri::command(async)]
@@ -842,6 +944,13 @@ pub fn model_download_list(
     models: State<'_, ModelServiceState>,
 ) -> Result<Vec<ModelDownloadJob>, AppError> {
     models.get()?.list_download_jobs()
+}
+
+#[tauri::command(async)]
+pub fn model_store_status_get(
+    models: State<'_, ModelServiceState>,
+) -> Result<ModelStoreStatus, AppError> {
+    models.get()?.store_status()
 }
 
 #[derive(Debug, Deserialize)]
@@ -901,9 +1010,9 @@ pub fn model_download_cancel(
     app: AppHandle,
     models: State<'_, ModelServiceState>,
     downloads: State<'_, ModelDownloadCoordinatorState>,
-) -> Result<ModelDownloadJob, AppError> {
+) -> Result<ModelDownloadRemoval, AppError> {
     let manager = models.get()?;
-    let mut job = manager.download_job(&request.job_id)?;
+    let job = manager.download_job(&request.job_id)?;
     if job.status == "completed" {
         return Err(AppError::new(
             "MODEL_DOWNLOAD_CONTROL_INVALID",
@@ -913,37 +1022,65 @@ pub fn model_download_cancel(
     }
     if job.phase == "indexing" {
         manager.cancel_embedding_activation(&request.job_id)?;
-        job.status = "cancelled".into();
-        job.phase = "cancelled".into();
-        job.bytes_per_second = 0;
-        job.eta_seconds = None;
-        job.error = None;
-        job = manager.update_download_job(&job)?;
-        emit_download_state(&app, &job);
-        return Ok(job);
     }
     let running = downloads.set_action(&request.job_id, DOWNLOAD_ACTION_CANCEL)?;
-    if !running {
-        job.status = "cancelled".into();
-        job.phase = "cancelled".into();
-        job.bytes_per_second = 0;
-        job.eta_seconds = None;
-        job.error = None;
-        job = manager.update_download_job(&job)?;
-        emit_download_state(&app, &job);
+    let removed = manager.remove_download_job(&request.job_id)?;
+    let mut partial_bytes_removed = 0_u64;
+    if running {
+        let cleanup_app = app.clone();
+        let cleanup_models = Arc::clone(&manager);
+        let cleanup_downloads = downloads.inner().clone();
+        let cleanup_job_id = request.job_id;
+        let cleanup_edition_id = job.edition_id.clone();
+        thread::spawn(move || {
+            let cleanup_job_id_text = cleanup_job_id.to_string();
+            for _ in 0..100 {
+                if !cleanup_downloads.is_running(&cleanup_job_id) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            match cleanup_models.remove_download_staging_for_edition(&cleanup_edition_id) {
+                Ok(bytes) => {
+                    let _ = cleanup_app.emit(
+                        "model:download_removed",
+                        ModelDownloadRemoval {
+                            job_id: cleanup_job_id,
+                            removed: true,
+                            partial_bytes_removed: bytes,
+                        },
+                    );
+                }
+                Err(error) => crate::runtime_log::event(
+                    "warning",
+                    "model_download",
+                    "model_download.cleanup_failed",
+                    Some(&cleanup_job_id_text),
+                    &json!({ "error_code": error.code, "retryable": error.retryable }),
+                ),
+            }
+        });
+    } else {
+        partial_bytes_removed = manager.remove_download_staging_for_edition(&job.edition_id)?;
     }
-    Ok(job)
+    let removal = ModelDownloadRemoval {
+        job_id: request.job_id,
+        removed,
+        partial_bytes_removed,
+    };
+    let _ = app.emit("model:download_removed", &removal);
+    Ok(removal)
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ModelDownloadRetryRequest {
+pub struct ModelDownloadSwitchSourceRequest {
     job_id: Uuid,
-    source: Option<String>,
+    source: String,
 }
 
 #[tauri::command]
-pub async fn model_download_retry(
-    request: ModelDownloadRetryRequest,
+pub async fn model_download_resume(
+    request: ModelDownloadJobRequest,
     app: AppHandle,
     catalog: State<'_, CatalogServiceState>,
     models: State<'_, ModelServiceState>,
@@ -953,16 +1090,16 @@ pub async fn model_download_retry(
 ) -> Result<ModelDownloadJob, AppError> {
     let manager = models.get()?;
     let previous = manager.download_job(&request.job_id)?;
-    let source = request.source.unwrap_or_else(|| match previous.source {
-        ModelSource::Modelscope => "modelscope".into(),
-        _ => "huggingface".into(),
-    });
-    let edition = remin_core::model_edition_by_id(&previous.edition_id, &source)?;
-    let selected_source = edition.artifacts[0].source;
-    if selected_source == previous.source
-        && manager
-            .pending_embedding_activation()?
-            .is_some_and(|pending| pending.download_job_id == Some(request.job_id))
+    if previous.status != "paused" {
+        return Err(AppError::new(
+            "MODEL_DOWNLOAD_CONTROL_INVALID",
+            "只有已暂停的模型下载可以继续",
+            false,
+        ));
+    }
+    if manager
+        .pending_embedding_activation()?
+        .is_some_and(|pending| pending.download_job_id == Some(request.job_id))
     {
         manager.resume_embedding_activation(&request.job_id)?;
         let mut job = previous;
@@ -976,42 +1113,200 @@ pub async fn model_download_retry(
         spawn_embed_pending(app, catalog.get()?);
         return Ok(job);
     }
-    let job = if selected_source == previous.source {
-        let mut job = previous;
-        job.status = "queued".into();
-        job.phase = "queued".into();
-        job.retry_count = job.retry_count.saturating_add(1);
-        job.bytes_per_second = 0;
-        job.eta_seconds = None;
-        job.current_file = None;
-        job.error = None;
-        manager.update_download_job(&job)?
-    } else {
-        manager.create_download_job(
-            &edition.edition_id,
-            &edition.name,
-            selected_source,
-            download_file_progress(&edition),
-        )?
-    };
-    spawn_model_download(
+    restart_existing_download(
         app,
         catalog.get()?,
-        Arc::clone(&manager),
-        edition,
-        job.job_id,
+        manager,
         downloads.inner().clone(),
         worker.client.isolated(),
         Arc::clone(&generation.0),
+        previous,
+        None,
+        false,
+    )
+}
+
+#[tauri::command]
+pub async fn model_download_retry(
+    request: ModelDownloadJobRequest,
+    app: AppHandle,
+    catalog: State<'_, CatalogServiceState>,
+    models: State<'_, ModelServiceState>,
+    downloads: State<'_, ModelDownloadCoordinatorState>,
+    worker: State<'_, WorkerServiceState>,
+    generation: State<'_, GenerationServiceState>,
+) -> Result<ModelDownloadJob, AppError> {
+    let manager = models.get()?;
+    let previous = manager.download_job(&request.job_id)?;
+    if previous.status != "failed" && previous.activation_status.as_deref() != Some("failed") {
+        return Err(AppError::new(
+            "MODEL_DOWNLOAD_CONTROL_INVALID",
+            "只有失败的模型任务可以重试",
+            false,
+        ));
+    }
+    restart_existing_download(
+        app,
+        catalog.get()?,
+        manager,
+        downloads.inner().clone(),
+        worker.client.isolated(),
+        Arc::clone(&generation.0),
+        previous,
+        None,
+        true,
+    )
+}
+
+#[tauri::command]
+pub async fn model_download_switch_source(
+    request: ModelDownloadSwitchSourceRequest,
+    app: AppHandle,
+    catalog: State<'_, CatalogServiceState>,
+    models: State<'_, ModelServiceState>,
+    downloads: State<'_, ModelDownloadCoordinatorState>,
+    worker: State<'_, WorkerServiceState>,
+    generation: State<'_, GenerationServiceState>,
+) -> Result<ModelDownloadJob, AppError> {
+    let manager = models.get()?;
+    let previous = manager.download_job(&request.job_id)?;
+    if !matches!(previous.status.as_str(), "paused" | "failed")
+        && previous.activation_status.as_deref() != Some("failed")
+    {
+        return Err(AppError::new(
+            "MODEL_DOWNLOAD_CONTROL_INVALID",
+            "当前模型任务不能切换来源",
+            false,
+        ));
+    }
+    let target_source = parse_download_source(&request.source)?;
+    if target_source == previous.source {
+        return Err(AppError::new(
+            "MODEL_DOWNLOAD_SOURCE_UNCHANGED",
+            "请选择另一个模型下载来源",
+            false,
+        ));
+    }
+    if manager
+        .pending_embedding_activation()?
+        .is_some_and(|pending| pending.download_job_id == Some(request.job_id))
+    {
+        manager.cancel_embedding_activation(&request.job_id)?;
+    }
+    restart_existing_download(
+        app,
+        catalog.get()?,
+        manager,
+        downloads.inner().clone(),
+        worker.client.isolated(),
+        Arc::clone(&generation.0),
+        previous,
+        Some(target_source),
+        true,
+    )
+}
+
+#[tauri::command(async)]
+pub fn model_download_remove(
+    request: ModelDownloadJobRequest,
+    app: AppHandle,
+    models: State<'_, ModelServiceState>,
+) -> Result<ModelDownloadRemoval, AppError> {
+    let manager = models.get()?;
+    let job = manager.download_job(&request.job_id)?;
+    if !matches!(job.status.as_str(), "failed" | "paused" | "cancelled")
+        && job.activation_status.as_deref() != Some("failed")
+    {
+        return Err(AppError::new(
+            "MODEL_DOWNLOAD_CONTROL_INVALID",
+            "只有暂停或失败的模型任务可以移除",
+            false,
+        ));
+    }
+    if job.phase == "indexing" {
+        manager.cancel_embedding_activation(&request.job_id)?;
+    }
+    let removed = manager.remove_download_job(&request.job_id)?;
+    let partial_bytes_removed = manager.remove_download_staging_for_edition(&job.edition_id)?;
+    let removal = ModelDownloadRemoval {
+        job_id: request.job_id,
+        removed,
+        partial_bytes_removed,
+    };
+    let _ = app.emit("model:download_removed", &removal);
+    Ok(removal)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restart_existing_download(
+    app: AppHandle,
+    catalog: Arc<CatalogService>,
+    manager: Arc<ModelManager>,
+    downloads: ModelDownloadCoordinatorState,
+    worker: WorkerClient,
+    generation: Arc<Mutex<LocalGenerationRuntime>>,
+    mut job: ModelDownloadJob,
+    source: Option<ModelSource>,
+    increment_retry: bool,
+) -> Result<ModelDownloadJob, AppError> {
+    let selected_source = source.unwrap_or(job.source);
+    let source_name = match selected_source {
+        ModelSource::Huggingface => "huggingface",
+        ModelSource::Modelscope => "modelscope",
+        ModelSource::LocalImport => {
+            return Err(AppError::new(
+                "MODEL_DOWNLOAD_SOURCE_UNAVAILABLE",
+                "本地导入不能作为联网下载来源",
+                false,
+            ));
+        }
+    };
+    let edition = fanfan_core::model_edition_by_id(&job.edition_id, source_name)?;
+    if selected_source != job.source {
+        job.source = selected_source;
+        job.files = download_file_progress(&edition);
+        job.downloaded_bytes = 0;
+        job.total_bytes = job.files.iter().map(|file| file.total_bytes).sum();
+        job.progress = 0.0;
+        job.installed_artifact_ids.clear();
+        job.profile_id = None;
+    }
+    job.status = "queued".into();
+    job.phase = "queued".into();
+    if increment_retry {
+        job.retry_count = job.retry_count.saturating_add(1);
+    }
+    job.bytes_per_second = 0;
+    job.eta_seconds = None;
+    job.current_file = None;
+    job.error = None;
+    job.activation_status = Some("pending".into());
+    job.activation_error = None;
+    let job = manager.update_download_job(&job)?;
+    emit_download_state(&app, &job);
+    spawn_model_download(
+        app,
+        catalog,
+        Arc::clone(&manager),
+        edition,
+        job.job_id,
+        downloads,
+        worker,
+        generation,
     )?;
     manager.download_job(&job.job_id)
 }
 
-fn manager_download_job(
-    models: &State<'_, ModelServiceState>,
-    job_id: &Uuid,
-) -> Result<ModelDownloadJob, AppError> {
-    models.get()?.download_job(job_id)
+fn parse_download_source(source: &str) -> Result<ModelSource, AppError> {
+    match source {
+        "huggingface" => Ok(ModelSource::Huggingface),
+        "modelscope" => Ok(ModelSource::Modelscope),
+        _ => Err(AppError::new(
+            "MODEL_DOWNLOAD_SOURCE_UNAVAILABLE",
+            "不支持的模型下载来源",
+            false,
+        )),
+    }
 }
 
 fn download_file_progress(edition: &ModelEdition) -> Vec<ModelDownloadFileProgress> {
@@ -1240,7 +1535,7 @@ fn run_model_download(
             runtime.activate(&generation_artifact.local_path, 4096, threads)?;
             let generated = match runtime.complete(
                 "只根据给定证据回答；每个事实句必须保留证据编号[S1]，不得补充证据外事实。",
-                "证据[S1]：拾忆在本地处理资料。请用一句完整中文事实句复述并引用。",
+                "证据[S1]：翻翻在本地处理资料。请用一句完整中文事实句复述并引用。",
                 64,
             ) {
                 Ok(generated) => generated,
@@ -1384,7 +1679,7 @@ fn self_test_and_activate_downloaded_roles(
                 runtime.activate(&artifact.local_path, 4096, interactive_inference_threads())?;
                 let generated = runtime.complete(
                     "你正在执行本地模型健康检查。只需用一句简短中文确认可以回答。",
-                    "请回复：拾忆本地模型可以工作。",
+                    "请回复：翻翻本地模型可以工作。",
                     32,
                 )?;
                 if generated.trim().chars().count() < 4 {
@@ -1461,7 +1756,7 @@ fn self_test_and_activate_downloaded_roles(
                     tokenizer_path: Some(tokenizer.to_string_lossy().into_owned()),
                     query: "哪段资料描述了本地知识库？".into(),
                     documents: vec![
-                        "拾忆在本地建立可检索的资料知识库。".into(),
+                        "翻翻在本地建立可检索的资料知识库。".into(),
                         "今天窗外天气晴朗。".into(),
                     ],
                     max_length: artifact.max_length.unwrap_or(512),
@@ -1479,17 +1774,32 @@ fn self_test_and_activate_downloaded_roles(
                 }
                 models.activate_artifact(&artifact.artifact_id, None)?;
             }
-            // OCR artifacts install and activate like other roles, but the
-            // recognition pipeline still runs on Windows OCR (no worker
-            // self-test yet). File integrity is enforced by import/download
-            // SHA-256 verification before activation.
             (ModelRole::Ocr, ModelFormat::Onnx) => {
+                worker.self_test_ocr(
+                    artifact.local_path.clone(),
+                    model_companion_path(artifact, "ch_PP-OCRv5_mobile_det.onnx")?,
+                    model_companion_path(artifact, "ch_ppocr_mobile_v2.0_cls_infer.onnx")?,
+                    model_companion_path(artifact, "ppocrv5_dict.txt")?,
+                    1,
+                )?;
                 models.activate_artifact(&artifact.artifact_id, None)?;
             }
-            // TTS/ASR artifacts activate without a worker self-test too — the
-            // synthesis/recognition pipeline is not wired up yet (channel-only
-            // milestone). SHA-256 verification happened at import/download.
-            (ModelRole::Tts, ModelFormat::Onnx) | (ModelRole::Asr, ModelFormat::Onnx) => {
+            (ModelRole::Tts, ModelFormat::Onnx) => {
+                worker.self_test_tts(
+                    artifact.local_path.clone(),
+                    model_companion_path(artifact, "tokens.txt")?,
+                    model_companion_path(artifact, "lexicon.txt")?,
+                    1,
+                )?;
+                models.activate_artifact(&artifact.artifact_id, None)?;
+            }
+            (ModelRole::Asr, ModelFormat::Onnx) => {
+                worker.self_test_asr(
+                    artifact.local_path.clone(),
+                    model_companion_path(artifact, "tokens.txt")?,
+                    model_companion_path(artifact, "silero_vad.onnx")?,
+                    1,
+                )?;
                 models.activate_artifact(&artifact.artifact_id, None)?;
             }
             _ => {
@@ -1536,7 +1846,7 @@ fn download_model_file(
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 return Err(AppError::new(
                     "MODEL_DOWNLOAD_INCOMPLETE",
-                    "模型断点不是拾忆管理的普通文件",
+                    "模型断点不是翻翻管理的普通文件",
                     false,
                 ));
             }
@@ -1573,7 +1883,7 @@ fn download_model_file(
                 "--continue-at",
                 "-",
                 "--user-agent",
-                "Remin/0.1",
+                "FanFan/0.1",
                 "--output",
             ])
             .arg(&partial_path)
@@ -1711,6 +2021,7 @@ fn emit_download_state(app: &AppHandle, job: &ModelDownloadJob) {
             "progress": job.progress,
             "phase": job.phase,
             "status": job.status,
+            "source": job.source,
         }),
     );
     let progress_bucket = (job.progress.clamp(0.0, 1.0) * 20.0).floor() as u8;
@@ -1914,7 +2225,7 @@ pub fn model_artifact_activate(
             runtime.activate(&artifact.local_path, 4096, threads)?;
             let self_test = runtime.complete(
                 "你正在执行本地模型健康检查。只需用一句简短中文确认可以回答。",
-                "请回复：拾忆本地模型可以工作。",
+                "请回复：翻翻本地模型可以工作。",
                 32,
             );
             let self_test_failed = match &self_test {
@@ -1966,7 +2277,7 @@ pub fn model_artifact_activate(
                 tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
                 query: "哪段资料描述了本地知识库？".into(),
                 documents: vec![
-                    "拾忆在本地建立可检索的资料知识库。".into(),
+                    "翻翻在本地建立可检索的资料知识库。".into(),
                     "今天窗外天气晴朗。".into(),
                 ],
                 max_length: artifact.max_length.unwrap_or(512),
@@ -1984,14 +2295,32 @@ pub fn model_artifact_activate(
             }
             models.activate_artifact(&artifact_id, None)?;
         }
-        // OCR artifacts activate without a worker self-test (pipeline still
-        // uses Windows OCR); SHA-256 verification happened at import/download.
         (ModelRole::Ocr, ModelFormat::Onnx) => {
+            worker.client.self_test_ocr(
+                artifact.local_path.clone(),
+                model_companion_path(&artifact, "ch_PP-OCRv5_mobile_det.onnx")?,
+                model_companion_path(&artifact, "ch_ppocr_mobile_v2.0_cls_infer.onnx")?,
+                model_companion_path(&artifact, "ppocrv5_dict.txt")?,
+                1,
+            )?;
             models.activate_artifact(&artifact_id, None)?;
         }
-        // TTS/ASR artifacts activate without a worker self-test — synthesis/
-        // recognition is not wired up yet (channel-only milestone).
-        (ModelRole::Tts, ModelFormat::Onnx) | (ModelRole::Asr, ModelFormat::Onnx) => {
+        (ModelRole::Tts, ModelFormat::Onnx) => {
+            worker.client.self_test_tts(
+                artifact.local_path.clone(),
+                model_companion_path(&artifact, "tokens.txt")?,
+                model_companion_path(&artifact, "lexicon.txt")?,
+                1,
+            )?;
+            models.activate_artifact(&artifact_id, None)?;
+        }
+        (ModelRole::Asr, ModelFormat::Onnx) => {
+            worker.client.self_test_asr(
+                artifact.local_path.clone(),
+                model_companion_path(&artifact, "tokens.txt")?,
+                model_companion_path(&artifact, "silero_vad.onnx")?,
+                1,
+            )?;
             models.activate_artifact(&artifact_id, None)?;
         }
         _ => {
@@ -2173,26 +2502,6 @@ fn model_state_from_manager(
             .unwrap_or(0.0),
         _ => 0.0,
     };
-    let rag_complete =
-        capabilities.generation && capabilities.embedding && semantic_index_coverage >= 0.999_999;
-    let message = match pending_embedding
-        .as_ref()
-        .map(|pending| pending.status.as_str())
-    {
-        Some("indexing") => "正在为新 Embedding 构建并校验语义索引，完成前继续使用原索引".into(),
-        Some("paused") => "新 Embedding 索引构建已暂停，当前仍使用原索引".into(),
-        Some("cancelled") => "新 Embedding 索引切换已取消，当前仍使用原索引".into(),
-        Some("failed") => "新 Embedding 索引构建失败，当前仍使用原索引；可重试模型任务".into(),
-        _ if capabilities.generation && capabilities.embedding && !rag_complete => format!(
-            "模型已就绪，语义索引覆盖率 {}%",
-            (semantic_index_coverage * 100.0).round() as u32
-        ),
-        _ if capabilities.generation => "本地生成模型已配置，将在提问时按需加载".into(),
-        _ if capabilities.embedding => "语义检索已就绪，问资料仍需生成模型".into(),
-        _ if capabilities.vision => "本地多模态模型已配置，图片理解将在后台串行处理".into(),
-        _ if artifacts.is_empty() => "未配置本地模型".into(),
-        _ => "模型已导入，等待运行自检".into(),
-    };
     let inference_runtime = inference_runtime.unwrap_or_else(default_inference_runtime_state);
     Ok(ModelRuntimeState {
         status: if any_active {
@@ -2213,10 +2522,11 @@ fn model_state_from_manager(
         active_profile_name: active_profile.as_ref().map(|profile| profile.name.clone()),
         runtime_backend: any_active.then(|| inference_runtime.backend.clone()),
         inference_runtime,
-        message,
         checked_at: Utc::now().to_rfc3339(),
+        rag_complete: capabilities.generation
+            && capabilities.embedding
+            && semantic_index_coverage >= 0.999_999,
         capabilities,
-        rag_complete,
         semantic_index_coverage,
         embedding_migration: pending_embedding.map(|pending| EmbeddingMigrationState {
             artifact_id: pending.artifact_id.to_string(),
@@ -2560,6 +2870,7 @@ pub fn inbox_retry(
                     "inbox_id": request.inbox_id,
                     "error_code": error.code,
                     "retryable": error.retryable,
+                    "error_details": error.details,
                     "elapsed_ms": started.elapsed().as_millis() as u64,
                 }),
             );
@@ -2687,7 +2998,7 @@ fn run_image_deep_analysis(
         )?;
     }
     let response = runtime.describe_image_cancellable(
-        "你是拾忆的本地图片证据分析器。只能根据当前图片中可验证的内容回答，不得补充外部知识；看不清或图片不支持的问题必须明确说明。",
+        "你是翻翻的本地图片证据分析器。只能根据当前图片中可验证的内容回答，不得补充外部知识；看不清或图片不支持的问题必须明确说明。",
         &format!(
             "用户问题：{question}\n只输出一个JSON对象，不要Markdown：{{\"answer\":\"基于图片的中文回答\",\"observations\":[\"支持回答的可见细节\"],\"uncertainties\":[\"看不清或无法确认的内容\"]}}。"
         ),
@@ -3209,7 +3520,7 @@ pub async fn answer_export(
                 AppError::new(
                     code,
                     if code == "EXPORT_TARGET_EXISTS" {
-                        "目标文件已存在，拾忆不会覆盖"
+                        "目标文件已存在，翻翻不会覆盖"
                     } else {
                         "无法在所选位置新建导出文件"
                     },
@@ -3245,7 +3556,7 @@ pub async fn answer_export(
 fn render_answer_export(answer: &AnswerResult, format: &str) -> Result<String, AppError> {
     let mut output = String::new();
     if format == "md" {
-        output.push_str("# 拾忆问答结果\n\n");
+        output.push_str("# 翻翻问答结果\n\n");
     }
     output.push_str(answer.answer.trim());
     output.push_str(if format == "md" {
@@ -3277,7 +3588,7 @@ fn render_answer_export(answer: &AnswerResult, format: &str) -> Result<String, A
             }
         }
     }
-    output.push_str("\n由拾忆在本地依据已验证资料生成。\n");
+    output.push_str("\n由翻翻在本地依据已验证资料生成。\n");
     Ok(output)
 }
 
@@ -3309,6 +3620,209 @@ pub fn exclusion_rule_delete(
     catalog.get()?.delete_exclusion_rule(&request.rule_id)
 }
 
+#[tauri::command]
+pub async fn speech_recognize(
+    request: SpeechRecognitionInput,
+    app: AppHandle,
+    models: State<'_, ModelServiceState>,
+    worker: State<'_, SpeechWorkerState>,
+    runtime_manager: State<'_, RuntimeManagerState>,
+) -> Result<SpeechRecognitionSession, AppError> {
+    if !(8_000..=96_000).contains(&request.sample_rate)
+        || request.samples.is_empty()
+        || request.samples.len() > request.sample_rate as usize * 120
+        || request
+            .samples
+            .iter()
+            .any(|sample| !sample.is_finite() || !(-1.0..=1.0).contains(sample))
+    {
+        return Err(AppError::new(
+            "SPEECH_AUDIO_INVALID",
+            "录音数据无效或超过两分钟限制",
+            false,
+        ));
+    }
+    let artifact = models
+        .get()?
+        .active_artifact(ModelRole::Asr)?
+        .ok_or_else(|| AppError::new("ASR_MODEL_UNAVAILABLE", "请先配置语音识别模型", false))?;
+    let tokens_path = model_companion_path(&artifact, "tokens.txt")?;
+    let vad_model_path = model_companion_path(&artifact, "silero_vad.onnx")?;
+    let speech_worker = worker.0.clone();
+    let runtime = runtime_manager.0.clone();
+    let session_id = Uuid::now_v7();
+    let threads = runtime
+        .snapshot()?
+        .budget
+        .foreground_cpu_threads
+        .clamp(1, 2);
+    let _ = app.emit(
+        "speech:partial",
+        json!({ "session_id": session_id, "status": "recognizing" }),
+    );
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let mut runtime_request = RuntimeTaskRequest::interactive(
+            RuntimeTaskKind::SpeechRecognition,
+            RuntimeBackendKind::SherpaOnnx,
+        );
+        runtime_request.model_id = Some(artifact.artifact_id.to_string());
+        runtime_request.cpu_threads = threads;
+        runtime_request.memory_bytes = 512 * 1024 * 1024;
+        runtime_request.timeout = Duration::from_secs(30);
+        runtime_request.idempotency_key = Some(format!("speech:asr:{session_id}"));
+        let lease = runtime.acquire(runtime_request)?;
+        match speech_worker.recognize_speech(&SpeechRecognitionRequest {
+            model_path: artifact.local_path,
+            tokens_path,
+            vad_model_path,
+            samples: request.samples,
+            sample_rate: request.sample_rate,
+            threads,
+        }) {
+            Ok(result) => {
+                lease.complete();
+                Ok(SpeechRecognitionSession {
+                    session_id,
+                    status: "completed",
+                    result,
+                    completed_at: Utc::now().to_rfc3339(),
+                })
+            }
+            Err(error) => {
+                lease.fail(error.code.clone());
+                Err(error)
+            }
+        }
+    })
+    .await
+    .map_err(|error| AppError::new("ASR_TASK_FAILED", error.to_string(), true))??;
+    let _ = app.emit("speech:final", &result);
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn speech_synthesize_answer(
+    request: SpeechSynthesisInput,
+    app: AppHandle,
+    catalog: State<'_, CatalogServiceState>,
+    models: State<'_, ModelServiceState>,
+    worker: State<'_, SpeechWorkerState>,
+    runtime_manager: State<'_, RuntimeManagerState>,
+) -> Result<SpeechSynthesisSession, AppError> {
+    if !(0.5..=2.0).contains(&request.speed) || request.speaker_id > 10_000 {
+        return Err(AppError::new(
+            "TTS_OPTIONS_INVALID",
+            "语速或音色参数无效",
+            false,
+        ));
+    }
+    let catalog = catalog.get()?;
+    let answer = catalog.answer_result(&request.message_id)?;
+    catalog.validate_answer_evidence(&answer)?;
+    if answer.answer.trim().is_empty() || answer.answer.chars().count() > 4_000 {
+        return Err(AppError::new(
+            "TTS_TEXT_INVALID",
+            "当前回答为空或过长，无法安全朗读",
+            false,
+        ));
+    }
+    let artifact = models
+        .get()?
+        .active_artifact(ModelRole::Tts)?
+        .ok_or_else(|| AppError::new("TTS_MODEL_UNAVAILABLE", "请先配置语音合成模型", false))?;
+    let tokens_path = model_companion_path(&artifact, "tokens.txt")?;
+    let lexicon_path = model_companion_path(&artifact, "lexicon.txt")?;
+    let speech_worker = worker.0.clone();
+    let runtime = runtime_manager.0.clone();
+    let session_id = Uuid::now_v7();
+    let message_id = request.message_id;
+    let threads = runtime
+        .snapshot()?
+        .budget
+        .foreground_cpu_threads
+        .clamp(1, 2);
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let mut runtime_request = RuntimeTaskRequest::interactive(
+            RuntimeTaskKind::SpeechSynthesis,
+            RuntimeBackendKind::SherpaOnnx,
+        );
+        runtime_request.model_id = Some(artifact.artifact_id.to_string());
+        runtime_request.cpu_threads = threads;
+        runtime_request.memory_bytes = 768 * 1024 * 1024;
+        runtime_request.timeout = Duration::from_secs(45);
+        runtime_request.idempotency_key = Some(format!("speech:tts:{message_id}:{session_id}"));
+        let lease = runtime.acquire(runtime_request)?;
+        match speech_worker.synthesize_speech(&SpeechSynthesisRequest {
+            model_path: artifact.local_path,
+            tokens_path,
+            lexicon_path,
+            text: answer.answer,
+            speaker_id: request.speaker_id,
+            speed: request.speed,
+            threads,
+        }) {
+            Ok(result) => {
+                lease.complete();
+                Ok(SpeechSynthesisSession {
+                    session_id,
+                    status: "completed",
+                    message_id,
+                    result,
+                    completed_at: Utc::now().to_rfc3339(),
+                })
+            }
+            Err(error) => {
+                lease.fail(error.code.clone());
+                Err(error)
+            }
+        }
+    })
+    .await
+    .map_err(|error| AppError::new("TTS_TASK_FAILED", error.to_string(), true))??;
+    let _ = app.emit("tts:chunk", &result);
+    Ok(result)
+}
+
+fn model_companion_path(artifact: &ModelArtifact, file_name: &str) -> Result<String, AppError> {
+    let parent = Path::new(&artifact.local_path)
+        .parent()
+        .ok_or_else(|| AppError::new("MODEL_COMPANION_MISSING", "模型组件目录无效", false))?;
+    let candidate = parent.join(file_name);
+    if candidate.is_symlink() || !candidate.is_file() {
+        return Err(AppError::new(
+            "MODEL_COMPANION_MISSING",
+            format!("模型缺少配套文件 {file_name}"),
+            false,
+        ));
+    }
+    let canonical_parent = fs::canonicalize(parent)
+        .map_err(|error| AppError::new("MODEL_COMPANION_MISSING", error.to_string(), false))?;
+    let canonical_candidate = fs::canonicalize(&candidate)
+        .map_err(|error| AppError::new("MODEL_COMPANION_MISSING", error.to_string(), false))?;
+    if !canonical_candidate.starts_with(canonical_parent) {
+        return Err(AppError::new(
+            "MODEL_COMPANION_INVALID",
+            "模型配套文件超出受管模型目录",
+            false,
+        ));
+    }
+    Ok(canonical_candidate.to_string_lossy().into_owned())
+}
+
+fn active_ocr_runtime(app: &AppHandle, threads: u32) -> Result<Option<OcrRuntimeConfig>, AppError> {
+    let manager = app.state::<ModelServiceState>().get()?;
+    let Some(artifact) = manager.active_artifact(ModelRole::Ocr)? else {
+        return Ok(None);
+    };
+    Ok(Some(OcrRuntimeConfig {
+        model_path: artifact.local_path.clone(),
+        det_model_path: model_companion_path(&artifact, "ch_PP-OCRv5_mobile_det.onnx")?,
+        cls_model_path: model_companion_path(&artifact, "ch_ppocr_mobile_v2.0_cls_infer.onnx")?,
+        dictionary_path: model_companion_path(&artifact, "ppocrv5_dict.txt")?,
+        threads: threads.clamp(1, 2),
+    }))
+}
+
 #[tauri::command(async)]
 pub fn maintenance_get(
     catalog: State<'_, CatalogServiceState>,
@@ -3325,6 +3839,7 @@ pub fn app_status_get(
     catalog: State<'_, CatalogServiceState>,
     generation: State<'_, GenerationServiceState>,
     worker: State<'_, WorkerServiceState>,
+    runtime_manager: State<'_, RuntimeManagerState>,
 ) -> Result<AppStatusSnapshot, AppError> {
     let catalog = catalog.get()?;
     let roots = catalog.list_roots()?;
@@ -3365,9 +3880,17 @@ pub fn app_status_get(
         scan_progress,
         maintenance,
         inference_runtime,
+        ai_runtime: runtime_manager.0.snapshot()?,
         recovery_actions,
         checked_at,
     })
+}
+
+#[tauri::command(async)]
+pub fn runtime_state_get(
+    runtime_manager: State<'_, RuntimeManagerState>,
+) -> Result<AiRuntimeSnapshot, AppError> {
+    runtime_manager.0.snapshot()
 }
 
 #[derive(Debug, Deserialize)]
@@ -3379,7 +3902,7 @@ pub struct MaintenanceCheckRequest {
 pub fn maintenance_check(
     request: MaintenanceCheckRequest,
     catalog: State<'_, CatalogServiceState>,
-) -> Result<remin_core::MaintenanceCheckResult, AppError> {
+) -> Result<fanfan_core::MaintenanceCheckResult, AppError> {
     catalog.get()?.maintenance_check(&request.level)
 }
 
@@ -3422,8 +3945,9 @@ pub struct CacheClearResult {
 #[tauri::command(async)]
 pub fn storage_usage_get(
     environment: State<'_, EnvironmentServiceState>,
+    models: State<'_, ModelServiceState>,
 ) -> Result<StorageUsageSnapshot, AppError> {
-    storage_usage_snapshot(&environment.data_directory)
+    storage_usage_snapshot(&environment.data_directory, models.get()?.model_root())
 }
 
 #[tauri::command(async)]
@@ -3478,6 +4002,7 @@ pub async fn storage_migration_schedule(
 pub fn cache_clear(
     request: CacheClearRequest,
     environment: State<'_, EnvironmentServiceState>,
+    models: State<'_, ModelServiceState>,
 ) -> Result<CacheClearResult, AppError> {
     if request.confirmation != "CLEAR_CACHE" {
         return Err(AppError::new(
@@ -3488,9 +4013,9 @@ pub fn cache_clear(
     }
     let target = match request.category.as_str() {
         "temporary_cache" => environment.data_directory.join("cache"),
-        "failed_downloads" => environment
-            .data_directory
-            .join("models")
+        "failed_downloads" => models
+            .get()?
+            .model_root()
             .join(".downloads")
             .join("quarantine"),
         _ => {
@@ -3538,19 +4063,21 @@ pub fn app_data_reset_schedule(
             false,
         )
     })?;
-    let marker = parent.join(".com.remin.desktop-reset-request");
+    let marker = parent.join(".com.fanfan.desktop-reset-request");
     fs::write(&marker, "RESET_APPLICATION_DATA")
         .map_err(|error| AppError::new("APP_DATA_RESET_MARKER_FAILED", error.to_string(), true))?;
     app.restart();
 }
 
-fn storage_usage_snapshot(data_directory: &Path) -> Result<StorageUsageSnapshot, AppError> {
-    let database_size = ["remin.db", "remin.db-wal", "remin.db-shm"]
+fn storage_usage_snapshot(
+    data_directory: &Path,
+    model_root: &Path,
+) -> Result<StorageUsageSnapshot, AppError> {
+    let database_size = ["fanfan.db", "fanfan.db-wal", "fanfan.db-shm"]
         .iter()
         .try_fold(0_u64, |total, name| {
             Ok::<u64, AppError>(total + file_size(&data_directory.join(name))?)
         })?;
-    let model_root = data_directory.join("models");
     let installed_models = [
         "generation",
         "embedding",
@@ -3675,7 +4202,11 @@ fn background_storage_budget_allows(app: &AppHandle) -> bool {
         }
     }
     let environment = app.state::<EnvironmentServiceState>();
-    match storage_usage_snapshot(&environment.data_directory) {
+    let models = app.state::<ModelServiceState>();
+    let Ok(models) = models.get() else {
+        return false;
+    };
+    match storage_usage_snapshot(&environment.data_directory, models.model_root()) {
         Ok(snapshot) if snapshot.background_tasks_paused => {
             crate::runtime_log::event(
                 "warning",
@@ -3962,7 +4493,7 @@ pub fn diagnostic_export(
         .get()
         .and_then(|manager| manager.list_download_jobs())
         .unwrap_or_default();
-    let payload = remin_core::sanitize_log_value(
+    let payload = fanfan_core::sanitize_log_value(
         &json!({
             "schema_version": 1,
             "generated_at": Utc::now().to_rfc3339(),
@@ -4025,7 +4556,7 @@ pub fn index_rebuild(
     app: AppHandle,
     catalog: State<'_, CatalogServiceState>,
 ) -> Result<OperationHandle, AppError> {
-    remin_core::validate_rebuild_confirmation(&request.confirmation)?;
+    fanfan_core::validate_rebuild_confirmation(&request.confirmation)?;
     let catalog = catalog.get()?;
     let operation_id = Uuid::now_v7();
     let handle = OperationHandle {
@@ -4076,6 +4607,7 @@ pub fn search_start(
     models: State<'_, ModelServiceState>,
     worker: State<'_, WorkerServiceState>,
     generation: State<'_, GenerationServiceState>,
+    runtime_manager: State<'_, RuntimeManagerState>,
 ) -> Result<SearchSession, AppError> {
     let _foreground_guard = ForegroundActivityGuard::begin(&worker.foreground_activity);
     let correlation_id = Uuid::now_v7().to_string();
@@ -4098,7 +4630,16 @@ pub fn search_start(
     let catalog = catalog.get()?;
     let models = models.get()?;
     // 查询理解：将自然语言转换为结构化检索参数
-    let intent: Option<remin_core::QueryIntent> = if is_natural_language_query(&request.query) {
+    let query_runtime_lease = if is_natural_language_query(&request.query) {
+        let mut runtime_request =
+            RuntimeTaskRequest::interactive(RuntimeTaskKind::Search, RuntimeBackendKind::LlamaCpp);
+        runtime_request.cpu_threads = background_inference_threads();
+        runtime_request.timeout = Duration::from_secs(3);
+        runtime_manager.0.acquire(runtime_request).ok()
+    } else {
+        None
+    };
+    let intent: Option<fanfan_core::QueryIntent> = if query_runtime_lease.is_some() {
         models
             .active_artifact(ModelRole::Generation)
             .ok()
@@ -4121,6 +4662,9 @@ pub fn search_start(
     } else {
         None
     };
+    if let Some(lease) = query_runtime_lease {
+        lease.complete();
+    }
     if let Some(intent) = intent {
         request.query = intent.rewritten_query;
         if let Some(hint) = intent.time_hint {
@@ -4149,10 +4693,18 @@ pub fn search_start(
     if matches!(request.mode, SearchMode::Semantic | SearchMode::Hybrid)
         && let Some(artifact) = models.active_artifact(ModelRole::Embedding)?
     {
+        let mut runtime_request = RuntimeTaskRequest::interactive(
+            RuntimeTaskKind::Search,
+            RuntimeBackendKind::OnnxRuntime,
+        );
+        runtime_request.cpu_threads = 2;
+        runtime_request.timeout = Duration::from_secs(5);
+        let mut embedding_runtime_lease = runtime_manager.0.acquire(runtime_request).ok();
         let tokenizer_path = PathBuf::from(&artifact.local_path)
             .parent()
             .map(|parent| parent.join("tokenizer.json"));
-        if let Some(tokenizer_path) = tokenizer_path
+        if embedding_runtime_lease.is_some()
+            && let Some(tokenizer_path) = tokenizer_path
             && let Ok(response) = worker.client.encode_embeddings(&EmbeddingRequest {
                 model_path: artifact.local_path,
                 tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
@@ -4182,7 +4734,13 @@ pub fn search_start(
                     "has_more": result.next_cursor.is_some(),
                 }),
             );
+            if let Some(lease) = embedding_runtime_lease.take() {
+                lease.complete();
+            }
             return Ok(result);
+        }
+        if let Some(lease) = embedding_runtime_lease {
+            lease.complete();
         }
     }
     let result = catalog.search(&request)?;
@@ -4210,6 +4768,7 @@ pub fn ask_start(
     models: State<'_, ModelServiceState>,
     worker: State<'_, WorkerServiceState>,
     generation: State<'_, GenerationServiceState>,
+    runtime_manager: State<'_, RuntimeManagerState>,
 ) -> Result<OperationHandle, AppError> {
     if request.session_id.is_none() {
         request.session_id = Some(Uuid::now_v7());
@@ -4226,10 +4785,9 @@ pub fn ask_start(
         &json!({
             "operation_id": operation_id,
             "session_id": request.session_id,
-            "mode": request.mode,
+            "mode": "rag",
             "question_length": request.question.chars().count(),
             "strict_evidence": request.strict_evidence,
-            "allow_degraded_extractive": request.allow_degraded_extractive,
             "retrieval_limit": request.retrieval_limit,
             "max_source_files": request.max_source_files,
             "root_scope_count": request.scope.root_ids.len(),
@@ -4284,11 +4842,46 @@ pub fn ask_start(
     drop(entries);
     let worker = ask_worker;
     let generation = Arc::clone(&generation.0);
+    let runtime_manager = runtime_manager.0.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let foreground_worker = app.state::<WorkerServiceState>();
         let _foreground_guard =
             ForegroundActivityGuard::begin(&foreground_worker.foreground_activity);
         let operation_started = Instant::now();
+        let generation_artifact_id = models
+            .active_artifact(ModelRole::Generation)
+            .ok()
+            .flatten()
+            .map(|artifact| artifact.artifact_id.to_string());
+        let mut runtime_request =
+            RuntimeTaskRequest::interactive(RuntimeTaskKind::Ask, RuntimeBackendKind::LlamaCpp);
+        runtime_request.cpu_threads = interactive_inference_threads();
+        runtime_request.timeout = Duration::from_secs(45);
+        runtime_request.model_id = generation_artifact_id;
+        runtime_request.idempotency_key = Some(format!("ask:{operation_id}"));
+        let runtime_lease = match runtime_manager.acquire(runtime_request) {
+            Ok(lease) => lease,
+            Err(error) => {
+                if let Ok(mut entries) = operations.0.lock()
+                    && let Some(entry) = entries.get_mut(&operation_id)
+                {
+                    entry.handle.status = "failed";
+                    entry.error = Some(error.clone());
+                }
+                let _ = app.emit(
+                    "ask:failed",
+                    json!({"operation_id": operation_id, "error": error}),
+                );
+                crate::runtime_log::event(
+                    "error",
+                    "runtime",
+                    "runtime.lease_failed",
+                    Some(&operation_id.to_string()),
+                    &json!({"task_kind": "ask", "error_code": error.code}),
+                );
+                return;
+            }
+        };
         if let Ok(mut entries) = operations.0.lock()
             && let Some(entry) = entries.get_mut(&operation_id)
         {
@@ -4346,6 +4939,7 @@ pub fn ask_start(
             &models,
             &worker,
             &generation,
+            &runtime_manager,
             &cancelled,
             (&phase, &verified_claim),
         );
@@ -4371,6 +4965,7 @@ pub fn ask_start(
                     "elapsed_ms": operation_started.elapsed().as_millis() as u64,
                 }),
             );
+            runtime_lease.fail("OPERATION_CANCELLED");
             return;
         }
         match result {
@@ -4397,6 +4992,7 @@ pub fn ask_start(
                             "elapsed_ms": operation_started.elapsed().as_millis() as u64,
                         }),
                     );
+                    runtime_lease.fail("OPERATION_CANCELLED");
                     return;
                 }
                 if let Ok(mut entries) = operations.0.lock()
@@ -4427,6 +5023,7 @@ pub fn ask_start(
                         "elapsed_ms": operation_started.elapsed().as_millis() as u64,
                     }),
                 );
+                runtime_lease.complete();
             }
             Err(error) => {
                 if error.code != "OPERATION_CANCELLED" {
@@ -4454,18 +5051,21 @@ pub fn ask_start(
                         "elapsed_ms": operation_started.elapsed().as_millis() as u64,
                     }),
                 );
+                runtime_lease.fail(error.code.clone());
             }
         }
     });
     Ok(handle)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_answer(
     request: &AskRequest,
     catalog: &CatalogService,
     models: &ModelManager,
     worker: &WorkerClient,
     generation: &Mutex<LocalGenerationRuntime>,
+    runtime_manager: &RuntimeManager,
     cancelled: &AtomicBool,
     progress: AskProgressCallbacks<'_>,
 ) -> Result<AnswerResult, AppError> {
@@ -4484,35 +5084,34 @@ fn compute_answer(
     } else {
         0.0
     };
-    let degradation_reason = if generation_artifact.is_none() {
-        Some("缺少已自检的本地生成模型".to_owned())
-    } else if embedding.is_none() {
-        Some("缺少已自检的中文 Embedding 模型".to_owned())
-    } else if index_coverage <= 0.0 {
-        Some("当前检索范围尚未建立语义索引".to_owned())
-    } else if maintenance.degradation_level == "core" {
-        Some("后台资源繁忙，语义检索与生成暂时暂停；搜索和预览仍可继续使用".to_owned())
-    } else {
-        None
-    };
-    let explicit_extracts = request.mode == AskMode::EvidenceExtracts;
-    if explicit_extracts || degradation_reason.is_some() {
-        phase("evidence_retrieval", 0.35);
-        let mut result = catalog.answer_extractively(request, None)?;
-        result.degradation_reason =
-            degradation_reason.or_else(|| Some("用户明确选择证据摘录模式".into()));
-        result.index_coverage = index_coverage;
-        result.retrieval_channels = vec!["filename".into(), "fts".into()];
-        catalog.validate_answer_evidence(&result)?;
-        for claim in &result.claims {
-            verified_claim(claim);
-        }
-        catalog.record_ask_exchange(request, &result)?;
-        phase("completed", 1.0);
-        return Ok(result);
+    let generation_artifact = generation_artifact.ok_or_else(|| {
+        AppError::new(
+            "RAG_GENERATION_MODEL_REQUIRED",
+            "问资料需要先配置并通过自检的本地生成模型",
+            false,
+        )
+    })?;
+    let embedding = embedding.ok_or_else(|| {
+        AppError::new(
+            "RAG_EMBEDDING_MODEL_REQUIRED",
+            "问资料需要先配置并通过自检的中文 Embedding 模型",
+            false,
+        )
+    })?;
+    if index_coverage <= 0.0 {
+        return Err(AppError::new(
+            "RAG_SEMANTIC_INDEX_REQUIRED",
+            "当前检索范围尚未建立语义索引，完整 RAG 已停止",
+            true,
+        ));
     }
-    let embedding = embedding.expect("RAG readiness checked embedding");
-    let generation_artifact = generation_artifact.expect("RAG readiness checked generation");
+    if maintenance.degradation_level == "core" {
+        return Err(AppError::new(
+            "RAG_RESOURCE_PRESSURE",
+            "当前资源压力较高，完整 RAG 暂未启动；请稍后重试",
+            true,
+        ));
+    }
     let history = request
         .session_id
         .map(|session_id| catalog.load_ask_history(&session_id, 8))
@@ -4580,6 +5179,14 @@ fn compute_answer(
         embedding.query_prefix.as_deref().unwrap_or(""),
         retrieval_question
     );
+    let mut embedding_runtime_request = RuntimeTaskRequest::interactive(
+        RuntimeTaskKind::Embedding,
+        RuntimeBackendKind::OnnxRuntime,
+    );
+    embedding_runtime_request.cpu_threads = 2;
+    embedding_runtime_request.timeout = Duration::from_secs(10);
+    embedding_runtime_request.model_id = Some(embedding.artifact_id.to_string());
+    let embedding_runtime_lease = runtime_manager.acquire(embedding_runtime_request)?;
     let response = worker.encode_embeddings(&EmbeddingRequest {
         model_path: embedding.local_path.clone(),
         tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
@@ -4587,11 +5194,14 @@ fn compute_answer(
         max_length: embedding.max_length.unwrap_or(512),
         threads: 2,
     })?;
+    embedding_runtime_lease.complete();
     let vector = response.vectors.first().ok_or_else(|| {
         AppError::new("EMBEDDING_EMPTY", "Embedding 运行时没有返回查询向量", true)
     })?;
     let mut retrieval_request = request.clone();
     retrieval_request.question = retrieval_question;
+    retrieval_request.retrieval_limit = retrieval_request.retrieval_limit.min(10);
+    retrieval_request.max_source_files = retrieval_request.max_source_files.min(6);
     let artifact_id = embedding.artifact_id.to_string();
     let mut extractive = catalog.answer_extractively(
         &retrieval_request,
@@ -4606,6 +5216,7 @@ fn compute_answer(
         "fts".into(),
         "embedding".into(),
         "rrf".into(),
+        "mmr".into(),
     ];
     if extractive.insufficient_evidence {
         extractive.answer_mode = "rag_refusal".into();
@@ -4629,15 +5240,25 @@ fn compute_answer(
                 .iter()
                 .map(|claim| compact_for_prompt(&claim.text, 12_000))
                 .collect::<Vec<_>>();
-            if let Ok(response) = worker.rerank(&RerankRequest {
-                model_path: reranker.local_path,
-                tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
-                query: retrieval_request.question.clone(),
-                documents,
-                max_length: reranker.max_length.unwrap_or(512),
-                threads: 2,
-            }) && apply_rerank_scores(&mut extractive, &response.scores).is_ok()
+            let mut rerank_runtime_request = RuntimeTaskRequest::interactive(
+                RuntimeTaskKind::Rerank,
+                RuntimeBackendKind::OnnxRuntime,
+            );
+            rerank_runtime_request.cpu_threads = 2;
+            rerank_runtime_request.timeout = Duration::from_secs(10);
+            rerank_runtime_request.model_id = Some(reranker.artifact_id.to_string());
+            if let Ok(rerank_runtime_lease) = runtime_manager.acquire(rerank_runtime_request)
+                && let Ok(response) = worker.rerank(&RerankRequest {
+                    model_path: reranker.local_path,
+                    tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
+                    query: retrieval_request.question.clone(),
+                    documents,
+                    max_length: reranker.max_length.unwrap_or(512),
+                    threads: 2,
+                })
+                && apply_rerank_scores(&mut extractive, &response.scores).is_ok()
             {
+                rerank_runtime_lease.complete();
                 extractive.retrieval_channels.push("reranker".into());
                 reranker_applied = true;
             }
@@ -4703,17 +5324,19 @@ fn compute_answer(
         ));
     }
     phase("generating", 0.62);
-    let mut prompt = remin_core::generation_prompt(request, &extractive, &history);
+    let mut prompt = fanfan_core::generation_prompt(request, &extractive, &history);
     if !image_analysis_context.is_empty() {
         prompt.push_str(
             "\n\n以下是针对当前问题重新查看候选原图得到的辅助观察。它不能替代[S数字]原始引用；只有同时受到原始引用支持的事实才能写入答案：\n",
         );
         prompt.push_str(&image_analysis_context.join("\n"));
     }
-    let generated = runtime.complete_cancellable(
-        "你是拾忆的本地资料回答器。只能使用用户提供的证据，严格保留[S数字]引用，不得补充外部知识。",
+    let answer_schema = fanfan_core::grounded_answer_json_schema();
+    let generated = runtime.complete_json_cancellable(
+        "你是翻翻的本地资料回答器。只能使用用户提供的证据；每个事实必须通过citation_ids关联证据，不得补充外部知识。",
         &prompt,
         512,
+        &answer_schema,
         cancelled,
     )
     .inspect_err(|error| {
@@ -4723,38 +5346,31 @@ fn compute_answer(
     })?;
     drop(runtime);
     phase("citation_validation", 0.88);
-    let mut grounded = remin_core::apply_grounded_generation(&extractive, &generated);
+    let mut grounded = fanfan_core::apply_grounded_generation(&extractive, &generated);
     if grounded.is_none() {
         phase("citation_structure_repair", 0.9);
         let repair_prompt = format!(
-            "下面的回答只需要修复Markdown引用格式，不得增加、删除或改写事实。每个事实段落、列表项和表格数据行必须以已有的[S数字]结束；标题和表格分隔行可无引用。只输出修复后的Markdown。\n\n原回答：\n{}",
+            "下面的输出没有满足结构约束。只修复JSON结构和citation_ids，不得增加、删除或改写事实，不得引入新的S编号。只输出符合指定JSON Schema的对象。\n\n原输出：\n{}",
             compact_for_prompt(&generated, 12_000)
         );
-        if let Ok(repaired) = complete_with_model(
+        if let Ok(repaired) = complete_json_with_model(
             generation,
             &generation_artifact,
-            "你是引用格式修复器。不得引入新事实或新来源编号。",
+            "你是结构化引用修复器。不得引入新事实或新来源编号。",
             &repair_prompt,
             640,
+            &answer_schema,
             cancelled,
         ) {
-            grounded = remin_core::apply_grounded_generation(&extractive, &repaired);
+            grounded = fanfan_core::apply_grounded_generation(&extractive, &repaired);
         }
     }
     let Some(mut grounded) = grounded else {
-        let mut fallback = extractive;
-        fallback.answer_mode = "evidence_fallback".into();
-        fallback.degradation_reason = Some(
-            "本次生成结果未通过引用核验（RAG_CITATION_VALIDATION_FAILED），已显示经过验证的原文摘录"
-                .into(),
-        );
-        catalog.validate_answer_evidence(&fallback)?;
-        for claim in &fallback.claims {
-            verified_claim(claim);
-        }
-        catalog.record_ask_exchange(request, &fallback)?;
-        phase("completed", 1.0);
-        return Ok(fallback);
+        return Err(AppError::new(
+            "RAG_CITATION_VALIDATION_FAILED",
+            "本次生成结果未通过引用核验，没有向你显示未验证内容；可以重试",
+            true,
+        ));
     };
     let candidates = std::mem::take(&mut grounded.claims);
     let candidate_count = candidates.len().max(1);
@@ -4770,15 +5386,27 @@ fn compute_answer(
             .map(|(index, citation)| format!("[E{}] {}", index + 1, citation.quote))
             .collect::<Vec<_>>()
             .join("\n");
-        let verification = complete_with_model(
-            generation,
-            &generation_artifact,
-            "你是严格的中文证据核验器。判断事实句是否完全由给定原文证据支持，只输出SUPPORTED或UNSUPPORTED。",
-            &format!("事实句：{}\n\n原文证据：\n{}", claim.text, evidence),
-            32,
-            cancelled,
-        )?;
-        if !claim_support_is_verified(&verification) {
+        let deterministically_supported = fanfan_core::claim_has_deterministic_support(
+            &claim.text,
+            claim
+                .citations
+                .iter()
+                .map(|citation| citation.quote.as_str()),
+        );
+        let supported = if deterministically_supported {
+            true
+        } else {
+            let verification = complete_with_model(
+                generation,
+                &generation_artifact,
+                "你是严格的中文证据核验器。判断事实句是否完全由给定原文证据支持，只输出SUPPORTED或UNSUPPORTED。",
+                &format!("事实句：{}\n\n原文证据：\n{}", claim.text, evidence),
+                32,
+                cancelled,
+            )?;
+            claim_support_is_verified(&verification)
+        };
+        if !supported {
             rejected_claims = rejected_claims.saturating_add(1);
             continue;
         }
@@ -4799,10 +5427,26 @@ fn compute_answer(
             true,
         ));
     }
+    let evidence_numbers = extractive
+        .claims
+        .iter()
+        .flat_map(|claim| claim.citations.iter())
+        .enumerate()
+        .map(|(index, citation)| (citation.evidence_id, index + 1))
+        .collect::<HashMap<_, _>>();
     grounded.answer = grounded
         .claims
         .iter()
-        .map(|claim| claim.text.as_str())
+        .map(|claim| {
+            let citations = claim
+                .citations
+                .iter()
+                .filter_map(|citation| evidence_numbers.get(&citation.evidence_id))
+                .map(|index| format!("[S{index}]"))
+                .collect::<Vec<_>>()
+                .join("");
+            format!("- {} {}", claim.text, citations)
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let verified_file_ids = grounded
@@ -4815,8 +5459,8 @@ fn compute_answer(
         .retain(|source| verified_file_ids.contains(&source.file_id));
     grounded.used_file_ids = verified_file_ids.into_iter().collect();
     if rejected_claims > 0 {
-        grounded.grounding_status = remin_core::GroundingStatus::Partial;
-        grounded.answer_mode = "rag_partial".into();
+        grounded.grounding_status = fanfan_core::GroundingStatus::Partial;
+        grounded.answer_mode = "generated".into();
         grounded.degradation_reason = Some(format!(
             "有{rejected_claims}个候选事实句未通过原文支持性校验，已自动隐藏"
         ));
@@ -4877,6 +5521,29 @@ fn complete_with_model(
         runtime.activate(&artifact.local_path, 4096, threads)?;
     }
     runtime.complete_cancellable(system_prompt, prompt, max_tokens, cancelled)
+}
+
+fn complete_json_with_model(
+    generation: &Mutex<LocalGenerationRuntime>,
+    artifact: &ModelArtifact,
+    system_prompt: &str,
+    prompt: &str,
+    max_tokens: u32,
+    schema: &serde_json::Value,
+    cancelled: &AtomicBool,
+) -> Result<String, AppError> {
+    let mut runtime = generation.lock().map_err(|_| {
+        AppError::new(
+            "GENERATION_RUNTIME_LOCK_FAILED",
+            "生成运行时状态已损坏",
+            true,
+        )
+    })?;
+    let threads = interactive_inference_threads();
+    if runtime.active_model_path() != Some(artifact.local_path.as_str()) || !runtime.is_active() {
+        runtime.activate(&artifact.local_path, 4096, threads)?;
+    }
+    runtime.complete_json_cancellable(system_prompt, prompt, max_tokens, schema, cancelled)
 }
 
 fn interactive_inference_threads() -> u32 {
@@ -4944,8 +5611,10 @@ fn detect_physical_core_count() -> u32 {
 }
 
 fn claim_support_is_verified(value: &str) -> bool {
-    let normalized = value.to_ascii_uppercase();
-    !normalized.contains("UNSUPPORTED") && normalized.contains("SUPPORTED")
+    value
+        .split(|character: char| !character.is_ascii_alphabetic())
+        .find(|token| !token.is_empty())
+        .is_some_and(|token| token.eq_ignore_ascii_case("SUPPORTED"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -5293,7 +5962,7 @@ fn run_scan(app: &AppHandle, catalog: &Arc<CatalogService>, root_id: Uuid, job_i
     match catalog.execute_scan(root_id, job_id) {
         Ok(job) => {
             crate::runtime_log::event(
-                if matches!(job.status, remin_core::JobStatus::Failed) {
+                if matches!(job.status, fanfan_core::JobStatus::Failed) {
                     "error"
                 } else {
                     "info"
@@ -5311,15 +5980,20 @@ fn run_scan(app: &AppHandle, catalog: &Arc<CatalogService>, root_id: Uuid, job_i
                     "total_items": job.total_items,
                     "error_code": job.error.as_ref().map(|error| error.code.as_str()),
                     "retryable": job.error.as_ref().map(|error| error.retryable),
+                    "error_details": job.error.as_ref().and_then(|error| error.details.as_deref()),
                     "elapsed_ms": started.elapsed().as_millis() as u64,
                 }),
             );
             let _ = app.emit("job:progress", &job);
             let _ = app.emit("catalog:changed", root_id.to_string());
-            if matches!(
-                job.status,
-                remin_core::JobStatus::Succeeded | remin_core::JobStatus::Partial
-            ) {
+            if job.processed_items > 0
+                && matches!(
+                    job.status,
+                    fanfan_core::JobStatus::Succeeded
+                        | fanfan_core::JobStatus::Partial
+                        | fanfan_core::JobStatus::Failed
+                )
+            {
                 spawn_parse_pending(app.clone(), Arc::clone(catalog));
             }
         }
@@ -5338,6 +6012,7 @@ fn run_scan(app: &AppHandle, catalog: &Arc<CatalogService>, root_id: Uuid, job_i
                 }),
             );
             let _ = app.emit("job:progress", &error);
+            spawn_parse_pending(app.clone(), Arc::clone(catalog));
         }
     }
 }
@@ -5417,7 +6092,69 @@ pub(crate) fn spawn_parse_pending(app: AppHandle, catalog: Arc<CatalogService>) 
                 let Some(revision_id) = file.current_revision_id else {
                     continue;
                 };
+                let parse_threads = background_inference_threads();
+                let source_format = file.extension.to_ascii_lowercase();
+                let uses_ocr = matches!(
+                    source_format.as_str(),
+                    "pdf" | "jpg" | "jpeg" | "png" | "tif" | "tiff" | "bmp" | "webp"
+                );
+                let ocr_runtime = if uses_ocr {
+                    match active_ocr_runtime(&app, parse_threads) {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            crate::runtime_log::event(
+                                "warning",
+                                "ocr",
+                                "ocr.runtime_resolution_failed",
+                                Some(&cycle_id),
+                                &json!({
+                                    "error_code": error.code,
+                                    "retryable": error.retryable,
+                                    "format": source_format,
+                                }),
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let runtime_manager = app.state::<RuntimeManagerState>();
+                let mut runtime_request = RuntimeTaskRequest::interactive(
+                    if ocr_runtime.is_some() {
+                        RuntimeTaskKind::Ocr
+                    } else {
+                        RuntimeTaskKind::Parse
+                    },
+                    if ocr_runtime.is_some() {
+                        RuntimeBackendKind::PaddleOcr
+                    } else {
+                        RuntimeBackendKind::Parser
+                    },
+                );
+                runtime_request.cpu_threads = parse_threads;
+                runtime_request.memory_bytes = if ocr_runtime.is_some() {
+                    512 * 1024 * 1024
+                } else {
+                    128 * 1024 * 1024
+                };
+                runtime_request.timeout = Duration::from_secs(2);
+                runtime_request.idempotency_key = Some(format!("parse:{revision_id}"));
+                let runtime_lease = match runtime_manager.0.acquire(runtime_request) {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        crate::runtime_log::event(
+                            "info",
+                            "runtime",
+                            "runtime.background_deferred",
+                            Some(&cycle_id),
+                            &json!({"task_kind": "parse", "error_code": error.code}),
+                        );
+                        break;
+                    }
+                };
                 if let Err(error) = catalog.mark_file_parsing(&file.file_id, &revision_id) {
+                    runtime_lease.fail(error.code.clone());
                     let _ = app.emit("index:failed", error);
                     continue;
                 }
@@ -5425,12 +6162,13 @@ pub(crate) fn spawn_parse_pending(app: AppHandle, catalog: Arc<CatalogService>) 
                     job_id: Uuid::now_v7(),
                     file_id: file.file_id,
                     revision_id,
-                    source_path: file.canonical_path.clone(),
+                    source_path: strip_long_path_prefix(&file.canonical_path),
                     format: file.extension.clone(),
                     ocr_policy: "auto".to_owned(),
                     language_hints: vec!["zh".to_owned()],
                     max_pages: None,
                     asset_cache_dir: image_asset_cache_dir(&app, &revision_id),
+                    ocr_runtime,
                     parser_version: "0.1.0".to_owned(),
                 };
                 let result = worker
@@ -5443,6 +6181,7 @@ pub(crate) fn spawn_parse_pending(app: AppHandle, catalog: Arc<CatalogService>) 
                         parser_version: request.parser_version.clone(),
                         nodes: vec![],
                         image_assets: vec![],
+                        ocr_attempts: vec![],
                         warnings: vec![],
                         metrics: ParseMetrics {
                             page_count: 0,
@@ -5453,8 +6192,39 @@ pub(crate) fn spawn_parse_pending(app: AppHandle, catalog: Arc<CatalogService>) 
                         },
                         error: Some(error),
                     });
+                let mut runtime_error_code = result.error.as_ref().map(|error| error.code.clone());
                 match catalog.commit_parse_result(&file.file_id, &result) {
                     Ok(()) => {
+                        if !result.ocr_attempts.is_empty() {
+                            crate::runtime_log::event(
+                                if result
+                                    .ocr_attempts
+                                    .iter()
+                                    .any(|attempt| attempt.status == "failed")
+                                {
+                                    "warning"
+                                } else {
+                                    "info"
+                                },
+                                "ocr",
+                                "ocr.attempt_chain_completed",
+                                Some(&cycle_id),
+                                &json!({
+                                    "file_id": file.file_id,
+                                    "revision_id": revision_id,
+                                    "attempts": result.ocr_attempts.iter().map(|attempt| json!({
+                                        "engine": &attempt.engine,
+                                        "model_version": attempt.model_version.as_deref(),
+                                        "status": &attempt.status,
+                                        "page_no": attempt.page_no,
+                                        "confidence": attempt.confidence,
+                                        "fallback_reason": attempt.fallback_reason.as_deref(),
+                                        "elapsed_ms": attempt.elapsed_ms,
+                                        "error_code": attempt.error.as_ref().map(|error| error.code.as_str()),
+                                    })).collect::<Vec<_>>(),
+                                }),
+                            );
+                        }
                         if matches!(result.status, ParseOutcome::Failed) {
                             failed_files = failed_files.saturating_add(1);
                             crate::runtime_log::event(
@@ -5480,6 +6250,7 @@ pub(crate) fn spawn_parse_pending(app: AppHandle, catalog: Arc<CatalogService>) 
                         let _ = app.emit("index:changed", file.file_id.to_string());
                     }
                     Err(error) => {
+                        runtime_error_code = Some(error.code.clone());
                         failed_files = failed_files.saturating_add(1);
                         crate::runtime_log::event(
                             "error",
@@ -5496,6 +6267,11 @@ pub(crate) fn spawn_parse_pending(app: AppHandle, catalog: Arc<CatalogService>) 
                         );
                         let _ = app.emit("index:failed", error);
                     }
+                }
+                if let Some(error_code) = runtime_error_code {
+                    runtime_lease.fail(error_code);
+                } else {
+                    runtime_lease.complete();
                 }
             }
             crate::runtime_log::event(
@@ -5742,6 +6518,27 @@ pub(crate) fn spawn_image_understanding_pending(app: AppHandle, catalog: Arc<Cat
             if degradation == "core" {
                 break;
             }
+            let runtime_manager = app.state::<RuntimeManagerState>();
+            let mut runtime_request = RuntimeTaskRequest::interactive(
+                RuntimeTaskKind::ImageUnderstanding,
+                RuntimeBackendKind::LlamaCpp,
+            );
+            runtime_request.cpu_threads = threads;
+            runtime_request.timeout = Duration::from_secs(2);
+            runtime_request.model_id = Some(model_artifact_id.clone());
+            let runtime_lease = match runtime_manager.0.acquire(runtime_request) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    crate::runtime_log::event(
+                        "info",
+                        "runtime",
+                        "runtime.background_deferred",
+                        Some(&cycle_id),
+                        &json!({"task_kind": "image_understanding", "error_code": error.code}),
+                    );
+                    break;
+                }
+            };
             let pending = match catalog.claim_pending_image_understanding(&model_artifact_id) {
                 Ok(Some(pending)) => pending,
                 Ok(None) => match catalog.image_understanding_stats() {
@@ -5804,7 +6601,7 @@ pub(crate) fn spawn_image_understanding_pending(app: AppHandle, catalog: Arc<Cat
                 );
                 let cancelled = AtomicBool::new(false);
                 let response = runtime.describe_image_cancellable(
-                    "你是拾忆的本地图片与图表理解器。只描述图中可验证内容，并严格输出指定JSON。",
+                    "你是翻翻的本地图片与图表理解器。只描述图中可验证内容，并严格输出指定JSON。",
                     &prompt,
                     Path::new(&pending.cache_path),
                     &pending.mime_type,
@@ -5826,6 +6623,7 @@ pub(crate) fn spawn_image_understanding_pending(app: AppHandle, catalog: Arc<Cat
             })();
             match operation.and_then(|result| catalog.commit_image_understanding(&result)) {
                 Ok(()) => {
+                    runtime_lease.complete();
                     committed = committed.saturating_add(1);
                     let _ = app.emit(
                         "vision:completed",
@@ -5844,6 +6642,7 @@ pub(crate) fn spawn_image_understanding_pending(app: AppHandle, catalog: Arc<Cat
                     }
                 }
                 Err(error) => {
+                    runtime_lease.fail(error.code.clone());
                     failed = failed.saturating_add(1);
                     crate::runtime_log::event(
                         "error",
@@ -6025,17 +6824,44 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
             if degradation == "core" {
                 return Ok(false);
             }
-            let chunks = catalog.list_pending_embedding_chunks(&model_artifact_id, 16)?;
+            let chunks = catalog.list_pending_embedding_chunks(&model_artifact_id, 32)?;
             if chunks.is_empty() {
                 break;
             }
-            let response = worker.client.encode_embeddings(&EmbeddingRequest {
+            let runtime_manager = app.state::<RuntimeManagerState>();
+            let mut runtime_request = RuntimeTaskRequest::interactive(
+                RuntimeTaskKind::IncrementalIndex,
+                RuntimeBackendKind::OnnxRuntime,
+            );
+            runtime_request.cpu_threads = background_inference_threads();
+            runtime_request.timeout = Duration::from_secs(2);
+            runtime_request.model_id = Some(model_artifact_id.clone());
+            let runtime_lease = match runtime_manager.0.acquire(runtime_request) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    crate::runtime_log::event(
+                        "info",
+                        "runtime",
+                        "runtime.background_deferred",
+                        Some(&cycle_id),
+                        &json!({"task_kind": "incremental_index", "error_code": error.code}),
+                    );
+                    return Ok(false);
+                }
+            };
+            let response = match worker.client.encode_embeddings(&EmbeddingRequest {
                 model_path: artifact.local_path.clone(),
                 tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
                 texts: chunks.iter().map(|chunk| chunk.text.clone()).collect(),
                 max_length: artifact.max_length.unwrap_or(512),
-                threads: 2,
-            })?;
+                threads: 4,
+            }) {
+                Ok(response) => response,
+                Err(error) => {
+                    runtime_lease.fail(error.code.clone());
+                    return Err(error);
+                }
+            };
             if response.dimension == 0
                 || expected_dimension.is_some_and(|dimension| dimension != response.dimension)
                 || response.vectors.len() != chunks.len()
@@ -6044,11 +6870,13 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
                     .iter()
                     .any(|vector| vector.len() != response.dimension as usize)
             {
-                return Err(AppError::new(
+                let error = AppError::new(
                     "EMBEDDING_OUTPUT_INVALID",
                     "向量数量或维度与模型自检结果不一致",
                     false,
-                ));
+                );
+                runtime_lease.fail(error.code.clone());
+                return Err(error);
             }
             let inputs = chunks
                 .iter()
@@ -6058,8 +6886,18 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
                     vector,
                 })
                 .collect::<Vec<_>>();
-            let committed =
-                catalog.commit_chunk_embeddings(&model_artifact_id, response.dimension, &inputs)?;
+            let committed = match catalog.commit_chunk_embeddings(
+                &model_artifact_id,
+                response.dimension,
+                &inputs,
+            ) {
+                Ok(committed) => committed,
+                Err(error) => {
+                    runtime_lease.fail(error.code.clone());
+                    return Err(error);
+                }
+            };
+            runtime_lease.complete();
             if committed == 0 {
                 break;
             }
@@ -6306,9 +7144,18 @@ fn finalize_embedding_download(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use remin_core::{
+    use fanfan_core::{
         AnswerClaim, AnswerSourceFile, EvidenceRef, GroundingStatus, SourceLocator, SupportStatus,
     };
+
+    #[test]
+    fn claim_support_requires_an_exact_positive_verdict() {
+        assert!(claim_support_is_verified("SUPPORTED"));
+        assert!(claim_support_is_verified("SUPPORTED\n"));
+        assert!(!claim_support_is_verified("UNSUPPORTED"));
+        assert!(!claim_support_is_verified("NOT SUPPORTED"));
+        assert!(!claim_support_is_verified("The claim is SUPPORTED"));
+    }
 
     #[cfg(windows)]
     #[test]

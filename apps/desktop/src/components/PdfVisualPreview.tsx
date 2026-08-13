@@ -7,7 +7,7 @@ interface PdfVisualPreviewProps {
   preview: FilePreview;
 }
 
-const sourceUrl = (fileId: string) => `http://remin-pdf.localhost/${encodeURIComponent(fileId)}`;
+const sourceUrl = (fileId: string) => `http://fanfan-pdf.localhost/${encodeURIComponent(fileId)}`;
 
 export function PdfVisualPreview({ preview }: PdfVisualPreviewProps) {
   const targetNode = useMemo(
@@ -86,7 +86,7 @@ export function PdfVisualPreview({ preview }: PdfVisualPreviewProps) {
 
   const highlight = preview.nodes.find((node) => node.locator.page_no === pageNo && node.locator.bbox)?.locator.bbox ?? null;
 
-  if (!window.__TAURI_INTERNALS__) return <p className="pdf-preview__notice">PDF视觉预览仅在拾忆桌面程序中加载。</p>;
+  if (!window.__TAURI_INTERNALS__) return <p className="pdf-preview__notice">PDF视觉预览仅在翻翻桌面程序中加载。</p>;
   return <section className="pdf-preview" aria-label={`${preview.file.display_name} PDF视觉预览`}>
     <header><strong>PDF视觉页</strong><span>{pdf ? `${pageNo} / ${pdf.numPages}` : "正在加载"}</span><div><button type="button" disabled={!pdf || pageNo <= 1} onClick={() => setPageNo((value) => value - 1)}>上一页</button><button type="button" disabled={!pdf || pageNo >= pdf.numPages} onClick={() => setPageNo((value) => value + 1)}>下一页</button></div></header>
     {error && <p role="alert" className="inline-error">PDF视觉预览失败：{error}</p>}

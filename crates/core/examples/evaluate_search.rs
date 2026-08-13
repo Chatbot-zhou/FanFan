@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf};
 
-use remin_core::{
+use fanfan_core::{
     Availability, CatalogService, ParseMetrics, ParseOutcome, ParseRequest, ParseResult,
     RootSource, ScopeFilter, SearchMode, SearchRequest, SearchSort, WorkerClient,
 };
@@ -55,6 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 language_hints: vec!["zh".into()],
                 max_pages: None,
                 asset_cache_dir: None,
+                ocr_runtime: None,
                 parser_version: "0.1.0".into(),
             };
             let result = worker
@@ -66,6 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     parser_version: request.parser_version,
                     nodes: vec![],
                     image_assets: vec![],
+                    ocr_attempts: vec![],
                     warnings: vec![],
                     metrics: ParseMetrics {
                         page_count: 0,

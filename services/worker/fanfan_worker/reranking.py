@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .protocol import WorkerError
+from .runtime_cache import get_onnx_session
 
 
 def rerank_documents(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, WorkerError | None]:
@@ -35,7 +36,6 @@ def rerank_documents(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, Wo
         return None, WorkerError("RERANK_TOKENIZER_UNAVAILABLE", "重排模型目录缺少tokenizer.json", False)
     try:
         import numpy as np
-        import onnxruntime as ort
         from tokenizers import Tokenizer
     except ImportError as error:
         return None, WorkerError("RERANK_RUNTIME_MISSING", f"本地重排运行依赖不可用：{error}", True)
@@ -47,10 +47,7 @@ def rerank_documents(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, Wo
         input_ids = np.asarray([item.ids for item in encoded], dtype=np.int64)
         attention_mask = np.asarray([item.attention_mask for item in encoded], dtype=np.int64)
         type_ids = np.asarray([item.type_ids for item in encoded], dtype=np.int64)
-        options = ort.SessionOptions()
-        options.intra_op_num_threads = threads
-        options.inter_op_num_threads = 1
-        session = ort.InferenceSession(str(model_path), sess_options=options, providers=["CPUExecutionProvider"])
+        session = get_onnx_session(model_path, threads)
         feed: dict[str, Any] = {}
         for item in session.get_inputs():
             lowered = item.name.lower()

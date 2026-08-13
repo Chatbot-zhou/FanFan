@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::AppError;
+use crate::{AppError, DownloadFile, locked_download_artifact};
 
-const REGISTRY_VERSION: u32 = 3;
+const REGISTRY_VERSION: u32 = 4;
 const DOWNLOAD_REGISTRY_VERSION: u32 = 1;
 const MAX_IMPORT_FILES: usize = 512;
 
@@ -89,6 +89,24 @@ pub struct DownloadedModelMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelPackageFile {
+    pub file_name: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub required: bool,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelPackageManifest {
+    pub manifest_version: u32,
+    pub files: Vec<ModelPackageFile>,
+    pub integrity_status: String,
+    pub self_test_status: String,
+    pub verified_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelArtifact {
     pub artifact_id: Uuid,
     pub role: ModelRole,
@@ -110,6 +128,8 @@ pub struct ModelArtifact {
     pub max_length: Option<u32>,
     pub license_name: Option<String>,
     pub status: String,
+    #[serde(default)]
+    pub package_manifest: Option<ModelPackageManifest>,
     pub imported_at: DateTime<Utc>,
 }
 
@@ -199,6 +219,22 @@ pub struct ModelDownloadJob {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelDownloadRemoval {
+    pub job_id: Uuid,
+    pub removed: bool,
+    pub partial_bytes_removed: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelStoreStatus {
+    pub store_path: String,
+    pub migration_state: String,
+    pub installed_artifacts: u64,
+    pub installed_bytes: u64,
+    pub integrity_status: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ModelDownloadRegistryState {
     registry_version: u32,
@@ -241,7 +277,11 @@ pub struct ModelManager {
 
 impl ModelManager {
     pub fn open(data_directory: impl Into<PathBuf>) -> Result<Self, AppError> {
-        let model_root = data_directory.into().join("models");
+        Self::open_store(data_directory.into().join("models"))
+    }
+
+    pub fn open_store(model_root: impl Into<PathBuf>) -> Result<Self, AppError> {
+        let model_root = model_root.into();
         fs::create_dir_all(&model_root).map_err(|error| {
             AppError::new("MODEL_DIRECTORY_CREATE_FAILED", error.to_string(), true)
         })?;
@@ -255,7 +295,162 @@ impl ModelManager {
         manager.load_registry()?;
         manager.recover_interrupted_downloads()?;
         manager.recover_interrupted_embedding_activation()?;
+        manager.refresh_package_manifests()?;
         Ok(manager)
+    }
+
+    pub fn store_status(&self) -> Result<ModelStoreStatus, AppError> {
+        let registry = self.load_registry()?;
+        let missing_or_changed = registry.artifacts.iter().any(|artifact| {
+            artifact
+                .package_manifest
+                .as_ref()
+                .is_none_or(|manifest| manifest.integrity_status != "ready")
+        });
+        Ok(ModelStoreStatus {
+            store_path: self.model_root.to_string_lossy().into_owned(),
+            migration_state: "ready".into(),
+            installed_artifacts: registry.artifacts.len() as u64,
+            installed_bytes: registry
+                .artifacts
+                .iter()
+                .map(|artifact| {
+                    artifact
+                        .package_manifest
+                        .as_ref()
+                        .map(|manifest| manifest.files.iter().map(|file| file.size_bytes).sum())
+                        .unwrap_or(artifact.size_bytes)
+                })
+                .sum(),
+            integrity_status: if missing_or_changed {
+                "missing_or_changed_files"
+            } else {
+                "ready"
+            }
+            .into(),
+        })
+    }
+
+    pub fn model_root(&self) -> &Path {
+        &self.model_root
+    }
+
+    pub fn restore_locked_companions_from(
+        &self,
+        legacy_roots: &[PathBuf],
+    ) -> Result<u64, AppError> {
+        let registry = self.load_registry()?;
+        let mut restored = 0_u64;
+        for artifact in &registry.artifacts {
+            let Some(locked) = locked_download_artifact(&artifact.model_id, artifact.source) else {
+                continue;
+            };
+            let Some(parent) = Path::new(&artifact.local_path).parent() else {
+                continue;
+            };
+            for expected in locked.companion_files {
+                let target = parent.join(&expected.file_name);
+                if package_file_matches(&target, &expected)? {
+                    continue;
+                }
+                let mut source = None;
+                for legacy_root in legacy_roots.iter().filter(|root| root.is_dir()) {
+                    if let Some(found) = find_verified_file(legacy_root, &expected)? {
+                        source = Some(found);
+                        break;
+                    }
+                }
+                let Some(source) = source else {
+                    continue;
+                };
+                let temporary = parent.join(format!(
+                    ".{}.restore-{}.tmp",
+                    expected.file_name,
+                    Uuid::now_v7()
+                ));
+                fs::copy(&source, &temporary).map_err(|error| {
+                    AppError::new("MODEL_COMPANION_RESTORE_FAILED", error.to_string(), true)
+                })?;
+                if !package_file_matches(&temporary, &expected)? {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(AppError::new(
+                        "MODEL_COMPANION_RESTORE_VERIFY_FAILED",
+                        "旧模型目录中的配套文件校验失败，未启用该文件",
+                        false,
+                    ));
+                }
+                fs::rename(&temporary, &target).map_err(|error| {
+                    let _ = fs::remove_file(&temporary);
+                    AppError::new("MODEL_COMPANION_RESTORE_FAILED", error.to_string(), true)
+                })?;
+                restored = restored.saturating_add(1);
+            }
+        }
+        if restored > 0 {
+            self.refresh_package_manifests()?;
+        }
+        Ok(restored)
+    }
+
+    pub fn refresh_package_manifests(&self) -> Result<(), AppError> {
+        let _guard = self.lock_registry()?;
+        let mut registry = self.load_registry()?;
+        let active = registry
+            .active_artifacts
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        for artifact in &mut registry.artifacts {
+            let previous_self_test = artifact
+                .package_manifest
+                .as_ref()
+                .map(|manifest| manifest.self_test_status.clone())
+                .unwrap_or_else(|| {
+                    if active.contains(&artifact.artifact_id) {
+                        "ready".into()
+                    } else {
+                        "pending".into()
+                    }
+                });
+            let mut manifest = build_package_manifest(artifact)?;
+            manifest.self_test_status = previous_self_test;
+            artifact.status = match (
+                manifest.integrity_status.as_str(),
+                manifest.self_test_status.as_str(),
+            ) {
+                ("ready", "ready") => "ready",
+                ("ready", _) => "pending_self_test",
+                _ => "incomplete",
+            }
+            .into();
+            artifact.package_manifest = Some(manifest);
+        }
+        registry.registry_version = REGISTRY_VERSION;
+        registry.updated_at = Utc::now();
+        self.save_registry(&registry)
+    }
+
+    pub fn rebase_store_paths(&self, previous_root: &Path) -> Result<u64, AppError> {
+        let _guard = self.lock_registry()?;
+        let mut registry = self.load_registry()?;
+        let mut changed = 0_u64;
+        for artifact in &mut registry.artifacts {
+            let path = PathBuf::from(&artifact.local_path);
+            let Ok(relative) = path.strip_prefix(previous_root) else {
+                continue;
+            };
+            artifact.local_path = self
+                .model_root
+                .join(relative)
+                .to_string_lossy()
+                .into_owned();
+            changed += 1;
+        }
+        if changed > 0 {
+            registry.updated_at = Utc::now();
+            self.save_registry(&registry)?;
+        }
+        Ok(changed)
     }
 
     pub fn scan_import_paths(&self, paths: &[String]) -> Result<Vec<ImportCandidate>, AppError> {
@@ -329,7 +524,7 @@ impl ModelManager {
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(AppError::new(
                 "MODEL_DOWNLOAD_INCOMPLETE",
-                "下载结果不是拾忆管理的普通文件",
+                "下载结果不是翻翻管理的普通文件",
                 false,
             ));
         }
@@ -466,7 +661,7 @@ impl ModelManager {
                     .file_name()
                     .expect("canonical model source has filename"),
             );
-            let artifact = ModelArtifact {
+            let mut artifact = ModelArtifact {
                 artifact_id,
                 role: selection.role,
                 format: candidate.format,
@@ -493,9 +688,11 @@ impl ModelManager {
                 query_prefix: metadata.and_then(|value| value.query_prefix.clone()),
                 max_length: metadata.and_then(|value| value.max_length),
                 license_name: metadata.map(|value| value.license_name.clone()),
-                status: "ready".into(),
+                status: "pending_self_test".into(),
+                package_manifest: None,
                 imported_at: Utc::now(),
             };
+            artifact.package_manifest = Some(build_package_manifest(&artifact)?);
             registry.artifacts.push(artifact.clone());
             imported.push(artifact);
             installation_guards.push(installation_guard);
@@ -532,7 +729,7 @@ impl ModelManager {
         Ok(registry
             .artifacts
             .into_iter()
-            .find(|artifact| artifact.artifact_id == *artifact_id))
+            .find(|artifact| artifact.artifact_id == *artifact_id && artifact.status == "ready"))
     }
 
     pub fn active_profile(&self) -> Result<Option<ModelProfile>, AppError> {
@@ -661,6 +858,26 @@ impl ModelManager {
                 false,
             ));
         }
+        ensure_package_integrity(&generation)?;
+        ensure_package_integrity(&embedding)?;
+        for artifact_id in [generation_artifact_id, embedding_artifact_id] {
+            if let Some(artifact) = registry
+                .artifacts
+                .iter_mut()
+                .find(|artifact| artifact.artifact_id == *artifact_id)
+            {
+                let manifest = artifact.package_manifest.as_mut().ok_or_else(|| {
+                    AppError::new(
+                        "MODEL_PACKAGE_NOT_VERIFIED",
+                        "模型包还没有完成完整性校验",
+                        true,
+                    )
+                })?;
+                manifest.self_test_status = "ready".into();
+                manifest.verified_at = Utc::now();
+                artifact.status = "ready".into();
+            }
+        }
         if let Some(artifact) = registry
             .artifacts
             .iter_mut()
@@ -758,7 +975,7 @@ impl ModelManager {
         if !Path::new(&artifact.local_path).is_file() {
             return Err(AppError::new(
                 "MODEL_SOURCE_UNAVAILABLE",
-                "模型组件文件已经离开拾忆管理目录",
+                "模型组件文件已经离开翻翻管理目录",
                 false,
             ));
         }
@@ -977,7 +1194,7 @@ impl ModelManager {
         if !Path::new(&artifact.local_path).is_file() {
             return Err(AppError::new(
                 "MODEL_SOURCE_UNAVAILABLE",
-                "模型组件文件已经离开拾忆管理目录",
+                "模型组件文件已经离开翻翻管理目录",
                 false,
             ));
         }
@@ -991,6 +1208,23 @@ impl ModelManager {
             }
             artifact.embedding_dimension = Some(dimension);
         }
+        let manifest = artifact.package_manifest.as_mut().ok_or_else(|| {
+            AppError::new(
+                "MODEL_PACKAGE_NOT_VERIFIED",
+                "模型包还没有完成完整性校验",
+                true,
+            )
+        })?;
+        if manifest.integrity_status != "ready" {
+            return Err(AppError::new(
+                "MODEL_PACKAGE_INCOMPLETE",
+                "模型包缺少配套文件或文件校验失败",
+                true,
+            ));
+        }
+        manifest.self_test_status = "ready".into();
+        manifest.verified_at = Utc::now();
+        artifact.status = "ready".into();
         let activated = artifact.clone();
         registry.active_artifacts.insert(
             activated.role.directory_name().to_owned(),
@@ -1002,13 +1236,6 @@ impl ModelManager {
     }
 
     pub fn deactivate_role(&self, role: ModelRole) -> Result<(), AppError> {
-        if role == ModelRole::Ocr {
-            return Err(AppError::new(
-                "MODEL_ROLE_DEACTIVATE_UNSUPPORTED",
-                "Windows OCR 由系统运行时管理，不能在这里停用",
-                false,
-            ));
-        }
         let _registry_guard = self.lock_registry()?;
         let mut registry = self.load_registry()?;
         registry.active_artifacts.remove(role.directory_name());
@@ -1085,7 +1312,6 @@ impl ModelManager {
         let mut registry = self.load_download_registry()?;
         if let Some(existing) = registry.jobs.iter().find(|job| {
             job.edition_id == edition_id
-                && job.source == source
                 && matches!(job.status.as_str(), "queued" | "running" | "paused")
         }) {
             return Ok(existing.clone());
@@ -1175,6 +1401,52 @@ impl ModelManager {
         registry.updated_at = next.updated_at;
         self.save_download_registry(&registry)?;
         Ok(next)
+    }
+
+    pub fn remove_download_job(&self, job_id: &Uuid) -> Result<bool, AppError> {
+        let _guard = self.download_lock.lock().map_err(|_| {
+            AppError::new(
+                "MODEL_DOWNLOAD_STATE_UNAVAILABLE",
+                "模型下载状态暂时不可用",
+                true,
+            )
+        })?;
+        let mut registry = self.load_download_registry()?;
+        let previous_len = registry.jobs.len();
+        registry.jobs.retain(|job| job.job_id != *job_id);
+        if registry.jobs.len() == previous_len {
+            return Ok(false);
+        }
+        registry.updated_at = Utc::now();
+        self.save_download_registry(&registry)?;
+        Ok(true)
+    }
+
+    pub fn remove_download_staging_for_edition(&self, edition_id: &str) -> Result<u64, AppError> {
+        if edition_id.is_empty()
+            || !edition_id.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            })
+        {
+            return Err(AppError::new(
+                "MODEL_DOWNLOAD_JOB_INVALID",
+                "模型下载任务包含无效的版本标识",
+                false,
+            ));
+        }
+        let root = self.download_staging_directory()?;
+        let mut removed_bytes = 0_u64;
+        for source in ["huggingface", "modelscope"] {
+            let target = root.join(source).join(edition_id);
+            if !target.exists() {
+                continue;
+            }
+            removed_bytes = removed_bytes.saturating_add(directory_size_without_links(&target)?);
+            fs::remove_dir_all(&target).map_err(|error| {
+                AppError::new("MODEL_DOWNLOAD_CLEANUP_FAILED", error.to_string(), true)
+            })?;
+        }
+        Ok(removed_bytes)
     }
 
     pub fn download_artifact_staging_directory(
@@ -1350,7 +1622,7 @@ impl ModelManager {
         if registry.registry_version > DOWNLOAD_REGISTRY_VERSION {
             return Err(AppError::new(
                 "MODEL_DOWNLOAD_STATE_TOO_NEW",
-                "模型下载状态来自更高版本的拾忆",
+                "模型下载状态来自更高版本的翻翻",
                 false,
             ));
         }
@@ -1390,7 +1662,7 @@ impl ModelManager {
         if registry.registry_version > REGISTRY_VERSION {
             return Err(AppError::new(
                 "MODEL_REGISTRY_TOO_NEW",
-                "模型注册表来自更高版本的拾忆",
+                "模型注册表来自更高版本的翻翻",
                 false,
             ));
         }
@@ -1401,7 +1673,7 @@ impl ModelManager {
         self.registry_lock.lock().map_err(|_| {
             AppError::new(
                 "MODEL_REGISTRY_LOCK_FAILED",
-                "模型注册表状态已损坏，请重启拾忆后重试",
+                "模型注册表状态已损坏，请重启翻翻后重试",
                 true,
             )
         })
@@ -1510,6 +1782,134 @@ fn atomic_replace_file(source: &Path, target: &Path) -> std::io::Result<()> {
 #[cfg(not(windows))]
 fn atomic_replace_file(source: &Path, target: &Path) -> std::io::Result<()> {
     fs::rename(source, target)
+}
+
+fn build_package_manifest(artifact: &ModelArtifact) -> Result<ModelPackageManifest, AppError> {
+    let main_path = Path::new(&artifact.local_path);
+    let parent = main_path.parent().ok_or_else(|| {
+        AppError::new(
+            "MODEL_PACKAGE_PATH_INVALID",
+            "模型包缺少有效的安装目录",
+            false,
+        )
+    })?;
+    let expected = locked_download_artifact(&artifact.model_id, artifact.source)
+        .map(|locked| locked.files())
+        .unwrap_or_else(|| {
+            vec![DownloadFile {
+                file_name: main_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "model".into()),
+                remote_path: String::new(),
+                url: String::new(),
+                sha256: artifact.sha256.clone(),
+                size_bytes: artifact.size_bytes,
+            }]
+        });
+    let mut files = Vec::with_capacity(expected.len());
+    for expected_file in expected {
+        let path = parent.join(&expected_file.file_name);
+        let status = match fs::metadata(&path) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && metadata.len() == expected_file.size_bytes
+                    && sha256_file(&path)? == expected_file.sha256 =>
+            {
+                "ready"
+            }
+            Ok(_) => "changed",
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => "missing",
+            Err(error) => {
+                return Err(AppError::new(
+                    "MODEL_PACKAGE_VERIFY_FAILED",
+                    error.to_string(),
+                    true,
+                ));
+            }
+        };
+        files.push(ModelPackageFile {
+            file_name: expected_file.file_name,
+            size_bytes: expected_file.size_bytes,
+            sha256: expected_file.sha256,
+            required: true,
+            status: status.into(),
+        });
+    }
+    let integrity_status = if files.iter().all(|file| file.status == "ready") {
+        "ready"
+    } else {
+        "incomplete"
+    };
+    Ok(ModelPackageManifest {
+        manifest_version: 1,
+        files,
+        integrity_status: integrity_status.into(),
+        self_test_status: "pending".into(),
+        verified_at: Utc::now(),
+    })
+}
+
+fn ensure_package_integrity(artifact: &ModelArtifact) -> Result<(), AppError> {
+    if artifact
+        .package_manifest
+        .as_ref()
+        .is_some_and(|manifest| manifest.integrity_status == "ready")
+    {
+        Ok(())
+    } else {
+        Err(AppError::new(
+            "MODEL_PACKAGE_INCOMPLETE",
+            "模型包缺少配套文件或文件校验失败",
+            true,
+        ))
+    }
+}
+
+fn package_file_matches(path: &Path, expected: &DownloadFile) -> Result<bool, AppError> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(AppError::new(
+                "MODEL_PACKAGE_VERIFY_FAILED",
+                error.to_string(),
+                true,
+            ));
+        }
+    };
+    Ok(metadata.len() == expected.size_bytes && sha256_file(path)? == expected.sha256)
+}
+
+fn find_verified_file(root: &Path, expected: &DownloadFile) -> Result<Option<PathBuf>, AppError> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut visited = 0_usize;
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).map_err(|error| {
+            AppError::new("MODEL_COMPANION_RESTORE_FAILED", error.to_string(), true)
+        })? {
+            let entry = entry.map_err(|error| {
+                AppError::new("MODEL_COMPANION_RESTORE_FAILED", error.to_string(), true)
+            })?;
+            let metadata = entry.metadata().map_err(|error| {
+                AppError::new("MODEL_COMPANION_RESTORE_FAILED", error.to_string(), true)
+            })?;
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file()
+                && entry.file_name().to_string_lossy() == expected.file_name
+                && package_file_matches(&entry.path(), expected)?
+            {
+                return Ok(Some(entry.path()));
+            }
+            visited = visited.saturating_add(1);
+            if visited > MAX_IMPORT_FILES.saturating_mul(8) {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn collect_model_files(path: &Path, output: &mut Vec<PathBuf>) -> Result<(), AppError> {
@@ -1728,6 +2128,34 @@ fn sha256_file(path: &Path) -> Result<String, AppError> {
         digest.update(&buffer[..read]);
     }
     Ok(format!("{:x}", digest.finalize()))
+}
+
+fn directory_size_without_links(path: &Path) -> Result<u64, AppError> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let mut total = 0_u64;
+    for entry in fs::read_dir(path)
+        .map_err(|error| AppError::new("MODEL_DOWNLOAD_CLEANUP_FAILED", error.to_string(), true))?
+    {
+        let entry = entry.map_err(|error| {
+            AppError::new("MODEL_DOWNLOAD_CLEANUP_FAILED", error.to_string(), true)
+        })?;
+        let metadata = entry.metadata().map_err(|error| {
+            AppError::new("MODEL_DOWNLOAD_CLEANUP_FAILED", error.to_string(), true)
+        })?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        total = total.saturating_add(if metadata.is_dir() {
+            directory_size_without_links(&entry.path())?
+        } else if metadata.is_file() {
+            metadata.len()
+        } else {
+            0
+        });
+    }
+    Ok(total)
 }
 
 fn infer_quantization(name: &str) -> Option<String> {
@@ -1992,6 +2420,78 @@ mod tests {
                 .next()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn durable_store_removes_download_task_without_touching_installed_models() {
+        let store = tempfile::tempdir().expect("model store tempdir");
+        let source = tempfile::tempdir().expect("source tempdir");
+        let manager = ModelManager::open_store(store.path()).expect("open durable store");
+        let installed = import_fake_model(
+            &manager,
+            source.path(),
+            "installed-generation",
+            ModelRole::Generation,
+        );
+        let job = manager
+            .create_download_job(
+                "test-edition",
+                "测试模型",
+                ModelSource::Huggingface,
+                Vec::new(),
+            )
+            .expect("create download job");
+        let staging = manager
+            .download_artifact_staging_directory(
+                ModelSource::Huggingface,
+                "test-edition",
+                ModelRole::Generation,
+            )
+            .expect("create staging");
+        fs::write(staging.join("model.gguf.part"), b"partial bytes").expect("write partial");
+
+        assert!(
+            manager
+                .remove_download_job(&job.job_id)
+                .expect("remove task")
+        );
+        assert!(
+            manager
+                .remove_download_staging_for_edition("test-edition")
+                .expect("remove staging")
+                > 0
+        );
+        assert!(Path::new(&installed.local_path).is_file());
+        assert!(manager.list_download_jobs().expect("list jobs").is_empty());
+        let status = manager.store_status().expect("store status");
+        assert_eq!(status.installed_artifacts, 1);
+        assert_eq!(status.integrity_status, "ready");
+    }
+
+    #[test]
+    fn edition_has_one_stable_download_job_across_sources() {
+        let store = tempfile::tempdir().expect("model store tempdir");
+        let manager = ModelManager::open_store(store.path()).expect("open durable store");
+        let first = manager
+            .create_download_job(
+                "same-edition",
+                "同一模型",
+                ModelSource::Huggingface,
+                Vec::new(),
+            )
+            .expect("create first task");
+        let second = manager
+            .create_download_job(
+                "same-edition",
+                "同一模型",
+                ModelSource::Modelscope,
+                Vec::new(),
+            )
+            .expect("reuse task");
+
+        assert_eq!(second.job_id, first.job_id);
+        assert_eq!(second.source, ModelSource::Huggingface);
+        assert_eq!(manager.list_download_jobs().expect("list jobs").len(), 1);
     }
 
     #[test]

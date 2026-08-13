@@ -19,7 +19,7 @@ export function RootAuthorizationPage({ onCompleted }: { onCompleted: () => Prom
     const selected = await open({
       directory: true,
       multiple: false,
-      title: volumeOnly ? "选择要扫描的本地磁盘" : "选择要加入拾忆的资料文件夹",
+      title: volumeOnly ? "选择要扫描的本地磁盘" : "选择要加入翻翻的资料文件夹",
     });
     if (typeof selected !== "string") return;
     const fullVolume = /^[a-zA-Z]:\\?$/.test(selected);
@@ -27,7 +27,7 @@ export function RootAuthorizationPage({ onCompleted }: { onCompleted: () => Prom
       setError("添加整个磁盘时请选择盘符根目录，例如 D:\\。");
       return;
     }
-    if (fullVolume && !await confirmAction({ actionKey: "authorize_full_volume", title: "授权扫描整个磁盘？", description: "扫描可能持续较长时间。系统、程序、凭据、应用数据和拾忆自身目录会被强制排除。", confirmLabel: "确认授权" })) return;
+    if (fullVolume && !await confirmAction({ actionKey: "authorize_full_volume", title: "授权扫描整个磁盘？", description: "扫描可能持续较长时间。系统、程序、凭据、应用数据和翻翻自身目录会被强制排除。", confirmLabel: "确认授权" })) return;
     setBusy(true);
     try {
       await bridge.root_add({
@@ -61,8 +61,8 @@ export function RootAuthorizationPage({ onCompleted }: { onCompleted: () => Prom
     <main className="authorization-page">
       <div className="authorization-card">
         <span className="authorization-card__mark"><SafetyCertificateOutlined /></span>
-        <h1>选择要交给拾忆理解的资料</h1>
-        <p>拾忆不会自动扫描桌面、文档或图片。只有你明确选择的位置才会被读取，源文件始终保持只读。</p>
+        <h1>选择要交给翻翻理解的资料</h1>
+        <p>翻翻不会自动扫描桌面、文档或图片。只有你明确选择的位置才会被读取，源文件始终保持只读。</p>
         <div className="authorization-actions">
           <button className="primary-button" type="button" disabled={busy} onClick={() => void choose(false)}><FolderOpenOutlined /> 选择资料文件夹</button>
           <button type="button" disabled={busy} onClick={() => void choose(true)}><HddOutlined /> 添加整个磁盘</button>

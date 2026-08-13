@@ -166,7 +166,7 @@ $manifest = [ordered]@{
 }
 $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $runtimeRoot 'MANIFEST.json') -Encoding UTF8
 @(
-    "This directory is managed by Remin for the official llama.cpp Windows x64 $selectedBackend runtime.",
+    "This directory is managed by FanFan for the official llama.cpp Windows x64 $selectedBackend runtime.",
     "Prepare: powershell -ExecutionPolicy Bypass -File scripts/prepare_llama_runtime.ps1 -Backend $selectedBackend",
     'Validate: powershell -ExecutionPolicy Bypass -File scripts/validate_llama_runtime.ps1 -RuntimeRoot <this-directory>',
     '',

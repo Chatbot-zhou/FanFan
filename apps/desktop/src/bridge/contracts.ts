@@ -170,7 +170,6 @@ export interface ModelRuntimeState {
   active_profile_name: string | null;
   runtime_backend: InferenceRuntimeState["backend"] | null;
   inference_runtime: InferenceRuntimeState;
-  message: string;
   checked_at: UtcDateTime | null;
   capabilities: {
     generation: boolean;
@@ -229,6 +228,96 @@ export interface InferenceBudget {
   ubatch_size: number;
   gpu_reserve_bytes: number;
   system_memory_reserve_bytes: number;
+}
+
+export type RuntimeBackendKind = "llama_cpp" | "onnx_runtime" | "sherpa_onnx" | "paddle_ocr" | "parser";
+export type RuntimeTaskKind = "cancel" | "preview" | "speech_recognition" | "speech_synthesis" | "ask" | "deep_image_analysis" | "search" | "embedding" | "rerank" | "incremental_index" | "ocr" | "image_understanding" | "collection_analysis" | "maintenance" | "parse";
+export type RuntimeTaskState = "queued" | "running" | "completed" | "cancelled" | "failed";
+
+export interface RuntimeResourceBudget {
+  physical_core_count: number;
+  foreground_cpu_threads: number;
+  background_cpu_threads: number;
+  total_memory_bytes: number;
+  reserved_memory_bytes: number;
+  total_gpu_memory_bytes: number | null;
+  reserved_gpu_memory_bytes: number | null;
+}
+
+export interface RuntimeOperationHandle {
+  operation_id: string;
+  kind: RuntimeTaskKind;
+  backend: RuntimeBackendKind;
+  state: RuntimeTaskState;
+  priority: number;
+  model_id: string | null;
+  idempotency_key: string | null;
+  queued_at: UtcDateTime;
+  started_at: UtcDateTime | null;
+  finished_at: UtcDateTime | null;
+  wait_ms: number | null;
+  error_code: string | null;
+}
+
+export interface RuntimeInstanceState {
+  instance_id: string;
+  backend: RuntimeBackendKind;
+  model_id: string | null;
+  device: string;
+  status: string;
+  memory_bytes: number;
+  gpu_memory_bytes: number;
+  idle_timeout_seconds: number;
+  loaded_at: UtcDateTime;
+  last_used_at: UtcDateTime;
+}
+
+export interface AiRuntimeSnapshot {
+  budget: RuntimeResourceBudget;
+  tasks: RuntimeOperationHandle[];
+  instances: RuntimeInstanceState[];
+  queued_count: number;
+  running_count: number;
+  active_heavy_task: string | null;
+  pressure_reason: string | null;
+  checked_at: UtcDateTime;
+}
+
+export interface SpeechRecognitionInput {
+  samples: number[];
+  sample_rate: number;
+}
+
+export interface SpeechRecognitionResult {
+  text: string;
+  sample_rate: number;
+  duration_ms: number;
+  timestamps: number[];
+  engine: "sherpa_onnx" | string;
+}
+
+export interface SpeechRecognitionSession {
+  session_id: string;
+  status: "completed";
+  result: SpeechRecognitionResult;
+  completed_at: UtcDateTime;
+}
+
+export interface SpeechSynthesisResult {
+  audio_base64: string;
+  sample_rate: number;
+  duration_ms: number;
+  speaker_id: number;
+  speed: number;
+  engine: "sherpa_onnx" | string;
+}
+
+export interface SpeechSynthesisSession {
+  session_id: string;
+  status: "completed";
+  message_id: string;
+  result: SpeechSynthesisResult;
+  completed_at: UtcDateTime;
 }
 
 export type ModelRole = "generation" | "embedding" | "vision" | "reranker" | "ocr" | "tts" | "asr";
@@ -371,6 +460,20 @@ export interface ModelDownloadJob {
   updated_at: UtcDateTime;
 }
 
+export interface ModelDownloadRemoval {
+  job_id: string;
+  removed: boolean;
+  partial_bytes_removed: number;
+}
+
+export interface ModelStoreStatus {
+  store_path: string;
+  migration_state: "ready" | "migrating" | "deferred";
+  installed_artifacts: number;
+  installed_bytes: number;
+  integrity_status: string;
+}
+
 export interface EnvironmentCheck {
   status: "checking" | "ready" | "degraded" | "failed";
   memory_total_gb: number | null;
@@ -503,8 +606,6 @@ export interface AskRequest {
   retrieval_limit: number;
   max_source_files: number;
   strict_evidence: true;
-  mode: "rag" | "evidence_extracts";
-  allow_degraded_extractive: boolean;
 }
 
 export interface RagReadiness {
@@ -544,7 +645,7 @@ export interface AnswerResult {
   source_files: AnswerSourceFile[];
   used_file_ids: string[];
   elapsed_ms: number;
-  answer_mode: "extractive" | "generated" | "rag_partial" | "rag_refusal" | "evidence_fallback";
+  answer_mode: "generated" | "rag_refusal";
   retrieval_channels: string[];
   index_coverage: number;
   degradation_reason: string | null;
@@ -863,6 +964,17 @@ export interface ImageAsset {
   error: AppError | null;
 }
 
+export interface OcrAttempt {
+  engine: string;
+  model_version: string | null;
+  status: "completed" | "failed" | "no_text" | string;
+  page_no: number | null;
+  confidence: number | null;
+  fallback_reason: string | null;
+  elapsed_ms: number;
+  error: AppError | null;
+}
+
 export interface ImageDeepAnalysis {
   asset_id: string;
   question: string;
@@ -878,6 +990,7 @@ export interface FilePreview {
   revision_id: string | null;
   nodes: DocumentNode[];
   image_assets: ImageAsset[];
+  ocr_attempts: OcrAttempt[];
   offset: number;
   next_offset: number | null;
   anchor_node_id: string | null;
@@ -921,6 +1034,7 @@ export interface AppStatusSnapshot {
   scan_progress: ScanProgress | null;
   maintenance: MaintenanceSnapshot;
   inference_runtime: InferenceRuntimeState;
+  ai_runtime: AiRuntimeSnapshot;
   recovery_actions: Array<"view_inbox" | "view_maintenance" | "view_models">;
   checked_at: UtcDateTime;
 }
@@ -1002,7 +1116,7 @@ export interface IndexRebuildResult {
   source_files_modified: false;
 }
 
-export interface ReminBridge {
+export interface FanFanBridge {
   startup_get_state(): Promise<StartupState>;
   welcome_get_state(): Promise<WelcomeState>;
   welcome_complete(welcome_version: string): Promise<WelcomeState>;
@@ -1021,10 +1135,14 @@ export interface ReminBridge {
   model_preset_list(): Promise<ModelPreset[]>;
   model_download_start(edition_id: ModelEdition["edition_id"], source: "huggingface" | "modelscope", confirmed: true): Promise<ModelDownloadJob>;
   model_download_list(): Promise<ModelDownloadJob[]>;
+  model_store_status_get(): Promise<ModelStoreStatus>;
   model_download_get(job_id: string): Promise<ModelDownloadJob>;
   model_download_pause(job_id: string): Promise<ModelDownloadJob>;
-  model_download_cancel(job_id: string): Promise<ModelDownloadJob>;
-  model_download_retry(job_id: string, source?: "huggingface" | "modelscope"): Promise<ModelDownloadJob>;
+  model_download_cancel(job_id: string): Promise<ModelDownloadRemoval>;
+  model_download_resume(job_id: string): Promise<ModelDownloadJob>;
+  model_download_retry(job_id: string): Promise<ModelDownloadJob>;
+  model_download_switch_source(job_id: string, source: "huggingface" | "modelscope"): Promise<ModelDownloadJob>;
+  model_download_remove(job_id: string): Promise<ModelDownloadRemoval>;
   model_artifact_activate(artifact_id: string): Promise<ModelRuntimeState>;
   model_role_disable(role: ModelRole): Promise<ModelRuntimeState>;
   home_get_summary(local_date: string): Promise<HomeSummary>;
@@ -1038,6 +1156,8 @@ export interface ReminBridge {
   ask_session_delete(session_id: string): Promise<void>;
   ask_operation_get(operation_id: string): Promise<AskOperationSnapshot>;
   ask_cancel(operation_id: string): Promise<AskOperationSnapshot>;
+  speech_recognize(request: SpeechRecognitionInput): Promise<SpeechRecognitionSession>;
+  speech_synthesize_answer(message_id: string, speed: number, speaker_id?: number): Promise<SpeechSynthesisSession>;
   answer_export(message_id: string, target_path: string, format: "md" | "txt", confirmation: "EXPORT_NEW_FILE"): Promise<ExportResult>;
   preview_get(file_id: string, offset?: number, limit?: number, anchor_node_id?: string | null): Promise<FilePreview>;
   file_open(file_id: string): Promise<void>;
@@ -1070,6 +1190,7 @@ export interface ReminBridge {
   exclusion_rule_upsert(request: ExclusionRuleInput): Promise<ExclusionRule>;
   exclusion_rule_delete(rule_id: string): Promise<void>;
   app_status_get(): Promise<AppStatusSnapshot>;
+  runtime_state_get(): Promise<AiRuntimeSnapshot>;
   maintenance_get(): Promise<MaintenanceSnapshot>;
   maintenance_check(level: "quick" | "full"): Promise<MaintenanceCheckResult>;
   storage_usage_get(): Promise<StorageUsageSnapshot>;

@@ -17,8 +17,9 @@ import type {
   ModelPreset,
   ModelRuntimeState,
   InferenceRuntimeState,
+  AiRuntimeSnapshot,
   ModelArtifact,
-  ReminBridge,
+  FanFanBridge,
   RootRecord,
   SearchRequest,
   SearchSession,
@@ -26,9 +27,9 @@ import type {
   WelcomeState,
 } from "./contracts";
 
-const WELCOME_KEY = "remin.welcome.v1";
-const THEME_KEY = "remin.theme.v1";
-const MODEL_KEY = "remin.model.state.v1";
+const WELCOME_KEY = "fanfan.welcome.v1";
+const THEME_KEY = "fanfan.theme.v1";
+const MODEL_KEY = "fanfan.model.state.v1";
 
 const now = () => new Date().toISOString();
 
@@ -159,13 +160,31 @@ const defaultInferenceRuntime: InferenceRuntimeState = {
   },
 };
 
+const defaultAiRuntime: AiRuntimeSnapshot = {
+  budget: {
+    physical_core_count: 4,
+    foreground_cpu_threads: 2,
+    background_cpu_threads: 2,
+    total_memory_bytes: 8 * 1024 * 1024 * 1024,
+    reserved_memory_bytes: 2 * 1024 * 1024 * 1024,
+    total_gpu_memory_bytes: null,
+    reserved_gpu_memory_bytes: null,
+  },
+  tasks: [],
+  instances: [],
+  queued_count: 0,
+  running_count: 0,
+  active_heavy_task: null,
+  pressure_reason: null,
+  checked_at: now(),
+};
+
 const defaultModelState: ModelRuntimeState = {
   status: "unconfigured",
   active_profile_id: null,
   active_profile_name: null,
   runtime_backend: null,
   inference_runtime: defaultInferenceRuntime,
-  message: "未配置本地模型",
   checked_at: now(),
   capabilities: { generation: false, embedding: false, vision: false, reranker: false, ocr: false, tts: false, asr: false },
   rag_complete: false,
@@ -237,14 +256,14 @@ const roots: RootRecord[] = [];
 const searchCatalog = [
   { file_id: "s1", name: "RAG项目总结.docx", extension: "docx", path: "文档\\项目资料", modified_at: "2025-11-08T03:00:00Z", snippet: "通过混合召回和重排提升召回率，并对关键词与语义结果进行融合。" },
   { file_id: "s2", name: "检索效果评估.xlsx", extension: "xlsx", path: "文档\\大模型学习", modified_at: "2025-10-16T03:00:00Z", snippet: "记录不同召回策略、Top K 与命中率的对比结果。" },
-  { file_id: "s3", name: "产品设计规范.pdf", extension: "pdf", path: "桌面\\拾忆", modified_at: "2025-09-20T03:00:00Z", snippet: "本地统一搜索采用文件名、全文和语义三个通道。" },
+  { file_id: "s3", name: "产品设计规范.pdf", extension: "pdf", path: "桌面\\翻翻", modified_at: "2025-09-20T03:00:00Z", snippet: "本地统一搜索采用文件名、全文和语义三个通道。" },
 ];
 
 const inbox: InboxPage = {
   items: [
     { inbox_id: "i1", file_id: "s1", display_name: "RAG项目总结.docx", display_path: "文档\\项目资料\\RAG项目总结.docx", event_type: "discovered", observed_at: now(), previous_display_path: null, triage_status: "new", resolution_status: "normal", attempt_count: 0, last_attempt_at: null, retry_action: null, suggested_collection_ids: [], duplicate_group_id: null, summary: "新增资料，已完成正文提取，可以全文搜索", error_code: null },
     { inbox_id: "i2", file_id: "s2", display_name: "检索效果评估.xlsx", display_path: "文档\\大模型学习\\检索效果评估.xlsx", event_type: "modified", observed_at: now(), previous_display_path: null, triage_status: "new", resolution_status: "normal", attempt_count: 0, last_attempt_at: null, retry_action: null, suggested_collection_ids: [], duplicate_group_id: "duplicate-demo-1", summary: "资料有新版本，并发现一份字节完全相同的副本", error_code: null },
-    { inbox_id: "i3", file_id: "s3", display_name: "产品设计规范.pdf", display_path: "桌面\\拾忆\\产品设计规范.pdf", event_type: "ocr_required", observed_at: now(), previous_display_path: null, triage_status: "new", resolution_status: "pending_retry", attempt_count: 0, last_attempt_at: null, retry_action: "retry_ocr", suggested_collection_ids: [], duplicate_group_id: null, summary: "当前未安装 OCR 模型，已保留文件名索引", error_code: "OCR_REQUIRED" },
+    { inbox_id: "i3", file_id: "s3", display_name: "产品设计规范.pdf", display_path: "桌面\\翻翻\\产品设计规范.pdf", event_type: "ocr_required", observed_at: now(), previous_display_path: null, triage_status: "new", resolution_status: "pending_retry", attempt_count: 0, last_attempt_at: null, retry_action: "retry_ocr", suggested_collection_ids: [], duplicate_group_id: null, summary: "当前未安装 OCR 模型，已保留文件名索引", error_code: "OCR_REQUIRED" },
   ],
   next_cursor: null,
   has_more: false,
@@ -280,7 +299,7 @@ let demoExclusionRules: ExclusionRule[] = [
   { rule_id: "018f0000-0000-7000-8000-000000009002", root_id: null, rule_class: "default", rule_type: "path_name", value: "node_modules", enabled: true, overridable: true },
 ];
 
-export const browserBridge: ReminBridge = {
+export const browserBridge: FanFanBridge = {
   async startup_get_state() {
     return {
       phase: "ready",
@@ -337,7 +356,7 @@ export const browserBridge: ReminBridge = {
     const stored = window.localStorage.getItem(MODEL_KEY);
     if (stored) return JSON.parse(stored) as ModelRuntimeState;
     const embedding = demoActiveRoles.has("embedding");
-    return embedding ? { ...defaultModelState, status: "ready", message: "语义检索已就绪，问资料仍需生成模型", runtime_backend: "cpu", capabilities: { ...defaultModelState.capabilities, embedding: true } } : defaultModelState;
+    return embedding ? { ...defaultModelState, status: "ready", runtime_backend: "cpu", capabilities: { ...defaultModelState.capabilities, embedding: true } } : defaultModelState;
   },
   async model_import_scan(paths) {
     return paths.map((path, index) => ({ candidate_id: crypto.randomUUID(), source_path: path, display_name: path.split(/[\\/]/).pop() || `model-${index + 1}`, format: path.toLowerCase().endsWith(".gguf") ? "gguf" as const : "onnx" as const, suggested_role: path.toLowerCase().endsWith(".gguf") ? "generation" as const : "embedding" as const, size_bytes: 1024 * 1024 * (index + 1), sha256: "0".repeat(64), companion_files: [], warnings: [] }));
@@ -376,7 +395,7 @@ export const browserBridge: ReminBridge = {
   async model_download_start(edition_id, source) {
     const edition = demoModelEditions.find((item) => item.edition_id === edition_id);
     if (!edition) throw new Error("模型版本不存在");
-    const installed = edition.artifacts.map<ModelArtifact>((artifact) => ({ artifact_id: crypto.randomUUID(), role: artifact.role, format: artifact.format, model_id: artifact.model_id, model_version: null, source, repository_id: artifact.repository_id, revision: artifact.revision, sha256: artifact.sha256, size_bytes: artifact.size_bytes, local_path: `C:\\Users\\你\\AppData\\Roaming\\com.remin.desktop\\models\\${artifact.file_name}`, quantization: artifact.role === "generation" ? (edition_id === "standard" ? "Q4_K_M" : "Q8_0") : null, context_length: null, embedding_dimension: artifact.role === "embedding" ? 512 : null, query_prefix: artifact.query_prefix, max_length: artifact.max_length, license_name: artifact.license_name, status: "ready", imported_at: now() }));
+    const installed = edition.artifacts.map<ModelArtifact>((artifact) => ({ artifact_id: crypto.randomUUID(), role: artifact.role, format: artifact.format, model_id: artifact.model_id, model_version: null, source, repository_id: artifact.repository_id, revision: artifact.revision, sha256: artifact.sha256, size_bytes: artifact.size_bytes, local_path: `C:\\Users\\你\\AppData\\Roaming\\com.fanfan.desktop\\models\\${artifact.file_name}`, quantization: artifact.role === "generation" ? (edition_id === "standard" ? "Q4_K_M" : "Q8_0") : null, context_length: null, embedding_dimension: artifact.role === "embedding" ? 512 : null, query_prefix: artifact.query_prefix, max_length: artifact.max_length, license_name: artifact.license_name, status: "ready", imported_at: now() }));
     demoArtifacts = [...demoArtifacts, ...installed];
     installed.forEach((artifact) => demoActiveRoles.add(artifact.role));
     const job: ModelDownloadJob = { job_id: crypto.randomUUID(), edition_id, edition_name: edition.name, source, status: "completed", phase: "completed", downloaded_bytes: edition.download_size_bytes, total_bytes: edition.download_size_bytes, progress: 1, bytes_per_second: 0, eta_seconds: null, retry_count: 0, current_file: null, files: edition.artifacts.flatMap((artifact) => [{ role: artifact.role, file_name: artifact.file_name, downloaded_bytes: artifact.size_bytes, total_bytes: artifact.size_bytes, status: "completed" }, ...artifact.companion_files.map((file) => ({ role: artifact.role, file_name: file.file_name, downloaded_bytes: file.size_bytes, total_bytes: file.size_bytes, status: "completed" }))]), installed_artifact_ids: installed.map((artifact) => artifact.artifact_id), profile_id: crypto.randomUUID(), error: null, activation_status: "active", activation_error: null, created_at: now(), updated_at: now() };
@@ -385,6 +404,9 @@ export const browserBridge: ReminBridge = {
   },
   async model_download_list() {
     return structuredClone(demoDownloadJobs);
+  },
+  async model_store_status_get() {
+    return { store_path: "C:\\Users\\你\\AppData\\Local\\FanFan\\ModelStore\\v1", migration_state: "ready" as const, installed_artifacts: demoArtifacts.length, installed_bytes: demoArtifacts.reduce((total, artifact) => total + artifact.size_bytes, 0), integrity_status: "registry_loaded" };
   },
   async model_download_get(job_id) {
     const job = demoDownloadJobs.find((item) => item.job_id === job_id);
@@ -400,27 +422,40 @@ export const browserBridge: ReminBridge = {
     return structuredClone(job);
   },
   async model_download_cancel(job_id) {
+    const before = demoDownloadJobs.length;
+    demoDownloadJobs = demoDownloadJobs.filter((item) => item.job_id !== job_id);
+    return { job_id, removed: demoDownloadJobs.length < before, partial_bytes_removed: 0 };
+  },
+  async model_download_resume(job_id) {
     const job = demoDownloadJobs.find((item) => item.job_id === job_id);
     if (!job) throw new Error("下载任务不存在");
-    job.status = "cancelled";
-    job.phase = "cancelled";
-    job.updated_at = now();
+    job.status = "running"; job.phase = "downloading"; job.error = null; job.updated_at = now();
     return structuredClone(job);
   },
-  async model_download_retry(job_id, source) {
-    const previous = demoDownloadJobs.find((item) => item.job_id === job_id);
-    if (!previous) throw new Error("下载任务不存在");
-    return browserBridge.model_download_start(previous.edition_id, source ?? previous.source, true);
+  async model_download_retry(job_id) {
+    const job = demoDownloadJobs.find((item) => item.job_id === job_id);
+    if (!job) throw new Error("下载任务不存在");
+    job.status = "queued"; job.phase = "queued"; job.error = null; job.retry_count += 1; job.updated_at = now();
+    return structuredClone(job);
+  },
+  async model_download_switch_source(job_id, source) {
+    const job = demoDownloadJobs.find((item) => item.job_id === job_id);
+    if (!job) throw new Error("下载任务不存在");
+    job.source = source; job.status = "queued"; job.phase = "queued"; job.error = null; job.downloaded_bytes = 0; job.progress = 0; job.updated_at = now();
+    return structuredClone(job);
+  },
+  async model_download_remove(job_id) {
+    return browserBridge.model_download_cancel(job_id);
   },
   async model_artifact_activate(artifact_id) {
     const artifact = demoArtifacts.find((item) => item.artifact_id === artifact_id);
     if (!artifact) throw new Error("模型组件不存在");
     demoActiveRoles.add(artifact.role);
-    return { ...defaultModelState, status: "ready", message: artifact.role === "generation" ? "本地生成模型已配置" : "语义检索已就绪", runtime_backend: "cpu", capabilities: { ...defaultModelState.capabilities, [artifact.role]: true } };
+    return { ...defaultModelState, status: "ready", runtime_backend: "cpu", capabilities: { ...defaultModelState.capabilities, [artifact.role]: true } };
   },
   async model_role_disable(role) {
     demoActiveRoles.delete(role);
-    return { ...defaultModelState, message: `${role} 已停用，模型文件仍保留在本机` };
+    return { ...defaultModelState };
   },
   async home_get_summary(local_date) {
     return makeSummary(local_date);
@@ -470,6 +505,12 @@ export const browserBridge: ReminBridge = {
     return { ready: blockers.length === 0, generation_ready, embedding_ready, vision_ready, semantic_index_coverage: embedding_ready ? 1 : 0, scope_index_coverage: embedding_ready ? 1 : 0, image_index_coverage: 1, pending_image_assets: 0, background_notice: null, blockers, checked_at: now() };
   },
   async ask_start(request) {
+    if (!demoActiveRoles.has("generation")) {
+      throw { code: "RAG_GENERATION_MODEL_REQUIRED", message: "问资料需要先配置并通过自检的本地生成模型", retryable: false, user_action: null, file_id: null, details: null };
+    }
+    if (!demoActiveRoles.has("embedding")) {
+      throw { code: "RAG_EMBEDDING_MODEL_REQUIRED", message: "问资料需要先配置并通过自检的中文 Embedding 模型", retryable: false, user_action: null, file_id: null, details: null };
+    }
     const search = await browserBridge.search_start({
       query: request.question,
       scope: request.scope,
@@ -494,10 +535,10 @@ export const browserBridge: ReminBridge = {
         source_files: [],
         used_file_ids: [],
         elapsed_ms: search.elapsed_ms,
-        answer_mode: "extractive",
-        retrieval_channels: ["filename", "fts"],
-        index_coverage: 0,
-        degradation_reason: request.mode === "evidence_extracts" ? "用户明确选择证据摘录模式" : null,
+        answer_mode: "rag_refusal",
+        retrieval_channels: ["filename", "fts", "embedding", "rrf"],
+        index_coverage: 1,
+        degradation_reason: null,
       };
     } else {
       const source_files = matches.map((match) => ({
@@ -524,17 +565,17 @@ export const browserBridge: ReminBridge = {
       result = {
         session_id,
         message_id: crypto.randomUUID(),
-        answer: `在你的本地资料中找到这些直接依据：\n${claims.map((claim, index) => `${index + 1}. ${claim.text}`).join("\n")}`,
+        answer: `本地生成模型根据混合检索证据整理如下：\n${claims.map((claim, index) => `${index + 1}. ${claim.text}`).join("\n")}`,
         grounding_status: "grounded",
         insufficient_evidence: false,
         claims,
         source_files,
         used_file_ids: source_files.map((source) => source.file_id),
         elapsed_ms: search.elapsed_ms,
-        answer_mode: request.mode === "rag" ? "generated" : "extractive",
-        retrieval_channels: request.mode === "rag" ? ["filename", "fts", "embedding", "rrf"] : ["filename", "fts"],
-        index_coverage: request.mode === "rag" ? 1 : 0,
-        degradation_reason: request.mode === "evidence_extracts" ? "用户明确选择证据摘录模式" : null,
+        answer_mode: "generated",
+        retrieval_channels: ["filename", "fts", "embedding", "rrf"],
+        index_coverage: 1,
+        degradation_reason: null,
       };
     }
     const operation_id = crypto.randomUUID();
@@ -595,6 +636,12 @@ export const browserBridge: ReminBridge = {
     browserAskOperations.set(operation_id, cancelled);
     return cancelled;
   },
+  async speech_recognize() {
+    throw new Error("浏览器预览无法访问本机麦克风语音运行时，请在翻翻桌面程序中使用。");
+  },
+  async speech_synthesize_answer() {
+    throw new Error("浏览器预览无法访问本地语音合成运行时，请在翻翻桌面程序中使用。");
+  },
   async answer_export(_message_id, target_path, format) {
     return { target_path, format, row_count: 0, size_bytes: 0, sha256: "0".repeat(64) };
   },
@@ -632,6 +679,7 @@ export const browserBridge: ReminBridge = {
         heading_path: ["检索优化"],
       }],
       image_assets: [],
+      ocr_attempts: [],
       offset,
       next_offset: null,
       anchor_node_id,
@@ -639,10 +687,10 @@ export const browserBridge: ReminBridge = {
     };
   },
   async file_open() {
-    throw new Error("浏览器预览不打开电脑文件，请在拾忆桌面程序中使用此操作。");
+    throw new Error("浏览器预览不打开电脑文件，请在翻翻桌面程序中使用此操作。");
   },
   async file_reveal() {
-    throw new Error("浏览器预览不打开资源管理器，请在拾忆桌面程序中使用此操作。");
+    throw new Error("浏览器预览不打开资源管理器，请在翻翻桌面程序中使用此操作。");
   },
   async inbox_query(request) {
     const items = inbox.items.filter((item) => request.status === "all"
@@ -720,7 +768,7 @@ export const browserBridge: ReminBridge = {
   async collection_suggestion_refresh() {
     if (demoSuggestions.length === 0) {
       const members = demoFileRecords().slice(0, 2).map((file, index) => ({ file, revision_id: file.current_revision_id!, confidence: index === 0 ? 1 : 0.86, rationale: index === 0 ? "该文档是本组语义质心候选" : "与组内核心文档的语义相似度为 86%", state: "suggested" }));
-      demoSuggestions = [{ suggestion_id: crypto.randomUUID(), suggested_name: "RAG 检索优化资料", description: "这些资料的语义画像都在讨论混合召回与检索效果。确认后只在拾忆中形成虚拟分类。", confidence: 0.86, status: "suggested", model_version: "demo-bge-small-zh-v1.5", algorithm_version: "semantic_lsh_v2", members, created_at: now(), updated_at: now() }];
+      demoSuggestions = [{ suggestion_id: crypto.randomUUID(), suggested_name: "RAG 检索优化资料", description: "这些资料的语义画像都在讨论混合召回与检索效果。确认后只在翻翻中形成虚拟分类。", confidence: 0.86, status: "suggested", model_version: "demo-bge-small-zh-v1.5", algorithm_version: "semantic_lsh_v2", members, created_at: now(), updated_at: now() }];
     }
     return { profiled_files: 2, candidate_edges: 1, created_suggestions: demoSuggestions.length, suggestion_ids: demoSuggestions.map((item) => item.suggestion_id), algorithm_version: "semantic_lsh_v2", model_version: "demo-bge-small-zh-v1.5" };
   },
@@ -794,11 +842,12 @@ export const browserBridge: ReminBridge = {
   },
   async exclusion_rule_delete(rule_id) { demoExclusionRules = demoExclusionRules.filter((item) => item.rule_id !== rule_id); },
   async app_status_get() {
-    const maintenance = { schema_version: 17, database_size_bytes: 12_582_912, indexed_files: 3, searchable_chunks: 18, embedded_chunks: 0, pending_files: 0, failed_files: 0, active_jobs: 0, log_events: 3, background_notice: null, checks: [{ key: "database", label: "本地数据库", status: "passed" as const, detail: "ok" }, { key: "schema", label: "数据结构", status: "passed" as const, detail: "版本 17" }, { key: "source_readonly", label: "源文件保护", status: "passed" as const, detail: "维护操作只作用于拾忆索引与日志" }], checked_at: now() };
-    return { local_only: true as const, source_files_readonly: true as const, roots: [...roots], scan_progress: null, maintenance, inference_runtime: defaultInferenceRuntime, recovery_actions: ["view_models" as const], checked_at: now() };
+    const maintenance = { schema_version: 19, database_size_bytes: 12_582_912, indexed_files: 3, searchable_chunks: 18, embedded_chunks: 0, pending_files: 0, failed_files: 0, active_jobs: 0, log_events: 3, background_notice: null, checks: [{ key: "database", label: "本地数据库", status: "passed" as const, detail: "ok" }, { key: "schema", label: "数据结构", status: "passed" as const, detail: "版本 19" }, { key: "source_readonly", label: "源文件保护", status: "passed" as const, detail: "维护操作只作用于翻翻索引与日志" }], checked_at: now() };
+    return { local_only: true as const, source_files_readonly: true as const, roots: [...roots], scan_progress: null, maintenance, inference_runtime: defaultInferenceRuntime, ai_runtime: defaultAiRuntime, recovery_actions: ["view_models" as const], checked_at: now() };
   },
+  async runtime_state_get() { return structuredClone(defaultAiRuntime); },
   async maintenance_get() {
-    return { schema_version: 17, database_size_bytes: 12_582_912, indexed_files: 3, searchable_chunks: 18, embedded_chunks: 0, pending_files: 0, failed_files: 0, active_jobs: 0, log_events: 3, background_notice: null, checks: [{ key: "database", label: "本地数据库", status: "passed" as const, detail: "ok" }, { key: "schema", label: "数据结构", status: "passed" as const, detail: "版本 17" }, { key: "source_readonly", label: "源文件保护", status: "passed" as const, detail: "维护操作只作用于拾忆索引与日志" }], checked_at: now() };
+    return { schema_version: 19, database_size_bytes: 12_582_912, indexed_files: 3, searchable_chunks: 18, embedded_chunks: 0, pending_files: 0, failed_files: 0, active_jobs: 0, log_events: 3, background_notice: null, checks: [{ key: "database", label: "本地数据库", status: "passed" as const, detail: "ok" }, { key: "schema", label: "数据结构", status: "passed" as const, detail: "版本 19" }, { key: "source_readonly", label: "源文件保护", status: "passed" as const, detail: "维护操作只作用于翻翻索引与日志" }], checked_at: now() };
   },
   async maintenance_check(level) {
     return { level, database_result: "ok", elapsed_ms: 1, source_files_modified: false };
@@ -819,13 +868,13 @@ export const browserBridge: ReminBridge = {
     return { active_data_directory: "应用管理目录", pending_target_directory: null, restart_required: false, last_error: null };
   },
   async storage_migration_schedule(selected_directory) {
-    return { active_data_directory: "应用管理目录", pending_target_directory: `${selected_directory}\\ReminData`, restart_required: true, last_error: null };
+    return { active_data_directory: "应用管理目录", pending_target_directory: `${selected_directory}\\FanFanData`, restart_required: true, last_error: null };
   },
   async cache_clear(category) {
     return { category, removed_entries: 1, freed_bytes: category === "temporary_cache" ? 1_048_576 : 0 };
   },
   async app_data_reset_schedule() {
-    throw new Error("浏览器预览不能重置桌面应用数据，请在拾忆桌面程序中使用。");
+    throw new Error("浏览器预览不能重置桌面应用数据，请在翻翻桌面程序中使用。");
   },
   async maintenance_log_query() {
     return { items: [{ log_id: "log-demo", level: "info", component: "catalog", event_name: "scan.completed", fields: { files: 3 }, created_at: now() }], next_cursor: null, total: 1 };
@@ -835,7 +884,7 @@ export const browserBridge: ReminBridge = {
   },
   async diagnostic_event_append() {},
   async diagnostic_export() {
-    throw new Error("浏览器预览不写入电脑文件，请在拾忆桌面程序中导出。");
+    throw new Error("浏览器预览不写入电脑文件，请在翻翻桌面程序中导出。");
   },
   async index_rebuild() {
     return { operation_id: crypto.randomUUID(), kind: "index_rebuild" as const, status: "queued" as const, created_at: now() };

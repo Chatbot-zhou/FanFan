@@ -13,7 +13,7 @@ WORKER_ROOT = REPO_ROOT / "services" / "worker"
 FIXTURE_ROOT = REPO_ROOT / "tests" / "fixtures"
 sys.path.insert(0, str(WORKER_ROOT))
 
-from remin_worker import ParseRequest, parse_document  # noqa: E402
+from fanfan_worker import ParseRequest, parse_document  # noqa: E402
 
 
 IDS = (

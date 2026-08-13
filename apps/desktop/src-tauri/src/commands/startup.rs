@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use remin_core::AppError;
+use fanfan_core::AppError;
 use serde::Serialize;
 use serde_json::json;
 use tauri::{AppHandle, Emitter, State};

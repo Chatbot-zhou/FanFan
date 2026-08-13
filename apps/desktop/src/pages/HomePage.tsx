@@ -75,7 +75,7 @@ function CandidateSourceCard({ candidate, onResolved }: { candidate: CandidateRo
     <div className="candidate-source">
       <div className="candidate-source__icon"><InboxOutlined /></div>
       <div><strong>{candidate.label}</strong><small>{candidate.display_path}</small></div>
-      <button type="button" disabled={busyAction !== null} onClick={() => void act("add")}><PlusOutlined /> {busyAction === "add" ? "正在添加" : "添加到拾忆"}</button>
+      <button type="button" disabled={busyAction !== null} onClick={() => void act("add")}><PlusOutlined /> {busyAction === "add" ? "正在添加" : "添加到翻翻"}</button>
       <button type="button" aria-label={`暂不添加${candidate.label}`} disabled={busyAction !== null} onClick={() => void act("ignore")}><CloseOutlined />{busyAction === "ignore" && <span className="sr-only">正在忽略</span>}</button>
       {error && <small role="alert" className="inline-error candidate-source__error">{error}</small>}
     </div>

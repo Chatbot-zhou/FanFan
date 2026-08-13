@@ -38,7 +38,7 @@ export class AppErrorBoundary extends Component<AppErrorBoundaryProps, AppErrorB
     return (
       <main className="fatal-diagnostic" role="alert">
         <div className="fatal-diagnostic__card">
-          <h1>拾忆遇到了界面错误</h1>
+          <h1>翻翻遇到了界面错误</h1>
           <p>诊断信息已经保存在本机日志中。错误编号：{this.state.errorCode}</p>
           <p>你可以先重新加载；如果再次出现，请在设置中导出诊断包交给开发者。</p>
           <button type="button" className="primary-button" onClick={() => window.location.reload()}>

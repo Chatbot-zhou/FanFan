@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 
-use remin_core::{AppError, WelcomeService};
+use fanfan_core::{AppError, WelcomeService};
 use serde::Deserialize;
 use tauri::State;
 
@@ -14,7 +14,7 @@ pub struct WelcomeCompleteRequest {
 #[tauri::command(async)]
 pub fn welcome_get_state(
     service: State<'_, WelcomeServiceState>,
-) -> Result<remin_core::welcome::WelcomeState, AppError> {
+) -> Result<fanfan_core::welcome::WelcomeState, AppError> {
     service
         .0
         .lock()
@@ -26,7 +26,7 @@ pub fn welcome_get_state(
 pub fn welcome_complete(
     request: WelcomeCompleteRequest,
     service: State<'_, WelcomeServiceState>,
-) -> Result<remin_core::welcome::WelcomeState, AppError> {
+) -> Result<fanfan_core::welcome::WelcomeState, AppError> {
     service
         .0
         .lock()
@@ -37,7 +37,7 @@ pub fn welcome_complete(
 #[tauri::command(async)]
 pub fn welcome_authorization_complete(
     service: State<'_, WelcomeServiceState>,
-) -> Result<remin_core::welcome::WelcomeState, AppError> {
+) -> Result<fanfan_core::welcome::WelcomeState, AppError> {
     service
         .0
         .lock()

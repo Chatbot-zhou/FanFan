@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_WORKER = REPO_ROOT / ".artifacts" / "worker" / "remin-worker" / "remin-worker.exe"
+DEFAULT_WORKER = REPO_ROOT / ".artifacts" / "worker" / "fanfan-worker" / "fanfan-worker.exe"
 FIXTURE = REPO_ROOT / "tests" / "fixtures" / "corpus" / "05-项目说明.md"
 PDF_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "corpus" / "02-归航计划会议纪要.pdf"
 IDS = (
@@ -20,6 +20,7 @@ IDS = (
     "018f0000-0000-7000-8000-000000000306",
     "018f0000-0000-7000-8000-000000000307",
     "018f0000-0000-7000-8000-000000000308",
+    "018f0000-0000-7000-8000-000000000309",
 )
 
 
@@ -68,6 +69,14 @@ def main() -> None:
         )
         if not health.get("ok") or health.get("result", {}).get("status") != "ready":
             raise RuntimeError(f"Worker健康检查失败: {health}")
+
+        backends = request(
+            process,
+            {"request_id": IDS[8], "operation": "runtime.backend_probe", "payload": {}},
+        )
+        loaded = (backends.get("result") or {}).get("loaded") or {}
+        if not backends.get("ok") or set(loaded) != {"onnxruntime", "rapidocr", "sherpa_onnx"}:
+            raise RuntimeError(f"Worker本地AI运行库检查失败: {backends}")
 
         parsed = request(
             process,
@@ -133,7 +142,8 @@ def main() -> None:
         raise RuntimeError("独立Worker修改了源文件")
     print(
         "独立Worker检查通过: "
-        f"health=ready, markdown=parsed, pdf=parsed, source_readonly=true, path={worker}"
+        "health=ready, ai_backends=loaded, markdown=parsed, pdf=parsed, "
+        f"source_readonly=true, path={worker}"
     )
 
 

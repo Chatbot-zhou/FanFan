@@ -187,7 +187,7 @@ impl LocalGenerationRuntime {
         if !self.executable.is_file() {
             return Err(AppError::new(
                 "GENERATION_RUNTIME_UNAVAILABLE",
-                "llama.cpp本地运行组件缺失，请修复拾忆安装",
+                "llama.cpp本地运行组件缺失，请修复翻翻安装",
                 false,
             ));
         }
@@ -221,7 +221,7 @@ impl LocalGenerationRuntime {
         let backend = capability.backend.clone();
         let device = capability.devices.first().cloned();
         let port = reserve_local_port()?;
-        let token = format!("remin-{}", uuid::Uuid::now_v7());
+        let token = format!("fanfan-{}", uuid::Uuid::now_v7());
         let mut command = Command::new(&self.executable);
         command
             .args([
@@ -278,7 +278,7 @@ impl LocalGenerationRuntime {
         let child = command.spawn().map_err(|error| {
             let mut err = AppError::new(
                 "GENERATION_RUNTIME_START_FAILED",
-                "本地模型服务启动失败，请重启拾忆后重试",
+                "本地模型服务启动失败，请重启翻翻后重试",
                 true,
             );
             err.details = Some(Box::new(
@@ -378,7 +378,7 @@ impl LocalGenerationRuntime {
         user: &str,
         max_tokens: u32,
     ) -> Result<String, AppError> {
-        self.complete_internal(system, user, max_tokens, None)
+        self.complete_internal(system, user, max_tokens, None, None)
     }
 
     pub fn complete_cancellable(
@@ -388,7 +388,18 @@ impl LocalGenerationRuntime {
         max_tokens: u32,
         cancelled: &AtomicBool,
     ) -> Result<String, AppError> {
-        self.complete_internal(system, user, max_tokens, Some(cancelled))
+        self.complete_internal(system, user, max_tokens, Some(cancelled), None)
+    }
+
+    pub fn complete_json_cancellable(
+        &mut self,
+        system: &str,
+        user: &str,
+        max_tokens: u32,
+        schema: &serde_json::Value,
+        cancelled: &AtomicBool,
+    ) -> Result<String, AppError> {
+        self.complete_internal(system, user, max_tokens, Some(cancelled), Some(schema))
     }
 
     fn complete_internal(
@@ -397,6 +408,7 @@ impl LocalGenerationRuntime {
         user: &str,
         max_tokens: u32,
         cancelled: Option<&AtomicBool>,
+        json_schema: Option<&serde_json::Value>,
     ) -> Result<String, AppError> {
         let process = self.process.as_mut().ok_or_else(|| {
             AppError::new("GENERATION_RUNTIME_INACTIVE", "生成模型尚未启动", true)
@@ -420,8 +432,8 @@ impl LocalGenerationRuntime {
                 true,
             ));
         }
-        let payload = json!({
-            "model": "remin-local",
+        let mut payload = json!({
+            "model": "fanfan-local",
             "stream": false,
             "temperature": 0.1,
             "max_tokens": max_tokens.clamp(1, 2048),
@@ -431,6 +443,16 @@ impl LocalGenerationRuntime {
                 {"role":"user","content":user}
             ]
         });
+        if let Some(schema) = json_schema {
+            payload["response_format"] = json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "grounded_answer",
+                    "strict": true,
+                    "schema": schema,
+                }
+            });
+        }
         let body = serde_json::to_vec(&payload).map_err(|_error| {
             AppError::new("GENERATION_REQUEST_INVALID", "本地模型请求构造失败", false)
         })?;
@@ -445,7 +467,7 @@ impl LocalGenerationRuntime {
         if status != 200 {
             return Err(AppError::new(
                 "GENERATION_REQUEST_FAILED",
-                format!("本地模型返回{status}：{response}"),
+                format!("本地模型请求失败（HTTP {status}）"),
                 status >= 500,
             ));
         }
@@ -551,7 +573,7 @@ impl LocalGenerationRuntime {
             ));
         }
         let payload = json!({
-            "model": "remin-local-vision",
+            "model": "fanfan-local-vision",
             "stream": false,
             "temperature": 0.1,
             "max_tokens": max_tokens.clamp(1, 2048),
@@ -578,7 +600,7 @@ impl LocalGenerationRuntime {
         if status != 200 {
             return Err(AppError::new(
                 "VISION_REQUEST_FAILED",
-                format!("本地多模态模型返回{status}：{response}"),
+                format!("本地多模态模型请求失败（HTTP {status}）"),
                 status >= 500,
             ));
         }
@@ -754,7 +776,7 @@ fn reserve_local_port() -> Result<u16, AppError> {
         .map_err(|_error| {
             AppError::new(
                 "GENERATION_PORT_UNAVAILABLE",
-                "本地模型通信端口异常，请重启拾忆",
+                "本地模型通信端口异常，请重启翻翻",
                 true,
             )
         })
@@ -788,7 +810,7 @@ fn http_request_internal(
     .map_err(|_error| {
         AppError::new(
             "GENERATION_RUNTIME_UNREACHABLE",
-            "本地模型服务无响应，请重启拾忆后重试",
+            "本地模型服务无响应，请重启翻翻后重试",
             true,
         )
     })?;
@@ -801,7 +823,7 @@ fn http_request_internal(
         .map_err(|_error| {
             AppError::new(
                 "GENERATION_RUNTIME_IO_FAILED",
-                "本地模型通信失败，请重启拾忆后重试",
+                "本地模型通信失败，请重启翻翻后重试",
                 true,
             )
         })?;
@@ -810,7 +832,7 @@ fn http_request_internal(
         .map_err(|_error| {
             AppError::new(
                 "GENERATION_RUNTIME_IO_FAILED",
-                "本地模型通信失败，请重启拾忆后重试",
+                "本地模型通信失败，请重启翻翻后重试",
                 true,
             )
         })?;
@@ -829,7 +851,7 @@ fn http_request_internal(
         .map_err(|_error| {
             AppError::new(
                 "GENERATION_RUNTIME_IO_FAILED",
-                "本地模型通信失败，请重启拾忆后重试",
+                "本地模型通信失败，请重启翻翻后重试",
                 true,
             )
         })?;
@@ -1061,10 +1083,10 @@ mod tests {
     #[test]
     #[ignore = "requires pinned llama.cpp runtime and Qwen3 GGUF"]
     fn real_llama_cpp_runtime_generates_locally() {
-        let executable = std::env::var("REMIN_LLAMA_SERVER")
+        let executable = std::env::var("FANFAN_LLAMA_SERVER")
             .map(PathBuf::from)
-            .expect("REMIN_LLAMA_SERVER is required");
-        let model = std::env::var("REMIN_TEST_GGUF").expect("REMIN_TEST_GGUF is required");
+            .expect("FANFAN_LLAMA_SERVER is required");
+        let model = std::env::var("FANFAN_TEST_GGUF").expect("FANFAN_TEST_GGUF is required");
         let mut runtime = LocalGenerationRuntime::new(executable);
         let activation = runtime
             .activate(&model, 1024, 2)
@@ -1074,7 +1096,7 @@ mod tests {
         let answer = runtime
             .complete(
                 "你是离线验收程序，只执行格式要求。",
-                "只回复 REMIN-LOCAL-OK，不要解释。",
+                "只回复 FANFAN-LOCAL-OK，不要解释。",
                 32,
             )
             .expect("generate local answer");
@@ -1085,14 +1107,14 @@ mod tests {
     #[test]
     #[ignore = "requires pinned llama.cpp runtime, multimodal GGUF and matching mmproj"]
     fn real_llama_cpp_runtime_understands_an_image_locally() {
-        let executable = std::env::var("REMIN_LLAMA_SERVER")
+        let executable = std::env::var("FANFAN_LLAMA_SERVER")
             .map(PathBuf::from)
-            .expect("REMIN_LLAMA_SERVER is required");
+            .expect("FANFAN_LLAMA_SERVER is required");
         let model =
-            std::env::var("REMIN_TEST_VISION_GGUF").expect("REMIN_TEST_VISION_GGUF is required");
-        let projector = std::env::var("REMIN_TEST_VISION_MMPROJ")
-            .expect("REMIN_TEST_VISION_MMPROJ is required");
-        let image = std::env::var("REMIN_TEST_IMAGE").expect("REMIN_TEST_IMAGE is required");
+            std::env::var("FANFAN_TEST_VISION_GGUF").expect("FANFAN_TEST_VISION_GGUF is required");
+        let projector = std::env::var("FANFAN_TEST_VISION_MMPROJ")
+            .expect("FANFAN_TEST_VISION_MMPROJ is required");
+        let image = std::env::var("FANFAN_TEST_IMAGE").expect("FANFAN_TEST_IMAGE is required");
         let mut runtime = LocalGenerationRuntime::new(executable);
         let activation = runtime
             .activate_multimodal(&model, &projector, 2048, 2)

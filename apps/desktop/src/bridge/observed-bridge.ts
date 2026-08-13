@@ -1,8 +1,8 @@
-import type { AppError, DiagnosticEventInput, ReminBridge } from "./contracts";
+import type { AppError, DiagnosticEventInput, FanFanBridge } from "./contracts";
 import { tauriBridge } from "./tauri-bridge";
 import { normalizeAppError } from "../utils/app-error";
 
-const IMPORTANT_ACTIONS = new Set<keyof ReminBridge>([
+const IMPORTANT_ACTIONS = new Set<keyof FanFanBridge>([
   "welcome_complete",
   "welcome_authorization_complete",
   "theme_set_preference",
@@ -12,7 +12,10 @@ const IMPORTANT_ACTIONS = new Set<keyof ReminBridge>([
   "model_download_start",
   "model_download_pause",
   "model_download_cancel",
+  "model_download_resume",
   "model_download_retry",
+  "model_download_switch_source",
+  "model_download_remove",
   "model_artifact_activate",
   "candidate_root_action",
   "search_start",
@@ -94,11 +97,11 @@ const responseSummary = (response: unknown): Record<string, unknown> => {
   return summary;
 };
 
-export const observedTauriBridge: ReminBridge = new Proxy(tauriBridge, {
+export const observedTauriBridge: FanFanBridge = new Proxy(tauriBridge, {
   get(target, property, receiver) {
     const value = Reflect.get(target, property, receiver);
     if (typeof value !== "function" || property === "diagnostic_event_append") return value;
-    const command = String(property) as keyof ReminBridge;
+    const command = String(property) as keyof FanFanBridge;
     return (...args: unknown[]) => {
       const correlationId = newCorrelationId();
       const startedAt = performance.now();

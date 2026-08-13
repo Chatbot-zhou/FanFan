@@ -8,7 +8,7 @@ from pathlib import Path
 WORKER_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(WORKER_ROOT))
 
-from remin_worker import (  # noqa: E402
+from fanfan_worker import (  # noqa: E402
     CheckpointPolicy,
     ExecutionUnit,
     RetryPolicy,
@@ -31,12 +31,16 @@ class WorkerServiceTests(unittest.TestCase):
     def test_health_check(self) -> None:
         response = self.service.handle(WorkerRequest(REQUEST_IDS[0], "health.check"))
         self.assertTrue(response.ok)
-        self.assertEqual(response.result, {"status": "ready", "protocol_version": "1.0"})
+        self.assertEqual(response.result["status"], "ready")
+        self.assertEqual(response.result["protocol_version"], "1.2")
+        self.assertIn("onnx", response.result["runtime"])
+        self.assertIn("speech", response.result["runtime"])
+        self.assertIn("ocr", response.result["runtime"])
 
     def test_probe_is_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "资料.txt"
-            path.write_text("拾忆", encoding="utf-8")
+            path.write_text("翻翻", encoding="utf-8")
             before = path.read_bytes()
             response = self.service.handle(WorkerRequest(REQUEST_IDS[1], "document.probe", {"path": str(path)}))
             after = path.read_bytes()
@@ -68,8 +72,8 @@ class WorkerServiceTests(unittest.TestCase):
         unit = ExecutionUnit(
             unit_id=REQUEST_IDS[0],
             unit_type="document.probe",
-            input_schema="remin://schema/document-probe-input/v1",
-            output_schema="remin://schema/document-probe-output/v1",
+            input_schema="fanfan://schema/document-probe-input/v1",
+            output_schema="fanfan://schema/document-probe-output/v1",
             inputs={},
             preconditions=(),
             postconditions=(),

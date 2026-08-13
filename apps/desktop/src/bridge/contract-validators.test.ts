@@ -8,8 +8,8 @@ const uuid7 = "018f0000-0000-7000-8000-000000000001";
 const unit = (): ExecutionUnit => ({
   unit_id: uuid7,
   unit_type: "document.probe",
-  input_schema: "remin://schema/document-probe-input/v1",
-  output_schema: "remin://schema/document-probe-output/v1",
+  input_schema: "fanfan://schema/document-probe-input/v1",
+  output_schema: "fanfan://schema/document-probe-output/v1",
   inputs: {},
   preconditions: [],
   postconditions: [],

@@ -77,17 +77,17 @@ pub fn parse_query_intent(raw: &str, fallback_query: &str) -> QueryIntent {
 
 /// 判断查询是否需要自然语言理解
 pub fn is_natural_language_query(query: &str) -> bool {
-    let nl_patterns = [
-        Regex::new(r"去[年天]|上个?[月周]|前[几些]|最[近新]|这[个些]|那[个些]").unwrap(),
-        Regex::new(r"在哪里|找一?[下个]|帮我|有没有|什么是|如何|怎么|什么时[候间]").unwrap(),
-        Regex::new(r"[，。！？,\.!\?]").unwrap(),
+    let ambiguous_patterns = [
+        Regex::new(r"去年|上个?[月周]|前[几些](天|周|月|年)|最近(几天|几周|几月|一年)").unwrap(),
+        Regex::new(r"这[个些]|那[个些]|上述|前面提到|之前说的").unwrap(),
     ];
     let trimmed = query.trim();
-    // 纯关键词通常短且无标点
-    if trimmed.chars().count() <= 4 && !nl_patterns[2].is_match(trimmed) {
+    if trimmed.is_empty() || trimmed.chars().count() > 200 {
         return false;
     }
-    nl_patterns.iter().any(|p| p.is_match(trimmed))
+    ambiguous_patterns
+        .iter()
+        .any(|pattern| pattern.is_match(trimmed))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -96,14 +96,6 @@ pub enum AnswerStyle {
     Concise,
     Detailed,
     List,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum AskMode {
-    #[default]
-    Rag,
-    EvidenceExtracts,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -115,10 +107,6 @@ pub struct AskRequest {
     pub retrieval_limit: u32,
     pub max_source_files: u32,
     pub strict_evidence: bool,
-    #[serde(default)]
-    pub mode: AskMode,
-    #[serde(default)]
-    pub allow_degraded_extractive: bool,
 }
 
 impl AskRequest {
@@ -134,7 +122,7 @@ impl AskRequest {
         if !self.strict_evidence {
             return Err(AppError::new(
                 "ASK_STRICT_EVIDENCE_REQUIRED",
-                "拾忆V1只允许开启严格证据模式的资料问答",
+                "翻翻V1只允许开启严格证据模式的资料问答",
                 false,
             ));
         }
@@ -171,6 +159,48 @@ pub struct AnswerClaim {
     pub text: String,
     pub support_status: SupportStatus,
     pub citations: Vec<EvidenceRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroundedAnswerClaimDraft {
+    pub text: String,
+    pub citation_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroundedAnswerDraft {
+    pub claims: Vec<GroundedAnswerClaimDraft>,
+    pub refusal: Option<String>,
+}
+
+pub fn grounded_answer_json_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["claims", "refusal"],
+        "properties": {
+            "claims": {
+                "type": "array",
+                "maxItems": 12,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["text", "citation_ids"],
+                    "properties": {
+                        "text": {"type": "string", "minLength": 1, "maxLength": 1000},
+                        "citation_ids": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 6,
+                            "uniqueItems": true,
+                            "items": {"type": "string", "pattern": "^S[1-9][0-9]*$"}
+                        }
+                    }
+                }
+            },
+            "refusal": {"type": ["string", "null"], "maxLength": 300}
+        }
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -264,6 +294,109 @@ pub struct AskMessagePage {
     pub items: Vec<AskMessage>,
     pub next_cursor: Option<String>,
     pub has_more: bool,
+}
+
+/// Fast, deterministic support check for claims that closely quote their
+/// evidence. It is deliberately conservative: numbers must be preserved and a
+/// paraphrase with weak lexical overlap falls through to the local entailment
+/// verifier instead of being accepted here.
+pub fn claim_has_deterministic_support<'a>(
+    claim: &str,
+    evidence: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    let claim_normalized = normalize_support_text(claim);
+    if claim_normalized.chars().count() < 4 {
+        return false;
+    }
+    let evidence_normalized = evidence
+        .into_iter()
+        .map(normalize_support_text)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if evidence_normalized.contains(&claim_normalized) {
+        return true;
+    }
+    let claim_numbers = support_numbers(&claim_normalized);
+    if claim_numbers
+        .iter()
+        .any(|number| !evidence_normalized.contains(number))
+    {
+        return false;
+    }
+    let claim_tokens = support_tokens(&claim_normalized);
+    if claim_tokens.len() < 3 {
+        return false;
+    }
+    let evidence_tokens = support_tokens(&evidence_normalized);
+    let matched = claim_tokens.intersection(&evidence_tokens).count();
+    matched as f64 / claim_tokens.len() as f64 >= 0.72
+}
+
+fn normalize_support_text(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(|character| {
+            if character.is_alphanumeric() || is_han_character(character) {
+                character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn support_numbers(value: &str) -> HashSet<String> {
+    value
+        .split(|character: char| !character.is_ascii_digit() && character != '.')
+        .filter(|token| token.chars().any(|character| character.is_ascii_digit()))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn support_tokens(value: &str) -> HashSet<String> {
+    let mut tokens = HashSet::new();
+    let mut han_run = Vec::new();
+    let mut latin = String::new();
+    let flush_han = |run: &mut Vec<char>, output: &mut HashSet<String>| {
+        if run.len() == 1 {
+            output.insert(run[0].to_string());
+        } else {
+            for pair in run.windows(2) {
+                output.insert(pair.iter().collect());
+            }
+        }
+        run.clear();
+    };
+    let flush_latin = |run: &mut String, output: &mut HashSet<String>| {
+        if run.chars().count() >= 2 {
+            output.insert(std::mem::take(run));
+        } else {
+            run.clear();
+        }
+    };
+    for character in value.chars() {
+        if is_han_character(character) {
+            flush_latin(&mut latin, &mut tokens);
+            han_run.push(character);
+        } else if character.is_ascii_alphanumeric() || character == '.' {
+            flush_han(&mut han_run, &mut tokens);
+            latin.push(character);
+        } else {
+            flush_han(&mut han_run, &mut tokens);
+            flush_latin(&mut latin, &mut tokens);
+        }
+    }
+    flush_han(&mut han_run, &mut tokens);
+    flush_latin(&mut latin, &mut tokens);
+    tokens
+}
+
+fn is_han_character(character: char) -> bool {
+    matches!(character as u32, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF)
 }
 
 pub fn assemble_extractive_answer(
@@ -372,7 +505,7 @@ pub fn generation_prompt(
                 let who = if message.role == "user" {
                     "用户"
                 } else {
-                    "拾忆"
+                    "翻翻"
                 };
                 let content = message
                     .content
@@ -388,32 +521,11 @@ pub fn generation_prompt(
         ));
     }
     prompt.push_str(&format!(
-        "问题：{}\n\n可用证据：\n{}\n\n只根据以上证据回答。每个包含事实的Markdown段落、列表项和表格数据行都必须在行末包含一个或多个来源编号，例如[S1]；不得使用不存在的编号。标题和表格分隔行可以不带引用；证据不足时只回复‘当前资料中未找到足够依据’。\n回答格式要求：使用Markdown组织内容；回答中涉及的关键概念或术语用**加粗**标出（每段不超过5处）；来源编号必须位于该事实行末尾，表格行可在编号后保留末尾竖线。不要输出代码块。",
+        "问题：{}\n\n可用证据：\n{}\n\n只根据以上证据回答。把每个可独立核验的事实写成一条claim，并在citation_ids中列出直接支持它的S编号。不得使用不存在的编号，不得把对话历史当作证据，不得补充外部知识。只输出符合指定JSON Schema的对象，不要输出Markdown、代码块或解释。证据不足时claims为空，并在refusal中说明‘当前资料中未找到足够依据’。",
         request.question.trim(),
         sources
     ));
     prompt
-}
-
-/// 严格证据校验中允许出现的非事实行：空行、Markdown 标题、分隔线和表格分隔行。
-fn is_decorative_line(line: &str) -> bool {
-    let trimmed = line.trim();
-    if trimmed.is_empty() || trimmed.starts_with('#') || matches!(trimmed, "---" | "***" | "___") {
-        return true;
-    }
-    if trimmed.starts_with('|') && trimmed.ends_with('|') {
-        let cells = trimmed
-            .trim_matches('|')
-            .split('|')
-            .map(str::trim)
-            .collect::<Vec<_>>();
-        return !cells.is_empty()
-            && cells.iter().all(|cell| {
-                let value = cell.trim_matches(':');
-                value.len() >= 3 && value.chars().all(|character| character == '-')
-            });
-    }
-    false
 }
 
 pub fn apply_grounded_generation(
@@ -428,38 +540,36 @@ pub fn apply_grounded_generation(
         .iter()
         .flat_map(|claim| claim.citations.iter().cloned())
         .collect::<Vec<_>>();
-    let marker = Regex::new(r"\[S(\d+)\]").expect("static citation pattern");
+    let cleaned = generated
+        .trim()
+        .strip_prefix("```json")
+        .or_else(|| generated.trim().strip_prefix("```"))
+        .unwrap_or(generated.trim())
+        .strip_suffix("```")
+        .unwrap_or(generated.trim())
+        .trim();
+    let draft = serde_json::from_str::<GroundedAnswerDraft>(cleaned).ok()?;
+    if draft.claims.is_empty()
+        || draft.claims.len() > 12
+        || draft
+            .refusal
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        return None;
+    }
     let mut claims = Vec::new();
-    let lines = generated.lines().collect::<Vec<_>>();
-    for (line_index, line) in lines.iter().enumerate() {
-        let sentence = line.trim();
-        if is_decorative_line(sentence) {
-            continue;
-        }
-        if sentence.starts_with('|')
-            && sentence.ends_with('|')
-            && lines
-                .iter()
-                .skip(line_index + 1)
-                .find(|candidate| !candidate.trim().is_empty())
-                .is_some_and(|candidate| is_decorative_line(candidate))
-        {
-            continue;
-        }
-        if sentence.starts_with("```") {
+    for draft_claim in draft.claims {
+        let text = draft_claim.text.trim();
+        if text.is_empty() || text.chars().count() > 1000 || text.contains("[S") {
             return None;
         }
-        let last_marker = marker.find_iter(sentence).last()?;
-        let suffix = sentence[last_marker.end()..].trim();
-        if !suffix
-            .chars()
-            .all(|character| matches!(character, '。' | '！' | '？' | '.' | '!' | '?' | '|'))
-        {
+        if draft_claim.citation_ids.is_empty() || draft_claim.citation_ids.len() > 6 {
             return None;
         }
         let mut citations = Vec::new();
-        for capture in marker.captures_iter(sentence) {
-            let index = capture.get(1)?.as_str().parse::<usize>().ok()?;
+        for citation_id in &draft_claim.citation_ids {
+            let index = citation_id.strip_prefix('S')?.parse::<usize>().ok()?;
             let selected = evidence.get(index.checked_sub(1)?)?.clone();
             if !citations
                 .iter()
@@ -473,13 +583,10 @@ pub fn apply_grounded_generation(
         }
         claims.push(AnswerClaim {
             claim_id: Uuid::now_v7(),
-            text: sentence.to_owned(),
+            text: text.to_owned(),
             support_status: SupportStatus::Supported,
             citations,
         });
-    }
-    if claims.is_empty() {
-        return None;
     }
     let used = claims
         .iter()
@@ -492,7 +599,24 @@ pub fn apply_grounded_generation(
         .cloned()
         .collect::<Vec<_>>();
     let mut result = extractive.clone();
-    result.answer = generated.trim().to_owned();
+    result.answer = claims
+        .iter()
+        .map(|claim| {
+            let markers = claim
+                .citations
+                .iter()
+                .filter_map(|citation| {
+                    evidence
+                        .iter()
+                        .position(|item| item.evidence_id == citation.evidence_id)
+                        .map(|index| format!("[S{}]", index + 1))
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            format!("- {} {}", claim.text, markers)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     result.claims = claims;
     result.used_file_ids = source_files.iter().map(|source| source.file_id).collect();
     result.source_files = source_files;
@@ -522,8 +646,6 @@ mod tests {
             retrieval_limit: 12,
             max_source_files: 8,
             strict_evidence: true,
-            mode: AskMode::Rag,
-            allow_degraded_extractive: false,
         }
     }
 
@@ -562,7 +684,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_answer_requires_a_valid_marker_on_every_sentence() {
+    fn generated_answer_requires_schema_valid_claims_and_existing_citations() {
         let mut base = assemble_extractive_answer(
             &request(),
             &SearchSession {
@@ -603,14 +725,52 @@ mod tests {
             display_name: "资料.md".into(),
             canonical_path: "D:\\资料.md".into(),
         }];
-        assert!(apply_grounded_generation(&base, "项目采用混合召回。[S1]").is_some());
-        assert!(apply_grounded_generation(
-            &base,
-            "## 结论\n\n- 项目采用混合召回。[S1]\n\n| 项目 | 说明 |\n| --- | --- |\n| 检索 | 采用混合召回。[S1] |"
-        )
-        .is_some());
-        assert!(apply_grounded_generation(&base, "项目采用混合召回。没有引用。").is_none());
-        assert!(apply_grounded_generation(&base, "- 缺少引用").is_none());
-        assert!(apply_grounded_generation(&base, "不存在的来源。[S2]").is_none());
+        assert!(
+            apply_grounded_generation(
+                &base,
+                r#"{"claims":[{"text":"项目采用混合召回。","citation_ids":["S1"]}],"refusal":null}"#
+            )
+            .is_some()
+        );
+        assert!(apply_grounded_generation(&base, "项目采用混合召回。[S1]").is_none());
+        assert!(
+            apply_grounded_generation(
+                &base,
+                r#"{"claims":[{"text":"缺少引用","citation_ids":[]}],"refusal":null}"#
+            )
+            .is_none()
+        );
+        assert!(
+            apply_grounded_generation(
+                &base,
+                r#"{"claims":[{"text":"不存在的来源","citation_ids":["S2"]}],"refusal":null}"#
+            )
+            .is_none()
+        );
+        assert!(
+            apply_grounded_generation(
+                &base,
+                r#"{"claims":[{"text":"项目采用混合召回。","citation_ids":["S1"]}],"refusal":"当前资料中未找到足够依据"}"#
+            )
+            .is_none(),
+            "a response cannot contain factual claims and a refusal at the same time"
+        );
+        assert_eq!(grounded_answer_json_schema()["additionalProperties"], false);
+    }
+
+    #[test]
+    fn deterministic_claim_support_preserves_numbers_and_requires_strong_overlap() {
+        assert!(claim_has_deterministic_support(
+            "项目采用混合召回，目标召回率为90%。",
+            ["项目采用混合召回，目标召回率为90%。"]
+        ));
+        assert!(!claim_has_deterministic_support(
+            "项目采用混合召回，目标召回率为80%。",
+            ["项目采用混合召回，目标召回率为90%。"]
+        ));
+        assert!(!claim_has_deterministic_support(
+            "这个项目表现非常优秀。",
+            ["项目采用混合召回，并通过引用核验。"]
+        ));
     }
 }

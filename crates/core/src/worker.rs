@@ -16,6 +16,17 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{AppError, ParseRequest, ParseResult};
 
+/// Strip the Windows long-path (`\\?\` / `\\?\UNC\`) prefix so the worker can
+/// open the file: pypdf tolerates it, but Windows.Data.Pdf and PowerShell
+/// reject it, which surfaces as PDF_RENDER_FAILED in the OCR chain.
+pub fn strip_long_path_prefix(path: &str) -> String {
+    if let Some(unc) = path.strip_prefix("\\\\?\\unc\\") {
+        format!("\\\\{unc}")
+    } else {
+        path.strip_prefix("\\\\?\\").unwrap_or(path).to_owned()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkerClient {
     launch: WorkerLaunch,
@@ -96,6 +107,89 @@ pub struct RerankResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeechRecognitionRequest {
+    pub model_path: String,
+    pub tokens_path: String,
+    pub vad_model_path: String,
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+    pub threads: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeechRecognitionResult {
+    pub text: String,
+    pub sample_rate: u32,
+    pub duration_ms: u64,
+    pub timestamps: Vec<f32>,
+    pub engine: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeechSynthesisRequest {
+    pub model_path: String,
+    pub tokens_path: String,
+    pub lexicon_path: String,
+    pub text: String,
+    pub speaker_id: u32,
+    pub speed: f32,
+    pub threads: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeechSynthesisResult {
+    pub audio_base64: String,
+    pub sample_rate: u32,
+    pub duration_ms: u64,
+    pub speaker_id: u32,
+    pub speed: f32,
+    pub engine: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeSelfTestResult {
+    pub status: String,
+    pub engine: String,
+    #[serde(default)]
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OcrRecognitionRequest {
+    pub model_path: String,
+    pub det_model_path: String,
+    pub cls_model_path: String,
+    pub dictionary_path: String,
+    pub image_path: String,
+    pub page_no: u32,
+    pub threads: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OcrPoint {
+    pub x: f32,
+    pub y: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OcrLineResult {
+    pub page_no: u32,
+    pub text: String,
+    pub confidence: f32,
+    pub polygon: Vec<OcrPoint>,
+    pub bbox: crate::BoundingBox,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OcrRecognitionResult {
+    pub engine: String,
+    pub model_version: String,
+    pub page_count: u32,
+    pub lines: Vec<OcrLineResult>,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportTableRequest {
     pub target_path: String,
     pub format: String,
@@ -134,7 +228,7 @@ impl WorkerClient {
 
     pub fn from_environment(worker_root: impl Into<PathBuf>) -> Self {
         Self::new(
-            std::env::var_os("REMIN_WORKER_PYTHON").unwrap_or_else(|| OsString::from("python")),
+            std::env::var_os("FANFAN_WORKER_PYTHON").unwrap_or_else(|| OsString::from("python")),
             worker_root,
         )
     }
@@ -159,6 +253,33 @@ impl WorkerClient {
         self.request_operation("document.parse", request)
     }
 
+    pub fn recognize_ocr(
+        &self,
+        request: &OcrRecognitionRequest,
+    ) -> Result<OcrRecognitionResult, AppError> {
+        self.request_operation("ocr.recognize", request)
+    }
+
+    pub fn self_test_ocr(
+        &self,
+        model_path: String,
+        det_model_path: String,
+        cls_model_path: String,
+        dictionary_path: String,
+        threads: u32,
+    ) -> Result<RuntimeSelfTestResult, AppError> {
+        self.request_operation(
+            "ocr.self_test",
+            &serde_json::json!({
+                "model_path": model_path,
+                "det_model_path": det_model_path,
+                "cls_model_path": cls_model_path,
+                "dictionary_path": dictionary_path,
+                "threads": threads,
+            }),
+        )
+    }
+
     pub fn encode_embeddings(
         &self,
         request: &EmbeddingRequest,
@@ -168,6 +289,70 @@ impl WorkerClient {
 
     pub fn rerank(&self, request: &RerankRequest) -> Result<RerankResponse, AppError> {
         self.request_operation("rerank.score", request)
+    }
+
+    pub fn recognize_speech(
+        &self,
+        request: &SpeechRecognitionRequest,
+    ) -> Result<SpeechRecognitionResult, AppError> {
+        self.request_operation("speech.recognize", request)
+    }
+
+    pub fn synthesize_speech(
+        &self,
+        request: &SpeechSynthesisRequest,
+    ) -> Result<SpeechSynthesisResult, AppError> {
+        self.request_operation("speech.synthesize", request)
+    }
+
+    pub fn self_test_asr(
+        &self,
+        model_path: String,
+        tokens_path: String,
+        vad_model_path: String,
+        threads: u32,
+    ) -> Result<RuntimeSelfTestResult, AppError> {
+        #[derive(Serialize)]
+        struct Request {
+            model_path: String,
+            tokens_path: String,
+            vad_model_path: String,
+            threads: u32,
+        }
+        self.request_operation(
+            "speech.asr_self_test",
+            &Request {
+                model_path,
+                tokens_path,
+                vad_model_path,
+                threads,
+            },
+        )
+    }
+
+    pub fn self_test_tts(
+        &self,
+        model_path: String,
+        tokens_path: String,
+        lexicon_path: String,
+        threads: u32,
+    ) -> Result<RuntimeSelfTestResult, AppError> {
+        #[derive(Serialize)]
+        struct Request {
+            model_path: String,
+            tokens_path: String,
+            lexicon_path: String,
+            threads: u32,
+        }
+        self.request_operation(
+            "speech.tts_self_test",
+            &Request {
+                model_path,
+                tokens_path,
+                lexicon_path,
+                threads,
+            },
+        )
     }
 
     pub fn export_table(&self, request: &ExportTableRequest) -> Result<ExportResult, AppError> {
@@ -279,13 +464,13 @@ impl WorkerClient {
         if pid != 0 {
             terminate_process_by_id(pid);
         }
+        if let Ok(mut runtime) = self.runtime.lock() {
+            runtime.stop();
+        }
     }
 
     pub fn cancel_active(&self) {
         self.terminate_active_worker();
-        if let Ok(mut runtime) = self.runtime.lock() {
-            runtime.stop();
-        }
     }
 
     fn validate_launch_target(&self) -> Result<(), AppError> {
@@ -300,7 +485,7 @@ impl WorkerClient {
             WorkerLaunch::Executable { executable, .. } if !executable.is_file() => {
                 Err(AppError::new(
                     "WORKER_EXECUTABLE_UNAVAILABLE",
-                    "本地文档处理组件不可用，请修复或重新安装拾忆",
+                    "本地文档处理组件不可用，请修复或重新安装翻翻",
                     false,
                 ))
             }
@@ -316,7 +501,7 @@ impl WorkerClient {
             } => {
                 let mut command = Command::new(python_executable);
                 command
-                    .args(["-m", "remin_worker"])
+                    .args(["-m", "fanfan_worker"])
                     .current_dir(worker_root)
                     .env("PYTHONUTF8", "1")
                     .env("PYTHONIOENCODING", "utf-8");
@@ -360,7 +545,12 @@ fn operation_timeout(operation: &str) -> Duration {
         // Must stay above the worker-side OCR budget (ocr.py caps at 270s)
         // so a long scan-heavy parse is never killed mid-OCR.
         "document.parse" => Duration::from_secs(360),
-        "embedding.encode" | "export.write" => Duration::from_secs(120),
+        "embedding.encode" | "export.write" | "speech.synthesize" => Duration::from_secs(120),
+        "speech.recognize"
+        | "speech.asr_self_test"
+        | "speech.tts_self_test"
+        | "ocr.recognize"
+        | "ocr.self_test" => Duration::from_secs(90),
         _ => Duration::from_secs(60),
     }
 }
@@ -398,20 +588,47 @@ impl WorkerProcess {
             .write_all(request_json)
             .and_then(|_| self.stdin.flush())
             .map_err(|error| AppError::new("WORKER_IO_FAILED", error.to_string(), true))?;
+        read_worker_protocol_response(&mut self.stdout)
+    }
+}
+
+fn read_worker_protocol_response(reader: &mut impl BufRead) -> Result<String, AppError> {
+    const MAX_NOISE_LINES: usize = 64;
+    const MAX_NOISE_BYTES: usize = 128 * 1024;
+    let mut ignored_bytes = 0_usize;
+    for _ in 0..MAX_NOISE_LINES {
         let mut response = String::new();
-        let bytes = self
-            .stdout
+        let bytes = reader
             .read_line(&mut response)
             .map_err(|error| AppError::new("WORKER_IO_FAILED", error.to_string(), true))?;
         if bytes == 0 {
             return Err(AppError::new(
                 "WORKER_RESPONSE_INVALID",
-                "Worker进程已经退出且没有返回结果",
+                "Worker进程已经退出且没有返回结构化结果",
                 true,
             ));
         }
-        Ok(response)
+        let is_protocol_response = serde_json::from_str::<serde_json::Value>(&response)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .is_some_and(|value| {
+                value.get("request_id").is_some()
+                    && value.get("ok").is_some_and(serde_json::Value::is_boolean)
+                    && (value.contains_key("result") || value.contains_key("error"))
+            });
+        if is_protocol_response {
+            return Ok(response);
+        }
+        ignored_bytes = ignored_bytes.saturating_add(bytes);
+        if ignored_bytes > MAX_NOISE_BYTES {
+            break;
+        }
     }
+    Err(AppError::new(
+        "WORKER_PROTOCOL_NOISE_LIMIT",
+        "Worker运行库向协议通道写入了过多非结构化输出，已停止本次操作",
+        true,
+    ))
 }
 
 impl WorkerRuntime {
@@ -478,8 +695,17 @@ mod tests {
     }
 
     #[test]
+    fn native_library_stdout_noise_does_not_replace_the_json_response() {
+        let mut input = std::io::Cursor::new(
+            b"native runtime banner\nprogress: 100%\n{\"request_id\":\"018f0000-0000-7000-8000-000000000001\",\"ok\":true,\"result\":{},\"error\":null}\n",
+        );
+        let response = read_worker_protocol_response(&mut input).expect("skip native noise");
+        assert!(response.contains("\"ok\":true"));
+    }
+
+    #[test]
     fn missing_packaged_worker_fails_before_process_start() {
-        let client = WorkerClient::from_executable("missing-remin-worker.exe");
+        let client = WorkerClient::from_executable("missing-fanfan-worker.exe");
         let request = ParseRequest {
             job_id: uuid::Uuid::now_v7(),
             file_id: uuid::Uuid::now_v7(),
@@ -490,6 +716,7 @@ mod tests {
             language_hints: vec!["zh".into()],
             max_pages: None,
             asset_cache_dir: None,
+            ocr_runtime: None,
             parser_version: "0.1.0".into(),
         };
 
@@ -517,6 +744,7 @@ mod tests {
             language_hints: vec!["zh".into()],
             max_pages: None,
             asset_cache_dir: None,
+            ocr_runtime: None,
             parser_version: "0.1.0".into(),
         };
         let result = client

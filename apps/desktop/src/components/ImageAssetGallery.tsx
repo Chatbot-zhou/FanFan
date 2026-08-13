@@ -2,7 +2,7 @@ import { useState } from "react";
 import { bridge, type ImageAsset } from "../bridge";
 import { errorMessage } from "../utils/app-error";
 
-export const imageAssetUrl = (assetId: string) => `http://remin-image.localhost/${encodeURIComponent(assetId)}`;
+export const imageAssetUrl = (assetId: string) => `http://fanfan-image.localhost/${encodeURIComponent(assetId)}`;
 
 const locationLabel = (asset: ImageAsset) => {
   const { locator } = asset;

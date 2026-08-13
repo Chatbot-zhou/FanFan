@@ -15,9 +15,9 @@ use crate::{
     FileRecord, FileRelation, FileSystemEvent, ImageUnderstandingResult, InboxPage, InboxQuery,
     InboxUpdateRequest, IndexActivityStats, IndexRebuildResult, JobRecord, JobStatus,
     LogEventInput, LogPage, LogQuery, MaintenanceSnapshot, ParseResult, PendingEmbeddingChunk,
-    PendingImageUnderstanding, RelationPage, RelationQuery, RelationRefreshResult,
-    RootRegistration, ScanControl, ScanPolicy, SearchRequest, SearchSession, SemanticQuery,
-    file_identity_for_path, path_key, scan_root_with_control,
+    PendingImageUnderstanding, ProcessingCoverageSnapshot, RelationPage, RelationQuery,
+    RelationRefreshResult, RootRegistration, ScanControl, ScanPolicy, SearchRequest, SearchSession,
+    SemanticQuery, file_identity_for_path, path_key, scan_root_with_control,
 };
 
 #[cfg(windows)]
@@ -347,7 +347,7 @@ pub struct AddRootRequest {
 
 impl CatalogService {
     pub fn open(data_directory: PathBuf) -> Result<Self, AppError> {
-        let store = CatalogStore::open(data_directory.join("remin.db"))?;
+        let store = CatalogStore::open(data_directory.join("fanfan.db"))?;
         let exclusion_rules = store.list_exclusion_rules()?;
         Ok(Self {
             store,
@@ -541,7 +541,7 @@ impl CatalogService {
         {
             return Err(AppError::new(
                 "ROOT_PROTECTED",
-                "拾忆的内部数据目录不能作为资料来源",
+                "翻翻的内部数据目录不能作为资料来源",
                 false,
             ));
         }
@@ -588,6 +588,16 @@ impl CatalogService {
 
     pub fn list_files(&self) -> Result<Vec<FileRecord>, AppError> {
         self.store.list_files()
+    }
+
+    pub fn processing_coverage_snapshot(&self) -> Result<ProcessingCoverageSnapshot, AppError> {
+        self.store.processing_coverage_snapshot()
+    }
+
+    pub fn evaluation_integrity_snapshot(
+        &self,
+    ) -> Result<crate::EvaluationIntegritySnapshot, AppError> {
+        self.store.evaluation_integrity_snapshot()
     }
 
     pub fn query_files(&self, request: &crate::FileQuery) -> Result<crate::FilePage, AppError> {
@@ -796,6 +806,14 @@ impl CatalogService {
 
     pub fn retry_ocr(&self, file_id: &Uuid) -> Result<(), AppError> {
         self.store.retry_ocr(file_id)
+    }
+
+    pub fn requeue_ocr_pending_for_available_runtime(&self, limit: usize) -> Result<u64, AppError> {
+        self.store.requeue_ocr_pending_for_available_runtime(limit)
+    }
+
+    pub fn sanitize_existing_ocr_attempt_errors(&self) -> Result<u64, AppError> {
+        self.store.sanitize_existing_ocr_attempt_errors()
     }
 
     pub fn mark_file_parsing(&self, file_id: &Uuid, revision_id: &Uuid) -> Result<(), AppError> {
@@ -1186,7 +1204,10 @@ impl CatalogService {
             .map_err(|_| AppError::new("SCAN_POLICY_UNAVAILABLE", "扫描排除策略状态不可用", true))?
             .clone();
         let result = match scan_root_with_control(&root_path, &policy, &control) {
-            Ok(outcome) => self.store.commit_scan(&root_id, &job_id, &outcome),
+            Ok(outcome) => match self.store.commit_scan(&root_id, &job_id, &outcome) {
+                Ok(job) => Ok(job),
+                Err(error) => self.store.fail_scan(&root_id, &job_id, error),
+            },
             Err(error) if error.code == "SCAN_CANCELLED" => self.store.cancel_scan(&job_id),
             Err(error) => self.store.fail_scan(&root_id, &job_id, error),
         };

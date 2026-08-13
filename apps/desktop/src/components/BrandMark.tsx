@@ -1,4 +1,5 @@
-import appIconUrl from "../../src-tauri/icons/icon.svg";
+import appIconUrl from "../assets/fanfan-logo.png";
+import wordmarkUrl from "../assets/fanfan-wordmark.png";
 
 interface BrandMarkProps {
   compact?: boolean;
@@ -7,9 +8,9 @@ interface BrandMarkProps {
 
 export function BrandMark({ compact = false, inverse = false }: BrandMarkProps) {
   return (
-    <div className={`brand-mark${compact ? " brand-mark--compact" : ""}${inverse ? " brand-mark--inverse" : ""}`} aria-label="拾忆">
+    <div className={`brand-mark${compact ? " brand-mark--compact" : ""}${inverse ? " brand-mark--inverse" : ""}`} aria-label="翻翻">
       <img className="brand-mark__symbol" src={appIconUrl} alt="" aria-hidden="true" draggable={false} />
-      <span className="brand-mark__word">拾忆</span>
+      <img className="brand-mark__wordmark" src={wordmarkUrl} alt="翻翻" draggable={false} />
     </div>
   );
 }

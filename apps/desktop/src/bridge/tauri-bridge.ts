@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ReminBridge, SearchRequest } from "./contracts";
+import type { FanFanBridge, SearchRequest } from "./contracts";
 
-export const tauriBridge: ReminBridge = {
+export const tauriBridge: FanFanBridge = {
   startup_get_state: () => invoke("startup_get_state"),
   welcome_get_state: () => invoke("welcome_get_state"),
   welcome_complete: (welcome_version) => invoke("welcome_complete", { request: { welcome_version } }),
@@ -20,10 +20,14 @@ export const tauriBridge: ReminBridge = {
   model_preset_list: () => invoke("model_preset_list"),
   model_download_start: (edition_id, source, confirmed) => invoke("model_download_start", { request: { edition_id, source, confirmed } }),
   model_download_list: () => invoke("model_download_list"),
+  model_store_status_get: () => invoke("model_store_status_get"),
   model_download_get: (job_id) => invoke("model_download_get", { request: { job_id } }),
   model_download_pause: (job_id) => invoke("model_download_pause", { request: { job_id } }),
   model_download_cancel: (job_id) => invoke("model_download_cancel", { request: { job_id } }),
-  model_download_retry: (job_id, source) => invoke("model_download_retry", { request: { job_id, source: source ?? null } }),
+  model_download_resume: (job_id) => invoke("model_download_resume", { request: { job_id } }),
+  model_download_retry: (job_id) => invoke("model_download_retry", { request: { job_id } }),
+  model_download_switch_source: (job_id, source) => invoke("model_download_switch_source", { request: { job_id, source } }),
+  model_download_remove: (job_id) => invoke("model_download_remove", { request: { job_id } }),
   model_artifact_activate: (artifact_id) => invoke("model_artifact_activate", { request: { artifact_id } }),
   model_role_disable: (role) => invoke("model_role_disable", { request: { role } }),
   home_get_summary: (local_date) => invoke("home_get_summary", { request: { local_date } }),
@@ -37,6 +41,8 @@ export const tauriBridge: ReminBridge = {
   ask_session_delete: (session_id) => invoke("ask_session_delete", { request: { session_id } }),
   ask_operation_get: (operation_id) => invoke("ask_operation_get", { request: { operation_id } }),
   ask_cancel: (operation_id) => invoke("ask_cancel", { request: { operation_id } }),
+  speech_recognize: (request) => invoke("speech_recognize", { request }),
+  speech_synthesize_answer: (message_id, speed, speaker_id = 0) => invoke("speech_synthesize_answer", { request: { message_id, speed, speaker_id } }),
   answer_export: (message_id, target_path, format, confirmation) => invoke("answer_export", { request: { message_id, target_path, format, confirmation } }),
   preview_get: (file_id, offset = 0, limit = 80, anchor_node_id = null) => invoke("preview_get", { request: { file_id, offset, limit, anchor_node_id } }),
   file_open: (file_id) => invoke("file_open", { request: { file_id } }),
@@ -69,6 +75,7 @@ export const tauriBridge: ReminBridge = {
   exclusion_rule_upsert: (request) => invoke("exclusion_rule_upsert", { request }),
   exclusion_rule_delete: (rule_id) => invoke("exclusion_rule_delete", { request: { rule_id } }),
   app_status_get: () => invoke("app_status_get"),
+  runtime_state_get: () => invoke("runtime_state_get"),
   maintenance_get: () => invoke("maintenance_get"),
   maintenance_check: (level) => invoke("maintenance_check", { request: { level } }),
   storage_usage_get: () => invoke("storage_usage_get"),

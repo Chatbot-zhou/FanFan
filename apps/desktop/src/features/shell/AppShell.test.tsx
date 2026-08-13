@@ -16,7 +16,7 @@ const bridgeMock = vi.hoisted(() => ({
 }));
 
 vi.mock("../../bridge", () => ({ bridge: bridgeMock }));
-vi.mock("../../hooks/useBackendEvents", () => ({ useBackendEvents: () => null }));
+vi.mock("../../hooks/useBackendEvents", () => ({ useBackendEvents: () => [] }));
 vi.mock("./TitleBar", () => ({ TitleBar: () => <div data-testid="title-bar" /> }));
 vi.mock("./Sidebar", () => ({ Sidebar: () => <div /> }));
 vi.mock("./StatusBar", () => ({ StatusBar: () => <div /> }));

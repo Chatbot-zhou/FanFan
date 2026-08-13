@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 
-use remin_core::{AppError, ThemePreference, ThemeService, ThemeState};
+use fanfan_core::{AppError, ThemePreference, ThemeService, ThemeState};
 use serde::Deserialize;
 use tauri::State;
 

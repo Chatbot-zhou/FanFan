@@ -63,7 +63,7 @@ impl WelcomeService {
                 code: "WELCOME_VERSION_MISMATCH".into(),
                 message: "欢迎页版本与当前应用不一致".into(),
                 retryable: false,
-                user_action: Some("请重新启动拾忆".into()),
+                user_action: Some("请重新启动翻翻".into()),
                 file_id: None,
                 details: None,
             });

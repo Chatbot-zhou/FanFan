@@ -9,7 +9,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use remin_core::{AppError, AppLogRecord, LogPage, LogQuery, sanitize_log_value};
+use fanfan_core::{AppError, AppLogRecord, LogPage, LogQuery, sanitize_log_value};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;

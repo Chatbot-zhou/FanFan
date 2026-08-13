@@ -53,5 +53,5 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
-      - run: cargo test -p remin-core cross_process_worker_parses_a_real_chinese_fixture --locked -- --ignored
-      - run: cargo run -p remin-core --example evaluate_search --locked
+      - run: cargo test -p fanfan-core cross_process_worker_parses_a_real_chinese_fixture --locked -- --ignored
+      - run: cargo run -p fanfan-core --example evaluate_search --locked

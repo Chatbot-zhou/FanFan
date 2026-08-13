@@ -94,6 +94,96 @@ pub enum ParseStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileProcessingDisposition {
+    ParseableContent,
+    ImageOcr,
+    ReadOnlyText,
+    ArchiveManifest,
+    MediaMetadata,
+    SafeMetadata,
+    EncryptedOrDamaged,
+    CapabilityMissing,
+    Unknown,
+}
+
+impl FileProcessingDisposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ParseableContent => "parseable_content",
+            Self::ImageOcr => "image_ocr",
+            Self::ReadOnlyText => "read_only_text",
+            Self::ArchiveManifest => "archive_manifest",
+            Self::MediaMetadata => "media_metadata",
+            Self::SafeMetadata => "safe_metadata",
+            Self::EncryptedOrDamaged => "encrypted_or_damaged",
+            Self::CapabilityMissing => "capability_missing",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_storage(value: &str) -> Self {
+        match value {
+            "parseable_content" => Self::ParseableContent,
+            "image_ocr" => Self::ImageOcr,
+            "read_only_text" => Self::ReadOnlyText,
+            "archive_manifest" => Self::ArchiveManifest,
+            "media_metadata" => Self::MediaMetadata,
+            "safe_metadata" => Self::SafeMetadata,
+            "encrypted_or_damaged" => Self::EncryptedOrDamaged,
+            "capability_missing" => Self::CapabilityMissing,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProcessingAttempt {
+    pub attempt_id: Uuid,
+    pub file_id: Option<Uuid>,
+    pub revision_id: Option<Uuid>,
+    pub operation: String,
+    pub engine: Option<String>,
+    pub model_version: Option<String>,
+    pub status: String,
+    pub attempt_no: u32,
+    pub elapsed_ms: u64,
+    pub retryable: bool,
+    pub error: Option<AppError>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScanCheckpoint {
+    pub job_id: Uuid,
+    pub root_id: Uuid,
+    pub batch_no: u32,
+    pub enumerated_items: u64,
+    pub committed_items: u64,
+    pub isolated_failures: u64,
+    pub retry_count: u32,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ProcessingCoverageSnapshot {
+    pub discovered_files: u64,
+    pub parseable_files: u64,
+    pub parsed_files: u64,
+    pub failed_files: u64,
+    pub explicitly_excluded_files: u64,
+    pub fts_chunks: u64,
+    pub embedding_chunks: u64,
+    pub active_vector_keys: u64,
+    pub pending_ocr_assets: u64,
+    pub pending_vision_assets: u64,
+    pub parse_coverage: f64,
+    pub embedding_coverage: f64,
+    pub vector_coverage: f64,
+    pub measured_at: DateTime<Utc>,
+}
+
 impl ParseStatus {
     pub fn as_str(self) -> &'static str {
         match self {

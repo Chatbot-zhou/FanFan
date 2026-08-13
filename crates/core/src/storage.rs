@@ -24,22 +24,23 @@ use crate::{
     CollectionModelReview, CollectionRecord, CollectionRule, CollectionSuggestedMember,
     CollectionSuggestion, CollectionSuggestionPage, CollectionSuggestionQuery,
     CollectionSuggestionRefreshResult, CollectionSuggestionUpdateRequest, CreateCollectionRequest,
-    DegradationLevel, DegradationState, DiscoveredFile, DocumentNode, ExclusionRule,
-    ExclusionRuleClass, ExclusionRuleInput, ExclusionRuleType, FilePage, FileQuery, FileRecord,
-    FileRelation, FileSystemEvent, HealthCheckItem, ImageAsset, ImageUnderstandingResult,
-    InboxEventType, InboxItem, InboxPage, InboxQuery, InboxUpdateRequest, IndexActivityStats,
-    IndexRebuildResult, JobRecord, JobStatus, LogPage, LogQuery, MaintenanceSnapshot, ParseOutcome,
-    ParseResult, ParseStatus, PendingEmbeddingChunk, PendingImageUnderstanding, RankedHit,
+    DegradationLevel, DegradationState, DiscoveredFile, DocumentNode, EvaluationIntegritySnapshot,
+    ExclusionRule, ExclusionRuleClass, ExclusionRuleInput, ExclusionRuleType, FilePage,
+    FileProcessingDisposition, FileQuery, FileRecord, FileRelation, FileSystemEvent,
+    HealthCheckItem, ImageAsset, ImageUnderstandingResult, InboxEventType, InboxItem, InboxPage,
+    InboxQuery, InboxUpdateRequest, IndexActivityStats, IndexRebuildResult, JobRecord, JobStatus,
+    LogPage, LogQuery, MaintenanceSnapshot, ParseOutcome, ParseResult, ParseStatus,
+    PendingEmbeddingChunk, PendingImageUnderstanding, ProcessingCoverageSnapshot, RankedHit,
     RelationPage, RelationQuery, RelationRefreshResult, RelationType, ResolutionStatus, RootKind,
     RootRecord, RootSource, RootStatus, ScanOutcome, ScopeFilter, SearchMode, SemanticQuery,
     SourceLocator, TriageStatus, VolumeType, WatchMode, chunks_from_nodes, fts_query,
     normalized_version_key,
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 18;
+pub const CURRENT_SCHEMA_VERSION: u32 = 21;
 
 type VectorSourceRow = (u64, String, String, String, Vec<f32>);
-type SemanticCandidate = (Uuid, (String, f32));
+type SemanticCandidate = (Uuid, String, f32);
 
 struct Migration {
     version: u32,
@@ -678,6 +679,153 @@ const MIGRATIONS: &[Migration] = &[
             DROP TABLE IF EXISTS knowledge_spaces;
         "#,
     },
+    Migration {
+        version: 19,
+        name: "local_ai_runtime_and_media_transcripts",
+        sql: r#"
+            CREATE TABLE runtime_task_checkpoints (
+                operation_id TEXT PRIMARY KEY,
+                task_kind TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                model_id TEXT,
+                idempotency_key TEXT,
+                state TEXT NOT NULL,
+                priority INTEGER NOT NULL,
+                checkpoint_json TEXT,
+                error_json TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                updated_at TEXT NOT NULL,
+                finished_at TEXT
+            );
+            CREATE UNIQUE INDEX idx_runtime_task_idempotency
+                ON runtime_task_checkpoints(idempotency_key)
+                WHERE idempotency_key IS NOT NULL;
+            CREATE INDEX idx_runtime_task_queue
+                ON runtime_task_checkpoints(state, priority, created_at);
+
+            CREATE TABLE runtime_instances (
+                instance_id TEXT PRIMARY KEY,
+                backend TEXT NOT NULL,
+                model_id TEXT,
+                device TEXT NOT NULL,
+                state TEXT NOT NULL,
+                memory_bytes INTEGER NOT NULL DEFAULT 0,
+                gpu_memory_bytes INTEGER NOT NULL DEFAULT 0,
+                loaded_at TEXT NOT NULL,
+                last_used_at TEXT NOT NULL,
+                unloaded_at TEXT,
+                error_json TEXT
+            );
+            CREATE INDEX idx_runtime_instances_state
+                ON runtime_instances(backend, state, last_used_at);
+
+            CREATE TABLE media_transcripts (
+                transcript_id TEXT PRIMARY KEY,
+                file_id TEXT NOT NULL REFERENCES files(file_id) ON DELETE CASCADE,
+                revision_id TEXT NOT NULL REFERENCES file_revisions(revision_id) ON DELETE CASCADE,
+                model_artifact_id TEXT NOT NULL,
+                language TEXT,
+                duration_ms INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                source_sha256 TEXT NOT NULL,
+                error_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(file_id, revision_id, model_artifact_id)
+            );
+            CREATE INDEX idx_media_transcripts_status
+                ON media_transcripts(status, updated_at);
+
+            CREATE TABLE transcript_segments (
+                segment_id TEXT PRIMARY KEY,
+                transcript_id TEXT NOT NULL REFERENCES media_transcripts(transcript_id) ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL,
+                start_ms INTEGER NOT NULL,
+                end_ms INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                confidence REAL,
+                chunk_id TEXT REFERENCES chunks(chunk_id) ON DELETE SET NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(transcript_id, ordinal)
+            );
+            CREATE INDEX idx_transcript_segments_time
+                ON transcript_segments(transcript_id, start_ms, end_ms);
+        "#,
+    },
+    Migration {
+        version: 20,
+        name: "observable_ocr_attempts",
+        sql: r#"
+            CREATE TABLE ocr_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                revision_id TEXT NOT NULL REFERENCES file_revisions(revision_id) ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL,
+                engine TEXT NOT NULL,
+                model_version TEXT,
+                status TEXT NOT NULL,
+                page_no INTEGER,
+                confidence REAL,
+                fallback_reason TEXT,
+                elapsed_ms INTEGER NOT NULL,
+                error_json TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(revision_id, ordinal)
+            );
+            CREATE INDEX idx_ocr_attempts_revision
+                ON ocr_attempts(revision_id, ordinal);
+        "#,
+    },
+    Migration {
+        version: 21,
+        name: "recoverable_processing_and_scan_checkpoints",
+        sql: r#"
+            ALTER TABLE files ADD COLUMN processing_disposition TEXT NOT NULL DEFAULT 'unknown';
+            ALTER TABLE files ADD COLUMN processing_reason_code TEXT;
+            ALTER TABLE files ADD COLUMN detected_mime_type TEXT;
+            ALTER TABLE jobs ADD COLUMN checkpoint_json TEXT;
+
+            CREATE TABLE processing_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                file_id TEXT REFERENCES files(file_id) ON DELETE CASCADE,
+                revision_id TEXT REFERENCES file_revisions(revision_id) ON DELETE CASCADE,
+                operation TEXT NOT NULL,
+                engine TEXT,
+                model_version TEXT,
+                status TEXT NOT NULL,
+                attempt_no INTEGER NOT NULL,
+                elapsed_ms INTEGER NOT NULL,
+                retryable INTEGER NOT NULL,
+                error_json TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX idx_processing_attempts_file_operation
+                ON processing_attempts(file_id, operation, created_at DESC);
+
+            CREATE TABLE scan_checkpoints (
+                job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE,
+                root_id TEXT NOT NULL REFERENCES roots(root_id) ON DELETE CASCADE,
+                batch_no INTEGER NOT NULL,
+                enumerated_items INTEGER NOT NULL,
+                committed_items INTEGER NOT NULL,
+                isolated_failures INTEGER NOT NULL,
+                retry_count INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX idx_scan_checkpoints_root
+                ON scan_checkpoints(root_id, updated_at DESC);
+
+            UPDATE files
+               SET processing_disposition = CASE
+                   WHEN extension IN ('jpg','jpeg','png','tif','tiff','bmp','webp') THEN 'image_ocr'
+                   WHEN extension IN ('exe','dll','msi') THEN 'safe_metadata'
+                   WHEN extension IN ('mp3','wav','m4a','flac','mp4','mkv','mov','avi') THEN 'media_metadata'
+                   WHEN extension IN ('zip','rar','7z','tar','gz') THEN 'archive_manifest'
+                   WHEN parse_status = 'unsupported' THEN 'capability_missing'
+                   ELSE 'parseable_content'
+               END;
+        "#,
+    },
 ];
 
 #[derive(Debug, Clone)]
@@ -823,6 +971,9 @@ impl CatalogStore {
                 .map_err(|error| AppError::local_config(error.to_string(), true))?;
         }
         let mut connection = store.connect()?;
+        connection
+            .execute_batch("PRAGMA journal_mode = WAL;")
+            .map_err(|error| storage_error("DATABASE_CONFIG_FAILED", error, true))?;
         store.migrate(&mut connection)?;
         store.ensure_builtin_exclusion_rules()?;
         store.ensure_builtin_collections()?;
@@ -835,11 +986,11 @@ impl CatalogStore {
         let connection = Connection::open(&self.database_path)
             .map_err(|error| storage_error("DATABASE_OPEN_FAILED", error, true))?;
         connection
-            .busy_timeout(Duration::from_millis(1_500))
+            .busy_timeout(Duration::from_millis(750))
             .map_err(|error| storage_error("DATABASE_CONFIG_FAILED", error, true))?;
         connection
             .execute_batch(
-                "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA temp_store = MEMORY;",
+                "PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL; PRAGMA temp_store = MEMORY;",
             )
             .map_err(|error| storage_error("DATABASE_CONFIG_FAILED", error, true))?;
         Ok(connection)
@@ -1718,63 +1869,170 @@ impl CatalogStore {
         job_id: &Uuid,
         outcome: &ScanOutcome,
     ) -> Result<JobRecord, AppError> {
-        const SCAN_WRITE_BATCH: usize = 250;
-        {
-            let _permit = self.acquire_write(WritePriority::Background);
-            let connection = self.connect()?;
-            connection
-                .execute(
-                    "DELETE FROM scan_seen_memberships WHERE job_id = ?1 AND root_id = ?2",
-                    params![job_id.to_string(), root_id.to_string()],
-                )
-                .map_err(|error| storage_error("SCAN_CHECKPOINT_WRITE_FAILED", error, true))?;
-        }
+        const SCAN_WRITE_BATCH: usize = 50;
+        const MAX_LOCK_RETRIES: u32 = 5;
+        let mut isolated_error_count = 0_u64;
+        let mut total_lock_retries = 0_u32;
+
         for (batch_index, batch) in outcome.files.chunks(SCAN_WRITE_BATCH).enumerate() {
-            let _permit = self.acquire_write(WritePriority::Background);
-            let mut connection = self.connect()?;
-            let root_enabled = connection
-                .query_row(
-                    "SELECT enabled FROM roots WHERE root_id = ?1",
-                    [root_id.to_string()],
-                    |row| row.get::<_, i64>(0),
-                )
-                .optional()
-                .map_err(|error| storage_error("ROOT_QUERY_FAILED", error, true))?
-                .unwrap_or_default()
-                != 0;
-            if !root_enabled {
-                return Err(AppError::new(
-                    "SCAN_ROOT_REVOKED",
-                    "资料位置授权已撤销，扫描结果未继续写入",
-                    false,
-                ));
+            let mut retry_count = 0_u32;
+            loop {
+                let write_result = (|| -> Result<u64, AppError> {
+                    let _permit = self.acquire_write(WritePriority::Background);
+                    let mut connection = self.connect()?;
+                    let root_enabled = connection
+                        .query_row(
+                            "SELECT enabled FROM roots WHERE root_id = ?1",
+                            [root_id.to_string()],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()
+                        .map_err(|error| storage_error("ROOT_QUERY_FAILED", error, true))?
+                        .unwrap_or_default()
+                        != 0;
+                    if !root_enabled {
+                        return Err(AppError::new(
+                            "SCAN_ROOT_REVOKED",
+                            "资料位置授权已撤销，扫描结果未继续写入",
+                            false,
+                        ));
+                    }
+                    let transaction = connection.transaction().map_err(|error| {
+                        storage_error("DATABASE_TRANSACTION_FAILED", error, true)
+                    })?;
+                    let mut batch_isolated_errors = 0_u64;
+                    for file in batch {
+                        let already_committed = transaction
+                            .query_row(
+                                "SELECT EXISTS(SELECT 1 FROM scan_seen_memberships s JOIN files f ON f.file_id = s.file_id WHERE s.job_id = ?1 AND s.root_id = ?2 AND f.path_key = ?3)",
+                                params![job_id.to_string(), root_id.to_string(), file.path_key],
+                                |row| row.get::<_, i64>(0),
+                            )
+                            .map_err(|error| {
+                                storage_error("SCAN_CHECKPOINT_QUERY_FAILED", error, true)
+                            })?
+                            != 0;
+                        if already_committed {
+                            continue;
+                        }
+
+                        transaction
+                            .execute_batch("SAVEPOINT scan_file")
+                            .map_err(|error| storage_error("SCAN_SAVEPOINT_FAILED", error, true))?;
+                        match upsert_file(&transaction, root_id, file) {
+                            Ok(file_id) => {
+                                transaction
+                                    .execute(
+                                        "INSERT OR IGNORE INTO scan_seen_memberships (job_id, root_id, file_id) VALUES (?1, ?2, ?3)",
+                                        params![job_id.to_string(), root_id.to_string(), file_id.to_string()],
+                                    )
+                                    .map_err(|error| storage_error("SCAN_CHECKPOINT_WRITE_FAILED", error, true))?;
+                                transaction.execute_batch("RELEASE scan_file").map_err(
+                                    |error| storage_error("SCAN_SAVEPOINT_FAILED", error, true),
+                                )?;
+                            }
+                            Err(error) if is_transient_storage_error(&error) => {
+                                let _ = transaction
+                                    .execute_batch("ROLLBACK TO scan_file; RELEASE scan_file");
+                                return Err(error);
+                            }
+                            Err(error) => {
+                                transaction
+                                    .execute_batch("ROLLBACK TO scan_file; RELEASE scan_file")
+                                    .map_err(|rollback_error| {
+                                        storage_error(
+                                            "SCAN_SAVEPOINT_ROLLBACK_FAILED",
+                                            rollback_error,
+                                            true,
+                                        )
+                                    })?;
+                                let error_json =
+                                    serde_json::to_string(&error).map_err(|json_error| {
+                                        AppError::new(
+                                            "PROCESSING_ATTEMPT_SERIALIZE_FAILED",
+                                            json_error.to_string(),
+                                            false,
+                                        )
+                                    })?;
+                                transaction
+                                    .execute(
+                                        "INSERT INTO processing_attempts (attempt_id, file_id, revision_id, operation, engine, model_version, status, attempt_no, elapsed_ms, retryable, error_json, created_at) VALUES (?1, NULL, NULL, 'scan_upsert', 'sqlite', NULL, 'failed', 1, 0, ?2, ?3, ?4)",
+                                        params![Uuid::now_v7().to_string(), if error.retryable { 1_i64 } else { 0_i64 }, error_json, Utc::now().to_rfc3339()],
+                                    )
+                                    .map_err(|database_error| storage_error("PROCESSING_ATTEMPT_WRITE_FAILED", database_error, true))?;
+                                batch_isolated_errors = batch_isolated_errors.saturating_add(1);
+                            }
+                        }
+                    }
+                    let committed_items = transaction
+                        .query_row(
+                            "SELECT COUNT(*) FROM scan_seen_memberships WHERE job_id = ?1 AND root_id = ?2",
+                            params![job_id.to_string(), root_id.to_string()],
+                            |row| row.get::<_, u64>(0),
+                        )
+                        .map_err(|error| {
+                            storage_error("SCAN_CHECKPOINT_QUERY_FAILED", error, true)
+                        })?;
+                    let enumerated_items =
+                        ((batch_index + 1) * SCAN_WRITE_BATCH).min(outcome.files.len()) as u64;
+                    let updated_at = Utc::now().to_rfc3339();
+                    let total_isolated = isolated_error_count.saturating_add(batch_isolated_errors);
+                    transaction
+                        .execute(
+                            "INSERT INTO scan_checkpoints (job_id, root_id, batch_no, enumerated_items, committed_items, isolated_failures, retry_count, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(job_id) DO UPDATE SET batch_no = excluded.batch_no, enumerated_items = excluded.enumerated_items, committed_items = excluded.committed_items, isolated_failures = excluded.isolated_failures, retry_count = excluded.retry_count, updated_at = excluded.updated_at",
+                            params![job_id.to_string(), root_id.to_string(), batch_index as u32, enumerated_items, committed_items, total_isolated, total_lock_retries.saturating_add(retry_count), updated_at],
+                        )
+                        .map_err(|error| storage_error("SCAN_CHECKPOINT_WRITE_FAILED", error, true))?;
+                    let checkpoint_json = serde_json::json!({
+                        "batch_no": batch_index,
+                        "enumerated_items": enumerated_items,
+                        "committed_items": committed_items,
+                        "isolated_failures": total_isolated,
+                        "retry_count": total_lock_retries.saturating_add(retry_count),
+                    })
+                    .to_string();
+                    transaction
+                        .execute(
+                            "UPDATE jobs SET stage = 'committing', processed_items = ?1, total_items = ?2, progress = CASE WHEN ?2 = 0 THEN 0.9 ELSE MIN(0.95, 0.7 + (CAST(?1 AS REAL) / CAST(?2 AS REAL)) * 0.25) END, checkpoint_json = ?3, last_heartbeat_at = ?4 WHERE job_id = ?5",
+                            params![committed_items, outcome.files.len() as u64, checkpoint_json, updated_at, job_id.to_string()],
+                        )
+                        .map_err(|error| storage_error("JOB_UPDATE_FAILED", error, true))?;
+                    transaction
+                        .commit()
+                        .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))?;
+                    Ok(batch_isolated_errors)
+                })();
+
+                match write_result {
+                    Ok(batch_errors) => {
+                        isolated_error_count = isolated_error_count.saturating_add(batch_errors);
+                        total_lock_retries = total_lock_retries.saturating_add(retry_count);
+                        break;
+                    }
+                    Err(error)
+                        if is_transient_storage_error(&error) && retry_count < MAX_LOCK_RETRIES =>
+                    {
+                        retry_count = retry_count.saturating_add(1);
+                        let delay_ms = 25_u64.saturating_mul(1_u64 << (retry_count - 1));
+                        std::thread::sleep(Duration::from_millis(delay_ms));
+                    }
+                    Err(mut error) => {
+                        let mut details = error
+                            .details
+                            .take()
+                            .and_then(|details| details.as_object().cloned())
+                            .unwrap_or_default();
+                        details.insert("batch_no".into(), serde_json::json!(batch_index));
+                        details.insert("retry_count".into(), serde_json::json!(retry_count));
+                        error.details = Some(Box::new(serde_json::Value::Object(details)));
+                        return Err(error);
+                    }
+                }
             }
-            let transaction = connection
-                .transaction()
-                .map_err(|error| storage_error("DATABASE_TRANSACTION_FAILED", error, true))?;
-            for file in batch {
-                let file_id = upsert_file(&transaction, root_id, file)?;
-                transaction
-                    .execute(
-                        "INSERT OR IGNORE INTO scan_seen_memberships (job_id, root_id, file_id) VALUES (?1, ?2, ?3)",
-                        params![job_id.to_string(), root_id.to_string(), file_id.to_string()],
-                    )
-                    .map_err(|error| storage_error("SCAN_CHECKPOINT_WRITE_FAILED", error, true))?;
-            }
-            let processed = ((batch_index + 1) * SCAN_WRITE_BATCH).min(outcome.files.len()) as u64;
-            transaction
-                .execute(
-                    "UPDATE jobs SET stage = 'committing', processed_items = ?1, total_items = ?2, progress = CASE WHEN ?2 = 0 THEN 0.9 ELSE MIN(0.95, 0.7 + (CAST(?1 AS REAL) / CAST(?2 AS REAL)) * 0.25) END, last_heartbeat_at = ?3 WHERE job_id = ?4",
-                    params![processed, outcome.files.len() as u64, Utc::now().to_rfc3339(), job_id.to_string()],
-                )
-                .map_err(|error| storage_error("JOB_UPDATE_FAILED", error, true))?;
-            transaction
-                .commit()
-                .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))?;
-            drop(_permit);
             std::thread::yield_now();
         }
-        if outcome.error_count == 0 && !outcome.deferred_by_budget {
+        let total_error_count = outcome.error_count.saturating_add(isolated_error_count);
+        if total_error_count == 0 && !outcome.deferred_by_budget {
             loop {
                 let _permit = self.acquire_write(WritePriority::Background);
                 let mut connection = self.connect()?;
@@ -1798,12 +2056,12 @@ impl CatalogStore {
             }
         }
 
-        let status = if outcome.error_count > 0 || outcome.deferred_by_budget {
+        let status = if total_error_count > 0 || outcome.deferred_by_budget {
             JobStatus::Partial
         } else {
             JobStatus::Succeeded
         };
-        let root_status = if outcome.error_count > 0 {
+        let root_status = if total_error_count > 0 {
             RootStatus::PartialDenied
         } else {
             RootStatus::Ready
@@ -1827,7 +2085,7 @@ impl CatalogStore {
                 params![
                     root_status.as_str(),
                     file_count,
-                    outcome.error_count,
+                    total_error_count,
                     finished_at.to_rfc3339(),
                     root_id.to_string(),
                 ],
@@ -1835,7 +2093,7 @@ impl CatalogStore {
             .map_err(|error| storage_error("ROOT_UPDATE_FAILED", error, true))?;
         transaction
             .execute(
-                "UPDATE jobs SET status = ?1, stage = 'completed', progress = 1.0, processed_items = ?2, total_items = ?2, finished_at = ?3 WHERE job_id = ?4",
+                "UPDATE jobs SET status = ?1, stage = 'completed', progress = 1.0, processed_items = ?2, total_items = ?2, finished_at = ?3, last_heartbeat_at = ?3 WHERE job_id = ?4",
                 params![
                     status.as_str(),
                     outcome.files.len() as u64,
@@ -1863,6 +2121,7 @@ impl CatalogStore {
         job_id: &Uuid,
         error: AppError,
     ) -> Result<JobRecord, AppError> {
+        let _permit = self.acquire_write(WritePriority::Background);
         let connection = self.connect()?;
         let transaction = connection
             .unchecked_transaction()
@@ -1903,6 +2162,183 @@ impl CatalogStore {
             .map_err(|error| storage_error("FILE_QUERY_FAILED", error, true))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| storage_error("FILE_QUERY_FAILED", error, true))
+    }
+
+    pub fn processing_coverage_snapshot(&self) -> Result<ProcessingCoverageSnapshot, AppError> {
+        let connection = self.connect()?;
+        let discovered_files = connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM files f WHERE {AUTHORIZED_FILE_SQL}"),
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(|error| storage_error("PROCESSING_COVERAGE_QUERY_FAILED", error, true))?;
+        let (parseable_files, parsed_files, failed_files, explicitly_excluded_files) = connection
+            .query_row(
+                &format!(
+                    "SELECT
+                        SUM(CASE WHEN f.processing_disposition IN ('parseable_content','image_ocr','read_only_text','archive_manifest') THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN f.parse_status = 'parsed' THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN f.parse_status IN ('failed','encrypted') THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN f.processing_disposition IN ('media_metadata','safe_metadata','capability_missing','unknown') THEN 1 ELSE 0 END)
+                     FROM files f WHERE {AUTHORIZED_FILE_SQL}"
+                ),
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<u64>>(0)?.unwrap_or_default(),
+                        row.get::<_, Option<u64>>(1)?.unwrap_or_default(),
+                        row.get::<_, Option<u64>>(2)?.unwrap_or_default(),
+                        row.get::<_, Option<u64>>(3)?.unwrap_or_default(),
+                    ))
+                },
+            )
+            .map_err(|error| storage_error("PROCESSING_COVERAGE_QUERY_FAILED", error, true))?;
+        let fts_chunks = connection
+            .query_row("SELECT COUNT(*) FROM chunks", [], |row| {
+                row.get::<_, u64>(0)
+            })
+            .map_err(|error| storage_error("PROCESSING_COVERAGE_QUERY_FAILED", error, true))?;
+        let embedding_chunks = connection
+            .query_row("SELECT COUNT(*) FROM chunk_embeddings", [], |row| {
+                row.get::<_, u64>(0)
+            })
+            .map_err(|error| storage_error("PROCESSING_COVERAGE_QUERY_FAILED", error, true))?;
+        let active_vector_keys = connection
+            .query_row(
+                "SELECT COUNT(*) FROM vector_index_keys k JOIN index_generations g ON g.generation_id = k.generation_id WHERE g.status = 'active'",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(|error| storage_error("PROCESSING_COVERAGE_QUERY_FAILED", error, true))?;
+        let (pending_ocr_assets, pending_vision_assets) = connection
+            .query_row(
+                "SELECT
+                    SUM(CASE WHEN ocr_text IS NULL AND status IN ('pending_understanding','failed') THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN description IS NULL AND status IN ('pending_understanding','failed') THEN 1 ELSE 0 END)
+                 FROM image_assets",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<u64>>(0)?.unwrap_or_default(),
+                        row.get::<_, Option<u64>>(1)?.unwrap_or_default(),
+                    ))
+                },
+            )
+            .map_err(|error| storage_error("PROCESSING_COVERAGE_QUERY_FAILED", error, true))?;
+        let parse_coverage = ratio(parsed_files, parseable_files);
+        let embedding_coverage = ratio(embedding_chunks, fts_chunks);
+        let vector_coverage = ratio(active_vector_keys, embedding_chunks);
+        Ok(ProcessingCoverageSnapshot {
+            discovered_files,
+            parseable_files,
+            parsed_files,
+            failed_files,
+            explicitly_excluded_files,
+            fts_chunks,
+            embedding_chunks,
+            active_vector_keys,
+            pending_ocr_assets,
+            pending_vision_assets,
+            parse_coverage,
+            embedding_coverage,
+            vector_coverage,
+            measured_at: Utc::now(),
+        })
+    }
+
+    pub fn evaluation_integrity_snapshot(&self) -> Result<EvaluationIntegritySnapshot, AppError> {
+        let connection = self.connect()?;
+        let mut active_jobs = 0_u64;
+        let mut stale_nonrecoverable_jobs = 0_u64;
+        {
+            let mut statement = connection
+                .prepare(
+                    "SELECT status, last_heartbeat_at, resume_count FROM jobs WHERE status IN ('queued','running','paused','awaiting_user')",
+                )
+                .map_err(|error| storage_error("EVALUATION_INTEGRITY_QUERY_FAILED", error, true))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, u64>(2)?,
+                    ))
+                })
+                .map_err(|error| storage_error("EVALUATION_INTEGRITY_QUERY_FAILED", error, true))?;
+            for row in rows {
+                let (status, heartbeat, resume_count) = row.map_err(|error| {
+                    storage_error("EVALUATION_INTEGRITY_QUERY_FAILED", error, true)
+                })?;
+                active_jobs += 1;
+                let stale = status == "running"
+                    && heartbeat
+                        .as_deref()
+                        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                        .is_none_or(|value| {
+                            Utc::now().signed_duration_since(value.with_timezone(&Utc))
+                                > chrono::Duration::minutes(10)
+                        });
+                if stale && resume_count >= 3 {
+                    stale_nonrecoverable_jobs += 1;
+                }
+            }
+        }
+        let orphan_embeddings = connection
+            .query_row(
+                "SELECT COUNT(*) FROM chunk_embeddings e LEFT JOIN chunks c ON c.chunk_id = e.chunk_id LEFT JOIN files f ON f.file_id = e.file_id WHERE c.chunk_id IS NULL OR f.file_id IS NULL",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(|error| storage_error("EVALUATION_INTEGRITY_QUERY_FAILED", error, true))?;
+        let missing_vector_embeddings = connection
+            .query_row(
+                "SELECT COUNT(*) FROM vector_index_keys k JOIN index_generations g ON g.generation_id = k.generation_id AND g.status = 'active' LEFT JOIN chunk_embeddings e ON e.chunk_id = k.chunk_id AND e.model_artifact_id = g.model_artifact_id AND e.file_id = k.file_id AND e.revision_id = k.revision_id WHERE e.chunk_id IS NULL",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(|error| storage_error("EVALUATION_INTEGRITY_QUERY_FAILED", error, true))?;
+        let generation_count_mismatches = connection
+            .query_row(
+                "SELECT COUNT(*) FROM index_generations g WHERE g.status = 'active' AND g.item_count != (SELECT COUNT(*) FROM vector_index_keys k WHERE k.generation_id = g.generation_id)",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(|error| storage_error("EVALUATION_INTEGRITY_QUERY_FAILED", error, true))?;
+        let mut missing_active_index_files = 0_u64;
+        {
+            let mut statement = connection
+                .prepare("SELECT index_path FROM index_generations WHERE status = 'active'")
+                .map_err(|error| storage_error("EVALUATION_INTEGRITY_QUERY_FAILED", error, true))?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|error| storage_error("EVALUATION_INTEGRITY_QUERY_FAILED", error, true))?;
+            for row in rows {
+                let path = row.map_err(|error| {
+                    storage_error("EVALUATION_INTEGRITY_QUERY_FAILED", error, true)
+                })?;
+                if !PathBuf::from(path).is_file() {
+                    missing_active_index_files += 1;
+                }
+            }
+        }
+        let files_without_authorized_roots = connection
+            .query_row(
+                "SELECT COUNT(*) FROM files f WHERE f.availability = 'present' AND NOT EXISTS (SELECT 1 FROM file_root_memberships m JOIN roots r ON r.root_id = m.root_id WHERE m.file_id = f.file_id AND r.enabled = 1)",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(|error| storage_error("EVALUATION_INTEGRITY_QUERY_FAILED", error, true))?;
+        Ok(EvaluationIntegritySnapshot {
+            active_jobs,
+            stale_nonrecoverable_jobs,
+            orphan_embeddings,
+            inconsistent_active_vector_keys: missing_vector_embeddings
+                .saturating_add(generation_count_mismatches),
+            missing_active_index_files,
+            files_without_authorized_roots,
+            measured_at: Utc::now(),
+        })
     }
 
     pub fn query_files(&self, request: &FileQuery) -> Result<FilePage, AppError> {
@@ -2542,15 +2978,12 @@ impl CatalogStore {
             ));
         }
         const ALGORITHM_VERSION: &str = "semantic_lsh_v2";
-        let mut connection = self.connect()?;
-        let transaction = connection
-            .transaction()
-            .map_err(|error| storage_error("COLLECTION_SUGGESTION_REFRESH_FAILED", error, true))?;
+        let connection = self.connect()?;
         let sql = format!(
             "WITH targets AS (SELECT f.file_id, f.current_revision_id, f.display_name FROM files f LEFT JOIN document_profiles p ON p.file_id = f.file_id WHERE f.current_revision_id IS NOT NULL AND f.parse_status = 'parsed' AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL} AND EXISTS (SELECT 1 FROM chunk_embeddings ce WHERE ce.file_id = f.file_id AND ce.revision_id = f.current_revision_id AND ce.model_artifact_id = ?1) AND (p.file_id IS NULL OR p.revision_id <> f.current_revision_id OR p.embedding_model_id <> ?1 OR p.algorithm_version <> ?2) ORDER BY f.last_seen_at DESC LIMIT ?3) SELECT t.file_id, t.current_revision_id, t.display_name, c.text, e.dimension, e.vector_blob FROM targets t JOIN chunks c ON c.file_id = t.file_id AND c.revision_id = t.current_revision_id JOIN chunk_embeddings e ON e.chunk_id = c.chunk_id AND e.model_artifact_id = ?1 ORDER BY t.file_id, c.ordinal"
         );
         let rows = {
-            let mut statement = transaction
+            let mut statement = connection
                 .prepare(&sql)
                 .map_err(|error| storage_error("COLLECTION_PROFILE_QUERY_FAILED", error, true))?;
             statement
@@ -2584,6 +3017,7 @@ impl CatalogStore {
         }
         let now = Utc::now().to_rfc3339();
         let mut profiles = Vec::new();
+        let mut profile_records = Vec::new();
         for (file_id, (revision_id, title, texts, vectors)) in grouped {
             let vector = mean_normalized_vector(&vectors)?;
             let bucket = semantic_bucket(&vector);
@@ -2592,24 +3026,50 @@ impl CatalogStore {
                 .map(|text| compact_profile_text(text, 260))
                 .unwrap_or_default();
             let keywords = profile_keywords(&title);
-            transaction
-                .execute(
-                    "INSERT INTO document_profiles (file_id, revision_id, title, summary, keywords_json, entities_json, embedding_model_id, dimension, vector_blob, candidate_bucket, algorithm_version, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, '[]', ?6, ?7, ?8, ?9, ?10, ?11, ?11) ON CONFLICT(file_id) DO UPDATE SET revision_id = excluded.revision_id, title = excluded.title, summary = excluded.summary, keywords_json = excluded.keywords_json, entities_json = excluded.entities_json, embedding_model_id = excluded.embedding_model_id, dimension = excluded.dimension, vector_blob = excluded.vector_blob, candidate_bucket = excluded.candidate_bucket, algorithm_version = excluded.algorithm_version, updated_at = excluded.updated_at",
-                    params![file_id, revision_id, title, summary, serde_json::to_string(&keywords).unwrap_or_else(|_| "[]".into()), model_artifact_id, vector.len() as u32, encode_vector(&vector), bucket, ALGORITHM_VERSION, now],
-                )
-                .map_err(|error| storage_error("COLLECTION_PROFILE_WRITE_FAILED", error, true))?;
             profiles.push(ProfileCandidate {
                 file_id: parse_uuid_value(&file_id)?,
                 revision_id: parse_uuid_value(&revision_id)?,
-                title,
-                vector,
-                bucket,
+                title: title.clone(),
+                vector: vector.clone(),
+                bucket: bucket.clone(),
             });
+            profile_records.push((
+                file_id,
+                revision_id,
+                title,
+                summary,
+                serde_json::to_string(&keywords).unwrap_or_else(|_| "[]".into()),
+                vector.len() as u32,
+                encode_vector(&vector),
+                bucket,
+            ));
         }
-        let mut candidate_edges = 0_u64;
+        drop(connection);
+        for batch in profile_records.chunks(100) {
+            let _permit = self.acquire_write(WritePriority::Background);
+            let mut connection = self.connect()?;
+            let transaction = connection.transaction().map_err(|error| {
+                storage_error("COLLECTION_SUGGESTION_REFRESH_FAILED", error, true)
+            })?;
+            for (file_id, revision_id, title, summary, keywords, dimension, vector, bucket) in batch
+            {
+                transaction
+                    .execute(
+                        "INSERT INTO document_profiles (file_id, revision_id, title, summary, keywords_json, entities_json, embedding_model_id, dimension, vector_blob, candidate_bucket, algorithm_version, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, '[]', ?6, ?7, ?8, ?9, ?10, ?11, ?11) ON CONFLICT(file_id) DO UPDATE SET revision_id = excluded.revision_id, title = excluded.title, summary = excluded.summary, keywords_json = excluded.keywords_json, entities_json = excluded.entities_json, embedding_model_id = excluded.embedding_model_id, dimension = excluded.dimension, vector_blob = excluded.vector_blob, candidate_bucket = excluded.candidate_bucket, algorithm_version = excluded.algorithm_version, updated_at = excluded.updated_at",
+                        params![file_id, revision_id, title, summary, keywords, model_artifact_id, dimension, vector, bucket, ALGORITHM_VERSION, now],
+                    )
+                    .map_err(|error| storage_error("COLLECTION_PROFILE_WRITE_FAILED", error, true))?;
+            }
+            transaction.commit().map_err(|error| {
+                storage_error("COLLECTION_SUGGESTION_REFRESH_FAILED", error, true)
+            })?;
+        }
+        let connection = self.connect()?;
+        let mut candidate_records = Vec::new();
+        let mut seen_edges = HashSet::new();
         for profile in &profiles {
             let candidates = {
-                let mut statement = transaction
+                let mut statement = connection
                     .prepare("SELECT file_id, revision_id, title, dimension, vector_blob FROM document_profiles WHERE embedding_model_id = ?1 AND candidate_bucket = ?2 AND file_id <> ?3 ORDER BY updated_at DESC LIMIT 96")
                     .map_err(|error| storage_error("COLLECTION_CANDIDATE_QUERY_FAILED", error, true))?;
                 statement
@@ -2669,6 +3129,9 @@ impl CatalogStore {
                             profile.revision_id,
                         )
                     };
+                if !seen_edges.insert((left, right)) {
+                    continue;
+                }
                 let reasons = serde_json::to_string(&vec![
                     format!("文档语义画像相似度 {:.0}%", similarity * 100.0),
                     format!(
@@ -2679,27 +3142,40 @@ impl CatalogStore {
                 .map_err(|error| {
                     AppError::new("COLLECTION_REASON_INVALID", error.to_string(), false)
                 })?;
+                candidate_records.push((
+                    left,
+                    right,
+                    left_revision,
+                    right_revision,
+                    f64::from(similarity),
+                    reasons,
+                ));
+            }
+        }
+        drop(connection);
+        for batch in candidate_records.chunks(100) {
+            let _permit = self.acquire_write(WritePriority::Background);
+            let mut connection = self.connect()?;
+            let transaction = connection.transaction().map_err(|error| {
+                storage_error("COLLECTION_SUGGESTION_REFRESH_FAILED", error, true)
+            })?;
+            for (left, right, left_revision, right_revision, confidence, reasons) in batch {
                 transaction
                     .execute(
                         "INSERT INTO file_relations (relation_id, left_file_id, right_file_id, relation_type, confidence, reasons_json, review_status, created_at, updated_at, algorithm_version, model_version, left_revision_id, right_revision_id) VALUES (?1, ?2, ?3, 'semantic_related', ?4, ?5, 'suggested', ?6, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(left_file_id, right_file_id, relation_type) DO UPDATE SET confidence = excluded.confidence, reasons_json = excluded.reasons_json, review_status = CASE WHEN file_relations.algorithm_version IS NOT excluded.algorithm_version OR file_relations.model_version IS NOT excluded.model_version OR file_relations.left_revision_id IS NOT excluded.left_revision_id OR file_relations.right_revision_id IS NOT excluded.right_revision_id THEN 'suggested' ELSE file_relations.review_status END, algorithm_version = excluded.algorithm_version, model_version = excluded.model_version, left_revision_id = excluded.left_revision_id, right_revision_id = excluded.right_revision_id, updated_at = excluded.updated_at",
-                        params![Uuid::now_v7().to_string(), left.to_string(), right.to_string(), f64::from(similarity), reasons, now, ALGORITHM_VERSION, model_artifact_id, left_revision.to_string(), right_revision.to_string()],
+                        params![Uuid::now_v7().to_string(), left.to_string(), right.to_string(), confidence, reasons, now, ALGORITHM_VERSION, model_artifact_id, left_revision.to_string(), right_revision.to_string()],
                     )
                     .map_err(|error| storage_error("COLLECTION_CANDIDATE_WRITE_FAILED", error, true))?;
-                candidate_edges += 1;
             }
+            transaction.commit().map_err(|error| {
+                storage_error("COLLECTION_SUGGESTION_REFRESH_FAILED", error, true)
+            })?;
         }
-        let mut created_suggestions = 0_u64;
-        let mut suggestion_ids = Vec::new();
-        let mut consumed = HashSet::new();
+        let connection = self.connect()?;
+        let mut suggestion_drafts = Vec::new();
         for profile in &profiles {
-            if suggestion_ids.len() >= 24 {
-                break;
-            }
-            if consumed.contains(&profile.file_id) {
-                continue;
-            }
             let related = {
-                let mut statement = transaction
+                let mut statement = connection
                     .prepare("SELECT CASE WHEN left_file_id = ?1 THEN right_file_id ELSE left_file_id END, confidence FROM file_relations WHERE relation_type IN ('semantic_related','related') AND review_status <> 'rejected' AND confidence >= 0.78 AND model_version = ?2 AND algorithm_version = ?3 AND (left_file_id = ?1 OR right_file_id = ?1) ORDER BY confidence DESC LIMIT 11")
                     .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?;
                 statement
@@ -2727,7 +3203,7 @@ impl CatalogStore {
             )];
             for (file_id, confidence) in related {
                 let file_id = parse_uuid_value(&file_id)?;
-                let profile_data = transaction
+                let profile_data = connection
                     .query_row(
                         "SELECT revision_id, title FROM document_profiles WHERE file_id = ?1",
                         [file_id.to_string()],
@@ -2762,44 +3238,74 @@ impl CatalogStore {
             let confidence = members.iter().skip(1).map(|member| member.2).sum::<f64>()
                 / (members.len() - 1) as f64;
             let name = deterministic_collection_name(&member_titles);
-            let changed = transaction
-                .execute(
-                    "INSERT OR IGNORE INTO collection_suggestions (suggestion_id, idempotency_key, suggested_name, description, confidence, status, model_version, algorithm_version, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'suggested', ?6, ?7, ?8, ?8)",
-                    params![suggestion_id.to_string(), idempotency_key, name, "基于文档级Embedding与内容关系形成的虚拟分组；不会改变任何原文件位置。", confidence, model_artifact_id, ALGORITHM_VERSION, now],
-                )
-                .map_err(|error| storage_error("COLLECTION_SUGGESTION_WRITE_FAILED", error, true))?;
-            if changed == 0 {
-                continue;
-            }
-            for (file_id, revision_id, member_confidence, rationale) in &members {
-                transaction
+            suggestion_drafts.push((
+                profile.file_id,
+                suggestion_id,
+                idempotency_key,
+                name,
+                confidence,
+                members,
+            ));
+        }
+        drop(connection);
+
+        let mut created_suggestions = 0_u64;
+        let mut suggestion_ids = Vec::new();
+        let mut consumed = HashSet::new();
+        if !suggestion_drafts.is_empty() {
+            let _permit = self.acquire_write(WritePriority::Background);
+            let mut connection = self.connect()?;
+            let transaction = connection.transaction().map_err(|error| {
+                storage_error("COLLECTION_SUGGESTION_REFRESH_FAILED", error, true)
+            })?;
+            for (core_file_id, suggestion_id, idempotency_key, name, confidence, members) in
+                suggestion_drafts
+            {
+                if suggestion_ids.len() >= 24 {
+                    break;
+                }
+                if consumed.contains(&core_file_id) {
+                    continue;
+                }
+                let changed = transaction
                     .execute(
-                        "INSERT INTO collection_suggested_members (suggestion_id, file_id, revision_id, confidence, rationale, state) VALUES (?1, ?2, ?3, ?4, ?5, 'suggested')",
-                        params![suggestion_id.to_string(), file_id.to_string(), revision_id.to_string(), member_confidence, rationale],
+                        "INSERT OR IGNORE INTO collection_suggestions (suggestion_id, idempotency_key, suggested_name, description, confidence, status, model_version, algorithm_version, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'suggested', ?6, ?7, ?8, ?8)",
+                        params![suggestion_id.to_string(), idempotency_key, name, "基于文档级Embedding与内容关系形成的虚拟分组；不会改变任何原文件位置。", confidence, model_artifact_id, ALGORITHM_VERSION, now],
                     )
                     .map_err(|error| storage_error("COLLECTION_SUGGESTION_WRITE_FAILED", error, true))?;
-                insert_inbox_event(
-                    &transaction,
-                    file_id,
-                    InboxEventType::CollectionSuggested,
-                    Utc::now(),
-                    None,
-                    TriageStatus::New,
-                    Some("AI发现这份资料与其他文档存在主题联系，等待审核虚拟集合建议"),
-                    None,
-                    &format!("collection_suggestion:{suggestion_id}:{file_id}"),
-                )?;
-                consumed.insert(*file_id);
+                if changed == 0 {
+                    continue;
+                }
+                for (file_id, revision_id, member_confidence, rationale) in &members {
+                    transaction
+                        .execute(
+                            "INSERT INTO collection_suggested_members (suggestion_id, file_id, revision_id, confidence, rationale, state) VALUES (?1, ?2, ?3, ?4, ?5, 'suggested')",
+                            params![suggestion_id.to_string(), file_id.to_string(), revision_id.to_string(), member_confidence, rationale],
+                        )
+                        .map_err(|error| storage_error("COLLECTION_SUGGESTION_WRITE_FAILED", error, true))?;
+                    insert_inbox_event(
+                        &transaction,
+                        file_id,
+                        InboxEventType::CollectionSuggested,
+                        Utc::now(),
+                        None,
+                        TriageStatus::New,
+                        Some("AI发现这份资料与其他文档存在主题联系，等待审核虚拟集合建议"),
+                        None,
+                        &format!("collection_suggestion:{suggestion_id}:{file_id}"),
+                    )?;
+                    consumed.insert(*file_id);
+                }
+                created_suggestions += 1;
+                suggestion_ids.push(suggestion_id);
             }
-            created_suggestions += 1;
-            suggestion_ids.push(suggestion_id);
+            transaction.commit().map_err(|error| {
+                storage_error("COLLECTION_SUGGESTION_REFRESH_FAILED", error, true)
+            })?;
         }
-        transaction
-            .commit()
-            .map_err(|error| storage_error("COLLECTION_SUGGESTION_REFRESH_FAILED", error, true))?;
         Ok(CollectionSuggestionRefreshResult {
             profiled_files: profiles.len() as u64,
-            candidate_edges,
+            candidate_edges: candidate_records.len() as u64,
             created_suggestions,
             suggestion_ids,
             algorithm_version: ALGORITHM_VERSION.into(),
@@ -2919,6 +3425,7 @@ impl CatalogStore {
                 false,
             ));
         }
+        let _permit = self.acquire_write(WritePriority::Interactive);
         let mut connection = self.connect()?;
         let transaction = connection
             .transaction()
@@ -2993,6 +3500,7 @@ impl CatalogStore {
                 false,
             ));
         }
+        let _permit = self.acquire_write(WritePriority::Interactive);
         let mut connection = self.connect()?;
         let transaction = connection
             .transaction()
@@ -3042,6 +3550,7 @@ impl CatalogStore {
         &self,
         suggestion_id: &Uuid,
     ) -> Result<CollectionRecord, AppError> {
+        let _permit = self.acquire_write(WritePriority::Interactive);
         let mut connection = self.connect()?;
         let transaction = connection
             .transaction()
@@ -3074,6 +3583,7 @@ impl CatalogStore {
     }
 
     pub fn reject_collection_suggestion(&self, suggestion_id: &Uuid) -> Result<(), AppError> {
+        let _permit = self.acquire_write(WritePriority::Interactive);
         let mut connection = self.connect()?;
         let transaction = connection
             .transaction()
@@ -3143,9 +3653,7 @@ impl CatalogStore {
 
         let mut hashed_files = 0_u64;
         let mut hashes = BTreeMap::<String, Vec<Uuid>>::new();
-        let transaction = connection
-            .transaction()
-            .map_err(|error| storage_error("DATABASE_TRANSACTION_FAILED", error, true))?;
+        let mut hash_updates = Vec::<(Uuid, Option<Uuid>, String)>::new();
         for file in &files {
             if size_counts
                 .get(&file.size_bytes)
@@ -3159,24 +3667,31 @@ impl CatalogStore {
                 hash.clone()
             } else {
                 let hash = hash_file_sha256(&PathBuf::from(&file.canonical_path))?;
-                transaction
-                    .execute(
-                        "UPDATE files SET content_sha256 = ?1 WHERE file_id = ?2 AND current_revision_id = ?3",
-                        params![hash, file.file_id.to_string(), file.current_revision_id.map(|value| value.to_string())],
-                    )
-                    .map_err(|error| storage_error("FILE_HASH_UPDATE_FAILED", error, true))?;
-                if let Some(revision_id) = file.current_revision_id {
-                    transaction
-                        .execute(
-                            "UPDATE file_revisions SET content_sha256 = ?1 WHERE revision_id = ?2",
-                            params![hash, revision_id.to_string()],
-                        )
-                        .map_err(|error| storage_error("FILE_HASH_UPDATE_FAILED", error, true))?;
-                }
+                hash_updates.push((file.file_id, file.current_revision_id, hash.clone()));
                 hashed_files += 1;
                 hash
             };
             hashes.entry(hash).or_default().push(file.file_id);
+        }
+        let _permit = self.acquire_write(WritePriority::Background);
+        let transaction = connection
+            .transaction()
+            .map_err(|error| storage_error("DATABASE_TRANSACTION_FAILED", error, true))?;
+        for (file_id, revision_id, hash) in hash_updates {
+            transaction
+                .execute(
+                    "UPDATE files SET content_sha256 = ?1 WHERE file_id = ?2 AND current_revision_id = ?3",
+                    params![hash, file_id.to_string(), revision_id.map(|value| value.to_string())],
+                )
+                .map_err(|error| storage_error("FILE_HASH_UPDATE_FAILED", error, true))?;
+            if let Some(revision_id) = revision_id {
+                transaction
+                    .execute(
+                        "UPDATE file_revisions SET content_sha256 = ?1 WHERE revision_id = ?2",
+                        params![hash, revision_id.to_string()],
+                    )
+                    .map_err(|error| storage_error("FILE_HASH_UPDATE_FAILED", error, true))?;
+            }
         }
         transaction
             .execute(
@@ -3286,6 +3801,7 @@ impl CatalogStore {
                 false,
             ));
         }
+        let _permit = self.acquire_write(WritePriority::Background);
         const ALGORITHM_VERSION: &str = "semantic_relation_bucket_v1";
         let mut connection = self.connect()?;
         let transaction = connection
@@ -3543,6 +4059,7 @@ impl CatalogStore {
                 false,
             ));
         }
+        let _permit = self.acquire_write(WritePriority::Interactive);
         let connection = self.connect()?;
         let changed = connection
             .execute(
@@ -3579,6 +4096,7 @@ impl CatalogStore {
                 false,
             ));
         }
+        let _permit = self.acquire_write(WritePriority::Interactive);
         let mut connection = self.connect()?;
         let transaction = connection
             .transaction()
@@ -3613,7 +4131,7 @@ impl CatalogStore {
         let connection = self.connect()?;
         let mut statement = connection
             .prepare(
-                "SELECT file_id, volume_id, canonical_path, display_name, extension, mime_type, size_bytes, fs_created_at, modified_at, windows_file_id, content_sha256, availability, current_revision_id, parse_status, first_seen_at, last_seen_at FROM files WHERE availability = 'present' AND current_revision_id IS NOT NULL AND parse_status = 'pending' AND extension IN ('pdf', 'docx', 'docm', 'xlsx', 'xlsm', 'pptx', 'pptm', 'csv', 'tsv', 'md', 'txt', 'html', 'htm', 'jpg', 'jpeg', 'png', 'tif', 'tiff', 'bmp', 'webp', 'doc', 'xls', 'ppt', 'zip', 'rs', 'py', 'js', 'jsx', 'mjs', 'cjs', 'ts', 'tsx', 'java', 'kt', 'kts', 'go', 'c', 'cc', 'cpp', 'h', 'hpp', 'cs', 'rb', 'php', 'swift', 'scala', 'sh', 'ps1', 'sql', 'json', 'yaml', 'yml', 'toml', 'xml', 'css', 'scss', 'vue', 'svelte') ORDER BY last_seen_at LIMIT ?1",
+                "SELECT file_id, volume_id, canonical_path, display_name, extension, mime_type, size_bytes, fs_created_at, modified_at, windows_file_id, content_sha256, availability, current_revision_id, parse_status, first_seen_at, last_seen_at FROM files WHERE availability = 'present' AND current_revision_id IS NOT NULL AND parse_status = 'pending' AND extension IN ('pdf', 'docx', 'docm', 'xlsx', 'xlsm', 'pptx', 'pptm', 'csv', 'tsv', 'md', 'txt', 'text', 'ini', 'iml', 'log', 'conf', 'cfg', 'properties', 'html', 'htm', 'jpg', 'jpeg', 'png', 'tif', 'tiff', 'bmp', 'webp', 'doc', 'xls', 'ppt', 'zip', 'rs', 'py', 'js', 'jsx', 'mjs', 'cjs', 'ts', 'tsx', 'java', 'kt', 'kts', 'go', 'c', 'cc', 'cpp', 'h', 'hpp', 'cs', 'rb', 'php', 'swift', 'scala', 'sh', 'ps1', 'sql', 'json', 'yaml', 'yml', 'toml', 'xml', 'css', 'scss', 'vue', 'svelte') ORDER BY last_seen_at, file_id LIMIT ?1",
             )
             .map_err(|error| storage_error("FILE_QUERY_FAILED", error, true))?;
         statement
@@ -3640,6 +4158,95 @@ impl CatalogStore {
             ));
         }
         Ok(())
+    }
+
+    pub fn requeue_ocr_pending_for_available_runtime(&self, limit: usize) -> Result<u64, AppError> {
+        if !(1..=5_000).contains(&limit) {
+            return Err(AppError::new(
+                "OCR_REQUEUE_LIMIT_INVALID",
+                "OCR恢复批量大小必须在1到5000之间",
+                false,
+            ));
+        }
+        let _permit = self.acquire_write(WritePriority::Background);
+        let connection = self.connect()?;
+        let changed = connection
+            .execute(
+                "WITH eligible AS (
+                    SELECT f.file_id
+                    FROM files f
+                    WHERE f.availability = 'present'
+                      AND f.current_revision_id IS NOT NULL
+                      AND f.parse_status = 'ocr_pending'
+                      AND EXISTS (
+                        SELECT 1
+                        FROM file_root_memberships frm
+                        JOIN roots r ON r.root_id = frm.root_id
+                        WHERE frm.file_id = f.file_id AND r.enabled = 1
+                      )
+                      AND (
+                        SELECT COUNT(*)
+                        FROM processing_attempts pa
+                        WHERE pa.file_id = f.file_id
+                          AND pa.operation = 'parse'
+                          AND pa.status = 'ocr_pending'
+                      ) < 3
+                    ORDER BY f.last_seen_at, f.file_id
+                    LIMIT ?1
+                )
+                UPDATE files
+                SET parse_status = 'pending', processing_reason_code = NULL
+                WHERE file_id IN (SELECT file_id FROM eligible)",
+                [limit as u64],
+            )
+            .map_err(|error| storage_error("OCR_REQUEUE_FAILED", error, true))?;
+        Ok(changed as u64)
+    }
+
+    pub fn sanitize_existing_ocr_attempt_errors(&self) -> Result<u64, AppError> {
+        let _permit = self.acquire_write(WritePriority::Background);
+        let mut connection = self.connect()?;
+        let rows = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT attempt_id, error_json FROM ocr_attempts WHERE error_json IS NOT NULL",
+                )
+                .map_err(|error| storage_error("OCR_ATTEMPT_QUERY_FAILED", error, true))?;
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|error| storage_error("OCR_ATTEMPT_QUERY_FAILED", error, true))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| storage_error("OCR_ATTEMPT_QUERY_FAILED", error, true))?
+        };
+        let transaction = connection
+            .transaction()
+            .map_err(|error| storage_error("OCR_ATTEMPT_SANITIZE_FAILED", error, true))?;
+        let mut changed = 0_u64;
+        for (attempt_id, raw_error) in rows {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw_error) else {
+                continue;
+            };
+            let sanitized = serde_json::to_string(&sanitize_log_value(&value, None))
+                .map_err(|error| AppError::new("OCR_ATTEMPT_INVALID", error.to_string(), false))?;
+            if sanitized == raw_error {
+                continue;
+            }
+            changed = changed.saturating_add(
+                transaction
+                    .execute(
+                        "UPDATE ocr_attempts SET error_json = ?1 WHERE attempt_id = ?2",
+                        params![sanitized, attempt_id],
+                    )
+                    .map_err(|error| storage_error("OCR_ATTEMPT_SANITIZE_FAILED", error, true))?
+                    as u64,
+            );
+        }
+        transaction
+            .commit()
+            .map_err(|error| storage_error("OCR_ATTEMPT_SANITIZE_FAILED", error, true))?;
+        Ok(changed)
     }
 
     pub fn list_pending_embedding_chunks(
@@ -4100,6 +4707,12 @@ impl CatalogStore {
                 [result.revision_id.to_string()],
             )
             .map_err(|error| storage_error("IMAGE_ASSET_WRITE_FAILED", error, true))?;
+        transaction
+            .execute(
+                "DELETE FROM ocr_attempts WHERE revision_id = ?1",
+                [result.revision_id.to_string()],
+            )
+            .map_err(|error| storage_error("OCR_ATTEMPT_WRITE_FAILED", error, true))?;
 
         for node in &result.nodes {
             insert_document_node(&transaction, &result.revision_id, node)?;
@@ -4132,6 +4745,37 @@ impl CatalogStore {
                 )
                 .map_err(|error| storage_error("IMAGE_ASSET_WRITE_FAILED", error, true))?;
         }
+        for (ordinal, attempt) in result.ocr_attempts.iter().enumerate() {
+            let error_json = attempt
+                .error
+                .as_ref()
+                .map(|error| {
+                    serde_json::to_value(error)
+                        .map(|value| sanitize_log_value(&value, None))
+                        .and_then(|value| serde_json::to_string(&value))
+                })
+                .transpose()
+                .map_err(|error| AppError::new("OCR_ATTEMPT_INVALID", error.to_string(), false))?;
+            transaction
+                .execute(
+                    "INSERT INTO ocr_attempts (attempt_id, revision_id, ordinal, engine, model_version, status, page_no, confidence, fallback_reason, elapsed_ms, error_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        Uuid::now_v7().to_string(),
+                        result.revision_id.to_string(),
+                        ordinal as u64,
+                        &attempt.engine,
+                        attempt.model_version.as_deref(),
+                        &attempt.status,
+                        attempt.page_no,
+                        attempt.confidence,
+                        attempt.fallback_reason.as_deref(),
+                        attempt.elapsed_ms,
+                        error_json,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )
+                .map_err(|error| storage_error("OCR_ATTEMPT_WRITE_FAILED", error, true))?;
+        }
 
         let parse_status = match result.status {
             ParseOutcome::Parsed => "parsed",
@@ -4154,6 +4798,39 @@ impl CatalogStore {
             .map(|error| error.code.as_str())
             .or_else(|| result.warnings.first().map(|warning| warning.code.as_str()));
         let now = Utc::now().to_rfc3339();
+        let attempt_no = transaction
+            .query_row(
+                "SELECT COUNT(*) + 1 FROM processing_attempts WHERE revision_id = ?1 AND operation = 'parse'",
+                [result.revision_id.to_string()],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(|error| storage_error("PROCESSING_ATTEMPT_QUERY_FAILED", error, true))?;
+        let safe_error_json = result
+            .error
+            .as_ref()
+            .map(|error| serde_json::to_value(error))
+            .transpose()
+            .map_err(|error| AppError::new("PROCESSING_ATTEMPT_INVALID", error.to_string(), false))?
+            .map(|value| sanitize_log_value(&value, None))
+            .map(|value| value.to_string());
+        transaction
+            .execute(
+                "INSERT INTO processing_attempts (attempt_id, file_id, revision_id, operation, engine, model_version, status, attempt_no, elapsed_ms, retryable, error_json, created_at) VALUES (?1, ?2, ?3, 'parse', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    Uuid::now_v7().to_string(),
+                    file_id.to_string(),
+                    result.revision_id.to_string(),
+                    result.parser_name,
+                    result.parser_version,
+                    parse_status,
+                    attempt_no,
+                    result.metrics.elapsed_ms,
+                    result.error.as_ref().is_some_and(|error| error.retryable),
+                    safe_error_json,
+                    now,
+                ],
+            )
+            .map_err(|error| storage_error("PROCESSING_ATTEMPT_WRITE_FAILED", error, true))?;
         transaction
             .execute(
                 "UPDATE file_revisions SET parse_status = ?1, parser_name = ?2, parser_version = ?3, index_version = ?4, completed_at = ?5, error_code = ?6 WHERE revision_id = ?7",
@@ -4162,8 +4839,8 @@ impl CatalogStore {
             .map_err(|error| storage_error("INDEX_STATE_UPDATE_FAILED", error, true))?;
         transaction
             .execute(
-                "UPDATE files SET parse_status = ?1 WHERE file_id = ?2 AND current_revision_id = ?3",
-                params![parse_status, file_id.to_string(), result.revision_id.to_string()],
+                "UPDATE files SET parse_status = ?1, processing_reason_code = ?2, processing_disposition = CASE WHEN ?1 = 'encrypted' THEN 'encrypted_or_damaged' ELSE processing_disposition END WHERE file_id = ?3 AND current_revision_id = ?4",
+                params![parse_status, error_code, file_id.to_string(), result.revision_id.to_string()],
             )
             .map_err(|error| storage_error("INDEX_STATE_UPDATE_FAILED", error, true))?;
         if matches!(
@@ -4506,6 +5183,7 @@ impl CatalogStore {
             parser_version: "1".into(),
             nodes: vec![node.clone()],
             image_assets: vec![],
+            ocr_attempts: vec![],
             warnings: vec![],
             metrics: crate::ParseMetrics {
                 page_count: 0,
@@ -4691,6 +5369,7 @@ impl CatalogStore {
                 };
                 filename_hits.push(RankedHit {
                     file: file.clone(),
+                    chunk_id: None,
                     revision_id: file.current_revision_id,
                     snippet: file.canonical_path.clone(),
                     locator: None,
@@ -4767,45 +5446,71 @@ impl CatalogStore {
     ) -> Result<AnswerResult, AppError> {
         request.validate()?;
         let started_at = std::time::Instant::now();
-        let search_request = crate::SearchRequest {
-            query: request.question.clone(),
-            scope: request.scope.clone(),
-            mode: crate::SearchMode::Hybrid,
-            sort: crate::SearchSort::Relevance,
-            page_size: request.retrieval_limit.clamp(10, 30),
-            cursor: None,
-        };
-        let session = self.search_with_semantic(&search_request, semantic_query)?;
         let connection = self.connect()?;
+        let files = list_files_with_connection(&connection)?;
+        let scoped_file_ids = collect_scoped_file_ids(&connection, &files, &request.scope)?;
+        let mut fulltext_hits = search_fulltext(&connection, &request.question, &request.scope)?;
+        fulltext_hits.sort_by(|left, right| right.channel_score.total_cmp(&left.channel_score));
+        let mut semantic_hits = if let Some(query) = semantic_query.as_ref() {
+            search_semantic(&connection, query, &scoped_file_ids)?
+        } else {
+            Vec::new()
+        };
+        semantic_hits.sort_by(|left, right| right.channel_score.total_cmp(&left.channel_score));
+        let candidates = crate::indexing::fuse_retrieval_candidates(
+            &[fulltext_hits, semantic_hits],
+            request.retrieval_limit as usize,
+        );
+        let session = crate::SearchSession {
+            search_id: Uuid::now_v7(),
+            status: "completed".into(),
+            channels: crate::SearchChannels {
+                filename: crate::SearchChannelState::Unavailable,
+                fulltext: crate::SearchChannelState::Completed,
+                semantic: if semantic_query.is_some() {
+                    crate::SearchChannelState::Completed
+                } else {
+                    crate::SearchChannelState::Unavailable
+                },
+            },
+            results: Vec::new(),
+            next_cursor: None,
+            elapsed_ms: started_at.elapsed().as_millis() as u64,
+        };
         let mut evidence = Vec::new();
-        for result in &session.results {
-            if !result
-                .match_reasons
-                .iter()
-                .any(|reason| reason == "fulltext" || reason == "semantic")
-            {
+        let mut evidence_tokens = 0_u64;
+        for candidate in candidates
+            .into_iter()
+            .filter(crate::indexing::candidate_is_relevant_rag_evidence)
+        {
+            let Some(revision_id) = candidate.revision_id else {
                 continue;
-            }
-            let Some(revision_id) = result.revision_id else {
+            };
+            let Some(candidate_chunk_id) = candidate.chunk_id else {
                 continue;
             };
             let row = connection
                 .query_row(
-                    "SELECT c.chunk_id, c.node_id, c.text, c.locator_json, n.image_asset_id FROM chunks c JOIN document_nodes n ON n.node_id = c.node_id WHERE c.file_id = ?1 AND c.revision_id = ?2 AND c.text = ?3 LIMIT 1",
-                    params![result.file_id.to_string(), revision_id.to_string(), result.snippet],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, Option<String>>(4)?)),
+                    "SELECT c.chunk_id, c.node_id, c.text, c.locator_json, n.image_asset_id, c.token_count FROM chunks c JOIN document_nodes n ON n.node_id = c.node_id JOIN files f ON f.file_id = c.file_id WHERE c.chunk_id = ?1 AND c.file_id = ?2 AND c.revision_id = ?3 AND f.current_revision_id = c.revision_id LIMIT 1",
+                    params![candidate_chunk_id.to_string(), candidate.file_id.to_string(), revision_id.to_string()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, u64>(5)?)),
                 )
                 .optional()
                 .map_err(|error| storage_error("ASK_EVIDENCE_QUERY_FAILED", error, true))?;
-            let Some((chunk_id, node_id, quote, locator_json, image_asset_id)) = row else {
+            let Some((chunk_id, node_id, quote, locator_json, image_asset_id, token_count)) = row
+            else {
                 continue;
             };
+            if !evidence.is_empty() && evidence_tokens.saturating_add(token_count) > 2_400 {
+                continue;
+            }
+            evidence_tokens = evidence_tokens.saturating_add(token_count);
             let locator = serde_json::from_str::<SourceLocator>(&locator_json)
                 .map_err(|error| AppError::new("ASK_EVIDENCE_INVALID", error.to_string(), false))?;
             evidence.push((
                 crate::EvidenceRef {
                     evidence_id: Uuid::now_v7(),
-                    file_id: result.file_id,
+                    file_id: candidate.file_id,
                     revision_id,
                     node_id: parse_uuid_value(&node_id)?,
                     chunk_id: parse_uuid_value(&chunk_id)?,
@@ -4815,18 +5520,22 @@ impl CatalogStore {
                         .transpose()?,
                     quote,
                     locator,
-                    retrieval_score: result.scores.fused,
+                    retrieval_score: candidate.scores.fused,
                 },
                 AnswerSourceFile {
-                    file_id: result.file_id,
-                    display_name: result.name.clone(),
-                    canonical_path: result.path.clone(),
+                    file_id: candidate.file_id,
+                    display_name: candidate.name,
+                    canonical_path: candidate.path,
                 },
             ));
         }
-        Ok(crate::assemble_extractive_answer(
-            request, &session, evidence, started_at,
-        ))
+        let mut answer = crate::assemble_extractive_answer(request, &session, evidence, started_at);
+        answer.retrieval_channels = if semantic_query.is_some() {
+            vec!["fts".into(), "embedding".into(), "rrf".into(), "mmr".into()]
+        } else {
+            vec!["fts".into(), "rrf".into(), "mmr".into()]
+        };
+        Ok(answer)
     }
 
     pub fn load_ask_history(
@@ -5311,6 +6020,7 @@ impl CatalogStore {
                 revision_id: None,
                 nodes: vec![],
                 image_assets: vec![],
+                ocr_attempts: vec![],
                 offset: 0,
                 next_offset: None,
                 anchor_node_id: None,
@@ -5364,12 +6074,14 @@ impl CatalogStore {
         let truncated = nodes.len() > node_limit;
         nodes.truncate(node_limit);
         let image_assets = image_assets_for_revision(&connection, &revision_id)?;
+        let ocr_attempts = ocr_attempts_for_revision(&connection, &revision_id)?;
         let next_offset = truncated.then_some((effective_offset + nodes.len()) as u32);
         Ok(crate::FilePreview {
             file,
             revision_id: Some(revision_id),
             nodes,
             image_assets,
+            ocr_attempts,
             offset: effective_offset as u32,
             next_offset,
             anchor_node_id: anchor_node_id.copied(),
@@ -5614,7 +6326,7 @@ impl CatalogStore {
                 key: "source_readonly".into(),
                 label: "源文件保护".into(),
                 status: "passed".into(),
-                detail: "维护操作只作用于拾忆索引与日志".into(),
+                detail: "维护操作只作用于翻翻索引与日志".into(),
             },
         ];
         if failed_files > 0 {
@@ -5625,27 +6337,18 @@ impl CatalogStore {
                 detail: format!("{failed_files} 份资料需要检查"),
             });
         }
-        let (desired_level, degradation_reasons) = if pending_files > 500 || active_jobs > 3 {
+        // The UI and background workers poll this method. Keep it a pure read:
+        // persisting derived resource state here made status polling contend
+        // with parse and embedding transactions.
+        let (degradation_level, degradation_reasons) = if pending_files > 500 || active_jobs > 3 {
             (
-                DegradationLevel::Balanced,
+                "balanced".to_owned(),
                 vec!["后台处理队列较长，已优先保证搜索与预览".to_owned()],
             )
         } else {
-            (DegradationLevel::Full, Vec::new())
+            ("full".to_owned(), Vec::new())
         };
-        let degradation = Self::reconcile_degradation_state_with_connection(
-            &connection,
-            desired_level,
-            degradation_reasons,
-        )?;
-        let degradation_level = match degradation.level {
-            DegradationLevel::Full => "full",
-            DegradationLevel::Balanced => "balanced",
-            DegradationLevel::Core => "core",
-        }
-        .to_owned();
-        let background_notice = degradation
-            .triggers
+        let background_notice = degradation_reasons
             .first()
             .cloned()
             .or_else(|| (active_jobs > 0).then(|| format!("{active_jobs}个后台任务正在处理")));
@@ -5660,7 +6363,7 @@ impl CatalogStore {
             active_jobs,
             log_events,
             degradation_level,
-            degradation_reasons: degradation.triggers,
+            degradation_reasons,
             background_notice,
             checks,
             checked_at: Utc::now(),
@@ -6347,6 +7050,14 @@ fn decode_keyset_cursor<T: serde::de::DeserializeOwned>(
 
 const AUTHORIZED_FILE_SQL: &str = "EXISTS (SELECT 1 FROM file_root_memberships m JOIN roots r ON r.root_id = m.root_id WHERE m.file_id = f.file_id AND r.enabled = 1)";
 
+fn ratio(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        (numerator as f64 / denominator as f64).clamp(0.0, 1.0)
+    }
+}
+
 fn count_manual_collection_files(
     connection: &Connection,
     collection_id: &Uuid,
@@ -6956,6 +7667,36 @@ fn image_assets_for_revision(
         .map_err(|error| storage_error("IMAGE_ASSET_QUERY_FAILED", error, true))
 }
 
+fn ocr_attempts_for_revision(
+    connection: &Connection,
+    revision_id: &Uuid,
+) -> Result<Vec<crate::OcrAttempt>, AppError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT engine, model_version, status, page_no, confidence, fallback_reason, elapsed_ms, error_json FROM ocr_attempts WHERE revision_id = ?1 ORDER BY ordinal, attempt_id LIMIT 1024",
+        )
+        .map_err(|error| storage_error("OCR_ATTEMPT_QUERY_FAILED", error, true))?;
+    statement
+        .query_map([revision_id.to_string()], |row| {
+            Ok(crate::OcrAttempt {
+                engine: row.get(0)?,
+                model_version: row.get(1)?,
+                status: row.get(2)?,
+                page_no: row.get(3)?,
+                confidence: row.get(4)?,
+                fallback_reason: row.get(5)?,
+                elapsed_ms: row.get(6)?,
+                error: row
+                    .get::<_, Option<String>>(7)?
+                    .map(|value| parse_json_column(7, &value))
+                    .transpose()?,
+            })
+        })
+        .map_err(|error| storage_error("OCR_ATTEMPT_QUERY_FAILED", error, true))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| storage_error("OCR_ATTEMPT_QUERY_FAILED", error, true))
+}
+
 fn parse_json_column<T: serde::de::DeserializeOwned>(
     index: usize,
     value: &str,
@@ -7173,7 +7914,7 @@ fn search_fulltext(
     }
     let mut statement = connection
         .prepare(
-            "SELECT f.file_id, f.volume_id, f.canonical_path, f.display_name, f.extension, f.mime_type, f.size_bytes, f.fs_created_at, f.modified_at, f.windows_file_id, f.content_sha256, f.availability, f.current_revision_id, f.parse_status, f.first_seen_at, f.last_seen_at, c.revision_id, c.text, c.locator_json, bm25(chunks_fts) FROM chunks_fts JOIN chunks c ON c.chunk_id = chunks_fts.chunk_id JOIN files f ON f.file_id = c.file_id WHERE chunks_fts MATCH ?1 AND f.current_revision_id = c.revision_id ORDER BY bm25(chunks_fts) LIMIT 500",
+            "SELECT f.file_id, f.volume_id, f.canonical_path, f.display_name, f.extension, f.mime_type, f.size_bytes, f.fs_created_at, f.modified_at, f.windows_file_id, f.content_sha256, f.availability, f.current_revision_id, f.parse_status, f.first_seen_at, f.last_seen_at, c.revision_id, c.text, c.locator_json, bm25(chunks_fts), c.chunk_id FROM chunks_fts JOIN chunks c ON c.chunk_id = chunks_fts.chunk_id JOIN files f ON f.file_id = c.file_id WHERE chunks_fts MATCH ?1 AND f.current_revision_id = c.revision_id ORDER BY bm25(chunks_fts) LIMIT 500",
         )
         .map_err(|error| storage_error("SEARCH_QUERY_FAILED", error, true))?;
     let mapped = statement
@@ -7190,13 +7931,19 @@ fn search_fulltext(
                         Box::new(error),
                     )
                 })?;
-            Ok((file, revision_id, row.get::<_, String>(17)?, locator, rank))
+            Ok((
+                file,
+                revision_id,
+                row.get::<_, String>(17)?,
+                locator,
+                rank,
+                row.get::<_, String>(20)?,
+            ))
         })
         .map_err(|error| storage_error("SEARCH_QUERY_FAILED", error, true))?;
-    let mut best_by_file: std::collections::HashMap<Uuid, RankedHit> =
-        std::collections::HashMap::new();
+    let mut hits = Vec::new();
     for row in mapped {
-        let (file, revision_id, text, locator, rank) =
+        let (file, revision_id, text, locator, rank, chunk_id) =
             row.map_err(|error| storage_error("SEARCH_QUERY_FAILED", error, true))?;
         if !file_matches_scope(connection, &file, scope)? {
             continue;
@@ -7204,20 +7951,16 @@ fn search_fulltext(
         let score = (1.0 / (1.0 + rank.abs())) as f32;
         let hit = RankedHit {
             file: file.clone(),
+            chunk_id: Some(parse_uuid_value(&chunk_id)?),
             revision_id: Some(parse_uuid_value(&revision_id)?),
             snippet: text,
             locator: Some(locator),
             reason: "fulltext",
             channel_score: score,
         };
-        let should_replace = best_by_file
-            .get(&file.file_id)
-            .is_none_or(|current| hit.channel_score > current.channel_score);
-        if should_replace {
-            best_by_file.insert(file.file_id, hit);
-        }
+        hits.push(hit);
     }
-    Ok(best_by_file.into_values().collect())
+    Ok(hits)
 }
 
 fn search_semantic(
@@ -7246,9 +7989,9 @@ fn search_semantic(
         )
         .map_err(|error| storage_error("EMBEDDING_QUERY_FAILED", error, true))?;
     let mut hits = Vec::with_capacity(candidates.len());
-    for (_file_id, (chunk_id, score)) in candidates {
+    for (_file_id, chunk_id, score) in candidates {
         let detail = details
-            .query_row([chunk_id], |row| {
+            .query_row([chunk_id.as_str()], |row| {
                 let file = file_from_row(row)?;
                 Ok((
                     file,
@@ -7266,6 +8009,7 @@ fn search_semantic(
             .map_err(|error| AppError::new("EMBEDDING_VECTOR_INVALID", error.to_string(), false))?;
         hits.push(RankedHit {
             file,
+            chunk_id: Some(parse_uuid_value(&chunk_id)?),
             revision_id: Some(parse_uuid_value(&revision_id)?),
             snippet: text,
             locator: Some(locator),
@@ -7296,7 +8040,7 @@ fn search_semantic_exact_candidates(
             ))
         })
         .map_err(|error| storage_error("EMBEDDING_QUERY_FAILED", error, true))?;
-    let mut best_by_file = std::collections::HashMap::<Uuid, (String, f32)>::new();
+    let mut candidates = Vec::new();
     for row in mapped {
         let (chunk_id, file_id, dimension, vector_blob) =
             row.map_err(|error| storage_error("EMBEDDING_QUERY_FAILED", error, true))?;
@@ -7309,15 +8053,9 @@ fn search_semantic_exact_candidates(
         if score < 0.2 {
             continue;
         }
-        if best_by_file
-            .get(&file_id)
-            .is_none_or(|current| score > current.1)
-        {
-            best_by_file.insert(file_id, (chunk_id, score));
-        }
+        candidates.push((file_id, chunk_id, score));
     }
-    let mut candidates = best_by_file.into_iter().collect::<Vec<_>>();
-    candidates.sort_by(|left, right| right.1.1.total_cmp(&left.1.1));
+    candidates.sort_by(|left, right| right.2.total_cmp(&left.2));
     candidates.truncate(500);
     Ok(candidates)
 }
@@ -7346,16 +8084,6 @@ fn search_semantic_usearch_candidates(
         return Ok(None);
     };
     if dimension as usize != query.vector.len() || item_count == 0 {
-        return Ok(None);
-    }
-    let indexed_files: u64 = connection
-        .query_row(
-            "SELECT COUNT(DISTINCT file_id) FROM vector_index_keys WHERE generation_id = ?1",
-            [&generation_id],
-            |row| row.get(0),
-        )
-        .map_err(|error| storage_error("VECTOR_INDEX_KEY_QUERY_FAILED", error, true))?;
-    if scoped_file_ids.len() < indexed_files as usize {
         return Ok(None);
     }
     let candidate_count = item_count.clamp(1, 5_000);
@@ -7404,7 +8132,7 @@ fn search_semantic_usearch_candidates(
             ))
         })
         .map_err(|error| storage_error("VECTOR_INDEX_KEY_QUERY_FAILED", error, true))?;
-    let mut best_by_file = HashMap::<Uuid, (String, f32)>::new();
+    let mut candidates = Vec::new();
     for row in rows {
         let (key, chunk_id, file_id) =
             row.map_err(|error| storage_error("VECTOR_INDEX_KEY_QUERY_FAILED", error, true))?;
@@ -7418,21 +8146,11 @@ fn search_semantic_usearch_candidates(
         if score < 0.2 {
             continue;
         }
-        if best_by_file
-            .get(&file_id)
-            .is_none_or(|current| score > current.1)
-        {
-            best_by_file.insert(file_id, (chunk_id, score));
-        }
+        candidates.push((file_id, chunk_id, score));
     }
-    let mut candidates = best_by_file.into_iter().collect::<Vec<_>>();
-    candidates.sort_by(|left, right| right.1.1.total_cmp(&left.1.1));
+    candidates.sort_by(|left, right| right.2.total_cmp(&left.2));
     candidates.truncate(500);
-    if candidates.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(candidates))
-    }
+    Ok(Some(candidates))
 }
 
 fn dot_product_with_le_f32(query: &[f32], bytes: &[u8], dimension: u32) -> Result<f32, AppError> {
@@ -7481,14 +8199,42 @@ fn active_scan_job_with(
         .map_err(|error| storage_error("JOB_QUERY_FAILED", error, true))
 }
 
-fn initial_parse_status(extension: &str) -> &'static str {
+fn file_processing_disposition(extension: &str, mime_type: &str) -> FileProcessingDisposition {
+    let extension = extension.to_ascii_lowercase();
+    if mime_type.starts_with("image/") {
+        return FileProcessingDisposition::ImageOcr;
+    }
+    if mime_type.starts_with("text/") {
+        return FileProcessingDisposition::ReadOnlyText;
+    }
+    match extension.as_str() {
+        "pdf" | "docx" | "docm" | "xlsx" | "xlsm" | "pptx" | "pptm" | "doc" | "xls" | "ppt" => {
+            FileProcessingDisposition::ParseableContent
+        }
+        "zip" | "rar" | "7z" | "tar" | "gz" => FileProcessingDisposition::ArchiveManifest,
+        "mp3" | "wav" | "flac" | "m4a" | "mp4" | "mkv" | "mov" | "avi" | "webm" => {
+            FileProcessingDisposition::MediaMetadata
+        }
+        "exe" | "dll" | "msi" | "db" | "sqlite" | "sqlite3" => {
+            FileProcessingDisposition::SafeMetadata
+        }
+        "ptqpaper" => FileProcessingDisposition::CapabilityMissing,
+        _ => FileProcessingDisposition::Unknown,
+    }
+}
+
+fn initial_parse_status(extension: &str, mime_type: &str) -> &'static str {
+    if mime_type.starts_with("text/") || mime_type.starts_with("image/") {
+        return "pending";
+    }
     match extension.to_ascii_lowercase().as_str() {
         "pdf" | "docx" | "docm" | "xlsx" | "xlsm" | "pptx" | "pptm" | "csv" | "tsv" | "md"
         | "txt" | "html" | "htm" | "jpg" | "jpeg" | "png" | "tif" | "tiff" | "bmp" | "webp"
         | "doc" | "xls" | "ppt" | "zip" | "rs" | "py" | "js" | "jsx" | "mjs" | "cjs" | "ts"
         | "tsx" | "java" | "kt" | "kts" | "go" | "c" | "cc" | "cpp" | "h" | "hpp" | "cs" | "rb"
         | "php" | "swift" | "scala" | "sh" | "ps1" | "sql" | "json" | "yaml" | "yml" | "toml"
-        | "xml" | "css" | "scss" | "vue" | "svelte" => "pending",
+        | "xml" | "css" | "scss" | "vue" | "svelte" | "text" | "ini" | "iml" | "log" | "conf"
+        | "cfg" | "properties" => "pending",
         _ => "unsupported",
     }
 }
@@ -7557,7 +8303,8 @@ fn upsert_file(
         .map_err(|error| storage_error("FILE_QUERY_FAILED", error, true))?;
     let now = Utc::now();
     let fingerprint = format!("{}:{}", file.size_bytes, file.modified_at.to_rfc3339());
-    let initial_parse_status = initial_parse_status(&file.extension);
+    let disposition = file_processing_disposition(&file.extension, &file.mime_type);
+    let initial_parse_status = initial_parse_status(&file.extension, &file.mime_type);
     let existing_fingerprint: Option<String> = transaction
         .query_row(
             "SELECT r.metadata_fingerprint FROM files f LEFT JOIN file_revisions r ON r.revision_id = f.current_revision_id WHERE f.file_id = ?1",
@@ -7571,8 +8318,8 @@ fn upsert_file(
     let revision_id = if revision_changed {
         transaction
             .execute(
-                "INSERT OR IGNORE INTO files (file_id, canonical_path, path_key, name, extension, size_bytes, modified_at, discovered_at, availability, volume_id, display_name, mime_type, fs_created_at, windows_file_id, parse_status, first_seen_at, last_seen_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'present', ?9, ?4, ?10, ?11, ?12, ?13, ?8, ?8)",
-                params![file_id.to_string(), file.canonical_path, file.path_key, file.name, file.extension, file.size_bytes, file.modified_at.to_rfc3339(), now.to_rfc3339(), file.volume_id, file.mime_type, file.created_at.map(|value| value.to_rfc3339()), file.windows_file_id, initial_parse_status],
+                "INSERT OR IGNORE INTO files (file_id, canonical_path, path_key, name, extension, size_bytes, modified_at, discovered_at, availability, volume_id, display_name, mime_type, fs_created_at, windows_file_id, parse_status, first_seen_at, last_seen_at, processing_disposition, detected_mime_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'present', ?9, ?4, ?10, ?11, ?12, ?13, ?8, ?8, ?14, ?10)",
+                params![file_id.to_string(), file.canonical_path, file.path_key, file.name, file.extension, file.size_bytes, file.modified_at.to_rfc3339(), now.to_rfc3339(), file.volume_id, file.mime_type, file.created_at.map(|value| value.to_rfc3339()), file.windows_file_id, initial_parse_status, disposition.as_str()],
             )
             .map_err(|error| storage_error("FILE_UPSERT_FAILED", error, true))?;
         let revision_id = Uuid::now_v7();
@@ -7595,7 +8342,7 @@ fn upsert_file(
     };
     transaction
         .execute(
-            "INSERT INTO files (file_id, canonical_path, path_key, name, extension, size_bytes, modified_at, discovered_at, availability, volume_id, display_name, mime_type, fs_created_at, windows_file_id, current_revision_id, parse_status, first_seen_at, last_seen_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'present', ?9, ?4, ?10, ?11, ?12, ?13, ?14, ?8, ?8) ON CONFLICT(file_id) DO UPDATE SET canonical_path = excluded.canonical_path, path_key = excluded.path_key, name = excluded.name, display_name = excluded.display_name, extension = excluded.extension, mime_type = excluded.mime_type, size_bytes = excluded.size_bytes, fs_created_at = excluded.fs_created_at, modified_at = excluded.modified_at, windows_file_id = excluded.windows_file_id, volume_id = excluded.volume_id, content_sha256 = CASE WHEN files.current_revision_id <> excluded.current_revision_id THEN NULL ELSE files.content_sha256 END, current_revision_id = excluded.current_revision_id, parse_status = CASE WHEN files.current_revision_id <> excluded.current_revision_id THEN excluded.parse_status ELSE files.parse_status END, availability = 'present', last_seen_at = excluded.last_seen_at",
+            "INSERT INTO files (file_id, canonical_path, path_key, name, extension, size_bytes, modified_at, discovered_at, availability, volume_id, display_name, mime_type, fs_created_at, windows_file_id, current_revision_id, parse_status, first_seen_at, last_seen_at, processing_disposition, detected_mime_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'present', ?9, ?4, ?10, ?11, ?12, ?13, ?14, ?8, ?8, ?15, ?10) ON CONFLICT(file_id) DO UPDATE SET canonical_path = excluded.canonical_path, path_key = excluded.path_key, name = excluded.name, display_name = excluded.display_name, extension = excluded.extension, mime_type = excluded.mime_type, detected_mime_type = excluded.detected_mime_type, processing_disposition = excluded.processing_disposition, size_bytes = excluded.size_bytes, fs_created_at = excluded.fs_created_at, modified_at = excluded.modified_at, windows_file_id = excluded.windows_file_id, volume_id = excluded.volume_id, content_sha256 = CASE WHEN files.current_revision_id <> excluded.current_revision_id THEN NULL ELSE files.content_sha256 END, current_revision_id = excluded.current_revision_id, parse_status = CASE WHEN files.current_revision_id <> excluded.current_revision_id THEN excluded.parse_status ELSE files.parse_status END, availability = 'present', last_seen_at = excluded.last_seen_at",
             params![
                 file_id.to_string(),
                 file.canonical_path,
@@ -7611,6 +8358,7 @@ fn upsert_file(
                 file.windows_file_id,
                 revision_id.to_string(),
                 initial_parse_status,
+                disposition.as_str(),
             ],
         )
         .map_err(|error| storage_error("FILE_UPSERT_FAILED", error, true))?;
@@ -7953,8 +8701,36 @@ fn storage_error(code: &str, error: rusqlite::Error, retryable: bool) -> AppErro
         "technical".to_owned(),
         serde_json::Value::String(error.to_string()),
     );
+    if let rusqlite::Error::SqliteFailure(sqlite, _) = &error {
+        details.insert(
+            "sqlite_primary_code".to_owned(),
+            serde_json::Value::String(format!("{:?}", sqlite.code)),
+        );
+        details.insert(
+            "sqlite_extended_code".to_owned(),
+            serde_json::Value::from(sqlite.extended_code),
+        );
+    }
     err.details = Some(Box::new(serde_json::Value::Object(details)));
     err
+}
+
+fn is_transient_storage_error(error: &AppError) -> bool {
+    error.details.as_deref().is_some_and(|details| {
+        let technical = details
+            .get("technical")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let primary = details
+            .get("sqlite_primary_code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        technical.contains("database is locked")
+            || technical.contains("database table is locked")
+            || technical.contains("database is busy")
+            || matches!(primary, "DatabaseBusy" | "DatabaseLocked")
+    })
 }
 
 fn map_storage_error(error: &rusqlite::Error, _code: &str) -> (String, Option<&'static str>) {
@@ -7967,7 +8743,7 @@ fn map_storage_error(error: &rusqlite::Error, _code: &str) -> (String, Option<&'
     } else if text.contains("disk i/o") || text.contains("disk full") || text.contains("no space") {
         (
             "磁盘读写出现问题".into(),
-            Some("请检查磁盘空间是否充足，或是否有杀毒软件干扰了拾忆"),
+            Some("请检查磁盘空间是否充足，或是否有杀毒软件干扰了翻翻"),
         )
     } else if text.contains("readonly")
         || text.contains("read-only")
@@ -7975,14 +8751,14 @@ fn map_storage_error(error: &rusqlite::Error, _code: &str) -> (String, Option<&'
     {
         (
             "资料库写入权限异常".into(),
-            Some("请检查杀毒软件或系统权限设置，确保拾忆可以正常写入应用数据"),
+            Some("请检查杀毒软件或系统权限设置，确保翻翻可以正常写入应用数据"),
         )
     } else if text.contains("no such table") || text.contains("no such column") {
-        ("资料库结构需要升级，重启拾忆即可完成自动迁移".into(), None)
+        ("资料库结构需要升级，重启翻翻即可完成自动迁移".into(), None)
     } else if text.contains("unable to open") || text.contains("cannot open") {
         (
             "无法打开资料库文件".into(),
-            Some("请确认拾忆应用数据目录未被移动或删除，重启后会自动修复"),
+            Some("请确认翻翻应用数据目录未被移动或删除，重启后会自动修复"),
         )
     } else if text.contains("malformed")
         || text.contains("corrupt")
@@ -7996,7 +8772,7 @@ fn map_storage_error(error: &rusqlite::Error, _code: &str) -> (String, Option<&'
         ("资料库操作超时，请稍后重试".into(), None)
     } else {
         (
-            "资料库操作失败，请重启拾忆后重试".into(),
+            "资料库操作失败，请重启翻翻后重试".into(),
             Some("如仍未解决，可在设置中导出诊断信息"),
         )
     }
@@ -8083,11 +8859,111 @@ mod tests {
     #[test]
     fn metadata_only_formats_never_enter_the_content_parser_queue() {
         for extension in ["exe", "dll", "msi", "mp4", "mp3", "7z", "unknown"] {
-            assert_eq!(initial_parse_status(extension), "unsupported");
+            assert_eq!(
+                initial_parse_status(extension, "application/octet-stream"),
+                "unsupported"
+            );
         }
-        for extension in ["pdf", "docx", "png", "zip", "rs", "py", "tsx"] {
-            assert_eq!(initial_parse_status(extension), "pending");
+        for extension in [
+            "pdf", "docx", "png", "zip", "rs", "py", "tsx", "text", "ini", "iml",
+        ] {
+            assert_eq!(initial_parse_status(extension, "text/plain"), "pending");
         }
+    }
+
+    #[test]
+    fn scan_resume_keeps_committed_memberships_and_only_writes_missing_files() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+        let root = store
+            .upsert_root(&test_root_registration())
+            .expect("insert root");
+        let (job, _) = store
+            .prepare_scan_job(&root.root_id, "resume")
+            .expect("prepare scan");
+        store
+            .mark_scan_running(&root.root_id, &job.job_id)
+            .expect("mark running");
+        let first_path = directory.path().join("first.txt");
+        let second_path = directory.path().join("second.txt");
+        let first = test_discovered(&first_path, "first.txt");
+        let second = test_discovered(&second_path, "second.txt");
+        {
+            let mut connection = store.connect().expect("connect");
+            let transaction = connection.transaction().expect("transaction");
+            let file_id = upsert_file(&transaction, &root.root_id, &first).expect("upsert first");
+            transaction
+                .execute(
+                    "INSERT INTO scan_seen_memberships (job_id, root_id, file_id) VALUES (?1, ?2, ?3)",
+                    params![job.job_id.to_string(), root.root_id.to_string(), file_id.to_string()],
+                )
+                .expect("checkpoint first");
+            transaction.commit().expect("commit checkpoint");
+        }
+
+        let completed = store
+            .commit_scan(
+                &root.root_id,
+                &job.job_id,
+                &ScanOutcome {
+                    files: vec![first, second],
+                    ..ScanOutcome::default()
+                },
+            )
+            .expect("resume scan");
+
+        assert_eq!(completed.status, JobStatus::Succeeded);
+        assert_eq!(store.list_files().expect("list files").len(), 2);
+        let connection = store.connect().expect("connect checkpoint");
+        let committed: u64 = connection
+            .query_row(
+                "SELECT committed_items FROM scan_checkpoints WHERE job_id = ?1",
+                [job.job_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("checkpoint row");
+        assert_eq!(committed, 2);
+    }
+
+    #[test]
+    fn deterministic_file_error_is_isolated_without_rolling_back_the_batch() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+        let root = store
+            .upsert_root(&test_root_registration())
+            .expect("insert root");
+        let (job, _) = store
+            .prepare_scan_job(&root.root_id, "isolate")
+            .expect("prepare scan");
+        store
+            .mark_scan_running(&root.root_id, &job.job_id)
+            .expect("mark running");
+        let mut invalid = test_discovered(&directory.path().join("invalid.txt"), "invalid.txt");
+        invalid.size_bytes = u64::MAX;
+        let valid = test_discovered(&directory.path().join("valid.txt"), "valid.txt");
+
+        let completed = store
+            .commit_scan(
+                &root.root_id,
+                &job.job_id,
+                &ScanOutcome {
+                    files: vec![invalid, valid],
+                    ..ScanOutcome::default()
+                },
+            )
+            .expect("partial scan");
+
+        assert_eq!(completed.status, JobStatus::Partial);
+        assert_eq!(store.list_files().expect("list files").len(), 1);
+        let connection = store.connect().expect("connect attempts");
+        let attempts: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM processing_attempts WHERE operation = 'scan_upsert' AND status = 'failed'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("attempt count");
+        assert_eq!(attempts, 1);
     }
 
     fn test_root_registration() -> RootRegistration {
@@ -8105,10 +8981,31 @@ mod tests {
         }
     }
 
+    fn test_discovered(path: &std::path::Path, name: &str) -> DiscoveredFile {
+        let now = Utc::now();
+        let extension = path
+            .extension()
+            .map(|value| value.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        DiscoveredFile {
+            volume_id: "vol-test".into(),
+            windows_file_id: None,
+            canonical_path: path.to_string_lossy().into_owned(),
+            path_key: path.to_string_lossy().to_ascii_lowercase(),
+            name: name.into(),
+            extension,
+            mime_type: "text/plain".into(),
+            size_bytes: 1,
+            created_at: Some(now),
+            modified_at: now,
+            relative_path: name.into(),
+        }
+    }
+
     #[test]
     fn root_registration_is_idempotent() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let store = CatalogStore::open(directory.path().join("remin.db")).expect("open store");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
         let first = store
             .upsert_root(&test_root_registration())
             .expect("insert root");
@@ -8123,7 +9020,7 @@ mod tests {
     #[test]
     fn disabled_default_root_stays_disabled_until_user_adds_it_again() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let store = CatalogStore::open(directory.path().join("remin.db")).expect("open store");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
         let root = store
             .upsert_root(&test_root_registration())
             .expect("insert root");
@@ -8149,7 +9046,7 @@ mod tests {
     #[test]
     fn index_activity_stats_report_authorized_current_index_content() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let store = CatalogStore::open(directory.path().join("remin.db")).expect("open store");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
         let root = store
             .upsert_root(&test_root_registration())
             .expect("insert root");
@@ -8226,7 +9123,7 @@ mod tests {
     #[test]
     fn degradation_state_persists_and_changes_only_one_level_per_checkpoint() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let database_path = directory.path().join("remin.db");
+        let database_path = directory.path().join("fanfan.db");
         let store = CatalogStore::open(&database_path).expect("open store");
 
         let balanced = store
@@ -8299,7 +9196,7 @@ mod tests {
     #[test]
     fn overlapping_roots_record_the_nearest_coverage_parent() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let store = CatalogStore::open(directory.path().join("remin.db")).expect("open store");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
         let parent = store
             .upsert_root(&test_root_registration())
             .expect("insert parent root");
@@ -8324,7 +9221,7 @@ mod tests {
     #[test]
     fn fresh_database_applies_ordered_migration_history() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let store = CatalogStore::open(directory.path().join("remin.db")).expect("open store");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
 
         assert_eq!(
             store.schema_version().expect("schema version"),
@@ -8351,6 +9248,9 @@ mod tests {
                 (16, "stable_keyset_paging_and_scan_checkpoints".to_owned()),
                 (17, "inbox_triage_resolution_split".to_owned()),
                 (18, "remove_knowledge_spaces".to_owned()),
+                (19, "local_ai_runtime_and_media_transcripts".to_owned()),
+                (20, "observable_ocr_attempts".to_owned()),
+                (21, "recoverable_processing_and_scan_checkpoints".to_owned()),
             ]
         );
         let rules = store.list_exclusion_rules().expect("list exclusion rules");
@@ -8380,7 +9280,7 @@ mod tests {
     #[test]
     fn version_one_database_upgrades_without_reapplying_foundation() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let database_path = directory.path().join("remin.db");
+        let database_path = directory.path().join("fanfan.db");
         let connection = Connection::open(&database_path).expect("open legacy database");
         connection
             .execute_batch(MIGRATIONS[0].sql)
@@ -8405,7 +9305,7 @@ mod tests {
     #[test]
     fn future_database_version_is_rejected_without_downgrade() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let database_path = directory.path().join("remin.db");
+        let database_path = directory.path().join("fanfan.db");
         let connection = Connection::open(&database_path).expect("open future database");
         connection
             .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)
@@ -8425,7 +9325,7 @@ mod tests {
     #[test]
     fn interrupted_scan_is_requeued_with_same_job_identity() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let database_path = directory.path().join("remin.db");
+        let database_path = directory.path().join("fanfan.db");
         let store = CatalogStore::open(&database_path).expect("open store");
         let root = store
             .upsert_root(&test_root_registration())
@@ -8454,7 +9354,7 @@ mod tests {
     #[test]
     fn structured_logs_are_persisted_locally() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let database_path = directory.path().join("remin.db");
+        let database_path = directory.path().join("fanfan.db");
         let store = CatalogStore::open(&database_path).expect("open store");
 
         let fields = serde_json::json!({ "source": "unit_test" });
@@ -8480,7 +9380,7 @@ mod tests {
     #[test]
     fn diagnostic_logs_are_returned_in_bounded_pages() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let store = CatalogStore::open(directory.path().join("remin.db")).expect("open store");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
         for index in 0..3 {
             let fields = serde_json::json!({ "index": index });
             store
@@ -8517,7 +9417,7 @@ mod tests {
     #[test]
     fn structured_logs_redact_document_text_and_absolute_paths() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let database_path = directory.path().join("remin.db");
+        let database_path = directory.path().join("fanfan.db");
         let store = CatalogStore::open(&database_path).expect("open store");
         let fields = serde_json::json!({
             "document_text": "敏感正文",
@@ -8553,7 +9453,7 @@ mod tests {
     #[test]
     fn scan_job_pause_resume_and_cancel_follow_state_machine() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let store = CatalogStore::open(directory.path().join("remin.db")).expect("open store");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
         let root = store
             .upsert_root(&test_root_registration())
             .expect("insert root");
@@ -8588,7 +9488,7 @@ mod tests {
     #[test]
     fn candidate_roots_are_idempotent_and_keep_user_decisions() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let store = CatalogStore::open(directory.path().join("remin.db")).expect("open store");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
         let first = store
             .upsert_candidate_root(
                 CandidateRootType::Onedrive,
@@ -8623,7 +9523,7 @@ mod tests {
         let second_path = directory.path().join("归航计划-v2.txt");
         fs::write(&first_path, "离线资料内容一致").expect("write first fixture");
         fs::write(&second_path, "离线资料内容一致").expect("write second fixture");
-        let store = CatalogStore::open(directory.path().join("remin.db")).expect("open store");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
         let root_path = directory.path().to_string_lossy().to_string();
         let root = store
             .upsert_root(&RootRegistration {
@@ -8914,7 +9814,7 @@ mod tests {
     #[test]
     fn parsed_chinese_content_is_searchable_with_real_locator() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let database_path = directory.path().join("remin.db");
+        let database_path = directory.path().join("fanfan.db");
         let store = CatalogStore::open(&database_path).expect("open store");
         let root = store
             .upsert_root(&test_root_registration())
@@ -9009,6 +9909,7 @@ mod tests {
                 status: "pending_understanding".into(),
                 error: None,
             }],
+            ocr_attempts: vec![],
             warnings: vec![],
             metrics: crate::ParseMetrics {
                 page_count: 0,
@@ -9237,8 +10138,6 @@ mod tests {
             retrieval_limit: 12,
             max_source_files: 8,
             strict_evidence: true,
-            mode: crate::AskMode::EvidenceExtracts,
-            allow_degraded_extractive: true,
         };
         let image_answer = store
             .answer_extractively(&ask, None)
@@ -9297,7 +10196,7 @@ mod tests {
     #[test]
     fn search_cursor_pages_results_and_rejects_a_changed_index() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let store = CatalogStore::open(directory.path().join("remin.db")).expect("open store");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
         let root = store
             .upsert_root(&test_root_registration())
             .expect("insert root");
@@ -9362,7 +10261,7 @@ mod tests {
         const FILE_COUNT: usize = 20_000;
         const DIMENSION: usize = 384;
         let directory = tempfile::tempdir().expect("tempdir");
-        let store = CatalogStore::open(directory.path().join("remin.db")).expect("open store");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
         let root = store
             .upsert_root(&test_root_registration())
             .expect("insert root");
@@ -9463,7 +10362,7 @@ mod tests {
         }
         elapsed_ms.sort_unstable();
         let p95_ms = *elapsed_ms.last().expect("benchmark samples");
-        let limit_ms = std::env::var("REMIN_SEMANTIC_P95_MS")
+        let limit_ms = std::env::var("FANFAN_SEMANTIC_P95_MS")
             .ok()
             .and_then(|value| value.parse::<u128>().ok())
             .unwrap_or(2_000);

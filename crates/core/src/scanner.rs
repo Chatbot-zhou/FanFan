@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     fs,
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -192,7 +193,7 @@ pub fn scan_root_with_control(
     if policy.protects(root) {
         return Err(AppError::new(
             "ROOT_PROTECTED",
-            "拾忆的内部数据目录不能作为资料来源",
+            "翻翻的内部数据目录不能作为资料来源",
             false,
         ));
     }
@@ -280,7 +281,7 @@ pub fn scan_root_with_control(
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_default(),
-                mime_type: mime_type_for_extension(&extension).to_owned(),
+                mime_type: detected_mime_type(&canonical, &extension),
                 extension,
                 size_bytes: metadata.len(),
                 created_at,
@@ -352,7 +353,9 @@ fn mime_type_for_extension(extension: &str) -> &'static str {
         "ppt" => "application/vnd.ms-powerpoint",
         "csv" => "text/csv",
         "tsv" => "text/tab-separated-values",
-        "md" | "txt" => "text/plain",
+        "md" | "txt" | "text" | "ini" | "iml" | "log" | "conf" | "cfg" | "properties" => {
+            "text/plain"
+        }
         "html" | "htm" => "text/html",
         "zip" => "application/zip",
         "7z" => "application/x-7z-compressed",
@@ -382,6 +385,48 @@ fn mime_type_for_extension(extension: &str) -> &'static str {
         "webp" => "image/webp",
         _ => "application/octet-stream",
     }
+}
+
+fn detected_mime_type(path: &Path, extension: &str) -> String {
+    let extension_mime = mime_type_for_extension(extension);
+    if extension_mime != "application/octet-stream" {
+        return extension_mime.to_owned();
+    }
+    let mut header = [0_u8; 4096];
+    let read = fs::File::open(path)
+        .and_then(|mut file| file.read(&mut header))
+        .unwrap_or_default();
+    let bytes = &header[..read];
+    if bytes.starts_with(b"%PDF-") {
+        return "application/pdf".into();
+    }
+    if bytes.starts_with(b"PK\x03\x04") {
+        return "application/zip".into();
+    }
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return "image/png".into();
+    }
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return "image/jpeg".into();
+    }
+    if bytes.starts_with(b"SQLite format 3\0") {
+        return "application/vnd.sqlite3".into();
+    }
+    if bytes.starts_with(b"MZ") {
+        return "application/vnd.microsoft.portable-executable".into();
+    }
+    if !bytes.is_empty()
+        && std::str::from_utf8(bytes).is_ok()
+        && bytes
+            .iter()
+            .filter(|byte| byte.is_ascii_control() && !matches!(byte, b'\n' | b'\r' | b'\t'))
+            .count()
+            .saturating_mul(100)
+            <= bytes.len()
+    {
+        return "text/plain".into();
+    }
+    extension_mime.to_owned()
 }
 
 pub fn path_key(path: &Path) -> String {
@@ -443,7 +488,7 @@ mod tests {
     fn scan_is_read_only_and_applies_default_exclusions() {
         let directory = tempfile::tempdir().expect("tempdir");
         let source = directory.path().join("资料.txt");
-        fs::write(&source, "拾忆").expect("write fixture");
+        fs::write(&source, "翻翻").expect("write fixture");
         fs::create_dir(directory.path().join("node_modules")).expect("create excluded directory");
         fs::write(
             directory.path().join("node_modules").join("ignored.js"),
@@ -471,7 +516,7 @@ mod tests {
     #[test]
     fn protected_paths_are_never_traversed() {
         let directory = tempfile::tempdir().expect("tempdir");
-        let protected = directory.path().join("ReminData");
+        let protected = directory.path().join("FanFanData");
         fs::create_dir(&protected).expect("create protected directory");
         fs::write(protected.join("private.db"), "internal").expect("write protected fixture");
 
@@ -500,7 +545,7 @@ mod tests {
     #[test]
     fn cancelled_scan_stops_at_the_next_atomic_checkpoint() {
         let directory = tempfile::tempdir().expect("tempdir");
-        fs::write(directory.path().join("资料.txt"), "拾忆").expect("write fixture");
+        fs::write(directory.path().join("资料.txt"), "翻翻").expect("write fixture");
         let control = ScanControl::default();
         control.cancel();
 
@@ -513,7 +558,7 @@ mod tests {
     #[test]
     fn paused_scan_resumes_without_losing_work() {
         let directory = tempfile::tempdir().expect("tempdir");
-        fs::write(directory.path().join("资料.txt"), "拾忆").expect("write fixture");
+        fs::write(directory.path().join("资料.txt"), "翻翻").expect("write fixture");
         let root = directory.path().to_path_buf();
         let control = ScanControl::default();
         control.pause();

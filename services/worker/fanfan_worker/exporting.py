@@ -40,12 +40,12 @@ def export_table(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, Worker
     if not target.parent.is_dir():
         return None, WorkerError("EXPORT_PARENT_UNAVAILABLE", "导出目录不存在", False)
     if target.exists():
-        return None, WorkerError("TARGET_EXISTS", "目标文件已经存在，拾忆不会覆盖它", False)
+        return None, WorkerError("TARGET_EXISTS", "目标文件已经存在，翻翻不会覆盖它", False)
 
     normalized_rows = [[_normalize_cell(cell) for cell in row] for row in rows]
     temporary: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile(prefix=".remin-export-", suffix=f".{export_format}.tmp", dir=target.parent, delete=False) as handle:
+        with tempfile.NamedTemporaryFile(prefix=".fanfan-export-", suffix=f".{export_format}.tmp", dir=target.parent, delete=False) as handle:
             temporary = Path(handle.name)
         if export_format == "json":
             _write_json(temporary, headers, normalized_rows)
@@ -59,7 +59,7 @@ def export_table(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, Worker
         try:
             os.link(temporary, target)
         except FileExistsError:
-            return None, WorkerError("TARGET_EXISTS", "目标文件已经存在，拾忆不会覆盖它", False)
+            return None, WorkerError("TARGET_EXISTS", "目标文件已经存在，翻翻不会覆盖它", False)
         except OSError as error:
             return None, WorkerError("EXPORT_COMMIT_FAILED", str(error), True)
         digest = hashlib.sha256(target.read_bytes()).hexdigest()
@@ -106,7 +106,7 @@ def _write_xlsx(path: Path, headers: list[str], rows: list[list[str]]) -> None:
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>')
         archive.writestr("_rels/.rels", '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>')
-        archive.writestr("xl/workbook.xml", '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="拾忆导出" sheetId="1" r:id="rId1"/></sheets></workbook>')
+        archive.writestr("xl/workbook.xml", '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="翻翻导出" sheetId="1" r:id="rId1"/></sheets></workbook>')
         archive.writestr("xl/_rels/workbook.xml.rels", '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>')
         archive.writestr("xl/worksheets/sheet1.xml", worksheet)
 
@@ -116,7 +116,7 @@ def _write_docx(path: Path, headers: list[str], rows: list[list[str]]) -> None:
     for row in [headers, *rows]:
         cells = "".join(f'<w:tc><w:p><w:r><w:t xml:space="preserve">{escape(value)}</w:t></w:r></w:p></w:tc>' for value in row)
         table_rows.append(f"<w:tr>{cells}</w:tr>")
-    document = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>拾忆导出结果</w:t></w:r></w:p><w:tbl>' + "".join(table_rows) + "</w:tbl><w:sectPr/></w:body></w:document>"
+    document = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>翻翻导出结果</w:t></w:r></w:p><w:tbl>' + "".join(table_rows) + "</w:tbl><w:sectPr/></w:body></w:document>"
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>')
         archive.writestr("_rels/.rels", '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>')

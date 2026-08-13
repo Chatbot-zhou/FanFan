@@ -344,18 +344,18 @@ pub fn built_in_model_catalog() -> Vec<ModelCatalogEntry> {
         catalog_entry(
             "ocr_paddleocr",
             ModelRole::Ocr,
-            "PaddleOCR V4 · 中文文字识别",
-            "ch_PP-OCRv4_rec",
-            "扫描件与图片的中文文字识别模型。本次仅完成文件安装与角色配置，识别流水线仍使用 Windows 内置 OCR。",
-            &["中文识别准确率高", "扫描件识别稳定"],
-            &["识别流水线尚未接入", "下载后暂不改变现有OCR路径"],
-            Some(15_603_475),
+            "PP-OCRv5 Mobile · 中文文字识别",
+            "ch_PP-OCRv5_mobile",
+            "RapidOCR + ONNX Runtime 的 PP-OCRv5 检测、方向分类和中文识别组件。",
+            &["轻量中文OCR", "检测、方向与识别完整链路", "会话按需加载"],
+            &["复杂表格与公式需要后续增强", "后台默认使用1至2个CPU线程"],
+            Some(22_110_426),
             1.0,
             None,
             "快",
             "Apache-2.0",
             false,
-            "可选；为后续本地 OCR 引擎预置的模型组件",
+            "推荐；图片和扫描文档默认使用的本地OCR组件",
             Some("ocr_paddleocr"),
             &["modelscope"],
         ),
@@ -364,9 +364,9 @@ pub fn built_in_model_catalog() -> Vec<ModelCatalogEntry> {
             ModelRole::Tts,
             "sherpa-onnx VITS · 中文语音合成",
             "vits_zh_ll",
-            "sherpa-onnx 官方 VITS 中文语音合成模型。本次仅打通下载/导入与角色配置渠道，语音合成功能后续实现。",
+            "sherpa-onnx 官方 VITS 中文语音合成模型，用于显式朗读已经通过引用校验的回答。",
             &["官方开源 ONNX 格式", "多说话人中文音色"],
-            &["合成功能尚未接入", "下载后暂不参与问答流程"],
+            &["需要用户主动点击朗读", "不会自动播放或上传文本"],
             Some(121_478_002),
             1.5,
             None,
@@ -382,10 +382,10 @@ pub fn built_in_model_catalog() -> Vec<ModelCatalogEntry> {
             ModelRole::Asr,
             "sherpa-onnx Paraformer · 中文语音识别",
             "paraformer-zh-small",
-            "sherpa-onnx 官方 Paraformer 中文语音识别模型。本次仅打通下载/导入与角色配置渠道，语音识别功能后续实现。",
-            &["官方开源 ONNX 格式", "体积小识别稳定"],
-            &["识别功能尚未接入", "下载后暂不参与问答流程"],
-            Some(81_904_027),
+            "sherpa-onnx 官方 Paraformer 中文语音识别模型，随预设安装 Silero VAD，仅在用户明确录音时运行。",
+            &["官方开源 ONNX 格式", "体积小识别稳定", "自动裁剪录音静音段"],
+            &["当前优先中文普通话", "不会后台静默录音"],
+            Some(82_547_881),
             1.0,
             None,
             "快",
@@ -447,6 +447,30 @@ fn catalog_entry(
 
 pub fn model_edition_by_id(edition_id: &str, source: &str) -> Result<ModelEdition, AppError> {
     resolved_model_edition(edition_id, source)
+}
+
+pub fn locked_download_artifact(model_id: &str, source: ModelSource) -> Option<DownloadArtifact> {
+    let source_name = match source {
+        ModelSource::Huggingface => "huggingface",
+        ModelSource::Modelscope => "modelscope",
+        ModelSource::LocalImport => return None,
+    };
+    [
+        "generation_qwen3_0_6b",
+        "generation_qwen3_1_7b",
+        "generation_qwen3_4b",
+        "embedding_bge_small",
+        "vision_qwen3_vl_2b_q4",
+        "vision_qwen3_vl_2b_q8",
+        "reranker_bge_base_int8",
+        "ocr_paddleocr",
+        "tts_sherpa_vits",
+        "asr_sherpa_paraformer",
+    ]
+    .into_iter()
+    .filter_map(|edition_id| resolved_model_edition(edition_id, source_name).ok())
+    .flat_map(|edition| edition.artifacts)
+    .find(|artifact| artifact.model_id == model_id)
 }
 
 fn resolved_model_edition(edition_id: &str, source: &str) -> Result<ModelEdition, AppError> {
@@ -586,7 +610,8 @@ fn resolved_model_edition(edition_id: &str, source: &str) -> Result<ModelEdition
             ))
         }
         "reranker_bge_base_int8" => {
-            require_huggingface(source)?;
+            // 2026-08-13: reranker 不再强制 Hugging Face 源——魔搭上有同模型的
+            // ONNX 导出（Xenova/bge-reranker-base），国内网络可直连下载。
             Ok(edition(
                 edition_id,
                 "BGE Reranker Base",
@@ -598,8 +623,8 @@ fn resolved_model_edition(edition_id: &str, source: &str) -> Result<ModelEdition
         }
         "ocr_paddleocr" => Ok(edition(
             edition_id,
-            "PaddleOCR V4",
-            "安装中文文字识别模型（检测+识别组件）。",
+            "PP-OCRv5 Mobile",
+            "安装中文文字识别模型（检测、方向分类、识别与词典）。",
             4,
             vec![ocr_artifact(source)],
             &["ocr"],
@@ -773,8 +798,13 @@ fn vision_artifact(source: ModelSource, quality: bool) -> DownloadArtifact {
 }
 
 fn reranker_artifact(source: ModelSource) -> DownloadArtifact {
-    const REPOSITORY: &str = "onnx-community/bge-reranker-base-ONNX";
-    const REVISION: &str = "f131ae72114cb18333648a2ee6b0942849e8ab95";
+    // 2026-08-13: 从 onnx-community/bge-reranker-base-ONNX（仅 HF，镜像下载
+    // 反复失败）切换为 Xenova/bge-reranker-base——同一模型（bge-reranker-base）
+    // 的 transformers.js ONNX 导出，魔搭与 HF 双源直连可下。格式（model_quantized
+    // .onnx + tokenizer.json）与推理输入输出与旧版一致。两个文件已在本机
+    // 下载并核对 sha256（2026-08-13）。
+    const REPOSITORY: &str = "Xenova/bge-reranker-base";
+    const REVISION: &str = "master";
     DownloadArtifact {
         model_id: "bge-reranker-base-onnx-int8".into(),
         role: ModelRole::Reranker,
@@ -784,14 +814,14 @@ fn reranker_artifact(source: ModelSource) -> DownloadArtifact {
         revision: REVISION.into(),
         file_name: "model_quantized.onnx".into(),
         url: artifact_url(source, REPOSITORY, REVISION, "onnx/model_quantized.onnx"),
-        sha256: "46a1bb4cf46ff1e300d27589d620141fbf04fc0eaf8e7bb6dea5e044475ff387".into(),
-        size_bytes: 279_252_659,
+        sha256: "dd98f3e67837d23210a6b7550c08cced4f61845b940ac45be3565840a10f3244".into(),
+        size_bytes: 279_301_077,
         companion_files: vec![DownloadFile {
             file_name: "tokenizer.json".into(),
             remote_path: "tokenizer.json".into(),
             url: artifact_url(source, REPOSITORY, REVISION, "tokenizer.json"),
-            sha256: "14917dd757b81bc44d4af6b028367351702656670c1954e055dabdfcf21593cf".into(),
-            size_bytes: 17_082_798,
+            sha256: "48564c5c7d3fa64d85d95e65414a542385f88b0f128fd8d4163fd7a57f2be05c".into(),
+            size_bytes: 17_098_079,
         }],
         license_name: "MIT".into(),
         query_prefix: None,
@@ -800,38 +830,65 @@ fn reranker_artifact(source: ModelSource) -> DownloadArtifact {
 }
 
 fn ocr_artifact(source: ModelSource) -> DownloadArtifact {
-    // Locked to RapidAI/RapidOCR on ModelScope (revision pinned). Both URLs were
-    // downloaded and verified against the sha256 values below on 2026-08-12.
+    // Locked to RapidAI/RapidOCR v3.5.0 on ModelScope. All four files were
+    // downloaded and verified against the sha256 values below on 2026-08-13.
     const REPOSITORY: &str = "RapidAI/RapidOCR";
-    const REVISION: &str = "b8ff564a23de421e7144385bfe120fe2bb869932";
+    const REVISION: &str = "v3.5.0";
     DownloadArtifact {
-        model_id: "ch_PP-OCRv4_rec".into(),
+        model_id: "ch_PP-OCRv5_mobile".into(),
         role: ModelRole::Ocr,
         format: ModelFormat::Onnx,
         source,
         repository_id: REPOSITORY.into(),
         revision: REVISION.into(),
-        file_name: "ch_PP-OCRv4_rec_mobile.onnx".into(),
+        file_name: "ch_PP-OCRv5_rec_mobile_infer.onnx".into(),
         url: artifact_url(
             source,
             REPOSITORY,
             REVISION,
-            "onnx/PP-OCRv4/rec/ch_PP-OCRv4_rec_mobile.onnx",
+            "onnx/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile_infer.onnx",
         ),
-        sha256: "48fc40f24f6d2a207a2b1091d3437eb3cc3eb6b676dc3ef9c37384005483683b".into(),
-        size_bytes: 10_857_958,
-        companion_files: vec![DownloadFile {
-            file_name: "ch_PP-OCRv4_det_mobile.onnx".into(),
-            remote_path: "onnx/PP-OCRv4/det/ch_PP-OCRv4_det_mobile.onnx".into(),
-            url: artifact_url(
-                source,
-                REPOSITORY,
-                REVISION,
-                "onnx/PP-OCRv4/det/ch_PP-OCRv4_det_mobile.onnx",
-            ),
-            sha256: "d2a7720d45a54257208b1e13e36a8479894cb74155a5efe29462512d42f49da9".into(),
-            size_bytes: 4_745_517,
-        }],
+        sha256: "5825fc7ebf84ae7a412be049820b4d86d77620f204a041697b0494669b1742c5".into(),
+        size_bytes: 16_631_306,
+        companion_files: vec![
+            DownloadFile {
+                file_name: "ch_PP-OCRv5_mobile_det.onnx".into(),
+                remote_path: "onnx/PP-OCRv5/det/ch_PP-OCRv5_mobile_det.onnx".into(),
+                url: artifact_url(
+                    source,
+                    REPOSITORY,
+                    REVISION,
+                    "onnx/PP-OCRv5/det/ch_PP-OCRv5_mobile_det.onnx",
+                ),
+                sha256: "4d97c44a20d30a81aad087d6a396b08f786c4635742afc391f6621f5c6ae78ae".into(),
+                size_bytes: 4_819_576,
+            },
+            DownloadFile {
+                file_name: "ch_ppocr_mobile_v2.0_cls_infer.onnx".into(),
+                remote_path: "onnx/PP-OCRv4/cls/ch_ppocr_mobile_v2.0_cls_infer.onnx".into(),
+                url: artifact_url(
+                    source,
+                    REPOSITORY,
+                    REVISION,
+                    "onnx/PP-OCRv4/cls/ch_ppocr_mobile_v2.0_cls_infer.onnx",
+                ),
+                sha256: "e47acedf663230f8863ff1ab0e64dd2d82b838fceb5957146dab185a89d6215c".into(),
+                size_bytes: 585_532,
+            },
+            DownloadFile {
+                file_name: "ppocrv5_dict.txt".into(),
+                remote_path: "paddle/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile_infer/ppocrv5_dict.txt"
+                    .into(),
+                url: artifact_url(
+                    source,
+                    REPOSITORY,
+                    REVISION,
+                    "paddle/PP-OCRv5/rec/ch_PP-OCRv5_rec_mobile_infer/ppocrv5_dict.txt",
+                ),
+                sha256: "d1979e9f794c464c0d2e0b70a7fe14dd978e9dc644c0e71f14158cdf8342af1b".into(),
+                size_bytes: 74_012,
+            },
+        ],
         license_name: "Apache-2.0".into(),
         query_prefix: None,
         max_length: None,
@@ -894,13 +951,22 @@ fn asr_paraformer_artifact(source: ModelSource) -> DownloadArtifact {
         url: artifact_url(source, REPOSITORY, REVISION, "model.int8.onnx"),
         sha256: "3ef6c19369b912f7caf3cef8e545c5ccd1a33d9d7ec792a46668dc41c4b229ec".into(),
         size_bytes: 81_828_675,
-        companion_files: vec![DownloadFile {
-            file_name: "tokens.txt".into(),
-            remote_path: "tokens.txt".into(),
-            url: artifact_url(source, REPOSITORY, REVISION, "tokens.txt"),
-            sha256: "4b2d964e18b9cf139b473003b6698fb2ed9a2a5ec55b93daa677b28f578897aa".into(),
-            size_bytes: 75_352,
-        }],
+        companion_files: vec![
+            DownloadFile {
+                file_name: "tokens.txt".into(),
+                remote_path: "tokens.txt".into(),
+                url: artifact_url(source, REPOSITORY, REVISION, "tokens.txt"),
+                sha256: "4b2d964e18b9cf139b473003b6698fb2ed9a2a5ec55b93daa677b28f578897aa".into(),
+                size_bytes: 75_352,
+            },
+            DownloadFile {
+                file_name: "silero_vad.onnx".into(),
+                remote_path: "sherpa-onnx/asr-models/silero_vad.onnx".into(),
+                url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx".into(),
+                sha256: "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6".into(),
+                size_bytes: 643_854,
+            },
+        ],
         license_name: "Apache-2.0".into(),
         query_prefix: None,
         max_length: None,
@@ -962,11 +1028,11 @@ fn embedding_artifact(source: ModelSource) -> DownloadArtifact {
 
 fn artifact_url(source: ModelSource, repository_id: &str, revision: &str, path: &str) -> String {
     match source {
-        // HF host is overridable via REMIN_HF_MIRROR (e.g. "hf-mirror.com" for
+        // HF host is overridable via FANFAN_HF_MIRROR (e.g. "hf-mirror.com" for
         // networks that cannot reach huggingface.co directly). Unset = unchanged.
         ModelSource::Huggingface => {
             let host =
-                std::env::var("REMIN_HF_MIRROR").unwrap_or_else(|_| "huggingface.co".to_string());
+                std::env::var("FANFAN_HF_MIRROR").unwrap_or_else(|_| "huggingface.co".to_string());
             format!("https://{host}/{repository_id}/resolve/{revision}/{path}?download=true")
         }
         ModelSource::Modelscope => format!(

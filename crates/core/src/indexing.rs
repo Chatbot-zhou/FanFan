@@ -12,6 +12,15 @@ use crate::{AppError, FileRecord, ScopeFilter, SourceLocator};
 pub const INDEX_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OcrRuntimeConfig {
+    pub model_path: String,
+    pub det_model_path: String,
+    pub cls_model_path: String,
+    pub dictionary_path: String,
+    pub threads: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParseRequest {
     pub job_id: Uuid,
     pub file_id: Uuid,
@@ -23,6 +32,8 @@ pub struct ParseRequest {
     pub max_pages: Option<u32>,
     #[serde(default)]
     pub asset_cache_dir: Option<String>,
+    #[serde(default)]
+    pub ocr_runtime: Option<OcrRuntimeConfig>,
     pub parser_version: String,
 }
 
@@ -41,6 +52,18 @@ pub struct ParseWarning {
     pub code: String,
     pub message: String,
     pub locator: Option<SourceLocator>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OcrAttempt {
+    pub engine: String,
+    pub model_version: Option<String>,
+    pub status: String,
+    pub page_no: Option<u32>,
+    pub confidence: Option<f32>,
+    pub fallback_reason: Option<String>,
+    pub elapsed_ms: u64,
+    pub error: Option<AppError>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -125,6 +148,8 @@ pub struct ParseResult {
     pub nodes: Vec<DocumentNode>,
     #[serde(default)]
     pub image_assets: Vec<ImageAsset>,
+    #[serde(default)]
+    pub ocr_attempts: Vec<OcrAttempt>,
     pub warnings: Vec<ParseWarning>,
     pub metrics: ParseMetrics,
     pub error: Option<AppError>,
@@ -263,6 +288,54 @@ pub struct SearchResult {
     pub scores: SearchScore,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RetrievalCandidate {
+    pub file_id: Uuid,
+    pub chunk_id: Option<Uuid>,
+    pub revision_id: Option<Uuid>,
+    pub name: String,
+    pub extension: String,
+    #[serde(
+        rename(serialize = "display_path"),
+        alias = "display_path",
+        serialize_with = "crate::serialize_display_path"
+    )]
+    pub path: String,
+    pub modified_at: DateTime<Utc>,
+    pub snippet: String,
+    pub locator: Option<SourceLocator>,
+    pub match_reasons: Vec<String>,
+    pub scores: SearchScore,
+    pub rank: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RetrievalTrace {
+    pub retrieval_id: Uuid,
+    pub channels: SearchChannels,
+    pub candidates: Vec<RetrievalCandidate>,
+    pub elapsed_ms: u64,
+}
+
+/// Search may surface weak nearest neighbours so the user can continue to
+/// explore, but strict RAG must not promote every ANN result to evidence. The
+/// persisted semantic score is cosine similarity mapped from `[-1, 1]` to
+/// `[0, 1]`; 0.70 therefore represents an original cosine similarity of 0.40.
+/// Lexical hits use the normalized BM25 score produced by `search_fulltext`.
+pub(crate) const RAG_MIN_SEMANTIC_SCORE: f32 = 0.70;
+pub(crate) const RAG_MIN_FULLTEXT_SCORE: f32 = 0.05;
+
+pub(crate) fn candidate_is_relevant_rag_evidence(candidate: &RetrievalCandidate) -> bool {
+    candidate
+        .scores
+        .fulltext
+        .is_some_and(|score| score >= RAG_MIN_FULLTEXT_SCORE)
+        || candidate
+            .scores
+            .semantic
+            .is_some_and(|score| score >= RAG_MIN_SEMANTIC_SCORE)
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchChannelState {
@@ -295,6 +368,8 @@ pub struct FilePreview {
     pub nodes: Vec<DocumentNode>,
     #[serde(default)]
     pub image_assets: Vec<ImageAsset>,
+    #[serde(default)]
+    pub ocr_attempts: Vec<OcrAttempt>,
     pub offset: u32,
     pub next_offset: Option<u32>,
     pub anchor_node_id: Option<Uuid>,
@@ -324,6 +399,7 @@ pub struct SemanticQuery<'a> {
 #[derive(Debug, Clone)]
 pub(crate) struct RankedHit {
     pub file: FileRecord,
+    pub chunk_id: Option<Uuid>,
     pub revision_id: Option<Uuid>,
     pub snippet: String,
     pub locator: Option<SourceLocator>,
@@ -337,14 +413,73 @@ pub(crate) fn fuse_ranked_hits(
     page_size: usize,
     started_at: Instant,
 ) -> SearchSession {
-    let mut fused: HashMap<Uuid, SearchResult> = HashMap::new();
+    let candidates =
+        fuse_retrieval_candidates(channels, page_size.saturating_mul(4).max(page_size));
+    let mut by_file = HashMap::<Uuid, SearchResult>::new();
+    for candidate in candidates {
+        by_file
+            .entry(candidate.file_id)
+            .or_insert_with(|| SearchResult {
+                file_id: candidate.file_id,
+                name: candidate.name,
+                extension: candidate.extension,
+                path: candidate.path,
+                modified_at: candidate.modified_at,
+                snippet: candidate.snippet,
+                match_reasons: candidate.match_reasons,
+                locator: candidate.locator,
+                revision_id: candidate.revision_id,
+                scores: candidate.scores,
+            });
+    }
+    let mut results = by_file.into_values().collect::<Vec<_>>();
+    match sort {
+        SearchSort::Relevance => results.sort_by(|left, right| {
+            right
+                .scores
+                .fused
+                .total_cmp(&left.scores.fused)
+                .then_with(|| right.modified_at.cmp(&left.modified_at))
+        }),
+        SearchSort::ModifiedDesc => {
+            results.sort_by_key(|result| std::cmp::Reverse(result.modified_at))
+        }
+        SearchSort::NameAsc => results.sort_by(|left, right| left.name.cmp(&right.name)),
+    }
+    results.truncate(page_size);
+    SearchSession {
+        search_id: Uuid::now_v7(),
+        status: "completed".to_owned(),
+        channels: SearchChannels {
+            filename: SearchChannelState::Completed,
+            fulltext: SearchChannelState::Completed,
+            semantic: SearchChannelState::Unavailable,
+        },
+        results,
+        next_cursor: None,
+        elapsed_ms: started_at.elapsed().as_millis() as u64,
+    }
+}
+
+pub(crate) fn fuse_retrieval_candidates(
+    channels: &[Vec<RankedHit>],
+    limit: usize,
+) -> Vec<RetrievalCandidate> {
+    let mut fused: HashMap<(Uuid, Option<Uuid>), RetrievalCandidate> = HashMap::new();
     for channel in channels {
         for (rank, hit) in channel.iter().enumerate() {
-            let reciprocal_rank = 1.0 / (60.0 + rank as f32 + 1.0);
+            let weight = match hit.reason {
+                "semantic" => 1.15,
+                "fulltext" => 1.0,
+                _ => 0.7,
+            };
+            let reciprocal_rank = weight / (60.0 + rank as f32 + 1.0);
             let entry = fused
-                .entry(hit.file.file_id)
-                .or_insert_with(|| SearchResult {
+                .entry((hit.file.file_id, hit.chunk_id))
+                .or_insert_with(|| RetrievalCandidate {
                     file_id: hit.file.file_id,
+                    chunk_id: hit.chunk_id,
+                    revision_id: hit.revision_id,
                     name: hit.file.display_name.clone(),
                     extension: hit.file.extension.clone(),
                     path: hit.file.canonical_path.clone(),
@@ -352,13 +487,13 @@ pub(crate) fn fuse_ranked_hits(
                     snippet: hit.snippet.clone(),
                     match_reasons: Vec::new(),
                     locator: hit.locator.clone(),
-                    revision_id: hit.revision_id,
                     scores: SearchScore {
                         filename: None,
                         fulltext: None,
                         semantic: None,
                         fused: 0.0,
                     },
+                    rank: 0,
                 });
             entry.scores.fused += reciprocal_rank;
             if !entry
@@ -386,7 +521,8 @@ pub(crate) fn fuse_ranked_hits(
                             .unwrap_or_default()
                             .max(hit.channel_score),
                     );
-                    if entry.locator.is_none() {
+                    if entry.locator.is_none() || entry.chunk_id.is_none() {
+                        entry.chunk_id = hit.chunk_id;
                         entry.locator = hit.locator.clone();
                         entry.snippet.clone_from(&hit.snippet);
                     }
@@ -399,7 +535,8 @@ pub(crate) fn fuse_ranked_hits(
                             .unwrap_or_default()
                             .max(hit.channel_score),
                     );
-                    if entry.locator.is_none() {
+                    if entry.locator.is_none() || entry.chunk_id.is_none() {
+                        entry.chunk_id = hit.chunk_id;
                         entry.locator = hit.locator.clone();
                         entry.snippet.clone_from(&hit.snippet);
                     }
@@ -408,33 +545,58 @@ pub(crate) fn fuse_ranked_hits(
             }
         }
     }
-    let mut results = fused.into_values().collect::<Vec<_>>();
-    match sort {
-        SearchSort::Relevance => results.sort_by(|left, right| {
-            right
-                .scores
-                .fused
-                .total_cmp(&left.scores.fused)
-                .then_with(|| right.modified_at.cmp(&left.modified_at))
-        }),
-        SearchSort::ModifiedDesc => {
-            results.sort_by_key(|result| std::cmp::Reverse(result.modified_at))
-        }
-        SearchSort::NameAsc => results.sort_by(|left, right| left.name.cmp(&right.name)),
+    let mut remaining = fused.into_values().collect::<Vec<_>>();
+    remaining.sort_by(|left, right| right.scores.fused.total_cmp(&left.scores.fused));
+    let max_relevance = remaining
+        .first()
+        .map(|candidate| candidate.scores.fused)
+        .unwrap_or(1.0)
+        .max(f32::EPSILON);
+    let mut selected = Vec::new();
+    while !remaining.is_empty() && selected.len() < limit {
+        let (best_index, _) = remaining
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                let relevance = candidate.scores.fused / max_relevance;
+                let redundancy = selected
+                    .iter()
+                    .map(|chosen: &RetrievalCandidate| {
+                        let lexical = token_jaccard(&candidate.snippet, &chosen.snippet);
+                        if candidate.file_id == chosen.file_id {
+                            lexical.max(0.2)
+                        } else {
+                            lexical
+                        }
+                    })
+                    .fold(0.0_f32, f32::max);
+                (index, relevance * 0.78 - redundancy * 0.22)
+            })
+            .max_by(|left, right| left.1.total_cmp(&right.1))
+            .expect("remaining candidates are not empty");
+        let mut candidate = remaining.swap_remove(best_index);
+        candidate.rank = selected.len() as u32 + 1;
+        selected.push(candidate);
     }
-    results.truncate(page_size);
-    SearchSession {
-        search_id: Uuid::now_v7(),
-        status: "completed".to_owned(),
-        channels: SearchChannels {
-            filename: SearchChannelState::Completed,
-            fulltext: SearchChannelState::Completed,
-            semantic: SearchChannelState::Unavailable,
-        },
-        results,
-        next_cursor: None,
-        elapsed_ms: started_at.elapsed().as_millis() as u64,
+    selected
+}
+
+fn token_jaccard(left: &str, right: &str) -> f32 {
+    let tokens = |value: &str| {
+        value
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|token| !token.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let left = tokens(left);
+    let right = tokens(right);
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
     }
+    let intersection = left.intersection(&right).count() as f32;
+    let union = left.union(&right).count() as f32;
+    intersection / union
 }
 
 pub fn chunks_from_nodes(result: &ParseResult) -> Vec<ChunkRecord> {
@@ -618,7 +780,43 @@ fn stable_content_hash(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SourceKind;
+    use crate::{Availability, ParseStatus, SourceKind};
+
+    fn ranked_hit(
+        file_id: Uuid,
+        chunk_id: Uuid,
+        reason: &'static str,
+        score: f32,
+        snippet: &str,
+    ) -> RankedHit {
+        let now = Utc::now();
+        RankedHit {
+            file: FileRecord {
+                file_id,
+                volume_id: "volume".into(),
+                canonical_path: format!("资料\\{file_id}.txt"),
+                display_name: format!("{file_id}.txt"),
+                extension: "txt".into(),
+                mime_type: "text/plain".into(),
+                size_bytes: 1,
+                fs_created_at: Some(now),
+                fs_modified_at: now,
+                windows_file_id: None,
+                content_sha256: None,
+                availability: Availability::Present,
+                current_revision_id: Some(Uuid::now_v7()),
+                parse_status: ParseStatus::Parsed,
+                first_seen_at: now,
+                last_seen_at: now,
+            },
+            chunk_id: Some(chunk_id),
+            revision_id: Some(Uuid::now_v7()),
+            snippet: snippet.into(),
+            locator: Some(SourceLocator::default()),
+            reason,
+            channel_score: score,
+        }
+    }
 
     #[test]
     fn chinese_normalization_emits_characters_and_bigrams() {
@@ -651,6 +849,51 @@ mod tests {
     }
 
     #[test]
+    fn strict_rag_rejects_weak_semantic_only_neighbours() {
+        let weak = fuse_retrieval_candidates(
+            &[vec![ranked_hit(
+                Uuid::now_v7(),
+                Uuid::now_v7(),
+                "semantic",
+                0.64,
+                "unrelated nearest neighbour",
+            )]],
+            10,
+        )
+        .remove(0);
+        assert!(!candidate_is_relevant_rag_evidence(&weak));
+
+        let strong = fuse_retrieval_candidates(
+            &[vec![ranked_hit(
+                Uuid::now_v7(),
+                Uuid::now_v7(),
+                "semantic",
+                0.82,
+                "semantically relevant evidence",
+            )]],
+            10,
+        )
+        .remove(0);
+        assert!(candidate_is_relevant_rag_evidence(&strong));
+    }
+
+    #[test]
+    fn strict_rag_keeps_lexical_evidence_above_the_floor() {
+        let lexical = fuse_retrieval_candidates(
+            &[vec![ranked_hit(
+                Uuid::now_v7(),
+                Uuid::now_v7(),
+                "fulltext",
+                0.25,
+                "exact phrase from the document",
+            )]],
+            10,
+        )
+        .remove(0);
+        assert!(candidate_is_relevant_rag_evidence(&lexical));
+    }
+
+    #[test]
     fn chunks_keep_their_source_locator() {
         let result = ParseResult {
             revision_id: Uuid::now_v7(),
@@ -672,6 +915,7 @@ mod tests {
                 heading_path: vec!["检索".into()],
             }],
             image_assets: vec![],
+            ocr_attempts: vec![],
             warnings: vec![],
             metrics: ParseMetrics {
                 page_count: 0,
@@ -689,6 +933,81 @@ mod tests {
             chunks
                 .iter()
                 .all(|chunk| chunk.locator.paragraph_no == Some(3))
+        );
+    }
+
+    #[test]
+    fn hybrid_fusion_keeps_chunks_until_mmr_and_merges_the_same_chunk_channels() {
+        let first_file = Uuid::now_v7();
+        let second_file = Uuid::now_v7();
+        let shared_chunk = Uuid::now_v7();
+        let sibling_chunk = Uuid::now_v7();
+        let other_chunk = Uuid::now_v7();
+        let fulltext = vec![
+            ranked_hit(
+                first_file,
+                shared_chunk,
+                "fulltext",
+                0.9,
+                "项目计划包含检索优化",
+            ),
+            ranked_hit(
+                first_file,
+                sibling_chunk,
+                "fulltext",
+                0.8,
+                "项目风险与恢复检查点",
+            ),
+        ];
+        let semantic = vec![
+            ranked_hit(
+                first_file,
+                shared_chunk,
+                "semantic",
+                0.95,
+                "项目计划包含检索优化",
+            ),
+            ranked_hit(
+                second_file,
+                other_chunk,
+                "semantic",
+                0.7,
+                "数据库锁竞争处理",
+            ),
+        ];
+
+        let candidates = fuse_retrieval_candidates(&[fulltext, semantic], 10);
+
+        assert_eq!(candidates.len(), 3);
+        let shared = candidates
+            .iter()
+            .find(|candidate| candidate.chunk_id == Some(shared_chunk))
+            .expect("shared chunk");
+        assert!(
+            shared
+                .match_reasons
+                .iter()
+                .any(|reason| reason == "fulltext")
+        );
+        assert!(
+            shared
+                .match_reasons
+                .iter()
+                .any(|reason| reason == "semantic")
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|candidate| candidate.file_id == first_file)
+                .count(),
+            2
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.rank)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
         );
     }
 }

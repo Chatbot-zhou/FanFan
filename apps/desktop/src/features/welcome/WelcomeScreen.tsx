@@ -74,7 +74,7 @@ export function WelcomeScreen({ interactive, on_completed, on_persist_error }: W
       <main className="welcome-screen__content">
         <div className="welcome-copy" aria-live="polite">
           <h1 key={showSecond ? "second" : "first"} className={stage === "transitioning" ? "welcome-copy--fading" : ""}>
-            {showSecond ? "拾起散落的信息，连接过去的自己" : "拾起你被遗忘的记忆"}
+            {showSecond ? "想得到，搜得到，翻翻知道。" : "想不起来？翻翻就知道。"}
           </h1>
           {showSecond && (
             <button className="welcome-start" type="button" autoFocus disabled={stage !== "action"} onClick={(event) => {

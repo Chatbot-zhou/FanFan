@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from contextlib import redirect_stdout
 
 from .protocol import WorkerError, WorkerRequest, WorkerResponse
 from .service import WorkerService
@@ -15,7 +16,12 @@ def main() -> int:
     for line in sys.stdin:
         try:
             request = WorkerRequest.from_dict(json.loads(line))
-            response = service.handle(request)
+            # Native/ML libraries sometimes print banners or warnings to stdout.
+            # stdout is the JSONL protocol channel, so any such text would make
+            # the Rust client report WORKER_RESPONSE_INVALID and lose the real
+            # structured error. Route third-party output away from the protocol.
+            with redirect_stdout(sys.stderr):
+                response = service.handle(request)
         except (ValueError, TypeError, json.JSONDecodeError) as error:
             response = WorkerResponse(
                 request_id="unknown",

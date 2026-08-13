@@ -21,16 +21,8 @@ interface AppShellProps {
   startup_notice: string | null;
 }
 
-const STARTUP_PHASE_LABELS: Record<string, string> = {
-  opening_catalog: "正在打开本地资料库",
-  recovering_jobs: "正在恢复上次未完成的任务",
-  scheduling_background_work: "正在安排后台索引任务",
-  ready: "后台服务已就绪",
-  degraded: "部分后台服务暂时不可用",
-};
-
 export function AppShell({ startup_notice }: AppShellProps) {
-  const eventNotice = useBackendEvents();
+  const eventNotices = useBackendEvents();
   const queryClient = useQueryClient();
   const route = useAppStore((state) => state.route);
   useEffect(() => {
@@ -149,16 +141,7 @@ export function AppShell({ startup_notice }: AppShellProps) {
       });
     }
     // 后台事件通知（模型下载失败等）
-    if (eventNotice) {
-      items.push({
-        notice_key: "backend-event",
-        level: "warning",
-        message: eventNotice,
-        details: eventNotice,
-        action_label: null,
-        action_route: null,
-      });
-    }
+    items.push(...eventNotices);
     // 欢迎页持久化失败
     if (startup_notice) {
       items.push({
@@ -196,12 +179,12 @@ export function AppShell({ startup_notice }: AppShellProps) {
       });
     }
     return items;
-  }, [startup.data?.blocker, eventNotice, startup_notice, appStatus.data?.maintenance.background_notice, route, currentModelState]);
+  }, [startup.data?.blocker, eventNotices, startup_notice, appStatus.data?.maintenance.background_notice, route, currentModelState]);
 
   if (authorizationRequired) {
     return (
       <div className="app-window">
-        <TitleBar model_state={currentModelState} model_download={modelDownloads.data?.[0] ?? null} />
+        <TitleBar model_state={currentModelState} model_downloads={modelDownloads.data ?? []} />
         <RootAuthorizationPage onCompleted={completeAuthorization} />
       </div>
     );
@@ -214,17 +197,16 @@ export function AppShell({ startup_notice }: AppShellProps) {
     library: <LibraryPage />,
     collections: <CollectionsPage />,
     inbox: <InboxPage />,
-    settings: <SettingsPage environment={environment.data ?? null} />,
+    settings: <SettingsPage />,
     model_setup: <ModelSetupPage />,
   }[route];
 
   return (
     <div className="app-window">
-      <TitleBar model_state={currentModelState} model_download={modelDownloads.data?.[0] ?? null} notices={notices} />
+      <TitleBar model_state={currentModelState} model_downloads={modelDownloads.data ?? []} notices={notices} />
       <div className="app-window__body">
         <Sidebar />
         <main className="workspace">
-          {!backendReady && <div className="startup-notice" role="status">{STARTUP_PHASE_LABELS[startup.data?.phase ?? "opening_catalog"]} · {Math.round((startup.data?.progress ?? 0.1) * 100)}%</div>}
           {page}
         </main>
       </div>

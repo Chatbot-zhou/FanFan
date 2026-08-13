@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "corpus_id": "remin-zh-v1",
+  "corpus_id": "fanfan-zh-v1",
   "generated_at": "2026-08-01",
   "deterministic_facts": {
     "project_id": "GH-2025-017",
@@ -19,7 +19,7 @@
     {"path": "corpus/08-资料清单.csv", "kind": "csv", "expected": "readable"},
     {"path": "corpus/09-会议行动项.tsv", "kind": "tsv", "expected": "readable"},
     {"path": "corpus/10-网页摘录.html", "kind": "html", "expected": "readable"},
-    {"path": "corpus/11-加密会议纪要.pdf", "kind": "encrypted_pdf", "expected": "password_required", "test_password": "remin-test-password"},
+    {"path": "corpus/11-加密会议纪要.pdf", "kind": "encrypted_pdf", "expected": "password_required", "test_password": "fanfan-test-password"},
     {"path": "corpus/12-损坏文档.pdf", "kind": "corrupt_pdf", "expected": "parse_failed"},
     {"path": "corpus/13-完全重复-A.txt", "kind": "text", "expected": "exact_duplicate"},
     {"path": "corpus/14-完全重复-B.txt", "kind": "text", "expected": "exact_duplicate"},

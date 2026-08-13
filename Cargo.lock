@@ -1048,6 +1048,43 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
+name = "fanfan-core"
+version = "0.2.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "notify",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.19",
+ "usearch",
+ "uuid",
+ "windows",
+]
+
+[[package]]
+name = "fanfan-desktop"
+version = "0.2.0"
+dependencies = [
+ "chrono",
+ "fanfan-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-single-instance",
+ "tempfile",
+ "uuid",
+ "windows",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2878,43 +2915,6 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
-
-[[package]]
-name = "remin-core"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "chrono",
- "notify",
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.19",
- "usearch",
- "uuid",
- "windows",
-]
-
-[[package]]
-name = "remin-desktop"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "remin-core",
- "serde",
- "serde_json",
- "sha2",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-single-instance",
- "tempfile",
- "uuid",
- "windows",
-]
 
 [[package]]
 name = "reqwest"
