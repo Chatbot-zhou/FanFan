@@ -206,17 +206,17 @@ export function ModelSetupPage() {
           <p>生成、Embedding、多模态与可选 Rerank 相互独立；更换 Embedding 会单独触发新索引代际。</p>
           <div>{roleConfigs.data?.map((config) => {
             const active = artifacts.data?.find((artifact) => artifact.artifact_id === config.active_artifact_id);
-            const names: Record<typeof config.role, string> = { generation: "问答基础模型", embedding: "Embedding", vision: "多模态模型", reranker: "Rerank", ocr: "OCR", tts: "语音合成", asr: "语音识别" };
+            const names: Record<typeof config.role, string> = { generation: "问答基础模型", embedding: "Embedding", vision: "多模态模型", reranker: "Rerank", ocr: "OCR", tts: "语音合成", asr: "语音识别", router: "意图路由" };
             return <article key={config.role} className={selectedRole === config.role ? "selected" : ""}>
-              <button type="button" onClick={() => selectRole(config.role, false)}><strong>{names[config.role]}</strong>{active && <span>{active.model_id}</span>}<small>{config.required_for} · {config.load_policy === "background_index" ? "后台索引" : config.load_policy === "serial_on_demand" ? "串行按需加载" : "按需加载"}</small></button>
-              {!active && <button type="button" className="role-card__configure" onClick={() => selectRole(config.role, true)}>点击配置</button>}
-              {active && config.role !== "ocr" && <button type="button" className="text-button" onClick={() => void disableRole(config.role)}>停用</button>}
+              <button type="button" onClick={() => selectRole(config.role, false)}><strong>{names[config.role]}</strong>{active && <span>{config.role === "router" ? `${active.model_id}（复用 Embedding）` : active.model_id}</span>}<small>{config.required_for}{config.role === "router" && active ? " · 自动跟随" : ""} · {config.load_policy === "background_index" ? "后台索引" : config.load_policy === "serial_on_demand" ? "串行按需加载" : "按需加载"}</small></button>
+              {!active && <button type="button" className="role-card__configure" onClick={() => selectRole(config.role, true)}>{config.role === "router" ? "查看说明" : "点击配置"}</button>}
+              {active && config.role !== "ocr" && config.role !== "router" && <button type="button" className="text-button" onClick={() => void disableRole(config.role)}>停用</button>}
             </article>;
           })}</div>
           {disable.isError && <p role="alert" className="inline-error">{errorMessage(disable.error)}</p>}
         </section>
         <section ref={poolRef} className="role-model-pool" aria-label="已验证模型选择池">
-          <header><div><h2>{selectedRole === "generation" ? "问答基础模型" : selectedRole === "embedding" ? "Embedding 模型" : selectedRole === "vision" ? "多模态模型" : selectedRole === "ocr" ? "OCR 模型" : selectedRole === "tts" ? "语音合成模型" : selectedRole === "asr" ? "语音识别模型" : "Rerank 模型"}</h2></div><button type="button" onClick={() => setStep("import")}>导入本地模型</button></header>
+          <header><div><h2>{selectedRole === "generation" ? "问答基础模型" : selectedRole === "embedding" ? "Embedding 模型" : selectedRole === "vision" ? "多模态模型" : selectedRole === "ocr" ? "OCR 模型" : selectedRole === "tts" ? "语音合成模型" : selectedRole === "asr" ? "语音识别模型" : selectedRole === "router" ? "意图路由" : "Rerank 模型"}</h2></div><button type="button" onClick={() => setStep("import")}>导入本地模型</button></header>
           <div className="role-model-grid">{roleCatalog.data?.filter((item) => item.role === selectedRole).map((item) => <article key={item.catalog_id} className={selectedCardId === item.catalog_id ? "selected" : ""} onClick={() => setSelectedCardId(item.catalog_id)}>
             <div className="role-model-card__heading"><strong>{item.name}</strong></div>
             {item.recommended && <em className="role-model-card__badge">推荐</em>}
@@ -227,6 +227,7 @@ export function ModelSetupPage() {
             <p className="role-model-card__fit">{item.device_guidance}</p>
             <button type="button" className={selectedCardId === item.catalog_id ? "primary-button" : ""} disabled={startDownload.isPending} onClick={() => openInstallDialog(item)}>{item.install_edition_id ? "联网安装并自检" : "选择本地文件"}</button>
           </article>)}</div>
+          {selectedRole === "router" && roleCatalog.data?.length === 0 && <p className="role-model-empty">意图路由复用当前 Embedding 模型（轻量中文 BERT 编码器）做 few-shot 语义路由，无需单独安装；启用 Embedding 后自动生效。</p>}
           {roleCatalog.isError && <p role="alert" className="inline-error">{errorMessage(roleCatalog.error)}</p>}
         </section>
       </>}

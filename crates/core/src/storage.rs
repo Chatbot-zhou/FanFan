@@ -29,15 +29,18 @@ use crate::{
     FileProcessingDisposition, FileQuery, FileRecord, FileRelation, FileSystemEvent,
     HealthCheckItem, ImageAsset, ImageUnderstandingResult, InboxEventType, InboxItem, InboxPage,
     InboxQuery, InboxUpdateRequest, IndexActivityStats, IndexRebuildResult, JobRecord, JobStatus,
-    LogPage, LogQuery, MaintenanceSnapshot, ParseOutcome, ParseResult, ParseStatus,
-    PendingEmbeddingChunk, PendingImageUnderstanding, ProcessingCoverageSnapshot, RankedHit,
-    RelationPage, RelationQuery, RelationRefreshResult, RelationType, ResolutionStatus, RootKind,
-    RootRecord, RootSource, RootStatus, ScanOutcome, ScopeFilter, SearchMode, SemanticQuery,
-    SourceLocator, TriageStatus, VolumeType, WatchMode, chunks_from_nodes, fts_query,
-    normalized_version_key,
+    LogPage, LogQuery, MaintenanceSnapshot, NodeTracePage, NodeTraceQuery, NodeTraceRecord,
+    ParseOutcome, ParseResult, ParseStatus, PendingEmbeddingChunk, PendingImageUnderstanding,
+    ProcessingCoverageSnapshot, RankedHit, RelationGroupMemberRecord, RelationGroupPage,
+    RelationGroupQuery, RelationGroupRecord, RelationGroupRole, RelationGroupType,
+    RelationPage, RelationQuery, RelationRefreshResult, RelationType, ResolutionStatus,
+    RootKind, RootRecord, RootSource, RootStatus, ScanOutcome, ScopeFilter, SearchMode,
+    SemanticQuery, SourceLocator, TriageStatus, VolumeType, WatchMode, chunks_from_nodes,
+    cluster_relation_edges, fts_query, normalized_version_key,
 };
+use crate::organizing::RelationEdge;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 21;
+pub const CURRENT_SCHEMA_VERSION: u32 = 24;
 
 type VectorSourceRow = (u64, String, String, String, Vec<f32>);
 type SemanticCandidate = (Uuid, String, f32);
@@ -826,6 +829,62 @@ const MIGRATIONS: &[Migration] = &[
                END;
         "#,
     },
+    Migration {
+        version: 22,
+        name: "node_traces",
+        sql: r#"
+            CREATE TABLE node_traces (
+                trace_id TEXT PRIMARY KEY,
+                flow TEXT NOT NULL,
+                node TEXT NOT NULL,
+                correlation_id TEXT NOT NULL,
+                session_id TEXT,
+                entity_id TEXT,
+                input_json TEXT NOT NULL,
+                output_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                elapsed_ms INTEGER,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX idx_node_traces_created ON node_traces(created_at DESC, trace_id DESC);
+            CREATE INDEX idx_node_traces_correlation ON node_traces(correlation_id);
+            CREATE INDEX idx_node_traces_flow ON node_traces(flow, node);
+        "#,
+    },
+    Migration {
+        version: 23,
+        name: "chunk_neighbor_context_index",
+        sql: r#"
+            CREATE INDEX IF NOT EXISTS idx_chunks_node_ordinal
+                ON chunks(node_id, ordinal);
+        "#,
+    },
+    Migration {
+        version: 24,
+        name: "relation_groups",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS relation_groups (
+                group_id TEXT PRIMARY KEY,
+                group_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                member_count INTEGER NOT NULL,
+                review_status TEXT NOT NULL DEFAULT 'suggested',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_relation_groups_review
+                ON relation_groups(review_status, updated_at DESC, group_id DESC);
+            CREATE TABLE IF NOT EXISTS relation_group_members (
+                group_id TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'member',
+                PRIMARY KEY (group_id, file_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_relation_group_members_file
+                ON relation_group_members(file_id);
+        "#,
+    },
 ];
 
 #[derive(Debug, Clone)]
@@ -958,6 +1017,46 @@ pub struct LogEventInput<'a> {
     pub root_id: Option<&'a Uuid>,
     pub file_id: Option<&'a Uuid>,
     pub fields: &'a serde_json::Value,
+}
+
+/// 相邻块上下文注入上限：每个邻居块截取到该 token 数（估算权重口径），
+/// 防止多证据 × 双邻居把小上下文窗口撑爆。
+const NEIGHBOR_CONTEXT_TOKEN_CAP: u64 = 128;
+
+/// 取命中块在同一节点内的前/后相邻块文本（ordinal ± 1），按 token 上限截断。
+/// 邻居块本身已含 64 token 的重叠，此处再取全文纯粹是为生成模型补足
+/// 「这段文字在原文中前后是什么」的线性语境。
+fn fetch_neighbor_context(
+    connection: &Connection,
+    node_id: &str,
+    ordinal: i64,
+) -> Result<(Option<String>, Option<String>), AppError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT ordinal, text FROM chunks
+             WHERE node_id = ?1 AND ordinal BETWEEN ?2 AND ?3
+             ORDER BY ordinal",
+        )
+        .map_err(|error| storage_error("ASK_NEIGHBOR_QUERY_FAILED", error, true))?;
+    let rows = statement
+        .query_map(
+            params![node_id, ordinal.saturating_sub(1), ordinal.saturating_add(1)],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(|error| storage_error("ASK_NEIGHBOR_QUERY_FAILED", error, true))?;
+    let mut before = None;
+    let mut after = None;
+    for row in rows {
+        let (neighbor_ordinal, text) =
+            row.map_err(|error| storage_error("ASK_NEIGHBOR_QUERY_FAILED", error, true))?;
+        let capped = crate::indexing::cap_by_estimated_tokens(&text, NEIGHBOR_CONTEXT_TOKEN_CAP);
+        if neighbor_ordinal < ordinal {
+            before = Some(capped);
+        } else if neighbor_ordinal > ordinal {
+            after = Some(capped);
+        }
+    }
+    Ok((before, after))
 }
 
 impl CatalogStore {
@@ -2977,7 +3076,9 @@ impl CatalogStore {
                 false,
             ));
         }
-        const ALGORITHM_VERSION: &str = "semantic_lsh_v2";
+        const ALGORITHM_VERSION: &str = "semantic_cluster_v3";
+        /// 每次「AI分析新建议」最多展示的集合建议数；确认/拒绝后再次分析出下一批。
+        const MAX_COLLECTION_SUGGESTIONS_PER_BATCH: usize = 5;
         let connection = self.connect()?;
         let sql = format!(
             "WITH targets AS (SELECT f.file_id, f.current_revision_id, f.display_name FROM files f LEFT JOIN document_profiles p ON p.file_id = f.file_id WHERE f.current_revision_id IS NOT NULL AND f.parse_status = 'parsed' AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL} AND EXISTS (SELECT 1 FROM chunk_embeddings ce WHERE ce.file_id = f.file_id AND ce.revision_id = f.current_revision_id AND ce.model_artifact_id = ?1) AND (p.file_id IS NULL OR p.revision_id <> f.current_revision_id OR p.embedding_model_id <> ?1 OR p.algorithm_version <> ?2) ORDER BY f.last_seen_at DESC LIMIT ?3) SELECT t.file_id, t.current_revision_id, t.display_name, c.text, e.dimension, e.vector_blob FROM targets t JOIN chunks c ON c.file_id = t.file_id AND c.revision_id = t.current_revision_id JOIN chunk_embeddings e ON e.chunk_id = c.chunk_id AND e.model_artifact_id = ?1 ORDER BY t.file_id, c.ordinal"
@@ -3171,116 +3272,237 @@ impl CatalogStore {
                 storage_error("COLLECTION_SUGGESTION_REFRESH_FAILED", error, true)
             })?;
         }
+        // 3. 聚类：同主题/同用途边（cosine ≥0.78）做连通分量，一类一组。
+        //    复用关系分析的聚类算法；成员分组完全由 Embedding 决定，不经过模型。
         let connection = self.connect()?;
-        let mut suggestion_drafts = Vec::new();
-        for profile in &profiles {
-            let related = {
-                let mut statement = connection
-                    .prepare("SELECT CASE WHEN left_file_id = ?1 THEN right_file_id ELSE left_file_id END, confidence FROM file_relations WHERE relation_type IN ('semantic_related','related') AND review_status <> 'rejected' AND confidence >= 0.78 AND model_version = ?2 AND algorithm_version = ?3 AND (left_file_id = ?1 OR right_file_id = ?1) ORDER BY confidence DESC LIMIT 11")
-                    .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?;
-                statement
-                    .query_map(
-                        params![
-                            profile.file_id.to_string(),
-                            model_artifact_id,
-                            ALGORITHM_VERSION
-                        ],
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
-                    )
-                    .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?
-            };
-            if related.is_empty() {
-                continue;
+        let mut consumed = HashSet::new();
+        {
+            let mut statement = connection
+                .prepare("SELECT DISTINCT m.file_id FROM collection_suggested_members m")
+                .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?;
+            for file_id in rows {
+                consumed.insert(parse_uuid_value(&file_id)?);
             }
-            let mut member_titles = vec![profile.title.clone()];
-            let mut members = vec![(
-                profile.file_id,
-                profile.revision_id,
-                1.0_f64,
-                "该文档是本组语义质心候选".to_owned(),
-            )];
-            for (file_id, confidence) in related {
-                let file_id = parse_uuid_value(&file_id)?;
-                let profile_data = connection
-                    .query_row(
-                        "SELECT revision_id, title FROM document_profiles WHERE file_id = ?1",
-                        [file_id.to_string()],
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                    )
-                    .optional()
-                    .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?;
-                if let Some((revision_id, title)) = profile_data {
-                    member_titles.push(title);
-                    members.push((
-                        file_id,
-                        parse_uuid_value(&revision_id)?,
-                        confidence,
-                        format!("与组内核心文档的语义相似度为 {:.0}%", confidence * 100.0),
-                    ));
+        }
+        let mut names_by_id = HashMap::<Uuid, String>::new();
+        {
+            let sql = format!(
+                "SELECT f.file_id, f.display_name FROM files f WHERE f.availability = 'present' AND {AUTHORIZED_FILE_SQL}"
+            );
+            let mut statement = connection
+                .prepare(&sql)
+                .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?;
+            for (file_id, name) in rows {
+                names_by_id.insert(parse_uuid_value(&file_id)?, name);
+            }
+        }
+        let mut edges = Vec::new();
+        {
+            let mut statement = connection
+                .prepare("SELECT left_file_id, right_file_id, confidence FROM file_relations WHERE relation_type IN ('semantic_related','related') AND review_status <> 'rejected' AND confidence >= 0.78 AND model_version = ?1 AND algorithm_version = ?2")
+                .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?;
+            let rows = statement
+                .query_map(params![model_artifact_id, ALGORITHM_VERSION], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, f64>(2)?,
+                    ))
+                })
+                .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?;
+            for (left, right, confidence) in rows {
+                let left_id = parse_uuid_value(&left)?;
+                let right_id = parse_uuid_value(&right)?;
+                if !names_by_id.contains_key(&left_id) || !names_by_id.contains_key(&right_id) {
+                    continue;
+                }
+                edges.push(RelationEdge {
+                    left_file_id: left_id,
+                    right_file_id: right_id,
+                    relation_type: crate::RelationType::SemanticRelated,
+                    confidence,
+                    directed: false,
+                });
+            }
+        }
+        let title_for = |member_ids: &[Uuid], _group_type: crate::RelationGroupType| -> String {
+            let names = member_ids
+                .iter()
+                .filter_map(|id| names_by_id.get(id).cloned())
+                .collect::<Vec<_>>();
+            deterministic_collection_name(&names)
+        };
+        let mut groups = cluster_relation_edges(&edges, &title_for);
+
+        // 4. 大组一致性校验：成员与组代表向量（均值）< 0.70 的踢出，
+        //    防止「A~B、B~C、A~C 弱」的长链把不同主题连成一组。
+        {
+            let mut vector_cache = HashMap::<Uuid, Vec<f32>>::new();
+            let mut kept = Vec::with_capacity(groups.len());
+            for mut group in groups {
+                if group.members.len() < 4 {
+                    kept.push(group);
+                    continue;
+                }
+                let mut vectors = Vec::new();
+                let mut valid = true;
+                for member in &group.members {
+                    match file_vector_for(
+                        &connection,
+                        Some(model_artifact_id),
+                        member.file_id,
+                        &mut vector_cache,
+                    )? {
+                        Some(vector) => vectors.push((member.file_id, vector)),
+                        None => {
+                            valid = false;
+                            break;
+                        }
+                    }
+                }
+                if !valid || vectors.is_empty() {
+                    continue;
+                }
+                let representative = mean_normalized_vector(
+                    &vectors
+                        .iter()
+                        .map(|(_, vector)| vector.clone())
+                        .collect::<Vec<_>>(),
+                )?;
+                let before = group.members.clone();
+                group.members.retain(|member| {
+                    vectors
+                        .iter()
+                        .find(|(file_id, _)| *file_id == member.file_id)
+                        .is_some_and(|(_, vector)| {
+                            representative
+                                .iter()
+                                .zip(vector)
+                                .map(|(a, b)| a * b)
+                                .sum::<f32>()
+                                >= 0.70
+                        })
+                });
+                if group.members.len() >= 2 {
+                    if group.members.len() < before.len() {
+                        group.confidence *= f64::from(group.members.len() as u32)
+                            / f64::from(before.len() as u32);
+                    }
+                    kept.push(group);
                 }
             }
-            members.sort_by_key(|member| member.0);
-            members.dedup_by_key(|member| member.0);
-            if members.len() < 2 {
-                continue;
-            }
-            let mut digest = Sha256::new();
-            digest.update(ALGORITHM_VERSION.as_bytes());
-            digest.update(model_artifact_id.as_bytes());
-            for (file_id, revision_id, _, _) in &members {
-                digest.update(file_id.as_bytes());
-                digest.update(revision_id.as_bytes());
-            }
-            let idempotency_key = format!("{:x}", digest.finalize());
-            let suggestion_id = Uuid::now_v7();
-            let confidence = members.iter().skip(1).map(|member| member.2).sum::<f64>()
-                / (members.len() - 1) as f64;
-            let name = deterministic_collection_name(&member_titles);
-            suggestion_drafts.push((
-                profile.file_id,
-                suggestion_id,
-                idempotency_key,
-                name,
-                confidence,
-                members,
-            ));
+            groups = kept;
         }
+
+        // 5. 每批最多展示 MAX_COLLECTION_SUGGESTIONS_PER_BATCH 组：跳过已被
+        //    任何集合建议（含已确认/已拒绝）消费过的文件，按规模与置信度取前 N；
+        //    确认或拒绝后再次分析即可看到下一批。
+        let available = groups
+            .into_iter()
+            .filter(|group| {
+                group
+                    .members
+                    .iter()
+                    .all(|member| !consumed.contains(&member.file_id))
+            })
+            .collect::<Vec<_>>();
+        let topic_groups = available.len() as u64;
+        let mut ordered = available;
+        ordered.sort_by(|left, right| {
+            right
+                .members
+                .len()
+                .cmp(&left.members.len())
+                .then(
+                    right
+                        .confidence
+                        .partial_cmp(&left.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+        });
+        let shown = ordered
+            .into_iter()
+            .take(MAX_COLLECTION_SUGGESTIONS_PER_BATCH)
+            .collect::<Vec<_>>();
+        let remaining_topic_groups = topic_groups.saturating_sub(shown.len() as u64);
         drop(connection);
 
         let mut created_suggestions = 0_u64;
         let mut suggestion_ids = Vec::new();
-        let mut consumed = HashSet::new();
-        if !suggestion_drafts.is_empty() {
+        if !shown.is_empty() {
             let _permit = self.acquire_write(WritePriority::Background);
             let mut connection = self.connect()?;
             let transaction = connection.transaction().map_err(|error| {
                 storage_error("COLLECTION_SUGGESTION_REFRESH_FAILED", error, true)
             })?;
-            for (core_file_id, suggestion_id, idempotency_key, name, confidence, members) in
-                suggestion_drafts
-            {
-                if suggestion_ids.len() >= 24 {
-                    break;
+            for group in shown {
+                // 成员按 file_id 排序，取各自档案的 revision
+                let mut members = Vec::new();
+                for member in &group.members {
+                    let profile_data = transaction
+                        .query_row(
+                            "SELECT revision_id, title FROM document_profiles WHERE file_id = ?1",
+                            [member.file_id.to_string()],
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                        )
+                        .optional()
+                        .map_err(|error| {
+                            storage_error("COLLECTION_SUGGESTION_WRITE_FAILED", error, true)
+                        })?;
+                    if let Some((revision_id, title)) = profile_data {
+                        members.push((
+                            member.file_id,
+                            parse_uuid_value(&revision_id)?,
+                            title,
+                            format!(
+                                "同主题分组，组内平均语义置信度 {:.0}%",
+                                group.confidence * 100.0
+                            ),
+                        ));
+                    }
                 }
-                if consumed.contains(&core_file_id) {
+                members.sort_by_key(|member| member.0);
+                members.dedup_by_key(|member| member.0);
+                if members.len() < 2 {
                     continue;
                 }
+                let mut digest = Sha256::new();
+                digest.update(ALGORITHM_VERSION.as_bytes());
+                digest.update(model_artifact_id.as_bytes());
+                for (file_id, revision_id, _, _) in &members {
+                    digest.update(file_id.as_bytes());
+                    digest.update(revision_id.as_bytes());
+                }
+                let idempotency_key = format!("{:x}", digest.finalize());
+                let suggestion_id = Uuid::now_v7();
                 let changed = transaction
                     .execute(
                         "INSERT OR IGNORE INTO collection_suggestions (suggestion_id, idempotency_key, suggested_name, description, confidence, status, model_version, algorithm_version, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'suggested', ?6, ?7, ?8, ?8)",
-                        params![suggestion_id.to_string(), idempotency_key, name, "基于文档级Embedding与内容关系形成的虚拟分组；不会改变任何原文件位置。", confidence, model_artifact_id, ALGORITHM_VERSION, now],
+                        params![suggestion_id.to_string(), idempotency_key, group.title.clone(), "AI按同主题/同用途聚类生成的虚拟分类；不会改变任何原文件位置。", group.confidence, model_artifact_id, ALGORITHM_VERSION, now],
                     )
                     .map_err(|error| storage_error("COLLECTION_SUGGESTION_WRITE_FAILED", error, true))?;
                 if changed == 0 {
                     continue;
                 }
-                for (file_id, revision_id, member_confidence, rationale) in &members {
+                for (file_id, revision_id, _, rationale) in &members {
                     transaction
                         .execute(
                             "INSERT INTO collection_suggested_members (suggestion_id, file_id, revision_id, confidence, rationale, state) VALUES (?1, ?2, ?3, ?4, ?5, 'suggested')",
-                            params![suggestion_id.to_string(), file_id.to_string(), revision_id.to_string(), member_confidence, rationale],
+                            params![suggestion_id.to_string(), file_id.to_string(), revision_id.to_string(), group.confidence, rationale],
                         )
                         .map_err(|error| storage_error("COLLECTION_SUGGESTION_WRITE_FAILED", error, true))?;
                     insert_inbox_event(
@@ -3294,7 +3516,6 @@ impl CatalogStore {
                         None,
                         &format!("collection_suggestion:{suggestion_id}:{file_id}"),
                     )?;
-                    consumed.insert(*file_id);
                 }
                 created_suggestions += 1;
                 suggestion_ids.push(suggestion_id);
@@ -3306,6 +3527,8 @@ impl CatalogStore {
         Ok(CollectionSuggestionRefreshResult {
             profiled_files: profiles.len() as u64,
             candidate_edges: candidate_records.len() as u64,
+            topic_groups,
+            remaining_topic_groups,
             created_suggestions,
             suggestion_ids,
             algorithm_version: ALGORITHM_VERSION.into(),
@@ -3397,7 +3620,8 @@ impl CatalogStore {
         self.update_collection_suggestion_internal(suggestion_id, request, None)
     }
 
-    pub fn apply_collection_model_review(
+    /// 生成模型的命名润色：只改名称和说明，成员分组不动（完全由 Embedding 聚类决定）。
+    pub fn apply_collection_model_naming(
         &self,
         suggestion_id: &Uuid,
         review: &CollectionModelReview,
@@ -3407,21 +3631,10 @@ impl CatalogStore {
             || review.suggested_name.trim().is_empty()
             || review.suggested_name.chars().count() > 40
             || review.description.chars().count() > 400
-            || !(2..=50).contains(&review.members.len())
-            || review.members.iter().any(|member| {
-                member.rationale.trim().is_empty() || member.rationale.chars().count() > 400
-            })
-            || review
-                .members
-                .iter()
-                .map(|member| member.file_id)
-                .collect::<HashSet<_>>()
-                .len()
-                != review.members.len()
         {
             return Err(AppError::new(
                 "COLLECTION_MODEL_REVIEW_INVALID",
-                "AI集合复核的名称、说明、成员或理由无效",
+                "AI集合命名的名称或说明无效",
                 false,
             ));
         }
@@ -3431,23 +3644,9 @@ impl CatalogStore {
             .transaction()
             .map_err(|error| storage_error("COLLECTION_MODEL_REVIEW_FAILED", error, true))?;
         ensure_suggestion_status(&transaction, suggestion_id, "suggested")?;
-        let existing = query_suggestion_members(&transaction, suggestion_id)?
-            .into_iter()
-            .map(|member| (member.file.file_id, member))
-            .collect::<HashMap<_, _>>();
-        if review
-            .members
-            .iter()
-            .any(|member| !existing.contains_key(&member.file_id))
-        {
-            return Err(AppError::new(
-                "COLLECTION_MODEL_REVIEW_INVALID",
-                "AI集合复核加入了候选组之外的资料",
-                false,
-            ));
-        }
+        let existing = query_suggestion_members(&transaction, suggestion_id)?;
         let member_titles = existing
-            .values()
+            .iter()
             .map(|member| member.file.display_name.clone())
             .collect::<Vec<_>>();
         let proposed_name = review.suggested_name.trim();
@@ -3463,19 +3662,6 @@ impl CatalogStore {
         let now = Utc::now().to_rfc3339();
         transaction.execute("UPDATE collection_suggestions SET suggested_name = ?1, description = ?2, model_version = ?3, updated_at = ?4 WHERE suggestion_id = ?5", params![validated_name, review.description.trim(), model_version, now, suggestion_id.to_string()])
             .map_err(|error| storage_error("COLLECTION_MODEL_REVIEW_FAILED", error, true))?;
-        transaction
-            .execute(
-                "DELETE FROM collection_suggested_members WHERE suggestion_id = ?1",
-                [suggestion_id.to_string()],
-            )
-            .map_err(|error| storage_error("COLLECTION_MODEL_REVIEW_FAILED", error, true))?;
-        for reviewed_member in &review.members {
-            let existing_member = existing
-                .get(&reviewed_member.file_id)
-                .expect("reviewed member was checked");
-            transaction.execute("INSERT INTO collection_suggested_members (suggestion_id, file_id, revision_id, confidence, rationale, state) VALUES (?1, ?2, ?3, ?4, ?5, 'suggested')", params![suggestion_id.to_string(), reviewed_member.file_id.to_string(), existing_member.revision_id.to_string(), existing_member.confidence, reviewed_member.rationale.trim()])
-                .map_err(|error| storage_error("COLLECTION_MODEL_REVIEW_FAILED", error, true))?;
-        }
         transaction
             .commit()
             .map_err(|error| storage_error("COLLECTION_MODEL_REVIEW_FAILED", error, true))?;
@@ -3776,6 +3962,7 @@ impl CatalogStore {
             version_candidate_pairs,
             semantic_related_pairs: 0,
             contains_or_summarizes_pairs: 0,
+            groups_created: 0,
         })
     }
 
@@ -4124,6 +4311,584 @@ impl CatalogStore {
         transaction
             .commit()
             .map_err(|error| storage_error("RELATION_REVIEW_FAILED", error, true))?;
+        Ok(changed)
+    }
+
+    /// 把当前（非已排除的）文件关系边聚类成组并落库。
+    ///
+    /// 流程：读边 → version 候选边用真实内容相似度校准（<0.84 降级为语义相关）
+    /// → 连通分量聚类 → 大语义组做组代表向量一致性校验（防长链蔓延）
+    /// → 版本族角色判定（最新版 / 近重复副本）→ 删旧组、插新组。
+    pub fn refresh_relation_groups(
+        &self,
+        model_artifact_id: Option<&str>,
+    ) -> Result<u64, AppError> {
+        let _permit = self.acquire_write(WritePriority::Background);
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| storage_error("RELATION_GROUP_REFRESH_FAILED", error, true))?;
+        let now = Utc::now().to_rfc3339();
+
+        // 1. 读取非排除边与文件信息
+        let mut edges = Vec::new();
+        let files = list_files_with_connection(&transaction)?
+            .into_iter()
+            .filter(|file| {
+                file.availability == crate::Availability::Present
+                    && file_is_authorized(&transaction, &file.file_id).unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        let mut file_by_id = HashMap::<Uuid, &FileRecord>::new();
+        for file in &files {
+            file_by_id.insert(file.file_id, file);
+        }
+        let relation_sql = "SELECT relation_id, relation_type, left_file_id, right_file_id, confidence, review_status FROM file_relations WHERE review_status <> 'rejected'";
+        let mut statement = transaction
+            .prepare(relation_sql)
+            .map_err(|error| storage_error("RELATION_GROUP_REFRESH_FAILED", error, true))?;
+        let raw_edges = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, f64>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(|error| storage_error("RELATION_GROUP_REFRESH_FAILED", error, true))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| storage_error("RELATION_GROUP_REFRESH_FAILED", error, true))?;
+        drop(statement);
+        for (_relation_id, relation_type, left, right, confidence, _review_status) in raw_edges {
+            let left_id = parse_uuid_value(&left)?;
+            let right_id = parse_uuid_value(&right)?;
+            if !file_by_id.contains_key(&left_id) || !file_by_id.contains_key(&right_id) {
+                continue;
+            }
+            let relation_type = crate::RelationType::from_storage(&relation_type);
+            // contains 边方向：名称像摘要或文件更小的一侧视为摘要候选
+            let directed = matches!(relation_type, crate::RelationType::ContainsOrSummarizes | crate::RelationType::Related) && {
+                let left_file = file_by_id[&left_id];
+                let right_file = file_by_id[&right_id];
+                is_summary_like_name(&left_file.display_name)
+                    || (!is_summary_like_name(&right_file.display_name) && left_file.size_bytes <= right_file.size_bytes)
+            };
+            edges.push(RelationEdge {
+                left_file_id: left_id,
+                right_file_id: right_id,
+                relation_type,
+                confidence,
+                directed,
+            });
+        }
+
+        // 2. version 候选边用内容相似度校准（有 embedding 时）
+        let mut vector_cache = HashMap::<Uuid, Vec<f32>>::new();
+        let version_edges = edges
+            .iter_mut()
+            .filter(|edge| edge.relation_type == crate::RelationType::VersionCandidate)
+            .collect::<Vec<_>>();
+        for edge in version_edges {
+            let Some(left_vector) = file_vector_for(
+                &transaction,
+                model_artifact_id,
+                edge.left_file_id,
+                &mut vector_cache,
+            )? else {
+                continue;
+            };
+            let Some(right_vector) = file_vector_for(
+                &transaction,
+                model_artifact_id,
+                edge.right_file_id,
+                &mut vector_cache,
+            )? else {
+                continue;
+            };
+            let similarity = left_vector
+                .iter()
+                .zip(&right_vector)
+                .map(|(a, b)| a * b)
+                .sum::<f32>();
+            if similarity < 0.84 {
+                // 同名但内容差异大：不是版本，降级为语义相关
+                transaction
+                    .execute(
+                        "UPDATE file_relations SET relation_type = 'semantic_related', confidence = ?1, updated_at = ?2 WHERE left_file_id = ?3 AND right_file_id = ?4 AND relation_type = 'version_candidate'",
+                        params![f64::from(similarity), now, edge.left_file_id.to_string(), edge.right_file_id.to_string()],
+                    )
+                    .map_err(|error| storage_error("RELATION_GROUP_REFRESH_FAILED", error, true))?;
+                edge.relation_type = crate::RelationType::SemanticRelated;
+            } else {
+                transaction
+                    .execute(
+                        "UPDATE file_relations SET confidence = ?1, updated_at = ?2 WHERE left_file_id = ?3 AND right_file_id = ?4 AND relation_type = 'version_candidate'",
+                        params![f64::from(similarity), now, edge.left_file_id.to_string(), edge.right_file_id.to_string()],
+                    )
+                    .map_err(|error| storage_error("RELATION_GROUP_REFRESH_FAILED", error, true))?;
+            }
+            edge.confidence = f64::from(similarity);
+        }
+
+        // 3. 连通分量聚类
+        let names_by_id = files
+            .iter()
+            .map(|file| (file.file_id, file.display_name.clone()))
+            .collect::<HashMap<_, _>>();
+        let title_for = |member_ids: &[Uuid], group_type: crate::RelationGroupType| -> String {
+            let names = member_ids
+                .iter()
+                .filter_map(|id| names_by_id.get(id).cloned())
+                .collect::<Vec<_>>();
+            match group_type {
+                RelationGroupType::Duplicate => {
+                    format!("{} 份完全重复文件", names.len())
+                }
+                RelationGroupType::VersionFamily => {
+                    let stems = names
+                        .iter()
+                        .filter_map(|name| {
+                            let key = normalized_version_key(name);
+                            (!key.is_empty()).then_some(key)
+                        })
+                        .collect::<HashSet<_>>();
+                    let stem = {
+                        let mut sorted = stems.into_iter().collect::<Vec<_>>();
+                        sorted.sort();
+                        sorted.join(" / ")
+                    };
+                    if stem.is_empty() {
+                        format!("版本族 · {} 个文件", names.len())
+                    } else {
+                        format!("{stem} · 版本族（{} 个文件）", names.len())
+                    }
+                }
+                _ => deterministic_collection_name(&names),
+            }
+        };
+        let mut groups = cluster_relation_edges(&edges, &title_for);
+
+        // 4. 大语义组一致性校验：成员与组代表向量（均值）< 0.70 的踢出，
+        //    防止「A~B、B~C、A~C 弱」的长链把不同主题连成一组。
+        if model_artifact_id.is_some() {
+            let mut kept = Vec::with_capacity(groups.len());
+            for mut group in groups {
+                if group.members.len() < 4
+                    || !matches!(
+                        group.group_type,
+                        RelationGroupType::TopicGroup
+                            | RelationGroupType::Mixed
+                    )
+                {
+                    kept.push(group);
+                    continue;
+                }
+                let mut vectors = Vec::new();
+                let mut valid = true;
+                for member in &group.members {
+                    match file_vector_for(
+                        &transaction,
+                        model_artifact_id,
+                        member.file_id,
+                        &mut vector_cache,
+                    )? {
+                        Some(vector) => vectors.push((member.file_id, vector)),
+                        None => {
+                            valid = false;
+                            break;
+                        }
+                    }
+                }
+                if !valid || vectors.is_empty() {
+                    continue;
+                }
+                let representative = mean_normalized_vector(
+                    &vectors.iter().map(|(_, vector)| vector.clone()).collect::<Vec<_>>(),
+                )?;
+                let before = group.members.clone();
+                group.members.retain(|member| {
+                    vectors
+                        .iter()
+                        .find(|(file_id, _)| *file_id == member.file_id)
+                        .is_some_and(|(_, vector)| {
+                            representative
+                                .iter()
+                                .zip(vector)
+                                .map(|(a, b)| a * b)
+                                .sum::<f32>()
+                                >= 0.70
+                        })
+                });
+                if group.members.len() >= 2 {
+                    if group.members.len() < before.len() {
+                        group.confidence *= f64::from(group.members.len() as u32)
+                            / f64::from(before.len() as u32);
+                    }
+                    kept.push(group);
+                }
+            }
+            groups = kept;
+        }
+
+        // 5. 版本族角色判定：修改时间最新 → latest；与最新内容相似 ≥0.99 → copy
+        for group in &mut groups {
+            if group.group_type != RelationGroupType::VersionFamily {
+                continue;
+            }
+            let latest_id = group
+                .members
+                .iter()
+                .filter_map(|member| {
+                    file_by_id
+                        .get(&member.file_id)
+                        .map(|file| (member.file_id, file.fs_modified_at))
+                })
+                .max_by(|left, right| left.1.cmp(&right.1))
+                .map(|(file_id, _)| file_id);
+            if let Some(latest_id) = latest_id {
+                for member in &mut group.members {
+                    if member.file_id == latest_id {
+                        member.role = RelationGroupRole::Latest;
+                    }
+                }
+                let Some(latest_vector) = file_vector_for(
+                    &transaction,
+                    model_artifact_id,
+                    latest_id,
+                    &mut vector_cache,
+                )?
+                else {
+                    continue;
+                };
+                for member in &mut group.members {
+                    if member.role == RelationGroupRole::Latest {
+                        continue;
+                    }
+                    let Some(vector) = file_vector_for(
+                        &transaction,
+                        model_artifact_id,
+                        member.file_id,
+                        &mut vector_cache,
+                    )?
+                    else {
+                        continue;
+                    };
+                    let similarity = latest_vector
+                        .iter()
+                        .zip(&vector)
+                        .map(|(a, b)| a * b)
+                        .sum::<f32>();
+                    if similarity >= 0.99 {
+                        member.role = RelationGroupRole::Copy;
+                    }
+                }
+            }
+        }
+
+        // 6. 删旧 suggested 组，插新组
+        transaction
+            .execute(
+                "DELETE FROM relation_group_members WHERE group_id IN (SELECT group_id FROM relation_groups WHERE review_status = 'suggested')",
+                [],
+            )
+            .map_err(|error| storage_error("RELATION_GROUP_REFRESH_FAILED", error, true))?;
+        transaction
+            .execute(
+                "DELETE FROM relation_groups WHERE review_status = 'suggested'",
+                [],
+            )
+            .map_err(|error| storage_error("RELATION_GROUP_REFRESH_FAILED", error, true))?;
+        for group in &groups {
+            let group_id = Uuid::now_v7();
+            transaction
+                .execute(
+                    "INSERT INTO relation_groups (group_id, group_type, title, confidence, member_count, review_status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'suggested', ?6, ?6)",
+                    params![group_id.to_string(), group.group_type.as_storage(), group.title, group.confidence, group.members.len() as u32, now],
+                )
+                .map_err(|error| storage_error("RELATION_GROUP_REFRESH_FAILED", error, true))?;
+            for member in &group.members {
+                transaction
+                    .execute(
+                        "INSERT INTO relation_group_members (group_id, file_id, role) VALUES (?1, ?2, ?3)",
+                        params![group_id.to_string(), member.file_id.to_string(), member.role.as_storage()],
+                    )
+                    .map_err(|error| storage_error("RELATION_GROUP_REFRESH_FAILED", error, true))?;
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| storage_error("RELATION_GROUP_REFRESH_FAILED", error, true))?;
+        Ok(groups.len() as u64)
+    }
+
+    pub fn query_relation_groups(
+        &self,
+        request: &RelationGroupQuery,
+    ) -> Result<RelationGroupPage, AppError> {
+        request.validate()?;
+        let offset = request.offset()?;
+        let page_size = u64::from(request.page_size);
+        let connection = self.connect()?;
+        let mut predicates = Vec::<String>::new();
+        if let Some(group_type) = request.group_type {
+            predicates.push(format!("group_type = '{}'", group_type.as_storage()));
+        }
+        if let Some(review_status) = request.review_status.as_deref() {
+            predicates.push(format!("review_status = '{review_status}'"));
+        } else {
+            predicates.push("review_status <> 'rejected'".to_owned());
+        }
+        let predicate = if predicates.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", predicates.join(" AND "))
+        };
+        let total = connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM relation_groups{predicate}"),
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(|error| storage_error("RELATION_GROUP_QUERY_FAILED", error, true))?;
+        let raw = {
+            let mut statement = connection
+                .prepare(&format!(
+                    "SELECT group_id, group_type, title, confidence, member_count, review_status, created_at, updated_at FROM relation_groups{predicate} ORDER BY confidence DESC, updated_at DESC, group_id DESC LIMIT ?1 OFFSET ?2"
+                ))
+                .map_err(|error| storage_error("RELATION_GROUP_QUERY_FAILED", error, true))?;
+            statement
+                .query_map(params![page_size, offset], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, f64>(3)?,
+                        row.get::<_, u32>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                })
+                .map_err(|error| storage_error("RELATION_GROUP_QUERY_FAILED", error, true))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| storage_error("RELATION_GROUP_QUERY_FAILED", error, true))?
+        };
+        let mut items = Vec::new();
+        for (group_id, group_type, title, confidence, member_count, review_status, created_at, updated_at) in raw {
+            let group_id_uuid = parse_uuid_value(&group_id)?;
+            let mut members = Vec::new();
+            {
+                let mut statement = connection
+                    .prepare(
+                        "SELECT file_id, role FROM relation_group_members WHERE group_id = ?1 ORDER BY rowid",
+                    )
+                    .map_err(|error| {
+                        storage_error("RELATION_GROUP_QUERY_FAILED", error, true)
+                    })?;
+                let rows = statement
+                    .query_map([&group_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(|error| {
+                        storage_error("RELATION_GROUP_QUERY_FAILED", error, true)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        storage_error("RELATION_GROUP_QUERY_FAILED", error, true)
+                    })?;
+                for (file_id, role) in rows {
+                    let file_id = parse_uuid_value(&file_id)?;
+                    members.push(RelationGroupMemberRecord {
+                        file_id,
+                        role: RelationGroupRole::from_storage(&role),
+                        file: authorized_file_by_id(&connection, &file_id)?,
+                    });
+                }
+            }
+            items.push(RelationGroupRecord {
+                group_id: group_id_uuid,
+                group_type: RelationGroupType::from_storage(&group_type),
+                title,
+                confidence,
+                member_count,
+                review_status,
+                created_at: DateTime::parse_from_rfc3339(&created_at)
+                    .map_err(|error| {
+                        AppError::new("RELATION_GROUP_DATA_INVALID", error.to_string(), false)
+                    })?
+                    .with_timezone(&Utc),
+                updated_at: DateTime::parse_from_rfc3339(&updated_at)
+                    .map_err(|error| {
+                        AppError::new("RELATION_GROUP_DATA_INVALID", error.to_string(), false)
+                    })?
+                    .with_timezone(&Utc),
+                members,
+            });
+        }
+        let consumed = offset.saturating_add(items.len() as u64);
+        Ok(RelationGroupPage {
+            items,
+            next_cursor: (consumed < total).then(|| consumed.to_string()),
+            total,
+        })
+    }
+
+    /// 组级复核：把组内所有同状态边批量复核，并同步组的复核状态。
+    pub fn review_relation_group(&self, group_id: &Uuid, action: &str) -> Result<(), AppError> {
+        if !matches!(action, "accepted" | "rejected") {
+            return Err(AppError::new(
+                "RELATION_GROUP_REVIEW_INVALID",
+                "关系组复核动作只能是 accepted 或 rejected",
+                false,
+            ));
+        }
+        let _permit = self.acquire_write(WritePriority::Interactive);
+        let connection = self.connect()?;
+        let member_ids = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT file_id FROM relation_group_members WHERE group_id = ?1",
+                )
+                .map_err(|error| {
+                    storage_error("RELATION_GROUP_REVIEW_FAILED", error, true)
+                })?;
+            statement
+                .query_map([group_id.to_string()], |row| row.get::<_, String>(0))
+                .map_err(|error| {
+                    storage_error("RELATION_GROUP_REVIEW_FAILED", error, true)
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    storage_error("RELATION_GROUP_REVIEW_FAILED", error, true)
+                })?
+        };
+        if member_ids.len() < 2 {
+            return Err(AppError::new(
+                "RELATION_GROUP_REVIEW_INVALID",
+                "待复核的关系组不存在",
+                false,
+            ));
+        }
+        let placeholders = std::iter::repeat_n("?", member_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut values = Vec::with_capacity(member_ids.len() * 2 + 2);
+        values.push(SqlValue::Text(action.to_owned()));
+        values.push(SqlValue::Text(Utc::now().to_rfc3339()));
+        values.extend(member_ids.iter().map(|id| SqlValue::Text(id.clone())));
+        values.extend(member_ids.iter().map(|id| SqlValue::Text(id.clone())));
+        let updated = connection
+            .execute(
+                &format!(
+                    "UPDATE file_relations SET review_status = ?, updated_at = ? WHERE review_status <> 'rejected' AND left_file_id IN ({placeholders}) AND right_file_id IN ({placeholders}) AND EXISTS (SELECT 1 FROM file_root_memberships m JOIN roots rt ON rt.root_id = m.root_id WHERE m.file_id = left_file_id AND rt.enabled = 1) AND EXISTS (SELECT 1 FROM file_root_memberships m JOIN roots rt ON rt.root_id = m.root_id WHERE m.file_id = right_file_id AND rt.enabled = 1)"
+                ),
+                params_from_iter(values),
+            )
+            .map_err(|error| storage_error("RELATION_GROUP_REVIEW_FAILED", error, true))?;
+        if updated == 0 {
+            return Err(AppError::new(
+                "RELATION_GROUP_REVIEW_INVALID",
+                "关系组内没有可复核的边",
+                false,
+            ));
+        }
+        connection
+            .execute(
+                "UPDATE relation_groups SET review_status = ?1, updated_at = ?2 WHERE group_id = ?3 AND review_status <> 'rejected'",
+                params![action, Utc::now().to_rfc3339(), group_id.to_string()],
+            )
+            .map_err(|error| storage_error("RELATION_GROUP_REVIEW_FAILED", error, true))?;
+        Ok(())
+    }
+
+    /// 组级批量复核。
+    pub fn review_relation_groups(
+        &self,
+        group_ids: &[Uuid],
+        action: &str,
+    ) -> Result<u64, AppError> {
+        if group_ids.is_empty() || group_ids.len() > 500 {
+            return Err(AppError::new(
+                "RELATION_GROUP_REVIEW_INVALID",
+                "每次批量复核需要选择1到500个关系组",
+                false,
+            ));
+        }
+        if !matches!(action, "accepted" | "rejected") {
+            return Err(AppError::new(
+                "RELATION_GROUP_REVIEW_INVALID",
+                "关系组复核动作只能是 accepted 或 rejected",
+                false,
+            ));
+        }
+        let _permit = self.acquire_write(WritePriority::Interactive);
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| storage_error("RELATION_GROUP_REVIEW_FAILED", error, true))?;
+        let updated_at = Utc::now().to_rfc3339();
+        let mut changed = 0_u64;
+        for group_id in group_ids.iter().collect::<HashSet<_>>() {
+            let member_ids = {
+                let mut statement = transaction
+                    .prepare("SELECT file_id FROM relation_group_members WHERE group_id = ?1")
+                    .map_err(|error| {
+                        storage_error("RELATION_GROUP_REVIEW_FAILED", error, true)
+                    })?;
+                statement
+                    .query_map([group_id.to_string()], |row| row.get::<_, String>(0))
+                    .map_err(|error| {
+                        storage_error("RELATION_GROUP_REVIEW_FAILED", error, true)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        storage_error("RELATION_GROUP_REVIEW_FAILED", error, true)
+                    })?
+            };
+            if member_ids.len() < 2 {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", member_ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut values = Vec::with_capacity(member_ids.len() * 2 + 2);
+            values.push(SqlValue::Text(action.to_owned()));
+            values.push(SqlValue::Text(updated_at.clone()));
+            values.extend(member_ids.iter().map(|id| SqlValue::Text(id.clone())));
+            values.extend(member_ids.iter().map(|id| SqlValue::Text(id.clone())));
+            changed = changed.saturating_add(
+                transaction
+                    .execute(
+                        &format!(
+                            "UPDATE file_relations SET review_status = ?, updated_at = ? WHERE review_status <> 'rejected' AND left_file_id IN ({placeholders}) AND right_file_id IN ({placeholders})"
+                        ),
+                        params_from_iter(values),
+                    )
+                    .map_err(|error| {
+                        storage_error("RELATION_GROUP_REVIEW_FAILED", error, true)
+                    })?
+                    as u64,
+            );
+            transaction
+                .execute(
+                    "UPDATE relation_groups SET review_status = ?1, updated_at = ?2 WHERE group_id = ?3 AND review_status <> 'rejected'",
+                    params![action, updated_at, group_id.to_string()],
+                )
+                .map_err(|error| storage_error("RELATION_GROUP_REVIEW_FAILED", error, true))?;
+        }
+        if changed == 0 {
+            return Err(AppError::new(
+                "RELATION_GROUP_REVIEW_INVALID",
+                "所选关系组内没有可复核的边",
+                false,
+            ));
+        }
+        transaction
+            .commit()
+            .map_err(|error| storage_error("RELATION_GROUP_REVIEW_FAILED", error, true))?;
         Ok(changed)
     }
 
@@ -5477,12 +6242,27 @@ impl CatalogStore {
             next_cursor: None,
             elapsed_ms: started_at.elapsed().as_millis() as u64,
         };
+        // 查询级整体门槛：乱码/无关查询的语义 top-1 虚高（模型先验方向）但
+        // 无真实命中，整个查询判为与知识库无关 → evidence 为空 → 拒绝回答。
+        // 只在语义引擎可用时启用（fulltext-only 回退不受影响）。
+        if semantic_query.is_some()
+            && !crate::indexing::query_has_relevant_evidence(&candidates)
+        {
+            return Ok(crate::assemble_extractive_answer(
+                request,
+                &session,
+                Vec::new(),
+                started_at,
+            ));
+        }
         let mut evidence = Vec::new();
         let mut evidence_tokens = 0_u64;
-        for candidate in candidates
-            .into_iter()
-            .filter(crate::indexing::candidate_is_relevant_rag_evidence)
-        {
+        for candidate in candidates.into_iter().filter(|candidate| {
+            crate::indexing::candidate_is_relevant_rag_evidence(
+                candidate,
+                semantic_query.is_some(),
+            )
+        }) {
             let Some(revision_id) = candidate.revision_id else {
                 continue;
             };
@@ -5491,16 +6271,22 @@ impl CatalogStore {
             };
             let row = connection
                 .query_row(
-                    "SELECT c.chunk_id, c.node_id, c.text, c.locator_json, n.image_asset_id, c.token_count FROM chunks c JOIN document_nodes n ON n.node_id = c.node_id JOIN files f ON f.file_id = c.file_id WHERE c.chunk_id = ?1 AND c.file_id = ?2 AND c.revision_id = ?3 AND f.current_revision_id = c.revision_id LIMIT 1",
+                    "SELECT c.chunk_id, c.node_id, c.text, c.locator_json, n.image_asset_id, c.token_count, c.ordinal FROM chunks c JOIN document_nodes n ON n.node_id = c.node_id JOIN files f ON f.file_id = c.file_id WHERE c.chunk_id = ?1 AND c.file_id = ?2 AND c.revision_id = ?3 AND f.current_revision_id = c.revision_id LIMIT 1",
                     params![candidate_chunk_id.to_string(), candidate.file_id.to_string(), revision_id.to_string()],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, u64>(5)?)),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, u64>(5)?, row.get::<_, i64>(6)?)),
                 )
                 .optional()
                 .map_err(|error| storage_error("ASK_EVIDENCE_QUERY_FAILED", error, true))?;
-            let Some((chunk_id, node_id, quote, locator_json, image_asset_id, token_count)) = row
+            let Some((chunk_id, node_id, quote, locator_json, image_asset_id, token_count, ordinal)) =
+                row
             else {
                 continue;
             };
+            // 相邻块上下文：命中块的前/后一块构成线性语境（块间本身已含 64
+            // token 重叠），供生成模型理解「这段文字在原文中前后是什么」。
+            // 只取同节点的相邻块，跨节点（标题、页眉）不视为相邻。
+            let (context_before, context_after) =
+                fetch_neighbor_context(&connection, &node_id, ordinal)?;
             if !evidence.is_empty() && evidence_tokens.saturating_add(token_count) > 2_400 {
                 continue;
             }
@@ -5519,6 +6305,8 @@ impl CatalogStore {
                         .map(parse_uuid_value)
                         .transpose()?,
                     quote,
+                    context_before,
+                    context_after,
                     locator,
                     retrieval_score: candidate.scores.fused,
                 },
@@ -5548,6 +6336,7 @@ impl CatalogStore {
             .prepare(
                 "SELECT message_id, role, content, answer_json, error_json, created_at FROM ask_messages WHERE session_id = ?1 ORDER BY created_at DESC, message_id DESC LIMIT ?2",
             )
+
             .map_err(|error| storage_error("ASK_HISTORY_QUERY_FAILED", error, true))?;
         let rows = statement
             .query_map(
@@ -6509,6 +7298,180 @@ impl CatalogStore {
             .map_err(|error| storage_error("LOG_CLEAR_FAILED", error, true))
     }
 
+    /// 记录一条节点追踪（明文存储，不走 sanitize_log_value；超 2 万条自动裁剪最旧记录）。
+    pub fn record_node_trace(
+        &self,
+        flow: &str,
+        node: &str,
+        correlation_id: &str,
+        session_id: Option<&str>,
+        entity_id: Option<&str>,
+        input_json: &serde_json::Value,
+        output_json: &serde_json::Value,
+        status: &str,
+        elapsed_ms: Option<u64>,
+    ) -> Result<(), AppError> {
+        let _permit = self.acquire_write(WritePriority::Background);
+        let mut connection = self.connect()?;
+        // 单事务提交：INSERT + COUNT + 条件裁剪只落一次盘
+        let transaction = connection
+            .transaction()
+            .map_err(|error| storage_error("NODE_TRACE_WRITE_FAILED", error, true))?;
+        transaction
+            .execute(
+                "INSERT INTO node_traces (trace_id, flow, node, correlation_id, session_id, entity_id, input_json, output_json, status, elapsed_ms, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    Uuid::now_v7().to_string(),
+                    flow,
+                    node,
+                    correlation_id,
+                    session_id,
+                    entity_id,
+                    serde_json::to_string(input_json)
+                        .map_err(|error| AppError::new("NODE_TRACE_SERIALIZE_FAILED", error.to_string(), false))?,
+                    serde_json::to_string(output_json)
+                        .map_err(|error| AppError::new("NODE_TRACE_SERIALIZE_FAILED", error.to_string(), false))?,
+                    status,
+                    elapsed_ms.map(i64::try_from).transpose().map_err(|error| {
+                        AppError::new("NODE_TRACE_ELAPSED_INVALID", error.to_string(), false)
+                    })?,
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .map_err(|error| storage_error("NODE_TRACE_WRITE_FAILED", error, true))?;
+        // 超 2 万条才裁剪（复合索引支撑 ORDER BY，避免每次插入都做全表排序）
+        let count = transaction
+            .query_row("SELECT COUNT(*) FROM node_traces", [], |row| {
+                row.get::<_, u64>(0)
+            })
+            .map_err(|error| storage_error("NODE_TRACE_PRUNE_FAILED", error, true))?;
+        if count > 20_000 {
+            transaction
+                .execute(
+                    "DELETE FROM node_traces WHERE trace_id IN (SELECT trace_id FROM node_traces ORDER BY created_at DESC, trace_id DESC LIMIT -1 OFFSET 20000)",
+                    [],
+                )
+                .map_err(|error| storage_error("NODE_TRACE_PRUNE_FAILED", error, true))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| storage_error("NODE_TRACE_WRITE_FAILED", error, true))?;
+        Ok(())
+    }
+
+    pub fn query_node_traces(&self, request: &NodeTraceQuery) -> Result<NodeTracePage, AppError> {
+        request.validate()?;
+        let offset = request.offset()?;
+        let connection = self.connect()?;
+        let (count_sql, filter_params) = match (request.flow.as_deref(), request.node.as_deref()) {
+            (Some(flow), Some(node)) => (
+                "SELECT COUNT(*) FROM node_traces WHERE flow = ?1 AND node = ?2",
+                vec![SqlValue::Text(flow.into()), SqlValue::Text(node.into())],
+            ),
+            (Some(flow), None) => (
+                "SELECT COUNT(*) FROM node_traces WHERE flow = ?1",
+                vec![SqlValue::Text(flow.into())],
+            ),
+            (None, Some(node)) => (
+                "SELECT COUNT(*) FROM node_traces WHERE node = ?1",
+                vec![SqlValue::Text(node.into())],
+            ),
+            (None, None) => ("SELECT COUNT(*) FROM node_traces", vec![]),
+        };
+        let total = connection
+            .query_row(
+                count_sql,
+                params_from_iter(filter_params.iter().cloned()),
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(|error| storage_error("NODE_TRACE_QUERY_FAILED", error, true))?;
+        let (sql, list_params): (&str, Vec<SqlValue>) = match (request.flow.as_deref(), request.node.as_deref()) {
+            (Some(flow), Some(node)) => (
+                "SELECT trace_id, flow, node, correlation_id, session_id, entity_id, input_json, output_json, status, elapsed_ms, created_at FROM node_traces WHERE flow = ?1 AND node = ?2 ORDER BY created_at DESC, trace_id DESC LIMIT ?3 OFFSET ?4",
+                vec![SqlValue::Text(flow.into()), SqlValue::Text(node.into())],
+            ),
+            (Some(flow), None) => (
+                "SELECT trace_id, flow, node, correlation_id, session_id, entity_id, input_json, output_json, status, elapsed_ms, created_at FROM node_traces WHERE flow = ?1 ORDER BY created_at DESC, trace_id DESC LIMIT ?2 OFFSET ?3",
+                vec![SqlValue::Text(flow.into())],
+            ),
+            (None, Some(node)) => (
+                "SELECT trace_id, flow, node, correlation_id, session_id, entity_id, input_json, output_json, status, elapsed_ms, created_at FROM node_traces WHERE node = ?1 ORDER BY created_at DESC, trace_id DESC LIMIT ?2 OFFSET ?3",
+                vec![SqlValue::Text(node.into())],
+            ),
+            (None, None) => (
+                "SELECT trace_id, flow, node, correlation_id, session_id, entity_id, input_json, output_json, status, elapsed_ms, created_at FROM node_traces ORDER BY created_at DESC, trace_id DESC LIMIT ?1 OFFSET ?2",
+                vec![],
+            ),
+        };
+        let mut parameters = list_params;
+        let page_size = i64::from(request.page_size);
+        let offset_i64 = i64::try_from(offset)
+            .map_err(|error| AppError::new("NODE_TRACE_QUERY_FAILED", error.to_string(), false))?;
+        parameters.push(SqlValue::Integer(page_size));
+        parameters.push(SqlValue::Integer(offset_i64));
+        let mut statement = connection
+            .prepare(sql)
+            .map_err(|error| storage_error("NODE_TRACE_QUERY_FAILED", error, true))?;
+        let items = statement
+            .query_map(params_from_iter(parameters.iter().cloned()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, String>(10)?,
+                ))
+            })
+            .map_err(|error| storage_error("NODE_TRACE_QUERY_FAILED", error, true))?
+            .map(|row| {
+                let (trace_id, flow, node, correlation_id, session_id, entity_id, input_json, output_json, status, elapsed_ms, created_at) =
+                    row.map_err(|error| storage_error("NODE_TRACE_QUERY_FAILED", error, true))?;
+                Ok(NodeTraceRecord {
+                    trace_id,
+                    flow,
+                    node,
+                    correlation_id,
+                    session_id,
+                    entity_id,
+                    input_json: serde_json::from_str(&input_json).map_err(|error| {
+                        AppError::new("NODE_TRACE_DATA_INVALID", error.to_string(), false)
+                    })?,
+                    output_json: serde_json::from_str(&output_json).map_err(|error| {
+                        AppError::new("NODE_TRACE_DATA_INVALID", error.to_string(), false)
+                    })?,
+                    status,
+                    elapsed_ms: elapsed_ms.map(|value| value as u64),
+                    created_at: DateTime::parse_from_rfc3339(&created_at)
+                        .map_err(|error| {
+                            AppError::new("NODE_TRACE_DATA_INVALID", error.to_string(), false)
+                        })?
+                        .with_timezone(&Utc),
+                })
+            })
+            .collect::<Result<Vec<_>, AppError>>()?;
+        let consumed = offset.saturating_add(items.len() as u64);
+        Ok(NodeTracePage {
+            items,
+            next_cursor: (consumed < total).then(|| consumed.to_string()),
+            total,
+        })
+    }
+
+    pub fn clear_node_traces(&self) -> Result<u64, AppError> {
+        let _permit = self.acquire_write(WritePriority::Background);
+        let connection = self.connect()?;
+        connection
+            .execute("DELETE FROM node_traces", [])
+            .map(|value| value as u64)
+            .map_err(|error| storage_error("NODE_TRACE_CLEAR_FAILED", error, true))
+    }
+
     pub fn rebuild_index(&self, confirmation: &str) -> Result<IndexRebuildResult, AppError> {
         crate::validate_rebuild_confirmation(confirmation)?;
         let reset_files = count_query(
@@ -7237,6 +8200,46 @@ fn mean_normalized_vector(vectors: &[Vec<f32>]) -> Result<Vec<f32>, AppError> {
     }
     mean.iter_mut().for_each(|value| *value /= norm);
     Ok(mean)
+}
+
+/// 取一个文件的文档级向量：文件前 3 个 chunk 的均值（与语义关系刷新口径一致）。
+/// 带进程内缓存；模型未配置或文件无向量时返回 None。
+fn file_vector_for(
+    connection: &Connection,
+    model_artifact_id: Option<&str>,
+    file_id: Uuid,
+    cache: &mut HashMap<Uuid, Vec<f32>>,
+) -> Result<Option<Vec<f32>>, AppError> {
+    if let Some(vector) = cache.get(&file_id) {
+        return Ok(Some(vector.clone()));
+    }
+    let Some(model_artifact_id) = model_artifact_id else {
+        return Ok(None);
+    };
+    let sql = format!(
+        "WITH ranked AS (SELECT ce.vector_blob, ce.dimension, ROW_NUMBER() OVER (PARTITION BY ce.file_id ORDER BY c.ordinal) AS rn FROM chunk_embeddings ce JOIN chunks c ON c.chunk_id = ce.chunk_id WHERE ce.model_artifact_id = ?1 AND ce.file_id = ?2) SELECT vector_blob, dimension FROM ranked WHERE rn <= 3"
+    );
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| storage_error("RELATION_VECTOR_QUERY_FAILED", error, true))?;
+    let rows = statement
+        .query_map(
+            params![model_artifact_id, file_id.to_string()],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, u32>(1)?)),
+        )
+        .map_err(|error| storage_error("RELATION_VECTOR_QUERY_FAILED", error, true))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| storage_error("RELATION_VECTOR_QUERY_FAILED", error, true))?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let mut vectors = Vec::with_capacity(rows.len());
+    for (bytes, dimension) in rows {
+        vectors.push(decode_vector(&bytes, dimension)?);
+    }
+    let vector = mean_normalized_vector(&vectors)?;
+    cache.insert(file_id, vector.clone());
+    Ok(Some(vector))
 }
 
 fn semantic_bucket(vector: &[f32]) -> String {
@@ -7983,26 +8986,43 @@ fn search_semantic(
             search_semantic_exact_candidates(connection, query, scoped_file_ids)?,
         );
 
+    // 逐候选查详情最多 5000 次 SQL（实测数百毫秒级）；改为一次 IN 查询取回
+    // 全部详情再按候选顺序组装，语义检索热路径上的主要成本只剩向量搜索本身。
+    let placeholders = std::iter::repeat_n("?", candidates.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT f.file_id, f.volume_id, f.canonical_path, f.display_name, f.extension, f.mime_type, f.size_bytes, f.fs_created_at, f.modified_at, f.windows_file_id, f.content_sha256, f.availability, f.current_revision_id, f.parse_status, f.first_seen_at, f.last_seen_at, c.revision_id, c.text, c.locator_json, c.chunk_id FROM chunks c JOIN files f ON f.file_id = c.file_id WHERE c.chunk_id IN ({placeholders}) AND f.current_revision_id = c.revision_id"
+    );
+    let mut values = Vec::<SqlValue>::with_capacity(candidates.len());
+    for (_file_id, chunk_id, _score) in &candidates {
+        values.push(SqlValue::Text(chunk_id.clone()));
+    }
     let mut details = connection
-        .prepare(
-            "SELECT f.file_id, f.volume_id, f.canonical_path, f.display_name, f.extension, f.mime_type, f.size_bytes, f.fs_created_at, f.modified_at, f.windows_file_id, f.content_sha256, f.availability, f.current_revision_id, f.parse_status, f.first_seen_at, f.last_seen_at, c.revision_id, c.text, c.locator_json FROM chunks c JOIN files f ON f.file_id = c.file_id WHERE c.chunk_id = ?1 AND f.current_revision_id = c.revision_id",
-        )
+        .prepare(&sql)
         .map_err(|error| storage_error("EMBEDDING_QUERY_FAILED", error, true))?;
+    let rows = details
+        .query_map(params_from_iter(values), |row| {
+            let file = file_from_row(row)?;
+            Ok((
+                row.get::<_, String>(19)?,
+                file,
+                row.get::<_, String>(16)?,
+                row.get::<_, String>(17)?,
+                row.get::<_, String>(18)?,
+            ))
+        })
+        .map_err(|error| storage_error("EMBEDDING_QUERY_FAILED", error, true))?;
+    let mut detail_by_chunk = HashMap::<String, (crate::FileRecord, String, String, String)>::new();
+    for row in rows {
+        let (chunk_id, file, revision_id, text, locator_json) =
+            row.map_err(|error| storage_error("EMBEDDING_QUERY_FAILED", error, true))?;
+        detail_by_chunk.insert(chunk_id, (file, revision_id, text, locator_json));
+    }
     let mut hits = Vec::with_capacity(candidates.len());
     for (_file_id, chunk_id, score) in candidates {
-        let detail = details
-            .query_row([chunk_id.as_str()], |row| {
-                let file = file_from_row(row)?;
-                Ok((
-                    file,
-                    row.get::<_, String>(16)?,
-                    row.get::<_, String>(17)?,
-                    row.get::<_, String>(18)?,
-                ))
-            })
-            .optional()
-            .map_err(|error| storage_error("EMBEDDING_QUERY_FAILED", error, true))?;
-        let Some((file, revision_id, text, locator_json)) = detail else {
+        let Some((file, revision_id, text, locator_json)) = detail_by_chunk.remove(&chunk_id)
+        else {
             continue;
         };
         let locator = serde_json::from_str::<SourceLocator>(&locator_json)
@@ -8050,7 +9070,7 @@ fn search_semantic_exact_candidates(
         }
         let similarity = dot_product_with_le_f32(query.vector, &vector_blob, dimension)?;
         let score = ((similarity + 1.0) / 2.0).clamp(0.0, 1.0);
-        if score < 0.2 {
+        if score < crate::indexing::RAG_MIN_SEMANTIC_SCORE {
             continue;
         }
         candidates.push((file_id, chunk_id, score));
@@ -8086,7 +9106,11 @@ fn search_semantic_usearch_candidates(
     if dimension as usize != query.vector.len() || item_count == 0 {
         return Ok(None);
     }
-    let candidate_count = item_count.clamp(1, 5_000);
+    // usearch 的 search 内部 expansion = max(ef, count)（index.hpp:3460），
+    // count 直接决定 beam 遍历深度：5000 近邻实测每次 ~10s（召回 0.783），
+    // 200 近邻 ~5.5s 但召回降到 0.683。1000 是折中：遍历深度足够接近
+    // 全量召回（HNSW 对 20 万节点 ef=1000 通常召回 95%+），实测 ~3-4s。
+    let candidate_count = item_count.clamp(1, 1000);
     let matches = match crate::search_index(
         std::path::Path::new(&index_path),
         query.vector,
@@ -8143,7 +9167,7 @@ fn search_semantic_usearch_candidates(
         let Some(score) = score_by_key.get(&key).copied() else {
             continue;
         };
-        if score < 0.2 {
+        if score < crate::indexing::RAG_MIN_SEMANTIC_SCORE {
             continue;
         }
         candidates.push((file_id, chunk_id, score));
@@ -9251,6 +10275,9 @@ mod tests {
                 (19, "local_ai_runtime_and_media_transcripts".to_owned()),
                 (20, "observable_ocr_attempts".to_owned()),
                 (21, "recoverable_processing_and_scan_checkpoints".to_owned()),
+                (22, "node_traces".to_owned()),
+                (23, "chunk_neighbor_context_index".to_owned()),
+                (24, "relation_groups".to_owned()),
             ]
         );
         let rules = store.list_exclusion_rules().expect("list exclusion rules");
@@ -9412,6 +10439,167 @@ mod tests {
             .expect("second log page");
         assert_eq!(second.items.len(), 1);
         assert!(second.next_cursor.is_none());
+    }
+
+    #[test]
+    fn node_traces_are_recorded_and_paginated_with_filters() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+
+        for index in 0..3 {
+            store
+                .record_node_trace(
+                    "ask",
+                    if index == 0 { "routing" } else { "retrieval" },
+                    &format!("corr-{index}"),
+                    Some("session-1"),
+                    None,
+                    &serde_json::json!({ "question": format!("问题{index}") }),
+                    &serde_json::json!({ "result": index }),
+                    "ok",
+                    Some(index as u64 * 10),
+                )
+                .expect("record trace");
+        }
+        store
+            .record_node_trace(
+                "search",
+                "retrieval",
+                "corr-search",
+                None,
+                None,
+                &serde_json::json!({ "query": "找资料" }),
+                &serde_json::json!({ "count": 5 }),
+                "error",
+                None,
+            )
+            .expect("record search trace");
+
+        // 无过滤分页：4 条
+        let first = store
+            .query_node_traces(&NodeTraceQuery {
+                flow: None,
+                node: None,
+                cursor: None,
+                page_size: 2,
+            })
+            .expect("first page");
+        assert_eq!(first.total, 4);
+        assert_eq!(first.items.len(), 2);
+        assert!(first.next_cursor.is_some());
+        let second = store
+            .query_node_traces(&NodeTraceQuery {
+                flow: None,
+                node: None,
+                cursor: first.next_cursor,
+                page_size: 2,
+            })
+            .expect("second page");
+        assert_eq!(second.items.len(), 2);
+        assert!(second.next_cursor.is_none());
+
+        // flow 过滤：ask 只有 3 条
+        let ask_page = store
+            .query_node_traces(&NodeTraceQuery {
+                flow: Some("ask".into()),
+                node: None,
+                cursor: None,
+                page_size: 10,
+            })
+            .expect("ask page");
+        assert_eq!(ask_page.total, 3);
+        assert!(ask_page
+            .items
+            .iter()
+            .all(|item| item.flow == "ask"));
+
+        // flow+node 过滤：retrieval 2 条（跨 ask/search），node 过滤只看 ask.retrieval
+        let node_page = store
+            .query_node_traces(&NodeTraceQuery {
+                flow: Some("ask".into()),
+                node: Some("retrieval".into()),
+                cursor: None,
+                page_size: 10,
+            })
+            .expect("node page");
+        assert_eq!(node_page.total, 2);
+        assert!(node_page
+            .items
+            .iter()
+            .all(|item| item.flow == "ask" && item.node == "retrieval"));
+        assert_eq!(node_page.items[0].input_json["question"], serde_json::json!("问题2"));
+
+        // 明文存储：不被 sanitize 脱敏
+        assert_eq!(node_page.items[0].input_json["question"], serde_json::json!("问题2"));
+        assert_eq!(node_page.items[0].elapsed_ms, Some(20));
+    }
+
+    #[test]
+    fn node_traces_are_trimmed_beyond_cap_and_cleared() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database_path = directory.path().join("fanfan.db");
+        let store = CatalogStore::open(&database_path).expect("open store");
+
+        // 批量直插 20000 条（单事务），逼近裁剪上限——逐条走 API 会因逐条 fsync 慢到超时
+        {
+            let mut connection = Connection::open(&database_path).expect("open raw connection");
+            let now = Utc::now().to_rfc3339();
+            let transaction = connection.transaction().expect("begin bulk insert");
+            for index in 0..20_000_u32 {
+                transaction
+                    .execute(
+                        "INSERT INTO node_traces (trace_id, flow, node, correlation_id, session_id, entity_id, input_json, output_json, status, elapsed_ms, created_at) VALUES (?1, 'ask', 'retrieval', ?2, NULL, NULL, ?3, ?4, 'ok', NULL, ?5)",
+                        params![
+                            Uuid::now_v7().to_string(),
+                            format!("corr-{index}"),
+                            serde_json::json!({ "question": index }).to_string(),
+                            serde_json::json!({ "ok": true }).to_string(),
+                            now,
+                        ],
+                    )
+                    .expect("bulk insert");
+            }
+            transaction.commit().expect("commit bulk insert");
+        }
+
+        // 第 20001 条走正式 API → 触发裁剪到 20000
+        store
+            .record_node_trace(
+                "ask",
+                "retrieval",
+                "corr-last",
+                None,
+                None,
+                &serde_json::json!({ "question": 20000 }),
+                &serde_json::json!({ "ok": true }),
+                "ok",
+                None,
+            )
+            .expect("record over cap");
+
+        let page = store
+            .query_node_traces(&NodeTraceQuery {
+                flow: None,
+                node: None,
+                cursor: None,
+                page_size: 1,
+            })
+            .expect("count traces");
+        assert_eq!(page.total, 20000);
+        assert_eq!(page.items.len(), 1);
+
+        let cleared = store.clear_node_traces().expect("clear traces");
+        assert_eq!(cleared, 20000);
+        let empty = store
+            .query_node_traces(&NodeTraceQuery {
+                flow: None,
+                node: None,
+                cursor: None,
+                page_size: 10,
+            })
+            .expect("empty page");
+        assert_eq!(empty.total, 0);
+        assert!(empty.items.is_empty());
     }
 
     #[test]
@@ -10194,6 +11382,154 @@ mod tests {
     }
 
     #[test]
+    fn extractive_answers_carry_neighbor_chunk_context() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database_path = directory.path().join("fanfan.db");
+        let store = CatalogStore::open(&database_path).expect("open store");
+        let root = store
+            .upsert_root(&test_root_registration())
+            .expect("insert root");
+        let file_id = Uuid::now_v7();
+        let revision_id = Uuid::now_v7();
+        let now = Utc::now();
+        let connection = store.connect().expect("connect");
+        connection
+            .execute(
+                "INSERT INTO files (file_id, canonical_path, path_key, name, extension, size_bytes, modified_at, discovered_at, availability, volume_id, display_name, mime_type, current_revision_id, parse_status, first_seen_at, last_seen_at) VALUES (?1, ?2, ?3, ?4, 'md', 128, ?5, ?5, 'present', 'vol-test', ?4, 'text/markdown', ?6, 'pending', ?5, ?5)",
+                params![file_id.to_string(), "C:\\Users\\Test\\Documents\\邻居上下文.md", "c:\\users\\test\\documents\\邻居上下文.md", "邻居上下文.md", now.to_rfc3339(), revision_id.to_string()],
+            )
+            .expect("insert file");
+        connection
+            .execute(
+                "INSERT INTO file_revisions (revision_id, file_id, size_bytes, fs_modified_at, metadata_fingerprint, created_at) VALUES (?1, ?2, 128, ?3, '128:test', ?3)",
+                params![revision_id.to_string(), file_id.to_string(), now.to_rfc3339()],
+            )
+            .expect("insert revision");
+        connection
+            .execute(
+                "INSERT INTO file_root_memberships (file_id, root_id, relative_path, is_primary) VALUES (?1, ?2, '邻居上下文.md', 1)",
+                params![file_id.to_string(), root.root_id.to_string()],
+            )
+            .expect("insert membership");
+        drop(connection);
+        store
+            .mark_file_parsing(&file_id, &revision_id)
+            .expect("mark parsing");
+        store
+            .recover_interrupted_parses()
+            .expect("recover parse");
+        store
+            .mark_file_parsing(&file_id, &revision_id)
+            .expect("restart parsing");
+
+        // 单节点超长文本：切块后形成 甲（上文）→ 乙（正文）→ 丙（下文）三块。
+        // 每段 480 token（边界符在目标位之外触发），块间 64 token 重叠。
+        let segment = |head: &str| {
+            let unit = format!("{head}。");
+            unit.repeat(96) // 96 × 5 字 = 480 token
+        };
+        let parse_result = ParseResult {
+            revision_id,
+            status: ParseOutcome::Parsed,
+            parser_name: "test".into(),
+            parser_version: "1".into(),
+            nodes: vec![DocumentNode {
+                node_id: Uuid::now_v7(),
+                parent_id: None,
+                ordinal: 1,
+                node_type: "paragraph".into(),
+                text: Some(format!(
+                    "{}{}{}",
+                    segment("上文甲段"),
+                    segment("正文乙段"),
+                    segment("下文丙段")
+                )),
+                table_data: None,
+                locator: SourceLocator {
+                    kind: crate::SourceKind::Text,
+                    line_start: Some(1),
+                    line_end: Some(1),
+                    ..SourceLocator::default()
+                },
+                heading_path: vec!["测试".into()],
+            }],
+            image_assets: vec![],
+            ocr_attempts: vec![],
+            warnings: vec![],
+            metrics: crate::ParseMetrics {
+                page_count: 0,
+                node_count: 1,
+                character_count: 1440,
+                ocr_page_count: 0,
+                elapsed_ms: 1,
+            },
+            error: None,
+        };
+        store
+            .commit_parse_result(&file_id, &parse_result)
+            .expect("commit parse result");
+
+        let answer = store
+            .answer_extractively(
+                &AskRequest {
+                    question: "正文乙段".into(),
+                    session_id: None,
+                    scope: crate::ScopeFilter {
+                        root_ids: vec![],
+                        collection_ids: vec![],
+                        file_ids: vec![],
+                        extensions: vec![],
+                        modified_from: None,
+                        modified_to: None,
+                        availability: crate::Availability::Present,
+                    },
+                    answer_style: crate::AnswerStyle::Concise,
+                    retrieval_limit: 12,
+                    max_source_files: 8,
+                    strict_evidence: true,
+                },
+                None,
+            )
+            .expect("answer extractively");
+        assert!(!answer.claims.is_empty(), "正文乙段应命中乙块");
+        let evidence = answer.claims[0].citations[0].clone();
+        assert!(
+            evidence.quote.contains("正文乙段"),
+            "命中块正文应包含乙段"
+        );
+        // 精确契约：邻居上下文 = 同节点相邻块文本按 NEIGHBOR_CONTEXT_TOKEN_CAP
+        // 截断，与库里真实相邻块逐字节一致。
+        let connection = store.connect().expect("connect");
+        let chunks = connection
+            .prepare("SELECT ordinal, text FROM chunks ORDER BY ordinal")
+            .expect("prepare chunks")
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .expect("query chunks")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect chunks");
+        assert!(chunks.len() >= 3, "应切出至少甲乙丙三段对应块");
+        // 命中块 = 含乙段、不含丙段的那块（丙块同时含乙段尾巴与丙段）
+        let hit = chunks
+            .iter()
+            .position(|(_, text)| text.contains("正文乙段") && !text.contains("下文丙段"))
+            .expect("命中中间块");
+        assert_eq!(
+            evidence.context_before.as_deref(),
+            Some(crate::indexing::cap_by_estimated_tokens(&chunks[hit - 1].1, 128).as_str()),
+            "前邻居应为甲块文本按上限截断"
+        );
+        assert_eq!(
+            evidence.context_after.as_deref(),
+            Some(crate::indexing::cap_by_estimated_tokens(&chunks[hit + 1].1, 128).as_str()),
+            "后邻居应为丙块文本按上限截断"
+        );
+        // 语义抽查：前邻居纯甲段、后邻居含丙段（在完整块文本上成立）
+        assert!(chunks[hit - 1].1.contains("上文甲段"));
+        assert!(!chunks[hit - 1].1.contains("正文乙段"));
+        assert!(chunks[hit + 1].1.contains("下文丙段"));
+    }
+
+    #[test]
     fn search_cursor_pages_results_and_rejects_a_changed_index() {
         let directory = tempfile::tempdir().expect("tempdir");
         let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
@@ -10373,5 +11709,157 @@ mod tests {
             p95_ms <= limit_ms,
             "20,000文件语义检索p95={p95_ms}ms，超过门限{limit_ms}ms"
         );
+    }
+
+    #[test]
+    fn relation_groups_cluster_refresh_query_and_review_flow() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let first_path = directory.path().join("归航计划-最终版.txt");
+        let second_path = directory.path().join("归航计划-v2.txt");
+        let third_path = directory.path().join("周报-3月.txt");
+        fs::write(&first_path, "项目归航计划内容").expect("write first fixture");
+        fs::write(&second_path, "项目归航计划内容").expect("write second fixture");
+        fs::write(&third_path, "三月份工作周报内容").expect("write third fixture");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+        let root_path = directory.path().to_string_lossy().to_string();
+        let root = store
+            .upsert_root(&RootRegistration {
+                label: "测试资料".into(),
+                canonical_path: root_path.clone(),
+                path_key: root_path.to_lowercase(),
+                source: RootSource::UserFolder,
+                volume_id: "vol-test".into(),
+                root_file_id: None,
+                authorization_source: AuthorizationSource::UserSelected,
+                root_kind: RootKind::Folder,
+                volume_type: VolumeType::Fixed,
+                watch_mode: WatchMode::Realtime,
+            })
+            .expect("register root");
+        let (job, _) = store
+            .prepare_scan_job(&root.root_id, "relations_test")
+            .expect("prepare scan");
+        store
+            .mark_scan_running(&root.root_id, &job.job_id)
+            .expect("start scan");
+        let now = Utc::now();
+        let discovered = |path: &std::path::Path, name: &str, offset_secs: i64| DiscoveredFile {
+            volume_id: "vol-test".into(),
+            windows_file_id: None,
+            canonical_path: path.to_string_lossy().to_string(),
+            path_key: path.to_string_lossy().to_lowercase(),
+            name: name.into(),
+            extension: "txt".into(),
+            mime_type: "text/plain".into(),
+            size_bytes: fs::metadata(path).expect("metadata").len(),
+            created_at: Some(now + chrono::Duration::seconds(offset_secs)),
+            modified_at: now + chrono::Duration::seconds(offset_secs),
+            relative_path: name.into(),
+        };
+        store
+            .commit_scan(
+                &root.root_id,
+                &job.job_id,
+                &ScanOutcome {
+                    files: vec![
+                        discovered(&first_path, "归航计划-最终版.txt", 3),
+                        discovered(&second_path, "归航计划-v2.txt", 2),
+                        discovered(&third_path, "周报-3月.txt", 1),
+                    ],
+                    ..ScanOutcome::default()
+                },
+            )
+            .expect("commit scan");
+
+        // 内容哈希相同的两份 → exact_duplicate + version_candidate 边
+        let refresh = store
+            .refresh_file_relations(100)
+            .expect("refresh relations");
+        assert_eq!(refresh.exact_duplicate_pairs, 1);
+        assert_eq!(refresh.version_candidate_pairs, 1);
+
+        // 聚类落库：两个文件应聚成 1 个版本族组
+        let groups_created = store
+            .refresh_relation_groups(None)
+            .expect("refresh groups");
+        assert_eq!(groups_created, 1);
+        let page = store
+            .query_relation_groups(&RelationGroupQuery {
+                cursor: None,
+                page_size: 50,
+                group_type: None,
+                review_status: None,
+            })
+            .expect("query groups");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items.len(), 1);
+        let group = &page.items[0];
+        assert_eq!(group.group_type, RelationGroupType::VersionFamily);
+        assert_eq!(group.member_count, 2);
+        assert_eq!(group.members.len(), 2);
+        assert_eq!(group.review_status, "suggested");
+        // 修改时间最新的是「归航计划-最终版」（offset 3）
+        let latest = group
+            .members
+            .iter()
+            .find(|member| member.role == RelationGroupRole::Latest)
+            .expect("latest member");
+        assert_eq!(latest.file.display_name, "归航计划-最终版.txt");
+
+        // 组级复核：组和组内边一起变 accepted
+        store
+            .review_relation_group(&group.group_id, "accepted")
+            .expect("review group");
+        let after = store
+            .query_relation_groups(&RelationGroupQuery {
+                cursor: None,
+                page_size: 50,
+                group_type: None,
+                review_status: Some("accepted".into()),
+            })
+            .expect("query accepted groups");
+        assert_eq!(after.total, 1);
+        let edges = store
+            .query_file_relations(&RelationQuery {
+                cursor: None,
+                page_size: 50,
+                relation_type: None,
+                review_status: Some("accepted".into()),
+            })
+            .expect("query accepted edges");
+        assert_eq!(edges.total, 2);
+
+        // 重新聚类：suggested 组被替换，accepted 组保留
+        let groups_created = store
+            .refresh_relation_groups(None)
+            .expect("refresh groups again");
+        assert_eq!(groups_created, 1);
+        let suggested = store
+            .query_relation_groups(&RelationGroupQuery {
+                cursor: None,
+                page_size: 50,
+                group_type: None,
+                review_status: Some("suggested".into()),
+            })
+            .expect("query suggested groups");
+        assert_eq!(suggested.total, 1);
+        let accepted = store
+            .query_relation_groups(&RelationGroupQuery {
+                cursor: None,
+                page_size: 50,
+                group_type: None,
+                review_status: Some("accepted".into()),
+            })
+            .expect("query accepted groups");
+        assert_eq!(accepted.total, 1);
+
+        // 排除后不再聚类
+        store
+            .review_relation_group(&suggested.items[0].group_id, "rejected")
+            .expect("reject group");
+        let groups_created = store
+            .refresh_relation_groups(None)
+            .expect("refresh groups after reject");
+        assert_eq!(groups_created, 0);
     }
 }

@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet, VecDeque};
+
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -483,6 +485,10 @@ pub struct CollectionSuggestionPage {
 pub struct CollectionSuggestionRefreshResult {
     pub profiled_files: u64,
     pub candidate_edges: u64,
+    /// 本次聚类发现的同主题/同用途分组数（已排除被已确认/已拒绝建议消费过的文件）。
+    pub topic_groups: u64,
+    /// 聚类发现但本批未展示的分组数（受每批建议数上限约束）。
+    pub remaining_topic_groups: u64,
     pub created_suggestions: u64,
     pub suggestion_ids: Vec<Uuid>,
     pub algorithm_version: String,
@@ -496,17 +502,11 @@ pub struct CollectionSuggestionUpdateRequest {
     pub member_file_ids: Vec<Uuid>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CollectionModelReviewMember {
-    pub file_id: Uuid,
-    pub rationale: String,
-}
-
+/// 生成模型对集合建议的命名润色：只改名称和说明，成员分组完全由 Embedding 聚类决定。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectionModelReview {
     pub suggested_name: String,
     pub description: String,
-    pub members: Vec<CollectionModelReviewMember>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -612,6 +612,310 @@ pub struct RelationRefreshResult {
     pub semantic_related_pairs: u64,
     #[serde(default)]
     pub contains_or_summarizes_pairs: u64,
+    #[serde(default)]
+    pub groups_created: u64,
+}
+
+/// 文件关系组类型：把成对的边按连通分量聚成「族」后的组标签。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationGroupType {
+    /// 字节级完全重复（组内全是 SHA-256 相同的副本）
+    Duplicate,
+    /// 版本族（同名/近名 + 内容相似，可能是副本改名、修订版、派生版）
+    VersionFamily,
+    /// 摘要/源稿组（一份是另一份的摘要、提纲或概括）
+    SummaryGroup,
+    /// 同主题或同用途（文档级语义相似）
+    TopicGroup,
+    /// 混合关系（组内边类型不止一种）
+    Mixed,
+}
+
+impl RelationGroupType {
+    pub(crate) fn as_storage(self) -> &'static str {
+        match self {
+            Self::Duplicate => "duplicate",
+            Self::VersionFamily => "version_family",
+            Self::SummaryGroup => "summary_group",
+            Self::TopicGroup => "topic_group",
+            Self::Mixed => "mixed",
+        }
+    }
+
+    pub(crate) fn from_storage(value: &str) -> Self {
+        match value {
+            "version_family" => Self::VersionFamily,
+            "summary_group" => Self::SummaryGroup,
+            "topic_group" => Self::TopicGroup,
+            "mixed" => Self::Mixed,
+            _ => Self::Duplicate,
+        }
+    }
+}
+
+/// 组内成员角色：版本族里谁是主版本、谁是副本、谁是摘要/源稿。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationGroupRole {
+    /// 版本族中修改时间最新的文件（候选主版本）
+    Latest,
+    /// 与组内最新版本内容相似度 ≥0.99 的近重复副本
+    Copy,
+    /// 摘要/提纲类文件
+    Summary,
+    /// 被摘要、被提纲化的源稿
+    Source,
+    /// 普通成员
+    Member,
+}
+
+impl RelationGroupRole {
+    pub(crate) fn as_storage(self) -> &'static str {
+        match self {
+            Self::Latest => "latest",
+            Self::Copy => "copy",
+            Self::Summary => "summary",
+            Self::Source => "source",
+            Self::Member => "member",
+        }
+    }
+
+    pub(crate) fn from_storage(value: &str) -> Self {
+        match value {
+            "latest" => Self::Latest,
+            "copy" => Self::Copy,
+            "summary" => Self::Summary,
+            "source" => Self::Source,
+            _ => Self::Member,
+        }
+    }
+}
+
+/// 聚类算法的中间结果：一组文件 + 组类型 + 成员角色（不带文件详情）。
+#[derive(Debug, Clone)]
+pub struct RelationGroup {
+    pub group_type: RelationGroupType,
+    pub title: String,
+    pub confidence: f64,
+    pub members: Vec<RelationGroupMember>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RelationGroupMember {
+    pub file_id: Uuid,
+    pub role: RelationGroupRole,
+}
+
+/// 落库/查询用：组 + 组内边的证据信息。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelationGroupRecord {
+    pub group_id: Uuid,
+    pub group_type: RelationGroupType,
+    pub title: String,
+    pub confidence: f64,
+    pub member_count: u32,
+    pub review_status: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub members: Vec<RelationGroupMemberRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelationGroupMemberRecord {
+    pub file_id: Uuid,
+    pub role: RelationGroupRole,
+    pub file: FileRecord,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RelationGroupQuery {
+    pub cursor: Option<String>,
+    pub page_size: u32,
+    #[serde(default)]
+    pub group_type: Option<RelationGroupType>,
+    #[serde(default)]
+    pub review_status: Option<String>,
+}
+
+impl RelationGroupQuery {
+    pub fn validate(&self) -> Result<(), AppError> {
+        if !(1..=500).contains(&self.page_size) {
+            return Err(AppError::new(
+                "RELATION_GROUP_QUERY_INVALID",
+                "关系组查询数量必须在1到500之间",
+                false,
+            ));
+        }
+        if self
+            .review_status
+            .as_deref()
+            .is_some_and(|status| !matches!(status, "suggested" | "accepted" | "rejected"))
+        {
+            return Err(AppError::new(
+                "RELATION_GROUP_QUERY_INVALID",
+                "关系组复核状态筛选无效",
+                false,
+            ));
+        }
+        self.offset().map(|_| ())
+    }
+
+    pub fn offset(&self) -> Result<u64, AppError> {
+        self.cursor
+            .as_deref()
+            .unwrap_or("0")
+            .parse::<u64>()
+            .map_err(|_| AppError::new("RELATION_GROUP_QUERY_INVALID", "关系组分页游标无效", false))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelationGroupPage {
+    pub items: Vec<RelationGroupRecord>,
+    pub next_cursor: Option<String>,
+    pub total: u64,
+}
+
+/// 聚类输入：一条「边」的轻量表示（算法层不直接依赖数据库行）。
+#[derive(Debug, Clone)]
+pub(crate) struct RelationEdge {
+    pub left_file_id: Uuid,
+    pub right_file_id: Uuid,
+    pub relation_type: RelationType,
+    pub confidence: f64,
+    /// 方向（contains_or_summarizes 才有意义：左 → 右 表示左是右的摘要）
+    pub directed: bool,
+}
+
+/// 把边按连通分量聚成组。
+///
+/// - exact_duplicate / version_candidate 是强证据（字节或名称），传递性成立，
+///   直接连通即可；链式蔓延风险由调用方对语义边做向量一致性校验兜底。
+/// - 组类型按优先级取：重复 > 版本族 > 摘要组 > 同主题组 > 混合。
+/// - 组置信度 = 组内边置信度的均值。
+pub(crate) fn cluster_relation_edges(
+    edges: &[RelationEdge],
+    title_for: &dyn Fn(&[Uuid], RelationGroupType) -> String,
+) -> Vec<RelationGroup> {
+    if edges.is_empty() {
+        return Vec::new();
+    }
+    let mut adjacency = HashMap::<Uuid, Vec<(Uuid, &RelationEdge)>>::new();
+    for edge in edges {
+        adjacency
+            .entry(edge.left_file_id)
+            .or_default()
+            .push((edge.right_file_id, edge));
+        adjacency
+            .entry(edge.right_file_id)
+            .or_default()
+            .push((edge.left_file_id, edge));
+    }
+    let mut visited = HashSet::<Uuid>::new();
+    let mut groups = Vec::new();
+    let mut member_ids = Vec::new();
+    let mut member_roles = HashMap::<Uuid, RelationGroupRole>::new();
+    for &start in adjacency.keys() {
+        if visited.contains(&start) {
+            continue;
+        }
+        // BFS 收集连通分量
+        member_ids.clear();
+        member_roles.clear();
+        let mut queue = VecDeque::new();
+        queue.push_back(start);
+        visited.insert(start);
+        let mut component_edges = Vec::new();
+        while let Some(file_id) = queue.pop_front() {
+            member_ids.push(file_id);
+            for (neighbor, edge) in &adjacency[&file_id] {
+                if edge.left_file_id == file_id || edge.right_file_id == file_id {
+                    component_edges.push(*edge);
+                }
+                if !visited.contains(neighbor) {
+                    visited.insert(*neighbor);
+                    queue.push_back(*neighbor);
+                }
+            }
+        }
+        if member_ids.len() < 2 {
+            continue;
+        }
+        // 组类型：按优先级取
+        let mut has_duplicate = false;
+        let mut has_version = false;
+        let mut has_summary = false;
+        let mut has_semantic = false;
+        for edge in &component_edges {
+            match edge.relation_type {
+                RelationType::ExactDuplicate => has_duplicate = true,
+                RelationType::VersionCandidate => has_version = true,
+                RelationType::ContainsOrSummarizes | RelationType::Related => {
+                    has_summary = true
+                }
+                RelationType::SemanticRelated => has_semantic = true,
+            }
+        }
+        let group_type = if has_duplicate && !has_version && !has_summary && !has_semantic {
+            RelationGroupType::Duplicate
+        } else if has_version {
+            RelationGroupType::VersionFamily
+        } else if has_summary && !has_semantic {
+            RelationGroupType::SummaryGroup
+        } else if has_semantic {
+            if has_summary || has_duplicate {
+                RelationGroupType::Mixed
+            } else {
+                RelationGroupType::TopicGroup
+            }
+        } else if has_duplicate {
+            RelationGroupType::Duplicate
+        } else {
+            RelationGroupType::Mixed
+        };
+        // 摘要方向：contains 边指向的成员标 summary/source
+        if has_summary {
+            for edge in &component_edges {
+                if matches!(
+                    edge.relation_type,
+                    RelationType::ContainsOrSummarizes | RelationType::Related
+                ) {
+                    let (summary_id, source_id) = if edge.directed {
+                        (edge.left_file_id, edge.right_file_id)
+                    } else {
+                        (edge.left_file_id, edge.right_file_id)
+                    };
+                    member_roles
+                        .entry(summary_id)
+                        .or_insert(RelationGroupRole::Summary);
+                    member_roles
+                        .entry(source_id)
+                        .or_insert(RelationGroupRole::Source);
+                }
+            }
+        }
+        let confidence = component_edges.iter().map(|edge| edge.confidence).sum::<f64>()
+            / component_edges.len() as f64;
+        let title = title_for(&member_ids, group_type);
+        let members = member_ids
+            .iter()
+            .map(|file_id| RelationGroupMember {
+                file_id: *file_id,
+                role: member_roles
+                    .get(file_id)
+                    .cloned()
+                    .unwrap_or(RelationGroupRole::Member),
+            })
+            .collect();
+        groups.push(RelationGroup {
+            group_type,
+            title,
+            confidence,
+            members,
+        });
+    }
+    groups
 }
 
 pub(crate) fn normalized_version_key(name: &str) -> String {
@@ -710,5 +1014,137 @@ mod tests {
             "归航计划"
         );
         assert_eq!(normalized_version_key("归航计划 copy 3.docx"), "归航计划");
+    }
+
+    fn edge(left: u64, right: u64, relation_type: RelationType, confidence: f64) -> RelationEdge {
+        RelationEdge {
+            left_file_id: Uuid::from_u128(u128::from(left)),
+            right_file_id: Uuid::from_u128(u128::from(right)),
+            relation_type,
+            confidence,
+            directed: false,
+        }
+    }
+
+    fn ids(left: u64, right: u64) -> (Uuid, Uuid) {
+        (
+            Uuid::from_u128(u128::from(left)),
+            Uuid::from_u128(u128::from(right)),
+        )
+    }
+
+    fn title_hook(_members: &[Uuid], _group_type: RelationGroupType) -> String {
+        "组".into()
+    }
+
+    #[test]
+    fn duplicate_edges_form_single_group() {
+        let (a, b) = ids(1, 2);
+        let (c, _) = ids(3, 1);
+        let groups = cluster_relation_edges(
+            &[
+                edge(1, 2, RelationType::ExactDuplicate, 1.0),
+                edge(3, 1, RelationType::ExactDuplicate, 1.0),
+            ],
+            &title_hook,
+        );
+        assert_eq!(groups.len(), 1);
+        let group = &groups[0];
+        assert_eq!(group.group_type, RelationGroupType::Duplicate);
+        assert_eq!(group.members.len(), 3);
+        assert!(group.members.iter().any(|m| m.file_id == a && m.role == RelationGroupRole::Member));
+        assert!(group.members.iter().any(|m| m.file_id == b));
+        assert!(group.members.iter().any(|m| m.file_id == c));
+        assert_eq!(group.confidence, 1.0);
+    }
+
+    #[test]
+    fn version_family_takes_priority_over_semantic() {
+        let groups = cluster_relation_edges(
+            &[
+                edge(1, 2, RelationType::VersionCandidate, 0.78),
+                edge(2, 3, RelationType::SemanticRelated, 0.82),
+            ],
+            &title_hook,
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].group_type, RelationGroupType::VersionFamily);
+        assert_eq!(groups[0].members.len(), 3);
+    }
+
+    #[test]
+    fn disconnected_components_split_into_separate_groups() {
+        let groups = cluster_relation_edges(
+            &[
+                edge(1, 2, RelationType::ExactDuplicate, 1.0),
+                edge(3, 4, RelationType::SemanticRelated, 0.90),
+            ],
+            &title_hook,
+        );
+        assert_eq!(groups.len(), 2);
+        let mut types = groups.iter().map(|g| g.group_type).collect::<Vec<_>>();
+        types.sort_by_key(|t| t.as_storage());
+        assert_eq!(types, vec![RelationGroupType::Duplicate, RelationGroupType::TopicGroup]);
+    }
+
+    #[test]
+    fn pure_semantic_chain_forms_topic_group() {
+        let groups = cluster_relation_edges(
+            &[
+                edge(1, 2, RelationType::SemanticRelated, 0.80),
+                edge(2, 3, RelationType::SemanticRelated, 0.81),
+            ],
+            &title_hook,
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].group_type, RelationGroupType::TopicGroup);
+        assert_eq!(groups[0].members.len(), 3);
+    }
+
+    #[test]
+    fn contains_edge_marks_summary_and_source_roles() {
+        let groups = cluster_relation_edges(
+            &[RelationEdge {
+                left_file_id: Uuid::from_u128(1),
+                right_file_id: Uuid::from_u128(2),
+                relation_type: RelationType::ContainsOrSummarizes,
+                confidence: 0.90,
+                directed: true,
+            }],
+            &title_hook,
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].group_type, RelationGroupType::SummaryGroup);
+        let roles = groups[0]
+            .members
+            .iter()
+            .map(|m| (m.file_id, m.role))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(roles[&Uuid::from_u128(1)], RelationGroupRole::Summary);
+        assert_eq!(roles[&Uuid::from_u128(2)], RelationGroupRole::Source);
+    }
+
+    #[test]
+    fn single_vertex_component_is_skipped() {
+        let groups = cluster_relation_edges(
+            &[edge(1, 2, RelationType::SemanticRelated, 0.80)],
+            &title_hook,
+        );
+        assert_eq!(groups.len(), 1);
+        let groups = cluster_relation_edges(&[], &title_hook);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn mixed_exact_and_semantic_is_mixed_type() {
+        let groups = cluster_relation_edges(
+            &[
+                edge(1, 2, RelationType::ExactDuplicate, 1.0),
+                edge(2, 3, RelationType::SemanticRelated, 0.85),
+            ],
+            &title_hook,
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].group_type, RelationGroupType::Mixed);
     }
 }

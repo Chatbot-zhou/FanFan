@@ -44,6 +44,8 @@ const IMPORTANT_ACTIONS = new Set<keyof FanFanBridge>([
   "relation_refresh",
   "relation_review",
   "relation_batch_review",
+  "relation_group_review",
+  "relation_group_batch_review",
   "answer_export",
   "exclusion_rule_upsert",
   "exclusion_rule_delete",

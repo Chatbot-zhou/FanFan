@@ -126,6 +126,7 @@ impl ModelRoleLabel for ModelRole {
             ModelRole::Ocr => "ocr",
             ModelRole::Tts => "tts",
             ModelRole::Asr => "asr",
+            ModelRole::Router => "router",
         }
     }
 }

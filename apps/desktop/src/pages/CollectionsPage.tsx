@@ -11,11 +11,15 @@ import { displayPath } from "../utils/display-path";
 
 const splitRuleValues = (value: string) => value.split(/[，,]+/).map((item) => item.trim()).filter(Boolean);
 const megabytesToBytes = (value: string) => value ? Math.round(Number(value) * 1024 * 1024) : null;
+/** 集合建议卡片里直接展示的成员上限；其余成员确认后仍会一并加入集合。 */
+const SUGGESTION_MEMBER_DISPLAY_CAP = 20;
 
 export function CollectionsPage() {
   const queryClient = useQueryClient();
   const initialCollectionId = useAppStore((state) => state.selected_collection_id);
   const clearCollectionSelection = useAppStore((state) => state.clear_collection_selection);
+  const collectionTask = useAppStore((state) => state.analysis_tasks.collection);
+  const setAnalysisTask = useAppStore((state) => state.set_analysis_task);
   const [creating, setCreating] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(initialCollectionId);
@@ -110,7 +114,13 @@ export function CollectionsPage() {
   });
   const refreshSuggestions = useMutation({
     mutationFn: () => bridge.collection_suggestion_refresh(500),
-    onSuccess: async () => queryClient.invalidateQueries({ queryKey: ["collection-suggestions"] }),
+    // 任务状态写入全局 store：切页后「正在分析」/完成反馈/错误仍能跨页保留
+    onMutate: () => setAnalysisTask("collection", { status: "running", started_at: Date.now(), summary: null, error: null }),
+    onSuccess: async (data) => {
+      setAnalysisTask("collection", { status: "done", finished_at: Date.now(), summary: `本次分析发现 ${data.topic_groups} 组同主题分类，已生成 ${data.created_suggestions} 条建议${data.remaining_topic_groups > 0 ? `；还有 ${data.remaining_topic_groups} 组待分析，确认或拒绝后可继续分析下一批。` : "。"}` });
+      await queryClient.invalidateQueries({ queryKey: ["collection-suggestions"] });
+    },
+    onError: (actionError) => setAnalysisTask("collection", { status: "error", finished_at: Date.now(), error: errorMessage(actionError) }),
   });
   const confirmSuggestion = useMutation({
     mutationFn: (suggestionId: string) => bridge.collection_suggestion_confirm(suggestionId),
@@ -198,25 +208,28 @@ export function CollectionsPage() {
       <header className="page-heading page-heading--inline-note page-heading--compact page-heading--divider">
         <div className="readonly-note"><SafetyCertificateOutlined /> 虚拟集合只做智能分类，不复制或移动任何文件</div>
         <div className="page-heading__actions">
-          <button type="button" className="secondary-gradient-button" disabled={refreshSuggestions.isPending} onClick={() => refreshSuggestions.mutate()}><RobotOutlined /> {refreshSuggestions.isPending ? "正在分析" : "AI分析新建议"}</button>
+          <button type="button" className="secondary-gradient-button" disabled={refreshSuggestions.isPending || collectionTask.status === "running"} onClick={() => refreshSuggestions.mutate()}><RobotOutlined /> {refreshSuggestions.isPending || collectionTask.status === "running" ? "正在分析" : "AI分析新建议"}</button>
           <button type="button" className={creating ? "text-button" : "primary-button"} onClick={() => { if (creating) closeEditor(); else { setEditingId(null); setCreating(true); } }}>{creating ? <CloseOutlined /> : <PlusOutlined />} {creating ? "取消" : "新建集合"}</button>
         </div>
       </header>
-      {refreshSuggestions.isError && <p role="alert" className="page-heading__feedback inline-error">AI分析未完成：{errorMessage(refreshSuggestions.error)}</p>}
+      {collectionTask.status === "running" && <p className="relation-summary">AI 分析进行中…</p>}
+      {collectionTask.status === "done" && collectionTask.finished_at !== null && collectionTask.finished_at > Date.now() - 2 * 60_000 && collectionTask.summary && <p className="relation-summary">{collectionTask.summary}</p>}
+      {collectionTask.status === "error" && collectionTask.finished_at !== null && collectionTask.finished_at > Date.now() - 2 * 60_000 && collectionTask.error && <p role="alert" className="page-heading__feedback inline-error">AI分析未完成：{collectionTask.error}</p>}
       {(confirmSuggestion.isError || rejectSuggestion.isError || updateSuggestion.isError || deleteCollection.isError || removeFile.isError) && <p role="alert" className="page-heading__feedback inline-error">{errorMessage(confirmSuggestion.error ?? rejectSuggestion.error ?? updateSuggestion.error ?? deleteCollection.error ?? removeFile.error)}</p>}
       {suggestions.isError && <p role="alert" className="inline-error">AI集合建议暂时无法读取：{errorMessage(suggestions.error)}</p>}
       {(suggestions.data?.items.length ?? 0) > 0 && <section className="ai-suggestions">
-        <header><div><h2>AI 集合建议</h2><p>建议需确认后才会成为正式虚拟集合；你可以先改名或移除误判成员。</p></div><strong>{suggestions.data?.total} 条待确认</strong></header>
+        <header><div><h2>AI 集合建议</h2><p>建议需确认后才会成为正式虚拟集合；每批最多 5 条，确认或拒绝后可继续分析下一批。你可以先改名或移除误判成员。</p></div><strong>{suggestions.data?.total} 条待确认</strong></header>
         {suggestions.data?.items.map((suggestion) => <article key={suggestion.suggestion_id}>
           <div className="ai-suggestion__summary">
             {editingSuggestionId === suggestion.suggestion_id ? <input value={suggestionName} maxLength={40} onChange={(event) => setSuggestionName(event.target.value)} /> : <h3>{suggestion.suggested_name}</h3>}
             <p>{suggestion.description}</p><small>整体置信度 {Math.round(suggestion.confidence * 100)}% · {suggestion.members.length} 份资料 · {suggestion.algorithm_version}</small>
           </div>
           <div className="ai-suggestion__members">
-            {suggestion.members.map((member) => {
+            {suggestion.members.slice(0, SUGGESTION_MEMBER_DISPLAY_CAP).map((member) => {
               const selected = editingSuggestionId !== suggestion.suggestion_id || suggestionMemberIds.includes(member.file.file_id);
               return <label key={member.file.file_id} className={selected ? "" : "excluded"}>{editingSuggestionId === suggestion.suggestion_id && <input type="checkbox" checked={selected} onChange={() => setSuggestionMemberIds((current) => current.includes(member.file.file_id) ? current.filter((id) => id !== member.file.file_id) : [...current, member.file.file_id])} />}<span><strong>{member.file.display_name}</strong><small>{member.rationale} · {Math.round(member.confidence * 100)}%</small></span></label>;
             })}
+            {suggestion.members.length > SUGGESTION_MEMBER_DISPLAY_CAP && <span className="ai-suggestion__members-more">+{suggestion.members.length - SUGGESTION_MEMBER_DISPLAY_CAP} 份同主题资料（确认后一并加入集合）</span>}
           </div>
           <div className="ai-suggestion__actions">
             {editingSuggestionId === suggestion.suggestion_id ? <><button type="button" onClick={() => setEditingSuggestionId(null)}>取消编辑</button><button type="button" className="primary-button" disabled={!suggestionName.trim() || suggestionMemberIds.length < 2 || updateSuggestion.isPending} onClick={() => updateSuggestion.mutate(suggestion.suggestion_id)}>保存建议</button></> : <button type="button" onClick={() => { setEditingSuggestionId(suggestion.suggestion_id); setSuggestionName(suggestion.suggested_name); setSuggestionMemberIds(suggestion.members.map((member) => member.file.file_id)); }}>编辑成员</button>}

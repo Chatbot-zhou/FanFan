@@ -1,4 +1,9 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Mutex,
+    time::SystemTime,
+};
 
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
@@ -8,6 +13,22 @@ use crate::AppError;
 pub struct VectorMatch {
     pub key: u64,
     pub distance: f32,
+}
+
+/// 已打开的视图索引缓存：restore_view 每次都会重建 HNSW 图结构（实测约 6 秒），
+/// 查询路径复用同一实例可省掉该固定开销。索引重建会替换文件（mtime 变化），
+/// 因此 build 前必须调用 `clear_index_cache` 释放旧句柄，否则 Windows 上
+/// 文件删除/替换会因占用而失败。
+struct CachedIndex {
+    path: PathBuf,
+    modified: SystemTime,
+    index: Index,
+}
+
+static INDEX_CACHE: Mutex<Option<CachedIndex>> = Mutex::new(None);
+
+pub fn clear_index_cache() {
+    *INDEX_CACHE.lock().expect("index cache poisoned") = None;
 }
 
 pub fn build_index(
@@ -27,6 +48,8 @@ pub fn build_index_refs(
     dimension: usize,
     entries: &[(u64, &[f32])],
 ) -> Result<(), AppError> {
+    // 释放旧句柄，避免 Windows 上文件替换因占用而失败。
+    clear_index_cache();
     if dimension == 0
         || entries.iter().any(|(key, vector)| {
             *key == 0 || vector.len() != dimension || vector.iter().any(|value| !value.is_finite())
@@ -91,8 +114,33 @@ pub fn search_index(
             false,
         ));
     }
-    let index = Index::restore_view(path_text(index_path)?)
-        .map_err(|error| vector_error("VECTOR_INDEX_OPEN_FAILED", error.to_string(), true))?;
+    let modified = fs::metadata(index_path)
+        .and_then(|meta| meta.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let mut cache = INDEX_CACHE.lock().expect("index cache poisoned");
+    let cached = cache
+        .as_ref()
+        .is_some_and(|entry| entry.path == index_path && entry.modified == modified);
+    if !cached {
+        eprintln!(
+            "[DBG] index cache MISS path={:?} size={}",
+            index_path,
+            fs::metadata(index_path).map(|m| m.len()).unwrap_or(0)
+        );
+    }
+    let index = match cache.as_ref() {
+        Some(entry) if entry.path == index_path && entry.modified == modified => &entry.index,
+        _ => {
+            let restored = Index::restore_view(path_text(index_path)?)
+                .map_err(|error| vector_error("VECTOR_INDEX_OPEN_FAILED", error.to_string(), true))?;
+            *cache = Some(CachedIndex {
+                path: index_path.to_path_buf(),
+                modified,
+                index: restored,
+            });
+            &cache.as_ref().expect("just inserted").index
+        }
+    };
     if index.dimensions() != query.len() {
         return Err(vector_error(
             "VECTOR_INDEX_DIMENSION_MISMATCH",

@@ -14,10 +14,12 @@ use crate::{
     CollectionRecord, CreateCollectionRequest, DegradationLevel, DegradationState, FilePreview,
     FileRecord, FileRelation, FileSystemEvent, ImageUnderstandingResult, InboxPage, InboxQuery,
     InboxUpdateRequest, IndexActivityStats, IndexRebuildResult, JobRecord, JobStatus,
-    LogEventInput, LogPage, LogQuery, MaintenanceSnapshot, ParseResult, PendingEmbeddingChunk,
-    PendingImageUnderstanding, ProcessingCoverageSnapshot, RelationPage, RelationQuery,
-    RelationRefreshResult, RootRegistration, ScanControl, ScanPolicy, SearchRequest, SearchSession,
-    SemanticQuery, file_identity_for_path, path_key, scan_root_with_control,
+    LogEventInput, LogPage, LogQuery, MaintenanceSnapshot, NodeTracePage, NodeTraceQuery,
+    ParseResult, PendingEmbeddingChunk, PendingImageUnderstanding, ProcessingCoverageSnapshot,
+    RelationGroupPage, RelationGroupQuery, RelationPage, RelationQuery, RelationRefreshResult,
+    RootRegistration, ScanControl, ScanPolicy,
+    SearchRequest, SearchSession, SemanticQuery, file_identity_for_path, path_key,
+    scan_root_with_control,
 };
 
 #[cfg(windows)]
@@ -743,14 +745,14 @@ impl CatalogService {
             .update_collection_suggestion(suggestion_id, request)
     }
 
-    pub fn apply_collection_model_review(
+    pub fn apply_collection_model_naming(
         &self,
         suggestion_id: &Uuid,
         review: &crate::CollectionModelReview,
         model_version: &str,
     ) -> Result<crate::CollectionSuggestion, AppError> {
         self.store
-            .apply_collection_model_review(suggestion_id, review, model_version)
+            .apply_collection_model_naming(suggestion_id, review, model_version)
     }
 
     pub fn confirm_collection_suggestion(
@@ -778,6 +780,32 @@ impl CatalogService {
     ) -> Result<(u64, u64), AppError> {
         self.store
             .refresh_semantic_file_relations(model_artifact_id, max_files)
+    }
+
+    pub fn refresh_relation_groups(
+        &self,
+        model_artifact_id: Option<&str>,
+    ) -> Result<u64, AppError> {
+        self.store.refresh_relation_groups(model_artifact_id)
+    }
+
+    pub fn query_relation_groups(
+        &self,
+        request: &RelationGroupQuery,
+    ) -> Result<RelationGroupPage, AppError> {
+        self.store.query_relation_groups(request)
+    }
+
+    pub fn review_relation_group(&self, group_id: &Uuid, action: &str) -> Result<(), AppError> {
+        self.store.review_relation_group(group_id, action)
+    }
+
+    pub fn review_relation_groups(
+        &self,
+        group_ids: &[Uuid],
+        action: &str,
+    ) -> Result<u64, AppError> {
+        self.store.review_relation_groups(group_ids, action)
     }
 
     pub fn list_file_relations(&self, limit: u32) -> Result<Vec<FileRelation>, AppError> {
@@ -986,6 +1014,39 @@ impl CatalogService {
 
     pub fn clear_logs(&self) -> Result<u64, AppError> {
         self.store.clear_logs()
+    }
+
+    pub fn record_node_trace(
+        &self,
+        flow: &str,
+        node: &str,
+        correlation_id: &str,
+        session_id: Option<&str>,
+        entity_id: Option<&str>,
+        input_json: &serde_json::Value,
+        output_json: &serde_json::Value,
+        status: &str,
+        elapsed_ms: Option<u64>,
+    ) -> Result<(), AppError> {
+        self.store.record_node_trace(
+            flow,
+            node,
+            correlation_id,
+            session_id,
+            entity_id,
+            input_json,
+            output_json,
+            status,
+            elapsed_ms,
+        )
+    }
+
+    pub fn query_node_traces(&self, request: &NodeTraceQuery) -> Result<NodeTracePage, AppError> {
+        self.store.query_node_traces(request)
+    }
+
+    pub fn clear_node_traces(&self) -> Result<u64, AppError> {
+        self.store.clear_node_traces()
     }
 
     pub fn rebuild_index(&self, confirmation: &str) -> Result<IndexRebuildResult, AppError> {

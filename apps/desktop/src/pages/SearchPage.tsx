@@ -1,13 +1,13 @@
 import { CloseOutlined, FileExcelOutlined, FilePdfOutlined, FileWordOutlined, SearchOutlined } from "@ant-design/icons";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { bridge, type CollectionRecord, type FilePreview, type SearchRequest, type SearchSession } from "../bridge";
+import { bridge, type CollectionRecord, type FilePreview, type SearchRequest } from "../bridge";
 import { PdfVisualPreview } from "../components/PdfVisualPreview";
 import { ImageAssetGallery } from "../components/ImageAssetGallery";
 import { OcrAttemptChain } from "../components/OcrAttemptChain";
 import { AppSelect } from "../components/AppSelect";
 import { errorMessage } from "../utils/app-error";
 import { highlightPlainTerms } from "../utils/query-terms";
-import { useAppStore } from "../state/app-store";
+import { useAppStore, type SearchModifiedWindow } from "../state/app-store";
 
 const emptyScope = {
   root_ids: [],
@@ -20,22 +20,23 @@ const emptyScope = {
 };
 
 export function SearchPage() {
-  const initial = useAppStore((state) => state.search_query);
-  const [query, setQuery] = useState(initial);
-  const [session, setSession] = useState<SearchSession | null>(null);
+  // 搜索会话（查询词、结果、筛选偏好）放在全局 store，切换页面后回来仍保留
+  const query = useAppStore((state) => state.search_query);
+  const setQuery = useAppStore((state) => state.set_search_query);
+  const session = useAppStore((state) => state.search_session);
+  const sessionQuery = useAppStore((state) => state.search_session_query);
+  const setSession = useAppStore((state) => state.set_search_session);
+  const prefs = useAppStore((state) => state.search_prefs);
+  const setPrefs = useAppStore((state) => state.set_search_prefs);
+  const { mode, sort, extension, modified_window: modifiedWindow, scope_collection_ids: scopeCollectionIds } = prefs;
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<FilePreview | null>(null);
   const [previewLoadingId, setPreviewLoadingId] = useState<string | null>(null);
-  const [mode, setMode] = useState<SearchRequest["mode"]>("hybrid");
-  const [extension, setExtension] = useState("");
-  const [modifiedWindow, setModifiedWindow] = useState<"all" | "7" | "30" | "365">("all");
-  const [sort, setSort] = useState<SearchRequest["sort"]>("relevance");
   const [collections, setCollections] = useState<CollectionRecord[]>([]);
-  const [scopeCollectionIds, setScopeCollectionIds] = useState<string[]>([]);
   const searchSerial = useRef(0);
-  const lastSearchRequest = useRef<Omit<SearchRequest, "cursor"> | null>(null);
+  const initialQuery = useRef(query);
 
   useEffect(() => {
     let active = true;
@@ -60,10 +61,10 @@ export function SearchPage() {
   }, [extension, modifiedWindow, scopeCollectionIds]);
   const addScopeCollection = (value: string) => {
     if (!value || scopeCollectionIds.includes(value)) return;
-    setScopeCollectionIds((current) => [...current, value]);
+    setPrefs({ scope_collection_ids: [...scopeCollectionIds, value] });
   };
   const removeScopeCollection = (collectionId: string) => {
-    setScopeCollectionIds((current) => current.filter((id) => id !== collectionId));
+    setPrefs({ scope_collection_ids: scopeCollectionIds.filter((id) => id !== collectionId) });
   };
 
   const showPreview = async (fileId: string, offset = 0) => {
@@ -98,11 +99,10 @@ export function SearchPage() {
     setPreview(null);
     const serial = ++searchSerial.current;
     const baseRequest: Omit<SearchRequest, "cursor"> = { query: trimmed, scope, mode, sort, page_size: 30 };
-    lastSearchRequest.current = baseRequest;
     try {
       setSession(null);
       const result = await bridge.search_start({ ...baseRequest, cursor: null });
-      if (serial === searchSerial.current) setSession(result);
+      if (serial === searchSerial.current) setSession(result, trimmed);
     } catch (searchError) {
       if (serial !== searchSerial.current) return;
       setSession(null);
@@ -113,17 +113,13 @@ export function SearchPage() {
   };
 
   const loadMore = async () => {
-    if (!session?.next_cursor || !lastSearchRequest.current) return;
+    if (!session?.next_cursor) return;
     setLoadingMore(true);
     setError(null);
     try {
-      const next = await bridge.search_start({ ...lastSearchRequest.current, cursor: session.next_cursor });
-      setSession((current) => {
-        if (!current) return next;
-        const results = new Map(current.results.map((result) => [result.file_id, result]));
-        next.results.forEach((result) => results.set(result.file_id, result));
-        return { ...next, results: [...results.values()] };
-      });
+      const baseRequest: Omit<SearchRequest, "cursor"> = { query: sessionQuery, scope, mode, sort, page_size: 30 };
+      const next = await bridge.search_start({ ...baseRequest, cursor: session.next_cursor });
+      setSession(next, sessionQuery);
     } catch (searchError) {
       setError(errorMessage(searchError));
     } finally {
@@ -131,9 +127,14 @@ export function SearchPage() {
     }
   };
 
+  // 挂载时：若 store 里已有同一查询词的搜索结果则直接恢复，否则（从首页发起等）自动搜索
   useEffect(() => {
-    if (initial) void search(initial);
-  }, [initial]);
+    const initialValue = initialQuery.current;
+    if (!initialValue || sessionQuery === initialValue) return;
+    void search(initialValue);
+    // 只在挂载时发起一次；之后的搜索由表单提交驱动
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <section className="page page--search">
@@ -145,7 +146,7 @@ export function SearchPage() {
       {loading && <div className="search-progress" role="progressbar"><div className="search-progress__bar" /></div>}
       <div className="search-filters">
         <label>方式
-          <AppSelect ariaLabel="搜索方式" value={mode} onChange={(value) => setMode(value as SearchRequest["mode"])} options={[{ value: "hybrid", label: "混合搜索" }, { value: "filename", label: "文件名" }, { value: "fulltext", label: "全文" }, { value: "semantic", label: "语义" }]} />
+          <AppSelect ariaLabel="搜索方式" value={mode} onChange={(value) => setPrefs({ mode: value as SearchRequest["mode"] })} options={[{ value: "hybrid", label: "混合搜索" }, { value: "filename", label: "文件名" }, { value: "fulltext", label: "全文" }, { value: "semantic", label: "语义" }]} />
         </label>
         <label>范围
           <AppSelect ariaLabel="选择检索范围" value="" showSearch onChange={addScopeCollection} labelRender={() => (
@@ -157,13 +158,13 @@ export function SearchPage() {
           ]} />
         </label>
         <label>类型
-          <AppSelect ariaLabel="资料类型" value={extension} onChange={setExtension} options={[{ value: "", label: "全部" }, { value: "pdf", label: "PDF" }, { value: "docx", label: "Word" }, { value: "xlsx", label: "Excel" }, { value: "pptx", label: "PPT" }, { value: "md", label: "Markdown" }, { value: "txt", label: "文本" }]} />
+          <AppSelect ariaLabel="资料类型" value={extension} onChange={(value) => setPrefs({ extension: value })} options={[{ value: "", label: "全部" }, { value: "pdf", label: "PDF" }, { value: "docx", label: "Word" }, { value: "xlsx", label: "Excel" }, { value: "pptx", label: "PPT" }, { value: "txt", label: "文本" }, { value: "md", label: "Markdown" }, { value: "png", label: "PNG 图片" }, { value: "jpg", label: "JPG 图片" }, { value: "zip", label: "ZIP" }]} />
         </label>
         <label>时间
-          <AppSelect ariaLabel="修改时间" value={modifiedWindow} onChange={(value) => setModifiedWindow(value as typeof modifiedWindow)} options={[{ value: "all", label: "不限" }, { value: "7", label: "最近7天" }, { value: "30", label: "最近30天" }, { value: "365", label: "最近一年" }]} />
+          <AppSelect ariaLabel="修改时间" value={modifiedWindow} onChange={(value) => setPrefs({ modified_window: value as SearchModifiedWindow })} options={[{ value: "all", label: "不限" }, { value: "7", label: "最近7天" }, { value: "30", label: "最近30天" }, { value: "365", label: "最近一年" }]} />
         </label>
         <label>排序
-          <AppSelect ariaLabel="结果排序" value={sort} onChange={(value) => setSort(value as SearchRequest["sort"])} options={[{ value: "relevance", label: "相关性" }, { value: "modified_desc", label: "最近修改" }, { value: "name_asc", label: "文件名" }]} />
+          <AppSelect ariaLabel="结果排序" value={sort} onChange={(value) => setPrefs({ sort: value as SearchRequest["sort"] })} options={[{ value: "relevance", label: "相关性" }, { value: "modified_desc", label: "最近修改" }, { value: "name_asc", label: "文件名" }]} />
         </label>
         {scopeCollectionIds.length > 0 && <div className="search-filters__tags">
           {scopeCollectionIds.map((collectionId) => {
@@ -179,9 +180,9 @@ export function SearchPage() {
         <div className="search-status">
           <span>找到 {session.results.length} 个结果</span>
           <span>
-            文件名 {session.channels.filename === "completed" ? "✓" : "—"}　
-            全文 {session.channels.fulltext === "completed" ? "✓" : "—"}　
-            {session.channels.semantic === "unavailable" ? "语义搜索未启用，已自动使用名称与全文" : "语义搜索 ✓"}
+            文件名 {session.channels.filename === "completed" ? "✓" : "—"}
+            {"　"}全文 {session.channels.fulltext === "completed" ? "✓" : "—"}
+            {"　"}{session.channels.semantic === "unavailable" ? "语义搜索未启用，已自动使用名称与全文" : "语义搜索 ✓"}
           </span>
         </div>
       )}

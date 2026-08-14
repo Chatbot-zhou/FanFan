@@ -1,21 +1,21 @@
-import { AudioOutlined, CaretRightOutlined, CloseOutlined, DownloadOutlined, EllipsisOutlined, FileSearchOutlined, PauseOutlined, QuestionCircleOutlined, SendOutlined, SoundOutlined, StopOutlined, UserOutlined, WarningOutlined } from "@ant-design/icons";
+import { AudioOutlined, CaretRightOutlined, CloseOutlined, CopyOutlined, EllipsisOutlined, FileSearchOutlined, FileTextOutlined, PauseOutlined, QuestionCircleOutlined, SendOutlined, SoundOutlined, StopOutlined, UserOutlined, WarningOutlined } from "@ant-design/icons";
 import { Dropdown, Input, Modal } from "antd";
 import { isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { save } from "@tauri-apps/plugin-dialog";
 import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { bridge, type AnswerResult, type AskSessionSummary, type CollectionRecord, type FilePreview, type ImageDeepAnalysis, type ModelRuntimeState, type RagReadiness } from "../bridge";
+import { bridge, type AnswerResult, type AskSessionSummary, type CollectionRecord, type FilePreview, type ModelRuntimeState, type RagReadiness } from "../bridge";
 import { RUNTIME_EVENTS } from "../bridge/runtime-events";
 import { displayPath } from "../utils/display-path";
 import { extractQuestionTerms, highlightPlainTerms } from "../utils/query-terms";
 import { PdfVisualPreview } from "../components/PdfVisualPreview";
 import { OcrAttemptChain } from "../components/OcrAttemptChain";
-import { ImageAssetGallery, imageAssetUrl } from "../components/ImageAssetGallery";
+import { ImageAssetGallery } from "../components/ImageAssetGallery";
 import { confirmAction } from "../components/AppConfirm";
 import { AppSelect } from "../components/AppSelect";
 import { errorMessage } from "../utils/app-error";
+import { useAppStore, type AskTurn } from "../state/app-store";
 import fanfanLogo from "../assets/fanfan-logo.png";
 
 const locatorLabel = (locator: AnswerResult["claims"][number]["citations"][number]["locator"]) => {
@@ -46,14 +46,75 @@ const MarkdownAnswer = ({ text, question }: { text: string; question: string }) 
   <ReactMarkdown remarkPlugins={[remarkGfm]}>{highlightQuestionTerms(text, question)}</ReactMarkdown>
 );
 
+// 引用文件过多（超过阈值）时折叠为单个"引用了 N 个文件"胶囊，点击展开
+const REFS_COLLAPSE_THRESHOLD = 3;
+
+// 回答下方的引用文件标签：胶囊排列在操作栏（导出/朗读）最左侧；
+// 点击文件胶囊展开该文件被引用的具体事实（润色句）与原文（quote），
+// 每条可"查看原文"跳转整页预览。
+function AnswerReferences({ answer, question, expanded, activeFile, onToggleRefs, onSelectFile, onOpenPreview }: {
+  answer: AnswerResult;
+  question: string;
+  expanded: boolean;
+  activeFile: string | null;
+  onToggleRefs: () => void;
+  onSelectFile: (fileId: string | null) => void;
+  onOpenPreview: (fileId: string, nodeId: string) => void;
+}) {
+  const files = answer.source_files;
+  if (files.length === 0) return null;
+  const collapsed = files.length > REFS_COLLAPSE_THRESHOLD && !expanded;
+  const citationsOf = (fileId: string) => answer.claims
+    .flatMap((claim) => claim.citations.map((citation) => ({ claimText: claim.text, citation })))
+    .filter((item) => item.citation.file_id === fileId);
+  return (
+    <div className="answer-refs">
+      {collapsed ? (
+        <button type="button" className="source-chip source-chip--collapse" onClick={onToggleRefs} title="展开全部引用文件">
+          <FileTextOutlined /> 引用了 {files.length} 个文件
+        </button>
+      ) : (
+        files.map((source) => (
+          <button
+            key={source.file_id}
+            type="button"
+            className={`source-chip${activeFile === source.file_id ? " source-chip--active" : ""}`}
+            title={source.display_path}
+            onClick={() => onSelectFile(activeFile === source.file_id ? null : source.file_id)}
+          >
+            <FileTextOutlined /> {source.display_name}
+          </button>
+        ))
+      )}
+      {activeFile !== null && (
+        <div className="answer-ref-detail">
+          <h2>{files.find((file) => file.file_id === activeFile)?.display_name ?? "引用详情"}</h2>
+          {citationsOf(activeFile).map((item, index) => (
+            <section key={`${item.citation.evidence_id}-${index}`}>
+              <div className="markdown-body"><MarkdownAnswer text={item.claimText} question={question} /></div>
+              <blockquote className="answer-ref-quote">{item.citation.quote}</blockquote>
+              <div className="answer-ref-detail__meta">
+                <small>{locatorLabel(item.citation.locator)}</small>
+                <button type="button" className="text-button" onClick={() => onOpenPreview(item.citation.file_id, item.citation.node_id)}>查看原文</button>
+              </div>
+            </section>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 const ASK_PHASE_LABELS: Record<string, string> = {
   queued: "正在进入本地问答队列",
+  intent_routing: "正在判断问题意图",
+  chat_generating: "正在生成回复",
   understanding: "正在理解问题",
   evidence_retrieval: "正在查找原文证据",
   hybrid_retrieval: "正在执行混合检索",
   reranking: "正在重排候选证据",
   evidence_selection: "正在筛选证据",
-  image_reanalysis: "正在按当前问题复核候选原图",
+  image_reanalysis: "正在复核候选原图",
   generating: "正在依据证据组织回答",
   citation_validation: "正在逐句核验引用",
   citation_structure_repair: "正在修复引用格式",
@@ -87,7 +148,7 @@ const UserMessage = ({ text }: { text: string }) => (
     <div className="chat-avatar chat-avatar--user"><UserOutlined /></div>
     <div className="chat-message__main">
       <span className="chat-message__name">我</span>
-      <div className="chat-bubble chat-bubble--user">{highlightPlainTerms(text, text)}</div>
+      <div className="chat-bubble chat-bubble--user">{text}</div>
     </div>
   </div>
 );
@@ -104,28 +165,38 @@ const AssistantMessage = ({ children }: { children: ReactNode }) => (
 );
 
 export function AskPage({ model_state }: { model_state: ModelRuntimeState | null }) {
+  // 问答会话（对话轮次、进行中状态、检索范围）放在全局 store，切换页面后回来仍保留
   const [question, setQuestion] = useState("");
-  const [turns, setTurns] = useState<Array<{ question: string; answer: AnswerResult }>>([]);
-  const [pendingQuestion, setPendingQuestion] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [streamedAnswer, setStreamedAnswer] = useState("");
-  const [activePhase, setActivePhase] = useState("queued");
+  const turns = useAppStore((state) => state.ask_turns);
+  const setTurns = useAppStore((state) => state.set_ask_turns);
+  const pendingQuestion = useAppStore((state) => state.ask_pending_question);
+  const setPendingQuestion = useAppStore((state) => state.set_ask_pending_question);
+  const loading = useAppStore((state) => state.ask_loading);
+  const setLoading = useAppStore((state) => state.set_ask_loading);
+  const streamedAnswer = useAppStore((state) => state.ask_streamed_answer);
+  const setStreamedAnswer = useAppStore((state) => state.set_ask_streamed_answer);
+  const activePhase = useAppStore((state) => state.ask_active_phase);
+  const setActivePhase = useAppStore((state) => state.set_ask_active_phase);
+  const activeSessionId = useAppStore((state) => state.ask_active_session_id);
+  const setActiveSessionId = useAppStore((state) => state.set_ask_active_session_id);
+  const scopeCollectionIds = useAppStore((state) => state.ask_scope_collection_ids);
+  const setScopeCollectionIds = useAppStore((state) => state.set_ask_scope_collection_ids);
+  const setAskOperationId = useAppStore((state) => state.set_ask_operation_id);
+  const resetAskState = useAppStore((state) => state.reset_ask_state);
   const [sessions, setSessions] = useState<AskSessionSummary[]>([]);
-  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [renameTarget, setRenameTarget] = useState<AskSessionSummary | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const [lastFailedQuestion, setLastFailedQuestion] = useState<string | null>(null);
   const activeOperationRef = useRef<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [collections, setCollections] = useState<CollectionRecord[]>([]);
-  const [scopeCollectionIds, setScopeCollectionIds] = useState<string[]>([]);
   const [preview, setPreview] = useState<FilePreview | null>(null);
   const [previewLoading, setPreviewLoading] = useState<string | null>(null);
   const [readiness, setReadiness] = useState<RagReadiness | null>(null);
-  const [deepAnalyses, setDeepAnalyses] = useState<Record<string, ImageDeepAnalysis>>({});
-  const [deepAnalysisLoading, setDeepAnalysisLoading] = useState<string | null>(null);
-  const [exportingMessageId, setExportingMessageId] = useState<string | null>(null);
-  const [exportMessage, setExportMessage] = useState<string | null>(null);
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  // 每条回答的引用文件标签状态：折叠区是否展开、正在查看引文的文件
+  const [refsExpanded, setRefsExpanded] = useState<Record<string, boolean>>({});
+  const [activeRefFile, setActiveRefFile] = useState<Record<string, string | null>>({});
   const [recording, setRecording] = useState(false);
   const [recognizing, setRecognizing] = useState(false);
   const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
@@ -141,10 +212,10 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
   const scope = useMemo(() => ({ root_ids: [], collection_ids: scopeCollectionIds, file_ids: [], extensions: [], modified_from: null, modified_to: null, availability: "present" as const }), [scopeCollectionIds]);
   const addScopeCollection = (value: string) => {
     if (!value || scopeCollectionIds.includes(value)) return;
-    setScopeCollectionIds((current) => [...current, value]);
+    setScopeCollectionIds([...scopeCollectionIds, value]);
   };
   const removeScopeCollection = (collectionId: string) => {
-    setScopeCollectionIds((current) => current.filter((id) => id !== collectionId));
+    setScopeCollectionIds(scopeCollectionIds.filter((id) => id !== collectionId));
   };
 
   const conversationRef = useRef<HTMLDivElement>(null);
@@ -156,7 +227,7 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
     // 内容溢出时才显示滚动条，否则隐藏
     const overflow = element.scrollHeight > element.clientHeight + 2;
     element.classList.toggle("conversation-area--scrollable", overflow);
-  }, [turns, pendingQuestion, streamedAnswer, loading, error, preview, deepAnalyses]);
+  }, [turns, pendingQuestion, streamedAnswer, loading, error, preview]);
   useEffect(() => {
     const element = conversationRef.current;
     if (!element) return;
@@ -193,7 +264,7 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
     setError(null);
     try {
       const page = await bridge.ask_message_query(sessionId, null, 200);
-      const loadedTurns: Array<{ question: string; answer: AnswerResult }> = [];
+      const loadedTurns: AskTurn[] = [];
       let pendingUser = "";
       let failedQuestion: string | null = null;
       for (const message of page.items) {
@@ -208,12 +279,15 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
           pendingUser = "";
         }
       }
+      setAskOperationId(null);
+      setLoading(false);
+      setStreamedAnswer("");
+      setActivePhase("queued");
       setTurns(loadedTurns);
       setLastFailedQuestion(failedQuestion);
       setActiveSessionId(sessionId);
       setPendingQuestion(null);
       setPreview(null);
-      setDeepAnalyses({});
       const selected = knownSession ?? sessions.find((session) => session.session_id === sessionId);
       if (selected) {
         setScopeCollectionIds(selected.scope.collection_ids ?? []);
@@ -229,7 +303,10 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
       if (disposed) return;
       setSessions(page.items);
       const latest = page.items[0];
-      if (latest) void loadSession(latest.session_id, latest);
+      // 若问答操作仍在进行（状态在全局 store 中，由提交循环继续驱动），不覆盖恢复中的会话
+      const state = useAppStore.getState();
+      const busy = state.ask_loading || state.ask_pending_question !== null;
+      if (latest && !busy) void loadSession(latest.session_id, latest);
     }).catch((actionError) => {
       if (!disposed) setError(errorMessage(actionError));
     });
@@ -239,12 +316,8 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
   }, []);
 
   const startNewSession = () => {
-    setActiveSessionId(null);
-    setTurns([]);
-    setPendingQuestion(null);
-    setLastFailedQuestion(null);
+    resetAskState();
     setPreview(null);
-    setDeepAnalyses({});
     setError(null);
   };
 
@@ -263,13 +336,15 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
     let disposed = false;
     const unlisteners: Array<() => void> = [];
     void listen<{ operation_id: string; token: string }>(RUNTIME_EVENTS.askToken, (event) => {
-      if (event.payload.operation_id === activeOperationRef.current) {
-        setStreamedAnswer((current) => current + event.payload.token);
+      const state = useAppStore.getState();
+      if (event.payload.operation_id === state.ask_operation_id) {
+        useAppStore.setState({ ask_streamed_answer: state.ask_streamed_answer + event.payload.token });
       }
     }).then((unlisten) => disposed ? unlisten() : unlisteners.push(unlisten));
     void listen<{ operation_id: string; phase: string; progress: number }>(RUNTIME_EVENTS.askPhase, (event) => {
-      if (event.payload.operation_id === activeOperationRef.current) {
-        setActivePhase(event.payload.phase);
+      const state = useAppStore.getState();
+      if (event.payload.operation_id === state.ask_operation_id) {
+        useAppStore.setState({ ask_active_phase: event.payload.phase });
       }
     }).then((unlisten) => disposed ? unlisten() : unlisteners.push(unlisten));
     return () => {
@@ -280,16 +355,14 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
 
   const lastAnswer = turns.at(-1)?.answer;
   const lastQuestion = turns.at(-1)?.question ?? pendingQuestion ?? "";
-  const sourceNames = useMemo(
-    () => new Map(lastAnswer?.source_files.map((source) => [source.file_id, source.display_name]) ?? []),
-    [lastAnswer],
-  );
+  // 意图路由已接入：生成模型就绪且无核心资源压力时，即使索引/Embedding 未就绪也可发送（闲聊路径可行）
+  const chatUnavailable = readiness !== null && !readiness.ready && readiness.blockers.some((blocker) => blocker.code === "RAG_GENERATION_MISSING" || blocker.code === "RAG_CORE_MODE");
 
   const submit = async (questionOverride?: string) => {
     const trimmed = (questionOverride ?? question).trim();
     if (!trimmed || loading) return;
-    if (readiness && !readiness.ready) {
-      setError(readiness.blockers.map((blocker) => blocker.message).join("；") || "完整 RAG 尚未就绪，请先配置生成模型、Embedding 并完成当前范围的语义索引。");
+    if (chatUnavailable) {
+      setError((readiness?.blockers ?? []).map((blocker) => blocker.message).join("；") || "完整 RAG 尚未就绪，请先配置生成模型、Embedding 并完成当前范围的语义索引。");
       setLastFailedQuestion(trimmed);
       return;
     }
@@ -311,13 +384,14 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
         strict_evidence: true,
       });
       activeOperationRef.current = result.operation_id;
+      setAskOperationId(result.operation_id);
       setActivePhase("understanding");
       setStreamedAnswer("");
       while (activeOperationRef.current === result.operation_id) {
         const snapshot = await bridge.ask_operation_get(result.operation_id);
         if (snapshot.handle.status === "completed") {
           if (!snapshot.result) throw new Error("问答已完成，但结果不完整");
-          setTurns((current) => [...current, { question: trimmed, answer: snapshot.result! }]);
+          setTurns([...turns, { question: trimmed, answer: snapshot.result }]);
           setActiveSessionId(snapshot.result.session_id);
           setPendingQuestion(null);
           void refreshSessions().catch(() => undefined);
@@ -335,6 +409,7 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
       void refreshSessions().catch(() => undefined);
     } finally {
       activeOperationRef.current = null;
+      setAskOperationId(null);
       setActivePhase("queued");
       setLoading(false);
     }
@@ -355,33 +430,13 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
     }
   };
 
-  const analyzeOriginalImage = async (assetId: string) => {
-    if (!lastQuestion || deepAnalysisLoading) return;
-    setDeepAnalysisLoading(assetId);
+  const copyAnswer = async (answer: AnswerResult) => {
     setError(null);
     try {
-      const result = await bridge.image_deep_analyze(assetId, lastQuestion);
-      setDeepAnalyses((current) => ({ ...current, [assetId]: result }));
-    } catch (analysisError) {
-      setError(errorMessage(analysisError));
-    } finally {
-      setDeepAnalysisLoading(null);
-    }
-  };
-
-  const exportAnswer = async (answer: AnswerResult) => {
-    setError(null); setExportMessage(null);
-    if (!isTauri()) { setError("浏览器预览不会写入电脑文件，请在翻翻桌面程序中导出。"); return; }
-    const target = await save({ title: "导出翻翻问答结果（只新建，不覆盖）", defaultPath: "翻翻问答结果.md", filters: [{ name: "Markdown", extensions: ["md"] }, { name: "纯文本", extensions: ["txt"] }] });
-    if (typeof target !== "string") return;
-    if (!await confirmAction({ actionKey: "answer_export", title: "导出当前回答？", description: "只会新建一个包含已验证回答与引用的文件；目标已存在时会拒绝覆盖，源文件不会发生任何变化。", confirmLabel: "新建导出文件" })) return;
-    const format = target.toLocaleLowerCase().endsWith(".txt") ? "txt" : "md";
-    setExportingMessageId(answer.message_id);
-    try {
-      const result = await bridge.answer_export(answer.message_id, target, format, "EXPORT_NEW_FILE");
-      setExportMessage(`已新建导出文件 · ${(result.size_bytes / 1024).toFixed(1)} KB · SHA-256 ${result.sha256.slice(0, 12)}…`);
+      await navigator.clipboard.writeText(answer.answer);
+      setCopiedMessageId(answer.message_id);
+      window.setTimeout(() => setCopiedMessageId((current) => current === answer.message_id ? null : current), 1600);
     } catch (actionError) { setError(errorMessage(actionError)); }
-    finally { setExportingMessageId(null); }
   };
 
   const releaseRecordingResources = async () => {
@@ -587,7 +642,7 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
             </span>;
           })}
         </div>
-        {readiness && !readiness.ready && <small className="rag-status-inline">完整 RAG 尚未就绪 · 语义覆盖 {Math.round(readiness.scope_index_coverage * 100)}% · 配置完成后才能发送</small>}
+        {readiness && !readiness.ready && <small className="rag-status-inline">完整 RAG 尚未就绪 · 语义覆盖 {Math.round(readiness.scope_index_coverage * 100)}%{chatUnavailable ? " · 配置完成后才能发送" : " · 可以直接闲聊，资料提问需索引就绪"}</small>}
         <AppSelect className="ask-scope-select" ariaLabel="选择检索范围" value="" showSearch onChange={addScopeCollection} labelRender={() => (
           scopeCollectionIds.length === 0
             ? <span>全部资料</span>
@@ -624,35 +679,21 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
               <div className="chat-bubble chat-bubble--assistant">
                 <div className="markdown-body"><MarkdownAnswer text={turn.answer.answer} question={turn.question} /></div>
                 <div className="answer-actions">
-                  <button type="button" disabled={exportingMessageId !== null} onClick={() => void exportAnswer(turn.answer)}><DownloadOutlined /> {exportingMessageId === turn.answer.message_id ? "正在导出" : "导出当前回答"}</button>
+                  <AnswerReferences
+                    answer={turn.answer}
+                    question={turn.question}
+                    expanded={refsExpanded[turn.answer.message_id] ?? false}
+                    activeFile={activeRefFile[turn.answer.message_id] ?? null}
+                    onToggleRefs={() => setRefsExpanded((prev) => ({ ...prev, [turn.answer.message_id]: !(prev[turn.answer.message_id] ?? false) }))}
+                    onSelectFile={(fileId) => setActiveRefFile((prev) => ({ ...prev, [turn.answer.message_id]: fileId }))}
+                    onOpenPreview={(fileId, nodeId) => void showPreview(fileId, nodeId)}
+                  />
+                  <button type="button" onClick={() => void copyAnswer(turn.answer)}><CopyOutlined /> {copiedMessageId === turn.answer.message_id ? "已复制" : "复制"}</button>
                   <button type="button" disabled={speechLoadingMessageId === turn.answer.message_id} onClick={() => void readAnswer(turn.answer)}>
                     {speechLoadingMessageId === turn.answer.message_id ? <><SoundOutlined /> 正在生成语音</> : speakingMessageId === turn.answer.message_id ? speechPaused ? <><CaretRightOutlined /> 继续朗读</> : <><PauseOutlined /> 暂停朗读</> : <><SoundOutlined /> 朗读</>}
                   </button>
                   {speakingMessageId === turn.answer.message_id && <button type="button" onClick={stopPlayback}><StopOutlined /> 停止</button>}
                 </div>
-                {isLast && turn.answer.claims.length > 0 && <div className="answer-claims">
-                  <h2>引用依据</h2>
-                  {turn.answer.claims.map((claim) => <section key={claim.claim_id}>
-                    <div className="markdown-body"><MarkdownAnswer text={claim.text} question={turn.question} /></div>
-                    <div>{claim.citations.map((citation, claimIndex) => {
-                      const imageAssetId = citation.image_asset_id;
-                      const deepAnalysis = imageAssetId ? deepAnalyses[imageAssetId] : undefined;
-                      return <div className="answer-citation-group" key={citation.evidence_id}>
-                        <button type="button" className={imageAssetId ? "answer-citation answer-citation--image" : "answer-citation"} onClick={() => void showPreview(citation.file_id, citation.node_id)}>
-                          {imageAssetId && <img src={imageAssetUrl(imageAssetId)} alt="图片证据缩略图" loading="lazy" />}
-                          [{claimIndex + 1}] {sourceNames.get(citation.file_id) ?? "本地资料"} · {locatorLabel(citation.locator)}{previewLoading === citation.file_id ? " · 载入中" : ""}
-                        </button>
-                        {imageAssetId && <button type="button" className="image-deep-analysis-button" disabled={deepAnalysisLoading !== null} onClick={() => void analyzeOriginalImage(imageAssetId)}>{deepAnalysisLoading === imageAssetId ? "正在分析原图…" : "深度分析原图"}</button>}
-                        {deepAnalysis && <aside className="image-deep-analysis" aria-live="polite">
-                          <strong>针对当前问题的原图分析</strong>
-                          <div className="markdown-body"><MarkdownAnswer text={deepAnalysis.answer} question={turn.question} /></div>
-                          {deepAnalysis.observations.length > 0 && <ul>{deepAnalysis.observations.map((observation) => <li key={observation}>{observation}</li>)}</ul>}
-                          {deepAnalysis.uncertainties.length > 0 && <small>无法确认：{deepAnalysis.uncertainties.join("；")}</small>}
-                        </aside>}
-                      </div>;
-                    })}</div>
-                  </section>)}
-                </div>}
                 {isLast && preview && <div className="answer-preview" aria-label={`${preview.file.display_name}原文预览`}>
                   <header><strong>{preview.file.display_name}</strong><small>{displayPath(preview.file.display_path)}</small></header>
                   {preview.file.extension.toLowerCase() === "pdf" && <PdfVisualPreview preview={preview} />}
@@ -676,7 +717,6 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
           <div className="chat-bubble chat-bubble--error"><WarningOutlined /> <span>{error}</span>{lastFailedQuestion && !loading && <button type="button" className="text-button" onClick={() => void submit(lastFailedQuestion)}>重试本次提问</button>}</div>
         </AssistantMessage>}
       </div>
-      {exportMessage && <p className="inline-success" role="status">{exportMessage}</p>}
       <form className="ask-composer" onSubmit={(event) => { event.preventDefault(); void submit(); }}>
         <textarea ref={composerRef} value={question} onChange={(event) => setQuestion(event.target.value)} onInput={resizeComposer} onKeyDown={(event) => {
           if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
@@ -692,7 +732,7 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
           disabled={recognizing || loading}
           onClick={() => recording ? void stopRecording(false) : void startRecording()}
         >{recording ? <StopOutlined /> : <AudioOutlined />}</button>
-        <button type="submit" aria-label="发送" disabled={loading || !question.trim() || readiness?.ready === false}><SendOutlined /></button>
+        <button type="submit" aria-label="发送" disabled={loading || !question.trim() || chatUnavailable}><SendOutlined /></button>
       </form>
     </section>
   );

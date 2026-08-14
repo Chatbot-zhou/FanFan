@@ -322,18 +322,82 @@ pub struct RetrievalTrace {
 /// persisted semantic score is cosine similarity mapped from `[-1, 1]` to
 /// `[0, 1]`; 0.70 therefore represents an original cosine similarity of 0.40.
 /// Lexical hits use the normalized BM25 score produced by `search_fulltext`.
+///
+/// `fts_query` expands tokens with OR, so a query that shares a common word
+/// with many chunks (or a gibberish string that happens to split into common
+/// tokens) gets large BM25 hits from weak single-token matches. Those weak
+/// matches must not become evidence: fulltext-only evidence requires the
+/// semantic channel to also support the candidate (>= 0.60, cosine >= 0.20),
+/// while the semantic channel alone still promotes strong neighbours (>= 0.70,
+/// cosine >= 0.40).
 pub(crate) const RAG_MIN_SEMANTIC_SCORE: f32 = 0.70;
+/// 融合排序时每个文件最多参与 RRF 分数累加的内容 chunk 数。
+const MAX_FUSED_CHUNKS_PER_FILE: usize = 3;
+/// 文件名/路径命中（「找文件」类查询的最强信号）在文件级排序时的保底加分，
+/// 保证语义噪声堆叠的大文档不会把真正目标文件挤出前列。
+const FILENAME_MATCH_BOOST: f32 = 2.0;
+pub(crate) const RAG_MIN_SEMANTIC_SUPPORT: f32 = 0.60;
 pub(crate) const RAG_MIN_FULLTEXT_SCORE: f32 = 0.05;
 
-pub(crate) fn candidate_is_relevant_rag_evidence(candidate: &RetrievalCandidate) -> bool {
+/// 查询级整体相关性门槛：乱码/无关查询的 BGE 向量落在模型先验方向上，
+/// 语义 top-1 虚高。2026-08-14 用 eval/calibrate_query_gate.py 对
+/// qa-fixtures 38 道正例 + 13 道寒暄/乱码负例做全量 197,601 块余弦扫描标定：
+/// - 正例 top-1 分布 0.784~0.912，负例 0.768~0.803，二者重叠，margin
+///   无区分力（正负例均 ≤0.032）——因此只保留纯 top-1 门槛 0.80；
+/// - 该门槛放行 35/38 正例（3 道困难查询 top-1 0.784~0.797 且 fulltext
+///   也弱，无法救），拒绝 12/13 负例（唯一误放的「你好」0.803 已被
+///   router::is_pure_greeting 白名单拦截，到不了检索）；
+/// - 0.87（含 margin 分支）在此标定集上误杀 34/38 正例，已废弃。
+/// fulltext 通道单独不设低门槛放行——部分 token 命中（bm25 中等负数）在
+/// 乱码查询上也会出现（实测 0.09-0.22），只有罕见词全部命中的极强全文
+/// 证据（>=0.30）才可作为查询相关的唯一依据（正例实测最高 0.171，正常
+/// 查询不会触发该分支）。
+pub(crate) const RAG_QUERY_RELEVANT_SEMANTIC: f32 = 0.80;
+pub(crate) const RAG_QUERY_RELEVANT_FULLTEXT: f32 = 0.30;
+
+/// 查询级证据存在性判断：候选里最高的语义分（或极高的全文命中）达到
+/// 门槛才认为库里有与查询相关的内容。
+pub(crate) fn query_has_relevant_evidence(candidates: &[RetrievalCandidate]) -> bool {
+    let mut top_semantic = f32::NEG_INFINITY;
+    let mut top_fulltext = f32::NEG_INFINITY;
+    for candidate in candidates {
+        if let Some(score) = candidate.scores.semantic {
+            top_semantic = top_semantic.max(score);
+        }
+        if let Some(score) = candidate.scores.fulltext {
+            top_fulltext = top_fulltext.max(score);
+        }
+    }
+    top_semantic >= RAG_QUERY_RELEVANT_SEMANTIC
+        || top_fulltext >= RAG_QUERY_RELEVANT_FULLTEXT
+}
+
+/// Whether this candidate may serve as RAG evidence, given whether the
+/// semantic engine is available for this query (`semantic_available`). Without
+/// a semantic engine the fulltext channel is the only retrieval path, so the
+/// plain fulltext floor applies.
+pub(crate) fn candidate_is_relevant_rag_evidence(
+    candidate: &RetrievalCandidate,
+    semantic_available: bool,
+) -> bool {
+    if !semantic_available {
+        return candidate
+            .scores
+            .fulltext
+            .is_some_and(|score| score >= RAG_MIN_FULLTEXT_SCORE);
+    }
     candidate
         .scores
-        .fulltext
-        .is_some_and(|score| score >= RAG_MIN_FULLTEXT_SCORE)
-        || candidate
+        .semantic
+        .is_some_and(|score| score >= RAG_MIN_SEMANTIC_SCORE)
+        || (candidate
             .scores
             .semantic
-            .is_some_and(|score| score >= RAG_MIN_SEMANTIC_SCORE)
+            .is_some_and(|score| score >= RAG_MIN_SEMANTIC_SUPPORT)
+            && candidate
+                .scores
+                .fulltext
+                .is_some_and(|score| score >= RAG_MIN_FULLTEXT_SCORE))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -433,6 +497,15 @@ pub(crate) fn fuse_ranked_hits(
             });
     }
     let mut results = by_file.into_values().collect::<Vec<_>>();
+    for result in &mut results {
+        if result
+            .match_reasons
+            .iter()
+            .any(|reason| matches!(reason.as_str(), "filename" | "path"))
+        {
+            result.scores.fused += FILENAME_MATCH_BOOST;
+        }
+    }
     match sort {
         SearchSort::Relevance => results.sort_by(|left, right| {
             right
@@ -466,36 +539,51 @@ pub(crate) fn fuse_retrieval_candidates(
     limit: usize,
 ) -> Vec<RetrievalCandidate> {
     let mut fused: HashMap<(Uuid, Option<Uuid>), RetrievalCandidate> = HashMap::new();
+    // 每文件最多让 MAX_FUSED_CHUNKS_PER_FILE 个内容 chunk 参与 RRF 累加：
+    // 防止大文档（论文/报告）靠 chunk 数量刷分霸榜，单次强命中的小文件被淹没。
+    let mut per_file_chunk_count = HashMap::<Uuid, usize>::new();
     for channel in channels {
         for (rank, hit) in channel.iter().enumerate() {
             let weight = match hit.reason {
+                "filename" | "path" => 1.3,
                 "semantic" => 1.15,
                 "fulltext" => 1.0,
                 _ => 0.7,
             };
             let reciprocal_rank = weight / (60.0 + rank as f32 + 1.0);
-            let entry = fused
-                .entry((hit.file.file_id, hit.chunk_id))
-                .or_insert_with(|| RetrievalCandidate {
-                    file_id: hit.file.file_id,
-                    chunk_id: hit.chunk_id,
-                    revision_id: hit.revision_id,
-                    name: hit.file.display_name.clone(),
-                    extension: hit.file.extension.clone(),
-                    path: hit.file.canonical_path.clone(),
-                    modified_at: hit.file.fs_modified_at,
-                    snippet: hit.snippet.clone(),
-                    match_reasons: Vec::new(),
-                    locator: hit.locator.clone(),
-                    scores: SearchScore {
-                        filename: None,
-                        fulltext: None,
-                        semantic: None,
-                        fused: 0.0,
-                    },
-                    rank: 0,
-                });
-            entry.scores.fused += reciprocal_rank;
+            let fused_key = (hit.file.file_id, hit.chunk_id);
+            let is_new_chunk = !fused.contains_key(&fused_key);
+            let mut accumulate_rank = true;
+            if is_new_chunk && hit.chunk_id.is_some() {
+                let count = per_file_chunk_count.entry(hit.file.file_id).or_insert(0);
+                if *count >= MAX_FUSED_CHUNKS_PER_FILE {
+                    accumulate_rank = false;
+                } else {
+                    *count += 1;
+                }
+            }
+            let entry = fused.entry(fused_key).or_insert_with(|| RetrievalCandidate {
+                file_id: hit.file.file_id,
+                chunk_id: hit.chunk_id,
+                revision_id: hit.revision_id,
+                name: hit.file.display_name.clone(),
+                extension: hit.file.extension.clone(),
+                path: hit.file.canonical_path.clone(),
+                modified_at: hit.file.fs_modified_at,
+                snippet: hit.snippet.clone(),
+                match_reasons: Vec::new(),
+                locator: hit.locator.clone(),
+                scores: SearchScore {
+                    filename: None,
+                    fulltext: None,
+                    semantic: None,
+                    fused: 0.0,
+                },
+                rank: 0,
+            });
+            if accumulate_rank {
+                entry.scores.fused += reciprocal_rank;
+            }
             if !entry
                 .match_reasons
                 .iter()
@@ -688,6 +776,23 @@ fn estimated_token_count(text: &str) -> u64 {
     text.chars().map(token_weight).sum::<f32>().ceil().max(1.0) as u64
 }
 
+/// 按切块同一套估算权重截取前 `max_tokens` token 的文本。
+/// 用于相邻块上下文：邻居块全文可能接近 480 token，注入答案前先压到
+/// 固定上限，避免把生成上下文窗口撑爆。
+pub(crate) fn cap_by_estimated_tokens(text: &str, max_tokens: u64) -> String {
+    let mut weight = 0.0_f32;
+    let mut length = 0;
+    for (index, character) in text.chars().enumerate() {
+        let next = weight + token_weight(character);
+        if next.ceil() > max_tokens as f32 {
+            break;
+        }
+        weight = next;
+        length = index + 1;
+    }
+    text.chars().take(length).collect()
+}
+
 fn token_weight(value: char) -> f32 {
     if value.is_whitespace() {
         0.0
@@ -861,7 +966,7 @@ mod tests {
             10,
         )
         .remove(0);
-        assert!(!candidate_is_relevant_rag_evidence(&weak));
+        assert!(!candidate_is_relevant_rag_evidence(&weak, true));
 
         let strong = fuse_retrieval_candidates(
             &[vec![ranked_hit(
@@ -874,12 +979,55 @@ mod tests {
             10,
         )
         .remove(0);
-        assert!(candidate_is_relevant_rag_evidence(&strong));
+        assert!(candidate_is_relevant_rag_evidence(&strong, true));
     }
 
     #[test]
-    fn strict_rag_keeps_lexical_evidence_above_the_floor() {
-        let lexical = fuse_retrieval_candidates(
+    fn strict_rag_keeps_lexical_evidence_with_semantic_support() {
+        // A fulltext hit that the semantic channel also supports is evidence.
+        let file_id = Uuid::now_v7();
+        let chunk_id = Uuid::now_v7();
+        let supported = fuse_retrieval_candidates(
+            &[
+                vec![ranked_hit(file_id, chunk_id, "semantic", 0.65, "shared chunk")],
+                vec![ranked_hit(
+                    file_id,
+                    chunk_id,
+                    "fulltext",
+                    0.25,
+                    "exact phrase from the document",
+                )],
+            ],
+            10,
+        )
+        .remove(0);
+        assert!(candidate_is_relevant_rag_evidence(&supported, true));
+
+        // Without a semantic engine the fulltext channel is the only
+        // retrieval path, so the plain floor applies.
+        assert!(candidate_is_relevant_rag_evidence(&supported, false));
+
+        // Semantic support below the floor: the lexical hit is too weak to
+        // stand on its own.
+        let unsupported = fuse_retrieval_candidates(
+            &[
+                vec![ranked_hit(file_id, chunk_id, "semantic", 0.55, "shared chunk")],
+                vec![ranked_hit(
+                    file_id,
+                    chunk_id,
+                    "fulltext",
+                    0.25,
+                    "exact phrase from the document",
+                )],
+            ],
+            10,
+        )
+        .remove(0);
+        assert!(!candidate_is_relevant_rag_evidence(&unsupported, true));
+
+        // A pure lexical hit -- e.g. a chunk that only matched an OR-expanded
+        // common token -- carries no semantic score and is not evidence.
+        let lexical_only = fuse_retrieval_candidates(
             &[vec![ranked_hit(
                 Uuid::now_v7(),
                 Uuid::now_v7(),
@@ -890,7 +1038,128 @@ mod tests {
             10,
         )
         .remove(0);
-        assert!(candidate_is_relevant_rag_evidence(&lexical));
+        assert!(!candidate_is_relevant_rag_evidence(&lexical_only, true));
+    }
+
+    #[test]
+    fn query_level_relevance_gate_rejects_gibberish() {
+        // 真实查询的语义 top-1 明显领先（实测 0.90+）：强语义命中放行。
+        let strong = fuse_retrieval_candidates(
+            &[
+                vec![
+                    ranked_hit(
+                        Uuid::now_v7(),
+                        Uuid::now_v7(),
+                        "semantic",
+                        0.9018,
+                        "产品定位",
+                    ),
+                    ranked_hit(
+                        Uuid::now_v7(),
+                        Uuid::now_v7(),
+                        "semantic",
+                        0.8889,
+                        "产品规划",
+                    ),
+                ],
+            ],
+            10,
+        );
+        assert!(query_has_relevant_evidence(&strong));
+
+        // 乱码查询：真实标定（calibrate_query_gate.py）中乱码/闲聊的 top-1
+        // 在 0.768~0.803，与正例重叠但都低于 0.80 门槛——必须拒绝。
+        let gibberish = fuse_retrieval_candidates(
+            &[vec![
+                ranked_hit(
+                    Uuid::now_v7(),
+                    Uuid::now_v7(),
+                    "semantic",
+                    0.7752,
+                    "重命名.png",
+                ),
+                ranked_hit(
+                    Uuid::now_v7(),
+                    Uuid::now_v7(),
+                    "semantic",
+                    0.7713,
+                    "查看属性.png",
+                ),
+                ranked_hit(
+                    Uuid::now_v7(),
+                    Uuid::now_v7(),
+                    "semantic",
+                    0.7690,
+                    "逐字稿",
+                ),
+            ]],
+            10,
+        );
+        assert!(!query_has_relevant_evidence(&gibberish));
+
+        // 中语义 0.80 整（真实正例最低档）：视为相关。
+        let leading = fuse_retrieval_candidates(
+            &[
+                vec![
+                    ranked_hit(
+                        Uuid::now_v7(),
+                        Uuid::now_v7(),
+                        "semantic",
+                        0.80,
+                        "报销流程",
+                    ),
+                    ranked_hit(
+                        Uuid::now_v7(),
+                        Uuid::now_v7(),
+                        "semantic",
+                        0.60,
+                        "其他文档",
+                    ),
+                ],
+            ],
+            10,
+        );
+        assert!(query_has_relevant_evidence(&leading));
+
+        // 极强全文命中（罕见词全部命中，>= 0.30）单独放行。
+        let exact_phrase = fuse_retrieval_candidates(
+            &[vec![ranked_hit(
+                Uuid::now_v7(),
+                Uuid::now_v7(),
+                "fulltext",
+                0.35,
+                "全库唯一精确命中",
+            )]],
+            10,
+        );
+        assert!(query_has_relevant_evidence(&exact_phrase));
+
+        // 弱语义（0.79 < 门槛）+ 部分 token 弱全文（0.22 < 0.30）：拒绝。
+        let weak_lexical = fuse_retrieval_candidates(
+            &[
+                vec![
+                    ranked_hit(
+                        Uuid::now_v7(),
+                        Uuid::now_v7(),
+                        "semantic",
+                        0.79,
+                        "共享 chunk",
+                    ),
+                    ranked_hit(
+                        Uuid::now_v7(),
+                        Uuid::now_v7(),
+                        "fulltext",
+                        0.221,
+                        "movies.csv 部分 token",
+                    ),
+                ],
+            ],
+            10,
+        );
+        assert!(!query_has_relevant_evidence(&weak_lexical));
+
+        // 空候选：无证据。
+        assert!(!query_has_relevant_evidence(&[]));
     }
 
     #[test]

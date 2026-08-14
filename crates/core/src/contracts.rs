@@ -400,6 +400,14 @@ pub struct EvidenceRef {
     #[serde(default)]
     pub image_asset_id: Option<Uuid>,
     pub quote: String,
+    /// 命中块在原文中紧邻的前一块文本（同节点 ordinal-1，已按 token 上限截断）。
+    /// 只用于让生成模型理解线性上下文，不作为可引用证据。
+    #[serde(default)]
+    pub context_before: Option<String>,
+    /// 命中块在原文中紧邻的后一块文本（同节点 ordinal+1，已按 token 上限截断）。
+    /// 只用于让生成模型理解线性上下文，不作为可引用证据。
+    #[serde(default)]
+    pub context_after: Option<String>,
     pub locator: SourceLocator,
     pub retrieval_score: f32,
 }
@@ -550,6 +558,62 @@ impl DegradationState {
                     | (DegradationLevel::Core, DegradationLevel::Balanced)
             )
     }
+}
+
+/// 一次链路节点的输入输出快照（用于复盘优化，明文存储）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NodeTraceRecord {
+    pub trace_id: String,
+    /// ask | search | relation | collection
+    pub flow: String,
+    pub node: String,
+    /// 一次用户操作的关联键（Ask 用 operation_id，其余用现有 correlation_id）
+    pub correlation_id: String,
+    pub session_id: Option<String>,
+    /// suggestion_id / claim 序号等，按节点类型而异
+    pub entity_id: Option<String>,
+    pub input_json: Value,
+    pub output_json: Value,
+    /// ok | error
+    pub status: String,
+    pub elapsed_ms: Option<u64>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeTraceQuery {
+    pub flow: Option<String>,
+    pub node: Option<String>,
+    pub cursor: Option<String>,
+    pub page_size: u32,
+}
+
+impl NodeTraceQuery {
+    pub fn validate(&self) -> Result<(), AppError> {
+        if !(1..=500).contains(&self.page_size) {
+            return Err(AppError::new(
+                "NODE_TRACE_LIMIT_INVALID",
+                "追踪记录读取数量需要在1到500之间",
+                false,
+            ));
+        }
+        self.offset().map(|_| ())
+    }
+
+    pub fn offset(&self) -> Result<u64, AppError> {
+        self.cursor
+            .as_deref()
+            .unwrap_or("0")
+            .parse::<u64>()
+            .map_err(|_| AppError::new("NODE_TRACE_CURSOR_INVALID", "追踪记录分页游标无效", false))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NodeTracePage {
+    pub items: Vec<NodeTraceRecord>,
+    pub next_cursor: Option<String>,
+    pub total: u64,
 }
 
 #[cfg(test)]

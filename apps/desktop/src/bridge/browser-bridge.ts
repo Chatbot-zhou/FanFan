@@ -558,6 +558,8 @@ export const browserBridge: FanFanBridge = {
           chunk_id: crypto.randomUUID(),
           image_asset_id: null,
           quote: match.snippet,
+          context_before: "",
+          context_after: "",
           locator: match.locator!,
           retrieval_score: match.scores.fused,
         }],
@@ -768,9 +770,9 @@ export const browserBridge: FanFanBridge = {
   async collection_suggestion_refresh() {
     if (demoSuggestions.length === 0) {
       const members = demoFileRecords().slice(0, 2).map((file, index) => ({ file, revision_id: file.current_revision_id!, confidence: index === 0 ? 1 : 0.86, rationale: index === 0 ? "该文档是本组语义质心候选" : "与组内核心文档的语义相似度为 86%", state: "suggested" }));
-      demoSuggestions = [{ suggestion_id: crypto.randomUUID(), suggested_name: "RAG 检索优化资料", description: "这些资料的语义画像都在讨论混合召回与检索效果。确认后只在翻翻中形成虚拟分类。", confidence: 0.86, status: "suggested", model_version: "demo-bge-small-zh-v1.5", algorithm_version: "semantic_lsh_v2", members, created_at: now(), updated_at: now() }];
+      demoSuggestions = [{ suggestion_id: crypto.randomUUID(), suggested_name: "RAG 检索优化资料", description: "这些资料的语义画像都在讨论混合召回与检索效果。确认后只在翻翻中形成虚拟分类。", confidence: 0.86, status: "suggested", model_version: "demo-bge-small-zh-v1.5", algorithm_version: "semantic_cluster_v3", members, created_at: now(), updated_at: now() }];
     }
-    return { profiled_files: 2, candidate_edges: 1, created_suggestions: demoSuggestions.length, suggestion_ids: demoSuggestions.map((item) => item.suggestion_id), algorithm_version: "semantic_lsh_v2", model_version: "demo-bge-small-zh-v1.5" };
+    return { profiled_files: 2, candidate_edges: 1, created_suggestions: demoSuggestions.length, suggestion_ids: demoSuggestions.map((item) => item.suggestion_id), algorithm_version: "semantic_cluster_v3", model_version: "demo-bge-small-zh-v1.5", topic_groups: 1, remaining_topic_groups: 0 };
   },
   async collection_suggestion_query(cursor, page_size, status = "suggested") {
     const filtered = demoSuggestions.filter((item) => item.status === status);
@@ -804,7 +806,7 @@ export const browserBridge: FanFanBridge = {
     current.updated_at = now();
   },
   async relation_refresh() {
-    return { hashed_files: 2, exact_duplicate_pairs: 1, version_candidate_pairs: 1, semantic_related_pairs: 2, contains_or_summarizes_pairs: 1 };
+    return { hashed_files: 2, exact_duplicate_pairs: 1, version_candidate_pairs: 1, semantic_related_pairs: 2, contains_or_summarizes_pairs: 1, groups_created: 1 };
   },
   async relation_query() {
     return { items: [], next_cursor: null, total: 0 };
@@ -814,6 +816,15 @@ export const browserBridge: FanFanBridge = {
   },
   async relation_batch_review(relation_ids) {
     return relation_ids.length;
+  },
+  async relation_group_query() {
+    return { items: [], next_cursor: null, total: 0 };
+  },
+  async relation_group_review() {
+    return undefined;
+  },
+  async relation_group_batch_review(group_ids) {
+    return group_ids.length;
   },
   async file_query(request) {
     const normalizedQuery = request.query?.trim().toLocaleLowerCase("zh-CN") ?? "";
@@ -881,6 +892,44 @@ export const browserBridge: FanFanBridge = {
   },
   async maintenance_logs_clear() {
     return 1;
+  },
+  async node_trace_query(request) {
+    const flow = request.flow ?? "ask";
+    return {
+      items: [
+        {
+          trace_id: "trace-demo-1",
+          flow,
+          node: "routing",
+          correlation_id: "demo-correlation",
+          session_id: null,
+          entity_id: null,
+          input_json: { question: "你好" },
+          output_json: { intent: "Retrieval", top_score: 0.466, margin: 0.066, router_active: true },
+          status: "ok",
+          elapsed_ms: 12,
+          created_at: now(),
+        },
+        {
+          trace_id: "trace-demo-2",
+          flow,
+          node: "retrieval",
+          correlation_id: "demo-correlation",
+          session_id: null,
+          entity_id: null,
+          input_json: { question: "你好", retrieval_limit: 10 },
+          output_json: { channels: ["filename", "fts", "embedding", "rrf", "mmr"], candidates: [{ quote: "……", citations: 1 }], insufficient_evidence: false },
+          status: "ok",
+          elapsed_ms: 3200,
+          created_at: now(),
+        },
+      ],
+      next_cursor: null,
+      total: 2,
+    };
+  },
+  async node_trace_clear() {
+    return 2;
   },
   async diagnostic_event_append() {},
   async diagnostic_export() {

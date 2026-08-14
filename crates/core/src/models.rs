@@ -27,6 +27,7 @@ pub enum ModelRole {
     Ocr,
     Tts,
     Asr,
+    Router,
 }
 
 impl ModelRole {
@@ -39,6 +40,7 @@ impl ModelRole {
             Self::Ocr => "ocr",
             Self::Tts => "tts",
             Self::Asr => "asr",
+            Self::Router => "router",
         }
     }
 }
@@ -765,6 +767,14 @@ impl ModelManager {
                 required_for: "语义检索与文档关系".into(),
                 optional: false,
                 load_policy: "background_index".into(),
+            },
+            ModelRoleConfig {
+                role: ModelRole::Router,
+                // 意图路由是合成角色：复用 Embedding 编码器做 few-shot 语义路由，无独立模型
+                active_artifact_id: active(ModelRole::Embedding),
+                required_for: "提问意图路由（闲聊走对话、检索走RAG）".into(),
+                optional: true,
+                load_policy: "on_demand".into(),
             },
             ModelRoleConfig {
                 role: ModelRole::Vision,

@@ -44,6 +44,10 @@ export interface EvidenceRef {
   chunk_id: string;
   image_asset_id: string | null;
   quote: string;
+  /** 命中块在原文中紧邻的前/后一块文本（同节点，已按 token 上限截断）。
+   *  仅用于生成模型理解线性上下文，不作为可引用证据。 */
+  context_before: string | null;
+  context_after: string | null;
   locator: SourceLocator;
   retrieval_score: number;
 }
@@ -320,7 +324,7 @@ export interface SpeechSynthesisSession {
   completed_at: UtcDateTime;
 }
 
-export type ModelRole = "generation" | "embedding" | "vision" | "reranker" | "ocr" | "tts" | "asr";
+export type ModelRole = "generation" | "embedding" | "vision" | "reranker" | "ocr" | "tts" | "asr" | "router";
 export type ModelFormat = "gguf" | "onnx";
 
 export interface ImportCandidate {
@@ -645,7 +649,7 @@ export interface AnswerResult {
   source_files: AnswerSourceFile[];
   used_file_ids: string[];
   elapsed_ms: number;
-  answer_mode: "generated" | "rag_refusal";
+  answer_mode: "extractive" | "generated" | "rag_refusal" | "chat" | "unverified";
   retrieval_channels: string[];
   index_coverage: number;
   degradation_reason: string | null;
@@ -804,6 +808,10 @@ export interface CollectionSuggestionPage {
 export interface CollectionSuggestionRefreshResult {
   profiled_files: number;
   candidate_edges: number;
+  /** 本次聚类发现的同主题/同用途分组数（已排除被已确认/已拒绝建议消费过的文件）。 */
+  topic_groups: number;
+  /** 聚类发现但本批未展示的分组数（受每批建议数上限约束）。 */
+  remaining_topic_groups: number;
   created_suggestions: number;
   suggestion_ids: string[];
   algorithm_version: string;
@@ -848,6 +856,41 @@ export interface RelationRefreshResult {
   version_candidate_pairs: number;
   semantic_related_pairs: number;
   contains_or_summarizes_pairs: number;
+  groups_created: number;
+}
+
+export type RelationGroupType = "duplicate" | "version_family" | "summary_group" | "topic_group" | "mixed";
+export type RelationGroupRole = "latest" | "copy" | "summary" | "source" | "member";
+
+export interface RelationGroupMemberRecord {
+  file_id: string;
+  role: RelationGroupRole;
+  file: FileRecord;
+}
+
+export interface RelationGroupRecord {
+  group_id: string;
+  group_type: RelationGroupType;
+  title: string;
+  confidence: number;
+  member_count: number;
+  review_status: string;
+  created_at: UtcDateTime;
+  updated_at: UtcDateTime;
+  members: RelationGroupMemberRecord[];
+}
+
+export interface RelationGroupQuery {
+  cursor: string | null;
+  page_size: number;
+  group_type?: RelationGroupType | null;
+  review_status?: "suggested" | "accepted" | "rejected" | null;
+}
+
+export interface RelationGroupPage {
+  items: RelationGroupRecord[];
+  next_cursor: string | null;
+  total: number;
 }
 
 export interface RootRecord {
@@ -1116,6 +1159,38 @@ export interface IndexRebuildResult {
   source_files_modified: false;
 }
 
+/** 一次链路节点的输入输出快照（节点追踪，明文存储） */
+export interface NodeTraceRecord {
+  trace_id: string;
+  /** ask | search | relation | collection */
+  flow: string;
+  node: string;
+  /** 一次用户操作的关联键 */
+  correlation_id: string;
+  session_id: string | null;
+  /** suggestion_id / claim 序号等 */
+  entity_id: string | null;
+  input_json: Record<string, unknown>;
+  output_json: Record<string, unknown>;
+  /** ok | error */
+  status: string;
+  elapsed_ms: number | null;
+  created_at: UtcDateTime;
+}
+
+export interface NodeTraceQuery {
+  flow: string | null;
+  node: string | null;
+  cursor: string | null;
+  page_size: number;
+}
+
+export interface NodeTracePage {
+  items: NodeTraceRecord[];
+  next_cursor: string | null;
+  total: number;
+}
+
 export interface FanFanBridge {
   startup_get_state(): Promise<StartupState>;
   welcome_get_state(): Promise<WelcomeState>;
@@ -1185,6 +1260,9 @@ export interface FanFanBridge {
   relation_query(request: RelationQuery): Promise<RelationPage>;
   relation_review(relation_id: string, action: "accepted" | "rejected"): Promise<void>;
   relation_batch_review(relation_ids: string[], action: "accepted" | "rejected"): Promise<number>;
+  relation_group_query(request: RelationGroupQuery): Promise<RelationGroupPage>;
+  relation_group_review(group_id: string, action: "accepted" | "rejected"): Promise<void>;
+  relation_group_batch_review(group_ids: string[], action: "accepted" | "rejected"): Promise<number>;
   file_query(request: FileQuery): Promise<FilePage>;
   exclusion_rule_list(): Promise<ExclusionRule[]>;
   exclusion_rule_upsert(request: ExclusionRuleInput): Promise<ExclusionRule>;
@@ -1200,6 +1278,8 @@ export interface FanFanBridge {
   app_data_reset_schedule(confirmation: "RESET_APPLICATION_DATA"): Promise<void>;
   maintenance_log_query(request: LogQuery): Promise<LogPage>;
   maintenance_logs_clear(): Promise<number>;
+  node_trace_query(request: NodeTraceQuery): Promise<NodeTracePage>;
+  node_trace_clear(): Promise<number>;
   diagnostic_event_append(request: DiagnosticEventInput): Promise<void>;
   diagnostic_export(target_path: string, confirmed: true): Promise<ExportResult>;
   index_rebuild(confirmation: "REBUILD_INDEX"): Promise<OperationHandle>;

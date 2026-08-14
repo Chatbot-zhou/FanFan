@@ -21,18 +21,22 @@ use fanfan_core::{
     CollectionSuggestionUpdateRequest, CreateCollectionRequest, DegradationLevel, DownloadFile,
     DownloadedModelMetadata, EmbeddingRequest, ExclusionRule, ExclusionRuleInput, ExportResult,
     FilePage, FilePreview, FileQuery, FileRecord, ImageUnderstandingResult, ImportCandidate,
-    InboxItem, InboxPage, InboxQuery, InboxUpdateRequest, IncrementalWatchManager, JobRecord,
-    LocalGenerationRuntime, LogPage, LogQuery, MaintenanceSnapshot, ModelArtifact,
+    InboxItem, InboxPage, InboxQuery, InboxUpdateRequest, IncrementalWatchManager, Intent,
+    JobRecord, LocalGenerationRuntime, LogPage, LogQuery, MaintenanceSnapshot, ModelArtifact,
     ModelCatalogEntry, ModelDownloadFileProgress, ModelDownloadJob, ModelDownloadRemoval,
     ModelEdition, ModelFormat, ModelImportSelection, ModelManager, ModelPreset, ModelRole,
-    ModelRoleConfig, ModelSource, ModelStoreStatus, OcrRuntimeConfig, ParseMetrics, ParseOutcome,
-    ParseRequest, ParseResult, PendingEmbeddingActivation, RagReadiness, RelationPage,
-    RelationQuery, RelationRefreshResult, RelationType, RerankRequest, RootRecord,
+    ModelRoleConfig, ModelSource, ModelStoreStatus, NodeTracePage, NodeTraceQuery, OcrRuntimeConfig,
+    ParseMetrics, ParseOutcome, ParseRequest, ParseResult, PendingEmbeddingActivation,
+    RagReadiness, RelationGroupPage, RelationGroupQuery, RelationPage, RelationQuery,
+    RelationRefreshResult, RelationType, RerankRequest,
+    RootRecord, RouteDecision,
     RuntimeBackendKind, RuntimeCapability, RuntimeManager, RuntimeResourceBudget, RuntimeTaskKind,
     RuntimeTaskRequest, ScopeFilter, SearchMode, SearchRequest, SearchSession, SemanticQuery,
     SpeechRecognitionRequest, SpeechRecognitionResult, SpeechSynthesisRequest,
-    SpeechSynthesisResult, TriageStatus, WorkerClient, is_natural_language_query,
-    parse_query_intent, query_understanding_prompt, strip_long_path_prefix,
+    SpeechSynthesisResult, TriageStatus, WorkerClient, chat_examples, chat_prompt,
+    intent_arbitration_prompt, is_natural_language_query, is_pure_greeting, parse_intent_verdict,
+    parse_query_intent, query_understanding_prompt, retrieval_examples, route_query,
+    strip_long_path_prefix, truncate_text,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -3186,17 +3190,27 @@ pub fn collection_suggestion_refresh(
                 true,
             )
         })?;
-    let generation_artifact = models
-        .active_artifact(ModelRole::Generation)?
-        .ok_or_else(|| {
-            AppError::new(
-                "COLLECTION_AI_GENERATION_MISSING",
-                "AI智能集合需要已通过自检的本地生成模型完成候选组复核",
-                true,
-            )
-        })?;
+    // 生成模型可选：有则给集合命名润色；没有则用规则名，成员分组不受影响。
+    let generation_artifact = models.active_artifact(ModelRole::Generation)?;
     let mut result = catalog
         .refresh_collection_suggestions(&embedding.artifact_id.to_string(), request.max_files)?;
+    trace_node(
+        &catalog,
+        "collection",
+        "candidates",
+        &correlation_id,
+        None,
+        None,
+        &json!({ "max_files": request.max_files }),
+        &json!({
+            "profiled_files": result.profiled_files,
+            "candidate_edges": result.candidate_edges,
+            "created_suggestions": result.created_suggestions,
+            "suggestion_ids": result.suggestion_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        }),
+        "ok",
+        None,
+    );
     if !result.suggestion_ids.is_empty() {
         let new_ids = result
             .suggestion_ids
@@ -3208,63 +3222,78 @@ pub fn collection_suggestion_refresh(
             page_size: 100,
             status: Some("suggested".into()),
         })?;
-        let mut reviewed_ids = Vec::new();
-        for suggestion in candidates
-            .items
-            .into_iter()
-            .filter(|item| new_ids.contains(&item.suggestion_id))
-        {
-            let _ = app.emit(
-                "collection:suggestion_phase",
-                json!({"suggestion_id": suggestion.suggestion_id, "phase": "model_review"}),
-            );
-            let candidate_json = serde_json::to_string(
-                &suggestion
-                    .members
-                    .iter()
-                    .map(|member| {
-                        json!({
-                            "file_id": member.file.file_id,
-                            "title": member.file.display_name,
-                            "semantic_reason": member.rationale,
-                            "confidence": member.confidence,
+        if let Some(generation_artifact) = generation_artifact {
+            for suggestion in candidates
+                .items
+                .into_iter()
+                .filter(|item| new_ids.contains(&item.suggestion_id))
+            {
+                let _ = app.emit(
+                    "collection:suggestion_phase",
+                    json!({"suggestion_id": suggestion.suggestion_id, "phase": "model_review"}),
+                );
+                let candidate_json = serde_json::to_string(
+                    &suggestion
+                        .members
+                        .iter()
+                        .map(|member| {
+                            json!({
+                                "file_id": member.file.file_id,
+                                "title": member.file.display_name,
+                                "confidence": member.confidence,
+                            })
                         })
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .map_err(|error| {
-                AppError::new("COLLECTION_MODEL_REVIEW_INVALID", error.to_string(), false)
-            })?;
-            let cancelled = AtomicBool::new(false);
-            let reviewed = complete_with_model(
-                generation.0.as_ref(),
-                &generation_artifact,
-                "你是本地文档分类复核器。只复核给定候选，不得添加候选外文件。集合名称必须概括成员共同主题、文档类型和用途，禁止直接复制任一文件名，也禁止使用‘相关资料’‘文档集合’等空泛名称。只输出JSON对象：{\"suggested_name\":\"不超过40字\",\"description\":\"说明共同主题和判断依据\",\"members\":[{\"file_id\":\"原UUID\",\"rationale\":\"该成员与主题的具体联系\"}]}。不相关成员应省略；少于2个相关成员也必须按原格式返回空members。",
-                &format!("请结构化复核这个Embedding候选组：\n{candidate_json}"),
-                640,
-                &cancelled,
-            ).and_then(|value| parse_collection_model_review(&value));
-            match reviewed.and_then(|review| {
-                catalog.apply_collection_model_review(
-                    &suggestion.suggestion_id,
-                    &review,
-                    &generation_artifact.artifact_id.to_string(),
+                        .collect::<Vec<_>>(),
                 )
-            }) {
-                Ok(_) => reviewed_ids.push(suggestion.suggestion_id),
-                Err(_) => catalog.reject_collection_suggestion(&suggestion.suggestion_id)?,
+                .map_err(|error| {
+                    AppError::new("COLLECTION_MODEL_REVIEW_INVALID", error.to_string(), false)
+                })?;
+                let cancelled = AtomicBool::new(false);
+                let review_started = Instant::now();
+                let raw_review = complete_with_model(
+                    generation.0.as_ref(),
+                    &generation_artifact,
+                    "你是本地文档集合命名助手。只根据给定分组内的资料命名，不得增删成员。名称必须概括成员的共同主题、文档类型和用途，禁止直接复制任一文件名，也禁止使用‘相关资料’‘文档集合’等空泛名称。只输出JSON对象：{\"suggested_name\":\"不超过40字\",\"description\":\"不超过200字的说明\"}。",
+                    &format!("请给这个同主题资料分组起名并写说明：\n{candidate_json}"),
+                    320,
+                    &cancelled,
+                );
+                // 命名只是润色：任何失败都保留规则名，不丢弃建议、不阻塞主流程。
+                let (decision, parsed) = match raw_review.as_deref().map(parse_collection_model_review) {
+                    Ok(Ok(review)) => match catalog.apply_collection_model_naming(
+                        &suggestion.suggestion_id,
+                        &review,
+                        &generation_artifact.artifact_id.to_string(),
+                    ) {
+                        Ok(_) => ("applied".into(), true),
+                        Err(error) => (format!("kept_rule_name:{error}"), true),
+                    },
+                    Ok(Err(_)) => ("kept_rule_name:parse_failed".into(), false),
+                    Err(error) => (format!("kept_rule_name:model_error:{error}"), false),
+                };
+                trace_node(
+                    &catalog,
+                    "collection",
+                    "model_review",
+                    &correlation_id,
+                    None,
+                    Some(&suggestion.suggestion_id.to_string()),
+                    &json!({
+                        "suggestion_id": suggestion.suggestion_id,
+                        "candidate_json": candidate_json,
+                    }),
+                    &json!({
+                        "raw": raw_review.unwrap_or_default(),
+                        "parsed": parsed,
+                        "decision": decision,
+                    }),
+                    "ok",
+                    Some(review_started.elapsed().as_millis() as u64),
+                );
             }
         }
-        if reviewed_ids.is_empty() {
-            return Err(AppError::new(
-                "COLLECTION_MODEL_REVIEW_FAILED",
-                "候选关系已计算，但没有候选组通过本地模型结构化复核",
-                true,
-            ));
-        }
-        result.created_suggestions = reviewed_ids.len() as u64;
-        result.suggestion_ids = reviewed_ids;
-        result.model_version = generation_artifact.artifact_id.to_string();
+        // 分组判断完全由 Embedding 聚类完成，建议一经写入即为创建成功。
+        result.created_suggestions = result.suggestion_ids.len() as u64;
     }
     let _ = app.emit("collection:suggestions_changed", &result);
     crate::runtime_log::event(
@@ -3390,15 +3419,59 @@ pub fn relation_refresh(
         &json!({ "max_files": request.max_files }),
     );
     let catalog = catalog.get()?;
+    let exact_started = Instant::now();
     let mut result = catalog.refresh_file_relations(request.max_files)?;
-    if let Some(embedding) = models.get()?.active_artifact(ModelRole::Embedding)? {
+    trace_node(
+        &catalog,
+        "relation",
+        "exact",
+        &correlation_id,
+        None,
+        None,
+        &json!({ "max_files": request.max_files }),
+        &json!({
+            "hashed_files": result.hashed_files,
+            "exact_duplicate_pairs": result.exact_duplicate_pairs,
+            "version_candidate_pairs": result.version_candidate_pairs,
+        }),
+        "ok",
+        Some(exact_started.elapsed().as_millis() as u64),
+    );
+    let semantic_started = Instant::now();
+    let semantic_found = if let Some(embedding) = models.get()?.active_artifact(ModelRole::Embedding)? {
         let (semantic, contains) = catalog.refresh_semantic_file_relations(
             &embedding.artifact_id.to_string(),
             request.max_files,
         )?;
         result.semantic_related_pairs = semantic;
         result.contains_or_summarizes_pairs = contains;
-    }
+        Some((semantic, contains, embedding.artifact_id.to_string()))
+    } else {
+        None
+    };
+    // 聚类：把成对的边按连通分量聚成组（重复组/版本族/同主题组/摘要组）
+    result.groups_created = catalog.refresh_relation_groups(
+        semantic_found.as_ref().map(|(_, _, artifact_id)| artifact_id.as_str()),
+    )?;
+    let (semantic_related, contains_pairs) = match semantic_found {
+        Some((semantic, contains, _)) => (Some(semantic), Some(contains)),
+        None => (None, None),
+    };
+    trace_node(
+        &catalog,
+        "relation",
+        "semantic",
+        &correlation_id,
+        None,
+        None,
+        &json!({ "max_files": request.max_files }),
+        &json!({
+            "semantic_related_pairs": semantic_related,
+            "contains_or_summarizes_pairs": contains_pairs,
+        }),
+        "ok",
+        Some(semantic_started.elapsed().as_millis() as u64),
+    );
     crate::runtime_log::event(
         "info",
         "relations",
@@ -3454,6 +3527,46 @@ pub fn relation_batch_review(
     catalog
         .get()?
         .review_file_relations(&request.relation_ids, &request.action)
+}
+
+#[tauri::command(async)]
+pub fn relation_group_query(
+    request: RelationGroupQuery,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<RelationGroupPage, AppError> {
+    catalog.get()?.query_relation_groups(&request)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RelationGroupReviewRequest {
+    group_id: Uuid,
+    action: String,
+}
+
+#[tauri::command(async)]
+pub fn relation_group_review(
+    request: RelationGroupReviewRequest,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<(), AppError> {
+    catalog
+        .get()?
+        .review_relation_group(&request.group_id, &request.action)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RelationGroupBatchReviewRequest {
+    group_ids: Vec<Uuid>,
+    action: String,
+}
+
+#[tauri::command(async)]
+pub fn relation_group_batch_review(
+    request: RelationGroupBatchReviewRequest,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<u64, AppError> {
+    catalog
+        .get()?
+        .review_relation_groups(&request.group_ids, &request.action)
 }
 
 #[tauri::command(async)]
@@ -4366,6 +4479,19 @@ pub fn maintenance_logs_clear(catalog: State<'_, CatalogServiceState>) -> Result
     Ok(runtime_removed.saturating_add(database_removed))
 }
 
+#[tauri::command(async)]
+pub fn node_trace_query(
+    request: NodeTraceQuery,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<NodeTracePage, AppError> {
+    catalog.get()?.query_node_traces(&request)
+}
+
+#[tauri::command(async)]
+pub fn node_trace_clear(catalog: State<'_, CatalogServiceState>) -> Result<u64, AppError> {
+    catalog.get()?.clear_node_traces()
+}
+
 #[derive(Debug, Deserialize)]
 pub struct DiagnosticEventInput {
     level: String,
@@ -4629,6 +4755,7 @@ pub fn search_start(
     );
     let catalog = catalog.get()?;
     let models = models.get()?;
+    let original_query = request.query.clone();
     // 查询理解：将自然语言转换为结构化检索参数
     let query_runtime_lease = if is_natural_language_query(&request.query) {
         let mut runtime_request =
@@ -4665,6 +4792,13 @@ pub fn search_start(
     if let Some(lease) = query_runtime_lease {
         lease.complete();
     }
+    let intent_used = intent.is_some();
+    let time_hint = intent.as_ref().and_then(|intent| {
+        intent
+            .time_hint
+            .as_ref()
+            .map(|hint| json!({ "from": hint.from, "to": hint.to }))
+    });
     if let Some(intent) = intent {
         request.query = intent.rewritten_query;
         if let Some(hint) = intent.time_hint {
@@ -4690,6 +4824,23 @@ pub fn search_start(
                 .collect();
         }
     }
+    trace_node(
+        &catalog,
+        "search",
+        "understanding",
+        &correlation_id,
+        None,
+        None,
+        &json!({ "query": original_query }),
+        &json!({
+            "rewritten_query": request.query.clone(),
+            "time_hint": time_hint,
+            "extensions": request.scope.extensions,
+            "used": intent_used,
+        }),
+        "ok",
+        None,
+    );
     if matches!(request.mode, SearchMode::Semantic | SearchMode::Hybrid)
         && let Some(artifact) = models.active_artifact(ModelRole::Embedding)?
     {
@@ -4734,6 +4885,35 @@ pub fn search_start(
                     "has_more": result.next_cursor.is_some(),
                 }),
             );
+            trace_node(
+                &catalog,
+                "search",
+                "retrieval",
+                &correlation_id,
+                None,
+                None,
+                &json!({
+                    "query": request.query,
+                    "mode": format!("{:?}", request.mode),
+                    "scope": json!({
+                        "roots": request.scope.root_ids.len(),
+                        "collections": request.scope.collection_ids.len(),
+                        "files": request.scope.file_ids.len(),
+                        "extensions": request.scope.extensions,
+                    }),
+                }),
+                &json!({
+                    "result_count": result.results.len(),
+                    "semantic_used": true,
+                    "top": result.results.iter().take(10).map(|hit| json!({
+                        "file_name": hit.name,
+                        "locator": hit.locator,
+                        "snippet": compact_for_prompt(&hit.snippet, 200),
+                    })).collect::<Vec<_>>(),
+                }),
+                "ok",
+                Some(started.elapsed().as_millis() as u64),
+            );
             if let Some(lease) = embedding_runtime_lease.take() {
                 lease.complete();
             }
@@ -4756,6 +4936,35 @@ pub fn search_start(
             "semantic_used": false,
             "has_more": result.next_cursor.is_some(),
         }),
+    );
+    trace_node(
+        &catalog,
+        "search",
+        "retrieval",
+        &correlation_id,
+        None,
+        None,
+        &json!({
+            "query": request.query,
+            "mode": format!("{:?}", request.mode),
+            "scope": json!({
+                "roots": request.scope.root_ids.len(),
+                "collections": request.scope.collection_ids.len(),
+                "files": request.scope.file_ids.len(),
+                "extensions": request.scope.extensions,
+            }),
+        }),
+        &json!({
+            "result_count": result.results.len(),
+            "semantic_used": false,
+            "top": result.results.iter().take(10).map(|hit| json!({
+                "file_name": hit.name,
+                "locator": hit.locator,
+                "snippet": compact_for_prompt(&hit.snippet, 200),
+            })).collect::<Vec<_>>(),
+        }),
+        "ok",
+        Some(started.elapsed().as_millis() as u64),
     );
     Ok(result)
 }
@@ -4940,6 +5149,7 @@ pub fn ask_start(
             &worker,
             &generation,
             &runtime_manager,
+            operation_id,
             &cancelled,
             (&phase, &verified_claim),
         );
@@ -5058,6 +5268,62 @@ pub fn ask_start(
     Ok(handle)
 }
 
+/// 节点追踪：一条链路节点的输入输出快照，明文落库（失败静默，绝不影响主链路）。
+fn trace_node(
+    catalog: &CatalogService,
+    flow: &str,
+    node: &str,
+    correlation_id: &str,
+    session_id: Option<&str>,
+    entity_id: Option<&str>,
+    input_json: &Value,
+    output_json: &Value,
+    status: &str,
+    elapsed_ms: Option<u64>,
+) {
+    let _ = catalog.record_node_trace(
+        flow,
+        node,
+        correlation_id,
+        session_id,
+        entity_id,
+        &truncate_for_trace(input_json),
+        &truncate_for_trace(output_json),
+        status,
+        elapsed_ms,
+    );
+}
+
+/// 追踪字段容量控制：单个字符串字段截 8KB；序列化后仍超 8KB 则整体降级为截断预览。
+fn truncate_for_trace(value: &Value) -> Value {
+    const NODE_TRACE_LIMIT: usize = 8000;
+    fn cap_strings(value: &mut Value, limit: usize) {
+        match value {
+            Value::String(text) if text.chars().count() > limit => {
+                let mut kept = text.chars().take(limit).collect::<String>();
+                kept.push_str("\n…[已截断]");
+                *text = kept;
+            }
+            Value::Array(items) => items.iter_mut().for_each(|item| cap_strings(item, limit)),
+            Value::Object(map) => map
+                .values_mut()
+                .for_each(|item| cap_strings(item, limit)),
+            _ => {}
+        }
+    }
+    let mut capped = value.clone();
+    cap_strings(&mut capped, NODE_TRACE_LIMIT);
+    let serialized = capped.to_string();
+    if serialized.len() <= NODE_TRACE_LIMIT {
+        return capped;
+    }
+    let mut end = NODE_TRACE_LIMIT;
+    while !serialized.is_char_boundary(end) {
+        end -= 1;
+    }
+    json!({ "__truncated": true, "preview": &serialized[..end] })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compute_answer(
     request: &AskRequest,
@@ -5066,6 +5332,7 @@ fn compute_answer(
     worker: &WorkerClient,
     generation: &Mutex<LocalGenerationRuntime>,
     runtime_manager: &RuntimeManager,
+    operation_id: Uuid,
     cancelled: &AtomicBool,
     progress: AskProgressCallbacks<'_>,
 ) -> Result<AnswerResult, AppError> {
@@ -5073,17 +5340,10 @@ fn compute_answer(
     if cancelled.load(Ordering::Acquire) {
         return Err(AppError::new("OPERATION_CANCELLED", "问答已取消", false));
     }
-    phase("understanding", 0.08);
+    phase("intent_routing", 0.05);
     let embedding = models.active_artifact(ModelRole::Embedding)?;
     let generation_artifact = models.active_artifact(ModelRole::Generation)?;
     let maintenance = catalog.maintenance_snapshot()?;
-    let index_coverage = if let Some(embedding) = embedding.as_ref() {
-        catalog
-            .semantic_index_coverage(&request.scope, &embedding.artifact_id.to_string())?
-            .1
-    } else {
-        0.0
-    };
     let generation_artifact = generation_artifact.ok_or_else(|| {
         AppError::new(
             "RAG_GENERATION_MODEL_REQUIRED",
@@ -5091,6 +5351,301 @@ fn compute_answer(
             false,
         )
     })?;
+    let routing_started = Instant::now();
+    let (routing, routed_vector, arbitration_raw) = route_question(
+        request,
+        embedding.as_ref(),
+        generation,
+        &generation_artifact,
+        worker,
+        runtime_manager,
+        cancelled,
+    )?;
+    let session_id = request.session_id.map(|id| id.to_string());
+    trace_node(
+        &catalog,
+        "ask",
+        "routing",
+        &operation_id.to_string(),
+        session_id.as_deref(),
+        None,
+        &json!({ "question": request.question }),
+        &json!({
+            "intent": format!("{:?}", routing.intent),
+            "top_category": format!("{:?}", routing.top_category),
+            "top_score": routing.top_score,
+            "margin": routing.margin,
+            "router_active": routing.top_score > 0.0,
+            "arbitration_raw": arbitration_raw,
+        }),
+        "ok",
+        Some(routing_started.elapsed().as_millis() as u64),
+    );
+    match routing.intent {
+        Intent::Chat => run_chat_answer(
+            request,
+            catalog,
+            generation,
+            &generation_artifact,
+            &maintenance,
+            operation_id,
+            cancelled,
+            phase,
+        ),
+        _ => run_retrieval_answer(
+            request,
+            catalog,
+            models,
+            worker,
+            runtime_manager,
+            generation,
+            generation_artifact,
+            embedding,
+            maintenance,
+            routed_vector,
+            operation_id,
+            cancelled,
+            (phase, verified_claim),
+        ),
+    }
+}
+
+/// 意图路由：编码提问 + 24 条 few-shot 示例句（一次批量 ≤ worker 上限 32），
+/// 余弦 argmax 判定；低置信（Ambiguous）交给生成模型仲裁，仲裁失败静默落 RAG。
+/// Router 未启用（无 Embedding）或编码失败 → 默认 Retrieval（行为等同现状）。
+/// Retrieval 决策时返回问题向量，可复用于语义检索（省一次编码）。
+/// 第三返回值是仲裁模型的原始输出（无仲裁时为 None），供节点追踪复盘。
+fn route_question(
+    request: &AskRequest,
+    embedding: Option<&ModelArtifact>,
+    generation: &Mutex<LocalGenerationRuntime>,
+    generation_artifact: &ModelArtifact,
+    worker: &WorkerClient,
+    runtime_manager: &RuntimeManager,
+    cancelled: &AtomicBool,
+) -> Result<(RouteDecision, Option<Vec<f32>>, Option<String>), AppError> {
+    // 纯寒暄白名单：整句精确匹配直接 Chat，不消耗一次编码/仲裁。
+    // 寒暄句的 BGE 向量与检索示例更近（实测「你好」chat top1 0.466），
+    // 语义路由和 0.6B 仲裁都会把寒暄误判为检索，必须在最前面分流。
+    if is_pure_greeting(&request.question) {
+        return Ok((
+            RouteDecision {
+                intent: Intent::Chat,
+                top_category: Intent::Chat,
+                top_score: 0.0,
+                margin: 0.0,
+            },
+            None,
+            None,
+        ));
+    }
+    let fallback = RouteDecision {
+        intent: Intent::Retrieval,
+        top_category: Intent::Retrieval,
+        top_score: 0.0,
+        margin: 0.0,
+    };
+    let Some(embedding) = embedding else {
+        return Ok((fallback, None, None));
+    };
+    let Some(vectors) = encode_routing_batch(request, embedding, worker, runtime_manager)? else {
+        return Ok((fallback, None, None));
+    };
+    let mut decision = route_query(
+        &vectors[0],
+        &vectors[1..13],
+        &vectors[13..25],
+    );
+    let mut arbitration_raw = None;
+    if decision.intent == Intent::Ambiguous {
+        // 兜底反转：仲裁成功按裁定走；仲裁失败（模型输出非法/调用失败）默认
+        // Chat 而不是 Retrieval——闲聊答错无副作用，检索答错会把资料库内容
+        // 当答案胡说。之前 0.6B 仲裁失败静默落 RAG 是答非所问的入口之一。
+        match arbitrate_intent(request, generation, generation_artifact, cancelled) {
+            Some((arbitrated, raw)) => {
+                decision.intent = arbitrated;
+                arbitration_raw = Some(raw);
+            }
+            None => decision.intent = Intent::Chat,
+        }
+    }
+    let vector = (decision.intent == Intent::Retrieval).then(|| vectors[0].clone());
+    Ok((decision, vector, arbitration_raw))
+}
+
+/// 一次批量编码提问（带 query_prefix）+ 12 条闲聊示例 + 12 条检索示例。
+/// 示例句不加 query_prefix（与 RAG 文档侧一致）。任何失败 → None（路由软降级）。
+fn encode_routing_batch(
+    request: &AskRequest,
+    embedding: &ModelArtifact,
+    worker: &WorkerClient,
+    runtime_manager: &RuntimeManager,
+) -> Result<Option<Vec<Vec<f32>>>, AppError> {
+    let tokenizer_path = PathBuf::from(&embedding.local_path)
+        .parent()
+        .map(|parent| parent.join("tokenizer.json"))
+        .ok_or_else(|| {
+            AppError::new(
+                "EMBEDDING_TOKENIZER_MISSING",
+                "Embedding 模型目录无效",
+                false,
+            )
+        })?;
+    if !tokenizer_path.is_file() {
+        return Ok(None);
+    }
+    let question = truncate_text(request.question.trim());
+    let mut texts = Vec::with_capacity(25);
+    texts.push(format!(
+        "{}{}",
+        embedding.query_prefix.as_deref().unwrap_or(""),
+        question
+    ));
+    texts.extend(chat_examples().iter().map(|example| example.to_string()));
+    texts.extend(retrieval_examples().iter().map(|example| example.to_string()));
+    let mut embedding_runtime_request = RuntimeTaskRequest::interactive(
+        RuntimeTaskKind::Embedding,
+        RuntimeBackendKind::OnnxRuntime,
+    );
+    embedding_runtime_request.cpu_threads = 2;
+    embedding_runtime_request.timeout = Duration::from_secs(10);
+    embedding_runtime_request.model_id = Some(embedding.artifact_id.to_string());
+    let Ok(embedding_runtime_lease) = runtime_manager.acquire(embedding_runtime_request) else {
+        return Ok(None);
+    };
+    let Ok(response) = worker.encode_embeddings(&EmbeddingRequest {
+        model_path: embedding.local_path.clone(),
+        tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
+        texts,
+        max_length: embedding.max_length.unwrap_or(512),
+        threads: 2,
+    }) else {
+        return Ok(None);
+    };
+    embedding_runtime_lease.complete();
+    if response.vectors.len() != 25 {
+        return Ok(None);
+    }
+    Ok(Some(response.vectors))
+}
+
+/// 低置信路由的 LLM 仲裁：few-shot JSON 意图分类（镜像查询理解模式）。
+/// 任何失败 → None（调用方静默落 RAG，不新增错误码）。
+/// 返回 (裁定意图, 模型原始输出)，原始输出供节点追踪复盘。
+fn arbitrate_intent(
+    request: &AskRequest,
+    generation: &Mutex<LocalGenerationRuntime>,
+    generation_artifact: &ModelArtifact,
+    cancelled: &AtomicBool,
+) -> Option<(Intent, String)> {
+    let (system, user) = intent_arbitration_prompt(request.question.trim());
+    let raw = complete_with_model(generation, generation_artifact, &system, &user, 32, cancelled)
+        .ok()?;
+    parse_intent_verdict(&raw).map(|intent| (intent, raw))
+}
+
+/// 闲聊分支：跳过检索/索引 gate，直接用生成模型对话（带会话历史）。
+fn run_chat_answer(
+    request: &AskRequest,
+    catalog: &CatalogService,
+    generation: &Mutex<LocalGenerationRuntime>,
+    generation_artifact: &ModelArtifact,
+    maintenance: &MaintenanceSnapshot,
+    operation_id: Uuid,
+    cancelled: &AtomicBool,
+    phase: &dyn Fn(&str, f64),
+) -> Result<AnswerResult, AppError> {
+    if maintenance.degradation_level == "core" {
+        return Err(AppError::new(
+            "RAG_RESOURCE_PRESSURE",
+            "当前资源压力较高，暂未启动回答；请稍后重试",
+            true,
+        ));
+    }
+    phase("chat_generating", 0.7);
+    let history = request
+        .session_id
+        .map(|session_id| catalog.load_ask_history(&session_id, 8))
+        .transpose()?
+        .unwrap_or_default();
+    let (system, user) = chat_prompt(request, &history);
+    let started_at = Instant::now();
+    let answer = complete_with_model(
+        generation,
+        generation_artifact,
+        &system,
+        &user,
+        512,
+        cancelled,
+    )?;
+    let result = AnswerResult {
+        session_id: request.session_id.unwrap_or_else(Uuid::now_v7),
+        message_id: Uuid::now_v7(),
+        answer: answer.trim().to_owned(),
+        grounding_status: fanfan_core::GroundingStatus::Insufficient,
+        insufficient_evidence: false,
+        claims: Vec::new(),
+        source_files: Vec::new(),
+        used_file_ids: Vec::new(),
+        elapsed_ms: started_at.elapsed().as_millis() as u64,
+        answer_mode: "chat".into(),
+        retrieval_channels: Vec::new(),
+        index_coverage: 0.0,
+        degradation_reason: None,
+    };
+    let session_id = request.session_id.map(|id| id.to_string());
+    trace_node(
+        catalog,
+        "ask",
+        "completed",
+        &operation_id.to_string(),
+        session_id.as_deref(),
+        None,
+        &json!({}),
+        &json!({
+            "answer_mode": result.answer_mode,
+            "claim_count": result.claims.len(),
+            "grounding_status": format!("{:?}", result.grounding_status),
+            "insufficient_evidence": result.insufficient_evidence,
+            "degradation_reason": result.degradation_reason,
+            "elapsed_ms": result.elapsed_ms,
+        }),
+        "ok",
+        Some(result.elapsed_ms),
+    );
+    catalog.record_ask_exchange(request, &result)?;
+    phase("completed", 1.0);
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_retrieval_answer(
+    request: &AskRequest,
+    catalog: &CatalogService,
+    models: &ModelManager,
+    worker: &WorkerClient,
+    runtime_manager: &RuntimeManager,
+    generation: &Mutex<LocalGenerationRuntime>,
+    generation_artifact: ModelArtifact,
+    embedding: Option<ModelArtifact>,
+    maintenance: MaintenanceSnapshot,
+    routed_vector: Option<Vec<f32>>,
+    operation_id: Uuid,
+    cancelled: &AtomicBool,
+    progress: AskProgressCallbacks<'_>,
+) -> Result<AnswerResult, AppError> {
+    let (phase, verified_claim) = progress;
+    let correlation_id = operation_id.to_string();
+    let session_id = request.session_id.map(|id| id.to_string());
+    let session_id_ref = session_id.as_deref();
+    phase("understanding", 0.08);
+    let index_coverage = if let Some(embedding) = embedding.as_ref() {
+        catalog
+            .semantic_index_coverage(&request.scope, &embedding.artifact_id.to_string())?
+            .1
+    } else {
+        0.0
+    };
     let embedding = embedding.ok_or_else(|| {
         AppError::new(
             "RAG_EMBEDDING_MODEL_REQUIRED",
@@ -5153,6 +5708,19 @@ fn compute_answer(
         }
         compact_for_prompt(rewritten, 2_000)
     };
+    let history_count = history.len();
+    trace_node(
+        catalog,
+        "ask",
+        "understanding",
+        &correlation_id,
+        session_id_ref,
+        None,
+        &json!({ "question": request.question, "history_count": history_count }),
+        &json!({ "rewritten_query": retrieval_question, "rewritten": history_count > 0 }),
+        "ok",
+        None,
+    );
     if cancelled.load(Ordering::Acquire) {
         return Err(AppError::new("OPERATION_CANCELLED", "问答已取消", false));
     }
@@ -5174,30 +5742,44 @@ fn compute_answer(
             true,
         ));
     }
-    let embedding_text = format!(
-        "{}{}",
-        embedding.query_prefix.as_deref().unwrap_or(""),
-        retrieval_question
-    );
-    let mut embedding_runtime_request = RuntimeTaskRequest::interactive(
-        RuntimeTaskKind::Embedding,
-        RuntimeBackendKind::OnnxRuntime,
-    );
-    embedding_runtime_request.cpu_threads = 2;
-    embedding_runtime_request.timeout = Duration::from_secs(10);
-    embedding_runtime_request.model_id = Some(embedding.artifact_id.to_string());
-    let embedding_runtime_lease = runtime_manager.acquire(embedding_runtime_request)?;
-    let response = worker.encode_embeddings(&EmbeddingRequest {
-        model_path: embedding.local_path.clone(),
-        tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
-        texts: vec![embedding_text],
-        max_length: embedding.max_length.unwrap_or(512),
-        threads: 2,
-    })?;
-    embedding_runtime_lease.complete();
-    let vector = response.vectors.first().ok_or_else(|| {
-        AppError::new("EMBEDDING_EMPTY", "Embedding 运行时没有返回查询向量", true)
-    })?;
+    // 复用路由阶段的问题向量：无历史（问题未改写）且未超长截断时直接使用，省一次编码。
+    // 改写后的追问或超长问题需按最终检索文本重新编码。
+    let vector = match routed_vector.filter(|_| {
+        retrieval_question == truncate_text(&retrieval_question)
+    }) {
+        Some(vector) => vector,
+        None => {
+            let embedding_text = format!(
+                "{}{}",
+                embedding.query_prefix.as_deref().unwrap_or(""),
+                retrieval_question
+            );
+            let mut embedding_runtime_request = RuntimeTaskRequest::interactive(
+                RuntimeTaskKind::Embedding,
+                RuntimeBackendKind::OnnxRuntime,
+            );
+            embedding_runtime_request.cpu_threads = 2;
+            embedding_runtime_request.timeout = Duration::from_secs(10);
+            embedding_runtime_request.model_id = Some(embedding.artifact_id.to_string());
+            let embedding_runtime_lease = runtime_manager.acquire(embedding_runtime_request)?;
+            let response = worker.encode_embeddings(&EmbeddingRequest {
+                model_path: embedding.local_path.clone(),
+                tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
+                texts: vec![embedding_text],
+                max_length: embedding.max_length.unwrap_or(512),
+                threads: 2,
+            })?;
+            embedding_runtime_lease.complete();
+            response.vectors.first().ok_or_else(|| {
+                AppError::new(
+                    "EMBEDDING_EMPTY",
+                    "Embedding 运行时没有返回查询向量",
+                    true,
+                )
+            })?
+            .clone()
+        }
+    };
     let mut retrieval_request = request.clone();
     retrieval_request.question = retrieval_question;
     retrieval_request.retrieval_limit = retrieval_request.retrieval_limit.min(10);
@@ -5207,7 +5789,7 @@ fn compute_answer(
         &retrieval_request,
         Some(SemanticQuery {
             model_artifact_id: &artifact_id,
-            vector,
+            vector: &vector,
         }),
     )?;
     extractive.index_coverage = index_coverage;
@@ -5218,8 +5800,46 @@ fn compute_answer(
         "rrf".into(),
         "mmr".into(),
     ];
+    trace_node(
+        catalog,
+        "ask",
+        "retrieval",
+        &correlation_id,
+        session_id_ref,
+        None,
+        &json!({ "question": retrieval_request.question, "retrieval_limit": retrieval_request.retrieval_limit }),
+        &json!({
+            "channels": extractive.retrieval_channels,
+            "insufficient_evidence": extractive.insufficient_evidence,
+            "candidates": extractive.claims.iter().take(10).map(|claim| json!({
+                "file_id": claim.citations.first().map(|citation| citation.file_id.to_string()),
+                "quote": compact_for_prompt(&claim.text, 500),
+                "citations": claim.citations.len(),
+            })).collect::<Vec<_>>(),
+        }),
+        "ok",
+        None,
+    );
     if extractive.insufficient_evidence {
         extractive.answer_mode = "rag_refusal".into();
+        trace_node(
+            catalog,
+            "ask",
+            "completed",
+            &correlation_id,
+            session_id_ref,
+            None,
+            &json!({}),
+            &json!({
+                "answer_mode": "rag_refusal",
+                "claim_count": 0,
+                "grounding_status": format!("{:?}", extractive.grounding_status),
+                "insufficient_evidence": true,
+                "degradation_reason": extractive.degradation_reason,
+            }),
+            "ok",
+            Some(extractive.elapsed_ms),
+        );
         catalog.record_ask_exchange(request, &extractive)?;
         phase("completed", 1.0);
         return Ok(extractive);
@@ -5264,6 +5884,24 @@ fn compute_answer(
             }
         }
     }
+    trace_node(
+        catalog,
+        "ask",
+        "reranking",
+        &correlation_id,
+        session_id_ref,
+        None,
+        &json!({}),
+        &json!({
+            "applied": reranker_applied,
+            "scores": extractive.claims.iter().take(10).map(|claim| json!({
+                "text": compact_for_prompt(&claim.text, 120),
+                "score": claim.citations.first().map(|citation| citation.retrieval_score),
+            })).collect::<Vec<_>>(),
+        }),
+        "ok",
+        None,
+    );
     phase("evidence_selection", 0.48);
     let mut image_analysis_context = Vec::new();
     if reranker_applied && models.active_artifact(ModelRole::Vision)?.is_some() {
@@ -5332,10 +5970,10 @@ fn compute_answer(
         prompt.push_str(&image_analysis_context.join("\n"));
     }
     let answer_schema = fanfan_core::grounded_answer_json_schema();
-    let generated = runtime.complete_json_cancellable(
+    let mut generated = runtime.complete_json_cancellable(
         "你是翻翻的本地资料回答器。只能使用用户提供的证据；每个事实必须通过citation_ids关联证据，不得补充外部知识。",
         &prompt,
-        512,
+        768,
         &answer_schema,
         cancelled,
     )
@@ -5345,6 +5983,18 @@ fn compute_answer(
         }
     })?;
     drop(runtime);
+    trace_node(
+        catalog,
+        "ask",
+        "generation",
+        &correlation_id,
+        session_id_ref,
+        None,
+        &json!({ "prompt": prompt }),
+        &json!({ "raw": generated }),
+        "ok",
+        None,
+    );
     phase("citation_validation", 0.88);
     let mut grounded = fanfan_core::apply_grounded_generation(&extractive, &generated);
     if grounded.is_none() {
@@ -5353,7 +6003,7 @@ fn compute_answer(
             "下面的输出没有满足结构约束。只修复JSON结构和citation_ids，不得增加、删除或改写事实，不得引入新的S编号。只输出符合指定JSON Schema的对象。\n\n原输出：\n{}",
             compact_for_prompt(&generated, 12_000)
         );
-        if let Ok(repaired) = complete_json_with_model(
+        let repaired = complete_json_with_model(
             generation,
             &generation_artifact,
             "你是结构化引用修复器。不得引入新事实或新来源编号。",
@@ -5361,16 +6011,66 @@ fn compute_answer(
             640,
             &answer_schema,
             cancelled,
-        ) {
+        );
+        trace_node(
+            catalog,
+            "ask",
+            "repair",
+            &correlation_id,
+            session_id_ref,
+            None,
+            &json!({ "broken": generated }),
+            &json!({
+                "repaired": repaired.as_ref().ok().map(|value| fanfan_core::apply_grounded_generation(&extractive, value).is_some()),
+                "raw": repaired.as_ref().map(String::as_str),
+            }),
+            if repaired.is_ok() { "ok" } else { "error" },
+            None,
+        );
+        if let Ok(repaired) = repaired {
             grounded = fanfan_core::apply_grounded_generation(&extractive, &repaired);
+            if grounded.is_some() {
+                generated = repaired;
+            }
         }
     }
     let Some(mut grounded) = grounded else {
-        return Err(AppError::new(
-            "RAG_CITATION_VALIDATION_FAILED",
-            "本次生成结果未通过引用核验，没有向你显示未验证内容；可以重试",
-            true,
-        ));
+        // 引用核验失败降级：尽量把已生成内容展示给用户，标记未通过核验
+        let fallback_text = fanfan_core::extract_unverified_text(&generated);
+        if fallback_text.is_empty() {
+            return Err(AppError::new(
+                "RAG_CITATION_VALIDATION_FAILED",
+                "本次生成结果未通过引用核验且没有可展示的内容，可以重试",
+                true,
+            ));
+        }
+        let degraded = fanfan_core::unverified_answer(
+            &extractive,
+            extractive.session_id,
+            fallback_text,
+            extractive.elapsed_ms,
+        );
+        trace_node(
+            catalog,
+            "ask",
+            "completed",
+            &correlation_id,
+            session_id_ref,
+            None,
+            &json!({}),
+            &json!({
+                "answer_mode": degraded.answer_mode,
+                "claim_count": 0,
+                "grounding_status": format!("{:?}", degraded.grounding_status),
+                "insufficient_evidence": degraded.insufficient_evidence,
+                "degradation_reason": degraded.degradation_reason,
+            }),
+            "ok",
+            Some(degraded.elapsed_ms),
+        );
+        catalog.record_ask_exchange(request, &degraded)?;
+        phase("completed", 1.0);
+        return Ok(degraded);
     };
     let candidates = std::mem::take(&mut grounded.claims);
     let candidate_count = candidates.len().max(1);
@@ -5393,6 +6093,7 @@ fn compute_answer(
                 .iter()
                 .map(|citation| citation.quote.as_str()),
         );
+        let mut llm_verdict = None;
         let supported = if deterministically_supported {
             true
         } else {
@@ -5404,8 +6105,29 @@ fn compute_answer(
                 32,
                 cancelled,
             )?;
+            llm_verdict = Some(verification.clone());
             claim_support_is_verified(&verification)
         };
+        trace_node(
+            catalog,
+            "ask",
+            "verification",
+            &correlation_id,
+            session_id_ref,
+            Some(&index.to_string()),
+            &json!({
+                "claim_index": index,
+                "claim_text": claim.text,
+                "evidence_count": claim.citations.len(),
+            }),
+            &json!({
+                "deterministic": deterministically_supported,
+                "llm_verdict": llm_verdict,
+                "supported": supported,
+            }),
+            "ok",
+            None,
+        );
         if !supported {
             rejected_claims = rejected_claims.saturating_add(1);
             continue;
@@ -5421,34 +6143,51 @@ fn compute_answer(
         );
     }
     if grounded.claims.is_empty() {
-        return Err(AppError::new(
-            "RAG_CLAIM_UNSUPPORTED",
-            "生成内容没有任何事实句通过原文支持性校验，回答已拒绝显示",
-            true,
-        ));
+        // 全部候选事实句未通过支持性校验：降级展示原始生成内容，标记未通过核验
+        let fallback_text = fanfan_core::extract_unverified_text(&generated);
+        if fallback_text.is_empty() {
+            return Err(AppError::new(
+                "RAG_CLAIM_UNSUPPORTED",
+                "生成内容没有任何事实句通过原文支持性校验，且没有可展示的内容，回答已拒绝显示",
+                true,
+            ));
+        }
+        let degraded = fanfan_core::unverified_answer(
+            &extractive,
+            extractive.session_id,
+            fallback_text,
+            extractive.elapsed_ms,
+        );
+        trace_node(
+            catalog,
+            "ask",
+            "completed",
+            &correlation_id,
+            session_id_ref,
+            None,
+            &json!({}),
+            &json!({
+                "answer_mode": degraded.answer_mode,
+                "claim_count": 0,
+                "grounding_status": format!("{:?}", degraded.grounding_status),
+                "insufficient_evidence": degraded.insufficient_evidence,
+                "degradation_reason": degraded.degradation_reason,
+            }),
+            "ok",
+            Some(degraded.elapsed_ms),
+        );
+        catalog.record_ask_exchange(request, &degraded)?;
+        phase("completed", 1.0);
+        return Ok(degraded);
     }
-    let evidence_numbers = extractive
-        .claims
-        .iter()
-        .flat_map(|claim| claim.citations.iter())
-        .enumerate()
-        .map(|(index, citation)| (citation.evidence_id, index + 1))
-        .collect::<HashMap<_, _>>();
+    // 润色后的回答：多条 claim 按自然段拼接，不带 [S#] 内联标记（引用通过
+    // 前端文件标签表达，claims/citations 结构保留给前端做引文详情）。
     grounded.answer = grounded
         .claims
         .iter()
-        .map(|claim| {
-            let citations = claim
-                .citations
-                .iter()
-                .filter_map(|citation| evidence_numbers.get(&citation.evidence_id))
-                .map(|index| format!("[S{index}]"))
-                .collect::<Vec<_>>()
-                .join("");
-            format!("- {} {}", claim.text, citations)
-        })
+        .map(|claim| claim.text.as_str())
         .collect::<Vec<_>>()
-        .join("\n");
+        .join("\n\n");
     let verified_file_ids = grounded
         .claims
         .iter()
@@ -5467,6 +6206,25 @@ fn compute_answer(
     }
     grounded.index_coverage = index_coverage;
     grounded.retrieval_channels = extractive.retrieval_channels;
+    trace_node(
+        catalog,
+        "ask",
+        "completed",
+        &correlation_id,
+        session_id_ref,
+        None,
+        &json!({}),
+        &json!({
+            "answer_mode": grounded.answer_mode,
+            "claim_count": grounded.claims.len(),
+            "grounding_status": format!("{:?}", grounded.grounding_status),
+            "insufficient_evidence": grounded.insufficient_evidence,
+            "degradation_reason": grounded.degradation_reason,
+            "used_file_ids": grounded.used_file_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        }),
+        "ok",
+        Some(grounded.elapsed_ms),
+    );
     catalog.validate_answer_evidence(&grounded)?;
     catalog.record_ask_exchange(request, &grounded)?;
     phase("completed", 1.0);
@@ -6931,11 +7689,14 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
             ));
         };
         let existing_generation = catalog.active_vector_generation(&model_artifact_id)?;
+        // 除新增分块外，active 代际覆盖不足（如上次构建被中断后残留的过期索引）也必须重建，
+        // 否则过期索引会一直保持 active，语义检索/RAG 持续命中陈旧子集。
         let needs_rebuild = searchable_chunks > 0
             && (committed_total > 0
-                || existing_generation
-                    .as_ref()
-                    .is_none_or(|generation| generation.dimension != dimension));
+                || existing_generation.as_ref().is_none_or(|generation| {
+                    generation.dimension != dimension
+                        || generation.item_count < searchable_chunks
+                }));
         if needs_rebuild {
             crate::runtime_log::event(
                 "info",
@@ -7268,6 +8029,8 @@ mod tests {
                 chunk_id: Uuid::now_v7(),
                 image_asset_id: None,
                 quote: text.into(),
+                context_before: None,
+                context_after: None,
                 locator: SourceLocator::default(),
                 retrieval_score: 0.0,
             }],
@@ -7333,6 +8096,8 @@ mod tests {
                     chunk_id: Uuid::now_v7(),
                     image_asset_id: None,
                     quote: "采用混合召回".into(),
+                    context_before: None,
+                    context_after: None,
                     locator: SourceLocator {
                         paragraph_no: Some(3),
                         ..Default::default()
