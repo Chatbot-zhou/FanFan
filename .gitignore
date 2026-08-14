@@ -67,3 +67,22 @@ Desktop.ini
 # Temporary helper scripts
 .git-commit-msg.txt
 push-to-rag.sh
+
+# Evaluation artifacts and QA fixtures (contain real authorized corpus
+# content; privacy-sensitive, never upload)
+eval/
+qa-fixtures/
+results*.json
+
+# Evaluation harness (depends on removed eval fixtures)
+evaluate_qa_fixtures.rs
+_dbg_eval.rs
+
+# Installers and packaging
+*.exe
+*.msi
+build/
+*.spec
+
+# Runtime vector indexes (app data lives in %APPDATA%, local copies only)
+vector-indexes/
