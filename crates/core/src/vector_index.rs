@@ -121,13 +121,6 @@ pub fn search_index(
     let cached = cache
         .as_ref()
         .is_some_and(|entry| entry.path == index_path && entry.modified == modified);
-    if !cached {
-        eprintln!(
-            "[DBG] index cache MISS path={:?} size={}",
-            index_path,
-            fs::metadata(index_path).map(|m| m.len()).unwrap_or(0)
-        );
-    }
     let index = match cache.as_ref() {
         Some(entry) if entry.path == index_path && entry.modified == modified => &entry.index,
         _ => {
