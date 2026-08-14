@@ -30,6 +30,7 @@ struct GenerationProcess {
     mmproj_path: Option<String>,
     backend: String,
     device: Option<String>,
+    context_size: u32,
     threads: u32,
     gpu_layers: Option<u32>,
 }
@@ -213,9 +214,53 @@ impl LocalGenerationRuntime {
                 false,
             ));
         }
+        let safe_threads = threads.clamp(1, 4);
+        // 复用已加载的同模型：搜索的查询理解/问答共享同一个 runtime，
+        // 每次 activate 都杀掉进程重载 610MB GGUF 是搜索 250s+ 的主因之一。
+        // threads 不参与比较：搜索理解用 2 线程、问答用 4 线程，若因线程数不同
+        // 就杀进程重载，两条链路交替调用会让模型永远无法复用。
+        if let Some(process) = self.process.as_mut()
+            && process.model_path == model_path
+            && process.mmproj_path.as_deref() == mmproj_path
+            && process.context_size == context_size
+            && process.child.try_wait().ok().flatten().is_none()
+        {
+            let backend = process.backend.clone();
+            let device = process.device.clone();
+            let gpu_layers = process.gpu_layers;
+            let self_test = if mmproj_path.is_some() {
+                self.complete_multimodal_data_url(
+                    "你是本地多模态运行状态检查器，不进行推理说明。",
+                    "只回复：就绪",
+                    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+                    64,
+                    None,
+                )?
+            } else {
+                self.complete(
+                    "你是本地运行状态检查器，不进行推理说明。",
+                    "只回复：就绪",
+                    64,
+                )?
+            };
+            if self_test.trim().is_empty() {
+                // 进程僵死：放弃复用，走正常重载路径
+                self.stop();
+            } else {
+                return Ok(GenerationActivation {
+                    backend,
+                    model_path: model_path.into(),
+                    context_size,
+                    self_test,
+                    multimodal: mmproj_path.is_some(),
+                    device,
+                    threads: safe_threads,
+                    gpu_layers,
+                });
+            }
+        }
         self.stop();
         let capability = self.probe_capability();
-        let safe_threads = threads.clamp(1, 4);
         let batch_threads = safe_threads.min(2);
         let requested_gpu_layers = if capability.gpu_available { 999 } else { 0 };
         let backend = capability.backend.clone();
@@ -295,6 +340,7 @@ impl LocalGenerationRuntime {
             mmproj_path: mmproj_path.map(str::to_owned),
             backend: backend.clone(),
             device: device.clone(),
+            context_size,
             threads: safe_threads,
             gpu_layers: (!capability.gpu_available).then_some(0),
         });

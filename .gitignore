@@ -76,7 +76,9 @@ results*.json
 
 # Evaluation harness (depends on removed eval fixtures)
 evaluate_qa_fixtures.rs
-_dbg_eval.rs
+
+# Debug probes (diagnostic-only binaries, not part of the product)
+_dbg_*.rs
 
 # Installers and packaging
 *.exe

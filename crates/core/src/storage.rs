@@ -3080,12 +3080,14 @@ impl CatalogStore {
         /// 每次「AI分析新建议」最多展示的集合建议数；确认/拒绝后再次分析出下一批。
         const MAX_COLLECTION_SUGGESTIONS_PER_BATCH: usize = 5;
         let connection = self.connect()?;
-        let sql = format!(
-            "WITH targets AS (SELECT f.file_id, f.current_revision_id, f.display_name FROM files f LEFT JOIN document_profiles p ON p.file_id = f.file_id WHERE f.current_revision_id IS NOT NULL AND f.parse_status = 'parsed' AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL} AND EXISTS (SELECT 1 FROM chunk_embeddings ce WHERE ce.file_id = f.file_id AND ce.revision_id = f.current_revision_id AND ce.model_artifact_id = ?1) AND (p.file_id IS NULL OR p.revision_id <> f.current_revision_id OR p.embedding_model_id <> ?1 OR p.algorithm_version <> ?2) ORDER BY f.last_seen_at DESC LIMIT ?3) SELECT t.file_id, t.current_revision_id, t.display_name, c.text, e.dimension, e.vector_blob FROM targets t JOIN chunks c ON c.file_id = t.file_id AND c.revision_id = t.current_revision_id JOIN chunk_embeddings e ON e.chunk_id = c.chunk_id AND e.model_artifact_id = ?1 ORDER BY t.file_id, c.ordinal"
+        // 两个查询拆分（同 refresh_semantic_file_relations）：避免 3.50 bundled 病态计划的
+        // 全量 JOIN（22.3s），先取 targets 元数据，再窗口取每文件前 3 个文本片段与向量。
+        let targets_sql = format!(
+            "WITH targets AS MATERIALIZED (SELECT f.file_id, f.current_revision_id, f.display_name FROM files f LEFT JOIN document_profiles p ON p.file_id = f.file_id WHERE f.current_revision_id IS NOT NULL AND f.parse_status = 'parsed' AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL} AND EXISTS (SELECT 1 FROM chunk_embeddings ce WHERE ce.file_id = f.file_id AND ce.revision_id = f.current_revision_id AND ce.model_artifact_id = ?1) AND (p.file_id IS NULL OR p.revision_id <> f.current_revision_id OR p.embedding_model_id <> ?1 OR p.algorithm_version <> ?2) ORDER BY f.last_seen_at DESC LIMIT ?3) SELECT t.file_id, t.current_revision_id, t.display_name FROM targets t"
         );
-        let rows = {
+        let targets = {
             let mut statement = connection
-                .prepare(&sql)
+                .prepare(&targets_sql)
                 .map_err(|error| storage_error("COLLECTION_PROFILE_QUERY_FAILED", error, true))?;
             statement
                 .query_map(
@@ -3095,9 +3097,6 @@ impl CatalogStore {
                             row.get::<_, String>(0)?,
                             row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, u32>(4)?,
-                            row.get::<_, Vec<u8>>(5)?,
                         ))
                     },
                 )
@@ -3105,16 +3104,45 @@ impl CatalogStore {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| storage_error("COLLECTION_PROFILE_QUERY_FAILED", error, true))?
         };
-        let mut grouped: BTreeMap<String, ProfileAggregate> = BTreeMap::new();
-        for (file_id, revision_id, title, text, dimension, bytes) in rows {
-            let vector = decode_vector(&bytes, dimension)?;
-            let entry = grouped
-                .entry(file_id)
-                .or_insert_with(|| (revision_id, title, Vec::new(), Vec::new()));
-            if entry.2.len() < 3 {
-                entry.2.push(text);
-                entry.3.push(vector);
+        // 每文件前 3 片段（文本+向量）：窗口全量计算 + 外层过滤（无 CTE 无多表 JOIN）
+        const TOP3_CHUNKS_SQL: &str =
+            "SELECT file_id, text, dimension, vector_blob FROM (SELECT ce.file_id, c.text, ce.dimension, ce.vector_blob, ROW_NUMBER() OVER (PARTITION BY ce.file_id ORDER BY c.ordinal) AS rn FROM chunk_embeddings ce JOIN chunks c ON c.chunk_id = ce.chunk_id WHERE ce.model_artifact_id = ?1) WHERE rn <= 3";
+        let mut chunks_by_file = HashMap::<String, Vec<(String, u32, Vec<u8>)>>::new();
+        {
+            let mut statement = connection
+                .prepare(TOP3_CHUNKS_SQL)
+                .map_err(|error| storage_error("COLLECTION_PROFILE_QUERY_FAILED", error, true))?;
+            let rows = statement
+                .query_map(params![model_artifact_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u32>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                })
+                .map_err(|error| storage_error("COLLECTION_PROFILE_QUERY_FAILED", error, true))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| storage_error("COLLECTION_PROFILE_QUERY_FAILED", error, true))?;
+            for (file_id, text, dimension, bytes) in rows {
+                chunks_by_file
+                    .entry(file_id)
+                    .or_default()
+                    .push((text, dimension, bytes));
             }
+        }
+        let mut grouped: BTreeMap<String, ProfileAggregate> = BTreeMap::new();
+        for (file_id, revision_id, title) in targets {
+            let Some(chunks) = chunks_by_file.get(&file_id) else {
+                continue;
+            };
+            let mut texts = Vec::with_capacity(chunks.len());
+            let mut vectors = Vec::with_capacity(chunks.len());
+            for (text, dimension, bytes) in chunks {
+                texts.push(text.clone());
+                vectors.push(decode_vector(bytes, *dimension)?);
+            }
+            grouped.insert(file_id, (revision_id, title, texts, vectors));
         }
         let now = Utc::now().to_rfc3339();
         let mut profiles = Vec::new();
@@ -3994,12 +4022,14 @@ impl CatalogStore {
         let transaction = connection
             .transaction()
             .map_err(|error| storage_error("SEMANTIC_RELATION_REFRESH_FAILED", error, true))?;
-        let sql = format!(
-            "WITH targets AS (SELECT f.file_id, f.current_revision_id, f.display_name, f.extension, f.size_bytes FROM files f WHERE f.current_revision_id IS NOT NULL AND f.parse_status = 'parsed' AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL} AND EXISTS (SELECT 1 FROM chunk_embeddings ce WHERE ce.file_id = f.file_id AND ce.revision_id = f.current_revision_id AND ce.model_artifact_id = ?1) ORDER BY f.last_seen_at DESC LIMIT ?2) SELECT t.file_id, t.current_revision_id, t.display_name, t.extension, t.size_bytes, e.dimension, e.vector_blob FROM targets t JOIN chunks c ON c.file_id = t.file_id AND c.revision_id = t.current_revision_id JOIN chunk_embeddings e ON e.chunk_id = c.chunk_id AND e.model_artifact_id = ?1 ORDER BY t.file_id, c.ordinal"
+        // 两个查询拆分：SQLite 3.50 bundled 对「物化 CTE JOIN 大表」的病态计划会让单查询
+        // 全量读 197k 行（26.7s）。先取 targets 元数据，再窗口取每文件前 3 向量，内存侧关联。
+        let targets_sql = format!(
+            "WITH targets AS MATERIALIZED (SELECT f.file_id, f.current_revision_id, f.display_name, f.extension, f.size_bytes FROM files f WHERE f.current_revision_id IS NOT NULL AND f.parse_status = 'parsed' AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL} AND EXISTS (SELECT 1 FROM chunk_embeddings ce WHERE ce.file_id = f.file_id AND ce.revision_id = f.current_revision_id AND ce.model_artifact_id = ?1) ORDER BY f.last_seen_at DESC LIMIT ?2) SELECT t.file_id, t.current_revision_id, t.display_name, t.extension, t.size_bytes FROM targets t"
         );
-        let rows = {
+        let targets = {
             let mut statement = transaction
-                .prepare(&sql)
+                .prepare(&targets_sql)
                 .map_err(|error| storage_error("SEMANTIC_RELATION_QUERY_FAILED", error, true))?;
             statement
                 .query_map(params![model_artifact_id, i64::from(max_files)], |row| {
@@ -4009,23 +4039,49 @@ impl CatalogStore {
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, u64>(4)?,
-                        row.get::<_, u32>(5)?,
-                        row.get::<_, Vec<u8>>(6)?,
                     ))
                 })
                 .map_err(|error| storage_error("SEMANTIC_RELATION_QUERY_FAILED", error, true))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| storage_error("SEMANTIC_RELATION_QUERY_FAILED", error, true))?
         };
+        // 每文件前 3 向量：窗口函数全量计算 + 外层过滤（无 CTE 无多表 JOIN，3.50 下 6.7s）
+        const TOP3_VECTORS_SQL: &str =
+            "SELECT file_id, dimension, vector_blob FROM (SELECT ce.file_id, ce.dimension, ce.vector_blob, ROW_NUMBER() OVER (PARTITION BY ce.file_id ORDER BY c.ordinal) AS rn FROM chunk_embeddings ce JOIN chunks c ON c.chunk_id = ce.chunk_id WHERE ce.model_artifact_id = ?1) WHERE rn <= 3";
+        let mut vectors_by_file = HashMap::<String, Vec<(u32, Vec<u8>)>>::new();
+        {
+            let mut statement = transaction
+                .prepare(TOP3_VECTORS_SQL)
+                .map_err(|error| storage_error("SEMANTIC_RELATION_QUERY_FAILED", error, true))?;
+            let rows = statement
+                .query_map(params![model_artifact_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
+                .map_err(|error| storage_error("SEMANTIC_RELATION_QUERY_FAILED", error, true))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| storage_error("SEMANTIC_RELATION_QUERY_FAILED", error, true))?;
+            for (file_id, dimension, bytes) in rows {
+                vectors_by_file
+                    .entry(file_id)
+                    .or_default()
+                    .push((dimension, bytes));
+            }
+        }
         type RelationProfileAggregate = (String, String, String, u64, Vec<Vec<f32>>);
         let mut grouped = BTreeMap::<String, RelationProfileAggregate>::new();
-        for (file_id, revision_id, name, extension, size, dimension, bytes) in rows {
-            let entry = grouped
-                .entry(file_id)
-                .or_insert_with(|| (revision_id, name, extension, size, Vec::new()));
-            if entry.4.len() < 3 {
-                entry.4.push(decode_vector(&bytes, dimension)?);
+        for (file_id, revision_id, name, extension, size) in targets {
+            let Some(vectors) = vectors_by_file.get(&file_id) else {
+                continue;
+            };
+            let mut decoded = Vec::with_capacity(vectors.len());
+            for (dimension, bytes) in vectors {
+                decoded.push(decode_vector(bytes, *dimension)?);
             }
+            grouped.insert(file_id, (revision_id, name, extension, size, decoded));
         }
         let mut profiles = Vec::new();
         for (file_id, (revision_id, name, extension, size, vectors)) in grouped {
@@ -4414,13 +4470,34 @@ impl CatalogStore {
                 .map(|(a, b)| a * b)
                 .sum::<f32>();
             if similarity < 0.84 {
-                // 同名但内容差异大：不是版本，降级为语义相关
-                transaction
-                    .execute(
-                        "UPDATE file_relations SET relation_type = 'semantic_related', confidence = ?1, updated_at = ?2 WHERE left_file_id = ?3 AND right_file_id = ?4 AND relation_type = 'version_candidate'",
-                        params![f64::from(similarity), now, edge.left_file_id.to_string(), edge.right_file_id.to_string()],
+                // 同名但内容差异大：不是版本，降级为语义相关。
+                // 若语义分析已建立同对 semantic_related 关系，先删 version_candidate 行
+                // 避免 UNIQUE(left_file_id, right_file_id, relation_type) 冲突，保留语义置信度。
+                // 注意：不用嵌套 EXISTS 子查询（SQLite 3.50 bundled 对子查询+主查询的病态计划
+                // 会造成假阴性，导致 DELETE 漏删后 UPDATE 撞 UNIQUE），改为先查后写。
+                let has_sr = transaction
+                    .query_row(
+                        "SELECT 1 FROM file_relations WHERE left_file_id = ?1 AND right_file_id = ?2 AND relation_type = 'semantic_related' LIMIT 1",
+                        params![edge.left_file_id.to_string(), edge.right_file_id.to_string()],
+                        |_| Ok(()),
                     )
+                    .optional()
                     .map_err(|error| storage_error("RELATION_GROUP_REFRESH_FAILED", error, true))?;
+                if has_sr.is_some() {
+                    transaction
+                        .execute(
+                            "DELETE FROM file_relations WHERE left_file_id = ?1 AND right_file_id = ?2 AND relation_type = 'version_candidate'",
+                            params![edge.left_file_id.to_string(), edge.right_file_id.to_string()],
+                        )
+                        .map_err(|error| storage_error("RELATION_GROUP_REFRESH_FAILED", error, true))?;
+                } else {
+                    transaction
+                        .execute(
+                            "UPDATE file_relations SET relation_type = 'semantic_related', confidence = ?1, updated_at = ?2 WHERE left_file_id = ?3 AND right_file_id = ?4 AND relation_type = 'version_candidate'",
+                            params![f64::from(similarity), now, edge.left_file_id.to_string(), edge.right_file_id.to_string()],
+                        )
+                        .map_err(|error| storage_error("RELATION_GROUP_REFRESH_FAILED", error, true))?;
+                }
                 edge.relation_type = crate::RelationType::SemanticRelated;
             } else {
                 transaction

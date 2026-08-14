@@ -21,7 +21,8 @@ use fanfan_core::{
     CollectionSuggestionUpdateRequest, CreateCollectionRequest, DegradationLevel, DownloadFile,
     DownloadedModelMetadata, EmbeddingRequest, ExclusionRule, ExclusionRuleInput, ExportResult,
     FilePage, FilePreview, FileQuery, FileRecord, ImageUnderstandingResult, ImportCandidate,
-    InboxItem, InboxPage, InboxQuery, InboxUpdateRequest, IncrementalWatchManager, Intent,
+    InboxItem, InboxPage, InboxQuery, InboxUpdateRequest, IncrementalWatchManager,
+    IndexActivityStats, Intent,
     JobRecord, LocalGenerationRuntime, LogPage, LogQuery, MaintenanceSnapshot, ModelArtifact,
     ModelCatalogEntry, ModelDownloadFileProgress, ModelDownloadJob, ModelDownloadRemoval,
     ModelEdition, ModelFormat, ModelImportSelection, ModelManager, ModelPreset, ModelRole,
@@ -3947,6 +3948,36 @@ pub fn maintenance_get(
     Ok(snapshot)
 }
 
+/// index_activity_stats 的 TTL 缓存：状态栏 1.5s 轮询会触发 3 个 COUNT(DISTINCT)
+/// 全表扫描（~0.5s/次），扫描/维护进行时前端退化为 1.5s 轮询会持续占满一个核。
+/// 索引内容分钟级才变化，10s 缓存足够，把真实查询频次降到 1/6。
+static INDEX_STATS_CACHE: OnceLock<Mutex<(Instant, IndexActivityStats)>> = OnceLock::new();
+const INDEX_STATS_CACHE_TTL: Duration = Duration::from_secs(10);
+
+fn cached_index_activity_stats(
+    catalog: &CatalogService,
+) -> Result<IndexActivityStats, AppError> {
+    let cache = INDEX_STATS_CACHE.get_or_init(|| {
+        Mutex::new((
+            Instant::now() - INDEX_STATS_CACHE_TTL,
+            IndexActivityStats {
+                discovered_files: 0,
+                searchable_files: 0,
+                parsed_files: 0,
+                embedded_files: 0,
+                ocr_pages: 0,
+            },
+        ))
+    });
+    let mut guard = cache
+        .lock()
+        .map_err(|_| AppError::new("STATUS_CACHE_LOCK", "状态统计缓存锁定失败", false))?;
+    if guard.0.elapsed() >= INDEX_STATS_CACHE_TTL {
+        *guard = (Instant::now(), catalog.index_activity_stats()?);
+    }
+    Ok(guard.1.clone())
+}
+
 #[tauri::command(async)]
 pub fn app_status_get(
     catalog: State<'_, CatalogServiceState>,
@@ -3957,7 +3988,7 @@ pub fn app_status_get(
     let catalog = catalog.get()?;
     let roots = catalog.list_roots()?;
     let active_scan = catalog.latest_active_scan_job()?;
-    let index_stats = catalog.index_activity_stats()?;
+    let index_stats = cached_index_activity_stats(&catalog)?;
     let mut maintenance = catalog.maintenance_snapshot()?;
     if let Ok(runtime_events) = crate::runtime_log::count() {
         maintenance.log_events = runtime_events;
