@@ -321,7 +321,12 @@ def _openxml_image_assets(request: ParseRequest, path: Path, source_format: str)
                             locations[media_path] = locator("docx", paragraph_no=paragraph_number)
         total_bytes = 0
         for media_path in media_paths[:512]:
-            content = package.read(media_path)
+            try:
+                content = package.read(media_path)
+            except (zipfile.BadZipFile, EOFError, OSError):
+                # 真实世界损坏的 zip 条目（如国产办公软件导出的 CRC 校验失败）
+                # 只跳过该图片，绝不让内嵌图片损坏连累整个文档解析失败。
+                continue
             total_bytes += len(content)
             if total_bytes > 256 * 1024 * 1024:
                 break
@@ -675,14 +680,27 @@ def _pdf_result(request: ParseRequest, path: Path, started_at: float) -> ParseRe
     try:
         reader = PdfReader(path)
         if reader.is_encrypted:
-            return _result(request, "encrypted", "pypdf", [], [ParseWarning("PDF_ENCRYPTED", "PDF已加密，请提供未加密副本")], 0)
+            # 大量办公扫描件只是空密码加密（内容实际可读）；pypdf 打开后
+            # is_encrypted 为真，先尝试空密码解密，成功则继续正常解析。
+            try:
+                unlocked = bool(reader.decrypt(""))
+            except Exception:
+                unlocked = False
+            if not unlocked:
+                return _result(request, "encrypted", "pypdf", [], [ParseWarning("PDF_ENCRYPTED", "PDF已加密，请提供未加密副本")], 0)
         nodes: list[DocumentNode] = []
         image_assets: list[ImageAsset] = []
         warnings: list[ParseWarning] = []
         ocr_pages: list[int] = []
         pages = reader.pages[: request.max_pages] if request.max_pages else reader.pages
         for page_number, page in enumerate(pages, 1):
-            text = (page.extract_text() or "").strip()
+            try:
+                text = (page.extract_text() or "").strip()
+            except Exception as error:
+                # 单页提取失败（如 JBIG2 图片无 jbig2dec 解码器）只空置该页并
+                # 标记 OCR 抢救，绝不让整份 PDF 解析失败。
+                text = ""
+                warnings.append(ParseWarning("PDF_PARSE_FAILED", str(error), locator("pdf", page_no=page_number)))
             if request.ocr_policy == "force" or (request.ocr_policy == "auto" and len(text) < 30):
                 ocr_pages.append(page_number)
             if len(text) < 30 and request.ocr_policy == "disabled":
@@ -701,7 +719,8 @@ def _pdf_result(request: ParseRequest, path: Path, started_at: float) -> ParseRe
                     )
                     if asset is not None:
                         image_assets.append(asset)
-            except (AttributeError, OSError, ValueError) as error:
+            except Exception as error:
+                # 图片提取尽力而为（如 JBIG2 无解码器抛 RuntimeError），失败只记警告。
                 warnings.append(ParseWarning("PDF_IMAGE_EXTRACT_FAILED", str(error), locator("pdf", page_no=page_number)))
         ocr_page_count = 0
         parser_name = "pypdf"

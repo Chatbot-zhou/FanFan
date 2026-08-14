@@ -50,6 +50,24 @@ def _probe_gpu_free_mb() -> int | None:
     return None
 
 
+def _cudnn_loadable() -> bool:
+    """验证 CUDA EP 运行时依赖 cudnn 是否真的可加载。
+
+    onnxruntime-gpu 的 CUDA EP 在 cudnn_graph64_9.dll 缺失/不在库路径时不会
+    回退——它直接 abort 整个进程（实测 2026-08：dll 在 site-packages 但不在
+    进程搜索路径，ORT 打印 "Could not locate cudnn_graph64_9.dll" 后崩溃）。
+    这里在创建 session 前按名字探测主符号，加载不到就提前走 CPU。
+    """
+    import ctypes
+
+    try:
+        graph = ctypes.WinDLL("cudnn_graph64_9.dll")
+        getattr(graph, "cudnnCreate")
+        return True
+    except (OSError, AttributeError):
+        return False
+
+
 def _resolve_providers() -> tuple[list[str], str | None]:
     import os
 
@@ -67,6 +85,8 @@ def _resolve_providers() -> tuple[list[str], str | None]:
             return ["CPUExecutionProvider"], f"gpu_memory_low:{free_mb}MiB"
     except Exception:
         pass
+    if not _cudnn_loadable():
+        return ["CPUExecutionProvider"], "cudnn_unavailable"
     return _ENABLED_PROVIDERS, None
 
 
