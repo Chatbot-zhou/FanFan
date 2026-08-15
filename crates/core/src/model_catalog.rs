@@ -2547,6 +2547,10 @@ fn tts_vits_artifact(source: ModelSource) -> DownloadArtifact {
     // Locked to csukuangfj/sherpa-onnx-vits-zh-ll on Hugging Face (revision pinned).
     // model.onnx is LFS-locked via its ETag; tokens/lexicon were downloaded and
     // verified locally on 2026-08-12.
+    // NOTE 2026-08-15: sha256 was corrected to the actual LFS oid
+    // (6c349bdd…) verified against hf-mirror API tree at this revision; the
+    // previously locked value (4704ba41…) failed MODE_DOWNLOAD_HASH_MISMATCH
+    // on a byte-identical 121,100,803-byte download.
     const REPOSITORY: &str = "csukuangfj/sherpa-onnx-vits-zh-ll";
     const REVISION: &str = "7ddf37bcacf05ed56afee360d96835be633a5265";
     DownloadArtifact {
@@ -2558,7 +2562,7 @@ fn tts_vits_artifact(source: ModelSource) -> DownloadArtifact {
         revision: REVISION.into(),
         file_name: "model.onnx".into(),
         url: artifact_url(source, REPOSITORY, REVISION, "model.onnx"),
-        sha256: "4704ba4197dbdb1e91eadb912dc90cc6a8c58935d0da36fe40e62e13d3675c0b".into(),
+        sha256: "6c349bdd73dc928234dd7bc86929748bba32cd5264d32d915bf7b7aa0595965b".into(),
         size_bytes: 121_100_803,
         companion_files: vec![
             DownloadFile {

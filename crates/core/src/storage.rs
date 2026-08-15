@@ -38,9 +38,9 @@ use crate::{
     SemanticQuery, SourceLocator, TriageStatus, VolumeType, WatchMode, chunks_from_nodes,
     cluster_relation_edges, fts_query, normalized_version_key,
 };
-use crate::organizing::RelationEdge;
+use crate::organizing::{RelationEdge, SeedProfile, seed_expand_semantic_groups};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 24;
+pub const CURRENT_SCHEMA_VERSION: u32 = 25;
 
 type VectorSourceRow = (u64, String, String, String, Vec<f32>);
 type SemanticCandidate = (Uuid, String, f32);
@@ -883,6 +883,16 @@ const MIGRATIONS: &[Migration] = &[
             );
             CREATE INDEX IF NOT EXISTS idx_relation_group_members_file
                 ON relation_group_members(file_id);
+        "#,
+    },
+    Migration {
+        version: 25,
+        name: "encrypted_disposition_consistency",
+        sql: r#"
+            UPDATE files
+               SET processing_disposition = 'encrypted_or_damaged'
+             WHERE parse_status = 'encrypted'
+               AND processing_disposition = 'parseable_content';
         "#,
     },
 ];
@@ -3145,7 +3155,6 @@ impl CatalogStore {
             grouped.insert(file_id, (revision_id, title, texts, vectors));
         }
         let now = Utc::now().to_rfc3339();
-        let mut profiles = Vec::new();
         let mut profile_records = Vec::new();
         for (file_id, (revision_id, title, texts, vectors)) in grouped {
             let vector = mean_normalized_vector(&vectors)?;
@@ -3155,13 +3164,6 @@ impl CatalogStore {
                 .map(|text| compact_profile_text(text, 260))
                 .unwrap_or_default();
             let keywords = profile_keywords(&title);
-            profiles.push(ProfileCandidate {
-                file_id: parse_uuid_value(&file_id)?,
-                revision_id: parse_uuid_value(&revision_id)?,
-                title: title.clone(),
-                vector: vector.clone(),
-                bucket: bucket.clone(),
-            });
             profile_records.push((
                 file_id,
                 revision_id,
@@ -3193,115 +3195,11 @@ impl CatalogStore {
                 storage_error("COLLECTION_SUGGESTION_REFRESH_FAILED", error, true)
             })?;
         }
-        let connection = self.connect()?;
-        let mut candidate_records = Vec::new();
-        let mut seen_edges = HashSet::new();
-        for profile in &profiles {
-            let candidates = {
-                let mut statement = connection
-                    .prepare("SELECT file_id, revision_id, title, dimension, vector_blob FROM document_profiles WHERE embedding_model_id = ?1 AND candidate_bucket = ?2 AND file_id <> ?3 ORDER BY updated_at DESC LIMIT 96")
-                    .map_err(|error| storage_error("COLLECTION_CANDIDATE_QUERY_FAILED", error, true))?;
-                statement
-                    .query_map(
-                        params![
-                            model_artifact_id,
-                            profile.bucket,
-                            profile.file_id.to_string()
-                        ],
-                        |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                                row.get::<_, u32>(3)?,
-                                row.get::<_, Vec<u8>>(4)?,
-                            ))
-                        },
-                    )
-                    .map_err(|error| {
-                        storage_error("COLLECTION_CANDIDATE_QUERY_FAILED", error, true)
-                    })?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| {
-                        storage_error("COLLECTION_CANDIDATE_QUERY_FAILED", error, true)
-                    })?
-            };
-            for (other_file_id, other_revision, other_title, dimension, bytes) in candidates {
-                let other_file_id = parse_uuid_value(&other_file_id)?;
-                let other_vector = decode_vector(&bytes, dimension)?;
-                if other_vector.len() != profile.vector.len() {
-                    continue;
-                }
-                let similarity = profile
-                    .vector
-                    .iter()
-                    .zip(&other_vector)
-                    .map(|(left, right)| left * right)
-                    .sum::<f32>();
-                if similarity < 0.78 {
-                    continue;
-                }
-                let other_revision = parse_uuid_value(&other_revision)?;
-                let (left, right, left_revision, right_revision) =
-                    if profile.file_id < other_file_id {
-                        (
-                            profile.file_id,
-                            other_file_id,
-                            profile.revision_id,
-                            other_revision,
-                        )
-                    } else {
-                        (
-                            other_file_id,
-                            profile.file_id,
-                            other_revision,
-                            profile.revision_id,
-                        )
-                    };
-                if !seen_edges.insert((left, right)) {
-                    continue;
-                }
-                let reasons = serde_json::to_string(&vec![
-                    format!("文档语义画像相似度 {:.0}%", similarity * 100.0),
-                    format!(
-                        "候选桶 {}，对比《{}》与《{}》",
-                        profile.bucket, profile.title, other_title
-                    ),
-                ])
-                .map_err(|error| {
-                    AppError::new("COLLECTION_REASON_INVALID", error.to_string(), false)
-                })?;
-                candidate_records.push((
-                    left,
-                    right,
-                    left_revision,
-                    right_revision,
-                    f64::from(similarity),
-                    reasons,
-                ));
-            }
-        }
-        drop(connection);
-        for batch in candidate_records.chunks(100) {
-            let _permit = self.acquire_write(WritePriority::Background);
-            let mut connection = self.connect()?;
-            let transaction = connection.transaction().map_err(|error| {
-                storage_error("COLLECTION_SUGGESTION_REFRESH_FAILED", error, true)
-            })?;
-            for (left, right, left_revision, right_revision, confidence, reasons) in batch {
-                transaction
-                    .execute(
-                        "INSERT INTO file_relations (relation_id, left_file_id, right_file_id, relation_type, confidence, reasons_json, review_status, created_at, updated_at, algorithm_version, model_version, left_revision_id, right_revision_id) VALUES (?1, ?2, ?3, 'semantic_related', ?4, ?5, 'suggested', ?6, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(left_file_id, right_file_id, relation_type) DO UPDATE SET confidence = excluded.confidence, reasons_json = excluded.reasons_json, review_status = CASE WHEN file_relations.algorithm_version IS NOT excluded.algorithm_version OR file_relations.model_version IS NOT excluded.model_version OR file_relations.left_revision_id IS NOT excluded.left_revision_id OR file_relations.right_revision_id IS NOT excluded.right_revision_id THEN 'suggested' ELSE file_relations.review_status END, algorithm_version = excluded.algorithm_version, model_version = excluded.model_version, left_revision_id = excluded.left_revision_id, right_revision_id = excluded.right_revision_id, updated_at = excluded.updated_at",
-                        params![Uuid::now_v7().to_string(), left.to_string(), right.to_string(), confidence, reasons, now, ALGORITHM_VERSION, model_artifact_id, left_revision.to_string(), right_revision.to_string()],
-                    )
-                    .map_err(|error| storage_error("COLLECTION_CANDIDATE_WRITE_FAILED", error, true))?;
-            }
-            transaction.commit().map_err(|error| {
-                storage_error("COLLECTION_SUGGESTION_REFRESH_FAILED", error, true)
-            })?;
-        }
-        // 3. 聚类：同主题/同用途边（cosine ≥0.78）做连通分量，一类一组。
-        //    复用关系分析的聚类算法；成员分组完全由 Embedding 决定，不经过模型。
+        // 2. 种子扩展聚类：universe 加载全量档案（含本批刚档案化的），
+        //    剔除已被任何集合建议消费过的文件，种子贪心扩展成互斥组。
+        //    与旧实现（写 file_relations 边再连通分量）不同：集合建议不再
+        //    读写 file_relations，与关系分析页彻底解耦。
+        const COLLECTION_UNIVERSE_CAP: i64 = 4_000;
         let connection = self.connect()?;
         let mut consumed = HashSet::new();
         {
@@ -3317,103 +3215,94 @@ impl CatalogStore {
                 consumed.insert(parse_uuid_value(&file_id)?);
             }
         }
-        let mut names_by_id = HashMap::<Uuid, String>::new();
-        {
-            let sql = format!(
-                "SELECT f.file_id, f.display_name FROM files f WHERE f.availability = 'present' AND {AUTHORIZED_FILE_SQL}"
-            );
-            let mut statement = connection
-                .prepare(&sql)
-                .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?;
-            let rows = statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?;
-            for (file_id, name) in rows {
-                names_by_id.insert(parse_uuid_value(&file_id)?, name);
-            }
-        }
-        let mut edges = Vec::new();
+        // 必须加载全量档案而非本批 targets：跨批次分组能力靠它保持，
+        // 只取本批 targets 会让分到后批的文件永远组不成
+        let universe_sql = format!(
+            "SELECT p.file_id, p.revision_id, p.title, p.dimension, p.vector_blob, p.candidate_bucket FROM document_profiles p JOIN files f ON f.file_id = p.file_id WHERE p.embedding_model_id = ?1 AND p.algorithm_version = ?2 AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL} ORDER BY p.updated_at DESC LIMIT ?3"
+        );
+        let mut seed_profiles = Vec::new();
         {
             let mut statement = connection
-                .prepare("SELECT left_file_id, right_file_id, confidence FROM file_relations WHERE relation_type IN ('semantic_related','related') AND review_status <> 'rejected' AND confidence >= 0.78 AND model_version = ?1 AND algorithm_version = ?2")
-                .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?;
+                .prepare(&universe_sql)
+                .map_err(|error| storage_error("COLLECTION_UNIVERSE_QUERY_FAILED", error, true))?;
             let rows = statement
-                .query_map(params![model_artifact_id, ALGORITHM_VERSION], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, f64>(2)?,
-                    ))
-                })
-                .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?
+                .query_map(
+                    params![model_artifact_id, ALGORITHM_VERSION, COLLECTION_UNIVERSE_CAP],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, u32>(3)?,
+                            row.get::<_, Vec<u8>>(4)?,
+                            row.get::<_, String>(5)?,
+                        ))
+                    },
+                )
+                .map_err(|error| storage_error("COLLECTION_UNIVERSE_QUERY_FAILED", error, true))?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| storage_error("COLLECTION_GROUP_QUERY_FAILED", error, true))?;
-            for (left, right, confidence) in rows {
-                let left_id = parse_uuid_value(&left)?;
-                let right_id = parse_uuid_value(&right)?;
-                if !names_by_id.contains_key(&left_id) || !names_by_id.contains_key(&right_id) {
-                    continue;
-                }
-                edges.push(RelationEdge {
-                    left_file_id: left_id,
-                    right_file_id: right_id,
-                    relation_type: crate::RelationType::SemanticRelated,
-                    confidence,
-                    directed: false,
+                .map_err(|error| storage_error("COLLECTION_UNIVERSE_QUERY_FAILED", error, true))?;
+            for (file_id, revision_id, title, dimension, bytes, bucket) in rows {
+                seed_profiles.push(SeedProfile {
+                    file_id: parse_uuid_value(&file_id)?,
+                    revision_id: parse_uuid_value(&revision_id)?,
+                    title,
+                    vector: decode_vector(&bytes, dimension)?,
+                    bucket,
                 });
             }
         }
-        let title_for = |member_ids: &[Uuid], _group_type: crate::RelationGroupType| -> String {
-            let names = member_ids
-                .iter()
-                .filter_map(|id| names_by_id.get(id).cloned())
-                .collect::<Vec<_>>();
-            deterministic_collection_name(&names)
-        };
-        let mut groups = cluster_relation_edges(&edges, &title_for);
+        drop(connection);
+        let mut groups = seed_expand_semantic_groups(&seed_profiles, &consumed, 0.78, 12, 96);
+        // 星形边数（种子→成员），仅 trace 用
+        let candidate_edges = groups
+            .iter()
+            .map(|group| group.members.len())
+            .sum::<usize>() as u64;
 
-        // 4. 大组一致性校验：成员与组代表向量（均值）< 0.70 的踢出，
+        // 3. 大组一致性校验：成员与组代表向量（均值）< 0.70 的踢出，
         //    防止「A~B、B~C、A~C 弱」的长链把不同主题连成一组。
+        //    （种子扩展组由种子贪心而来，链式蔓延已不存在，此校验仅作兜底；
+        //     种子不参与踢出——它是组的核，与成员相似度必 ≥0.78）
         {
-            let mut vector_cache = HashMap::<Uuid, Vec<f32>>::new();
             let mut kept = Vec::with_capacity(groups.len());
             for mut group in groups {
                 if group.members.len() < 4 {
                     kept.push(group);
                     continue;
                 }
-                let mut vectors = Vec::new();
-                let mut valid = true;
+                let Some(seed_vector) = seed_profiles
+                    .iter()
+                    .find(|profile| profile.file_id == group.seed_file_id)
+                    .map(|profile| profile.vector.clone())
+                else {
+                    continue;
+                };
+                let mut all_vectors = Vec::with_capacity(group.members.len() + 1);
+                all_vectors.push(seed_vector);
+                let mut member_vectors = Vec::with_capacity(group.members.len());
                 for member in &group.members {
-                    match file_vector_for(
-                        &connection,
-                        Some(model_artifact_id),
-                        member.file_id,
-                        &mut vector_cache,
-                    )? {
-                        Some(vector) => vectors.push((member.file_id, vector)),
+                    match seed_profiles
+                        .iter()
+                        .find(|profile| profile.file_id == member.file_id)
+                    {
+                        Some(profile) => {
+                            member_vectors.push((member.file_id, profile.vector.clone()));
+                            all_vectors.push(profile.vector.clone());
+                        }
                         None => {
-                            valid = false;
+                            member_vectors.clear();
                             break;
                         }
                     }
                 }
-                if !valid || vectors.is_empty() {
+                if member_vectors.is_empty() || all_vectors.is_empty() {
                     continue;
                 }
-                let representative = mean_normalized_vector(
-                    &vectors
-                        .iter()
-                        .map(|(_, vector)| vector.clone())
-                        .collect::<Vec<_>>(),
-                )?;
-                let before = group.members.clone();
+                let representative = mean_normalized_vector(&all_vectors)?;
+                let before = group.members.len();
                 group.members.retain(|member| {
-                    vectors
+                    member_vectors
                         .iter()
                         .find(|(file_id, _)| *file_id == member.file_id)
                         .is_some_and(|(_, vector)| {
@@ -3426,9 +3315,9 @@ impl CatalogStore {
                         })
                 });
                 if group.members.len() >= 2 {
-                    if group.members.len() < before.len() {
+                    if group.members.len() < before {
                         group.confidence *= f64::from(group.members.len() as u32)
-                            / f64::from(before.len() as u32);
+                            / f64::from(before as u32);
                     }
                     kept.push(group);
                 }
@@ -3467,10 +3356,10 @@ impl CatalogStore {
             .take(MAX_COLLECTION_SUGGESTIONS_PER_BATCH)
             .collect::<Vec<_>>();
         let remaining_topic_groups = topic_groups.saturating_sub(shown.len() as u64);
-        drop(connection);
 
         let mut created_suggestions = 0_u64;
         let mut suggestion_ids = Vec::new();
+        let mut seed_file_id_by_suggestion = HashMap::<Uuid, Uuid>::new();
         if !shown.is_empty() {
             let _permit = self.acquire_write(WritePriority::Background);
             let mut connection = self.connect()?;
@@ -3478,30 +3367,31 @@ impl CatalogStore {
                 storage_error("COLLECTION_SUGGESTION_REFRESH_FAILED", error, true)
             })?;
             for group in shown {
-                // 成员按 file_id 排序，取各自档案的 revision
+                // 成员按 file_id 排序，revision/title 直接取聚类结果（universe 同源）
+                let seed_title = seed_profiles
+                    .iter()
+                    .find(|profile| profile.file_id == group.seed_file_id)
+                    .map(|profile| profile.title.as_str())
+                    .unwrap_or("种子");
+                let group_title = deterministic_collection_name(
+                    &group
+                        .members
+                        .iter()
+                        .map(|member| member.title.clone())
+                        .collect::<Vec<_>>(),
+                );
                 let mut members = Vec::new();
                 for member in &group.members {
-                    let profile_data = transaction
-                        .query_row(
-                            "SELECT revision_id, title FROM document_profiles WHERE file_id = ?1",
-                            [member.file_id.to_string()],
-                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                        )
-                        .optional()
-                        .map_err(|error| {
-                            storage_error("COLLECTION_SUGGESTION_WRITE_FAILED", error, true)
-                        })?;
-                    if let Some((revision_id, title)) = profile_data {
-                        members.push((
-                            member.file_id,
-                            parse_uuid_value(&revision_id)?,
-                            title,
-                            format!(
-                                "同主题分组，组内平均语义置信度 {:.0}%",
-                                group.confidence * 100.0
-                            ),
-                        ));
-                    }
+                    members.push((
+                        member.file_id,
+                        member.revision_id,
+                        member.title.clone(),
+                        format!(
+                            "与《{seed_title}》语义最相近（{:.0}%），组内平均置信度 {:.0}%",
+                            member.similarity * 100.0,
+                            group.confidence * 100.0
+                        ),
+                    ));
                 }
                 members.sort_by_key(|member| member.0);
                 members.dedup_by_key(|member| member.0);
@@ -3520,7 +3410,7 @@ impl CatalogStore {
                 let changed = transaction
                     .execute(
                         "INSERT OR IGNORE INTO collection_suggestions (suggestion_id, idempotency_key, suggested_name, description, confidence, status, model_version, algorithm_version, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'suggested', ?6, ?7, ?8, ?8)",
-                        params![suggestion_id.to_string(), idempotency_key, group.title.clone(), "AI按同主题/同用途聚类生成的虚拟分类；不会改变任何原文件位置。", group.confidence, model_artifact_id, ALGORITHM_VERSION, now],
+                        params![suggestion_id.to_string(), idempotency_key, group_title.clone(), "AI按同主题/同用途聚类生成的虚拟分类；不会改变任何原文件位置。", group.confidence, model_artifact_id, ALGORITHM_VERSION, now],
                     )
                     .map_err(|error| storage_error("COLLECTION_SUGGESTION_WRITE_FAILED", error, true))?;
                 if changed == 0 {
@@ -3547,18 +3437,20 @@ impl CatalogStore {
                 }
                 created_suggestions += 1;
                 suggestion_ids.push(suggestion_id);
+                seed_file_id_by_suggestion.insert(suggestion_id, group.seed_file_id);
             }
             transaction.commit().map_err(|error| {
                 storage_error("COLLECTION_SUGGESTION_REFRESH_FAILED", error, true)
             })?;
         }
         Ok(CollectionSuggestionRefreshResult {
-            profiled_files: profiles.len() as u64,
-            candidate_edges: candidate_records.len() as u64,
+            profiled_files: profile_records.len() as u64,
+            candidate_edges,
             topic_groups,
             remaining_topic_groups,
             created_suggestions,
             suggestion_ids,
+            seed_file_id_by_suggestion,
             algorithm_version: ALGORITHM_VERSION.into(),
             model_version: model_artifact_id.into(),
         })
@@ -3815,6 +3707,155 @@ impl CatalogStore {
         transaction
             .commit()
             .map_err(|error| storage_error("COLLECTION_SUGGESTION_REJECT_FAILED", error, true))
+    }
+
+    /// 批量取建议成员的档案摘要（document_profiles.summary，260 字），file_id → summary。
+    /// 供生成模型命名时参考每个成员的内容片段。
+    pub fn collection_suggestion_member_summaries(
+        &self,
+        suggestion_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, String>, AppError> {
+        if suggestion_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", suggestion_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let connection = self.connect()?;
+        let sql = format!(
+            "SELECT m.file_id, p.summary FROM collection_suggested_members m JOIN document_profiles p ON p.file_id = m.file_id WHERE m.suggestion_id IN ({placeholders})"
+        );
+        let mut statement = connection
+            .prepare(&sql)
+            .map_err(|error| storage_error("COLLECTION_SUMMARY_QUERY_FAILED", error, true))?;
+        let rows = statement
+            .query_map(
+                params_from_iter(suggestion_ids.iter().map(|id| id.to_string())),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|error| storage_error("COLLECTION_SUMMARY_QUERY_FAILED", error, true))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| storage_error("COLLECTION_SUMMARY_QUERY_FAILED", error, true))?;
+        let mut by_file = HashMap::with_capacity(rows.len());
+        for (file_id, summary) in rows {
+            by_file.insert(parse_uuid_value(&file_id)?, summary);
+        }
+        Ok(by_file)
+    }
+
+    /// rerank 修剪：删除被移除成员的行及对应 inbox 事件；剩余成员 <2 则整条建议作废
+    /// （删 suggestion+成员+inbox）；否则按剩余成员（file_id 升序）重算并 UPDATE
+    /// idempotency_key 与 confidence（剩余成员均值）——幂等键不重算的话，下次刷新
+    /// 完整成员集会与旧键不匹配，INSERT OR IGNORE 不命中，产生重叠建议。
+    /// 返回 true=存活，false=已作废。事务内完成。
+    pub fn prune_collection_suggestion_members(
+        &self,
+        suggestion_id: &Uuid,
+        removed_file_ids: &[Uuid],
+    ) -> Result<bool, AppError> {
+        if removed_file_ids.is_empty() {
+            return Ok(true);
+        }
+        let _permit = self.acquire_write(WritePriority::Background);
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| storage_error("COLLECTION_PRUNE_FAILED", error, true))?;
+        let (algorithm_version, model_version): (String, String) = transaction
+            .query_row(
+                "SELECT algorithm_version, model_version FROM collection_suggestions WHERE suggestion_id = ?1",
+                [suggestion_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|error| storage_error("COLLECTION_PRUNE_FAILED", error, true))?;
+        let placeholders = std::iter::repeat_n("?", removed_file_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        transaction
+            .execute(
+                &format!(
+                    "DELETE FROM collection_suggested_members WHERE suggestion_id = ?1 AND file_id IN ({placeholders})"
+                ),
+                params_from_iter(
+                    std::iter::once(suggestion_id.to_string())
+                        .chain(removed_file_ids.iter().map(|id| id.to_string())),
+                ),
+            )
+            .map_err(|error| storage_error("COLLECTION_PRUNE_FAILED", error, true))?;
+        // 只删被移除成员的 inbox 事件（存活成员的事件保留，等待审核）
+        for removed in removed_file_ids {
+            transaction
+                .execute(
+                    "DELETE FROM inbox_events WHERE dedupe_key = ?1",
+                    [format!("collection_suggestion:{suggestion_id}:{removed}")],
+                )
+                .map_err(|error| storage_error("COLLECTION_PRUNE_FAILED", error, true))?;
+        }
+        // 剩余成员：按 file_id 排序重算幂等键与置信度（与写入侧口径一致）
+        let remaining = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT file_id, revision_id, confidence FROM collection_suggested_members WHERE suggestion_id = ?1 ORDER BY file_id",
+                )
+                .map_err(|error| storage_error("COLLECTION_PRUNE_FAILED", error, true))?;
+            statement
+                .query_map([suggestion_id.to_string()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, f64>(2)?,
+                    ))
+                })
+                .map_err(|error| storage_error("COLLECTION_PRUNE_FAILED", error, true))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| storage_error("COLLECTION_PRUNE_FAILED", error, true))?
+        };
+        if remaining.len() < 2 {
+            // 存活成员不足两个，整条作废（成员行+建议行+全部 inbox 事件）
+            transaction
+                .execute(
+                    "DELETE FROM collection_suggestions WHERE suggestion_id = ?1",
+                    [suggestion_id.to_string()],
+                )
+                .map_err(|error| storage_error("COLLECTION_PRUNE_FAILED", error, true))?;
+            transaction
+                .execute(
+                    "DELETE FROM collection_suggested_members WHERE suggestion_id = ?1",
+                    [suggestion_id.to_string()],
+                )
+                .map_err(|error| storage_error("COLLECTION_PRUNE_FAILED", error, true))?;
+            transaction
+                .execute(
+                    "DELETE FROM inbox_events WHERE dedupe_key LIKE ?1",
+                    [format!("collection_suggestion:{suggestion_id}:%")],
+                )
+                .map_err(|error| storage_error("COLLECTION_PRUNE_FAILED", error, true))?;
+            transaction
+                .commit()
+                .map_err(|error| storage_error("COLLECTION_PRUNE_FAILED", error, true))?;
+            return Ok(false);
+        }
+        let mut digest = Sha256::new();
+        digest.update(algorithm_version.as_bytes());
+        digest.update(model_version.as_bytes());
+        for (file_id, revision_id, _) in &remaining {
+            digest.update(file_id.as_bytes());
+            digest.update(revision_id.as_bytes());
+        }
+        let idempotency_key = format!("{:x}", digest.finalize());
+        let confidence = remaining.iter().map(|(_, _, value)| *value).sum::<f64>()
+            / remaining.len() as f64;
+        let now = Utc::now().to_rfc3339();
+        transaction
+            .execute(
+                "UPDATE collection_suggestions SET idempotency_key = ?1, confidence = ?2, updated_at = ?3 WHERE suggestion_id = ?4",
+                params![idempotency_key, confidence, now, suggestion_id.to_string()],
+            )
+            .map_err(|error| storage_error("COLLECTION_PRUNE_FAILED", error, true))?;
+        transaction
+            .commit()
+            .map_err(|error| storage_error("COLLECTION_PRUNE_FAILED", error, true))?;
+        Ok(true)
     }
 
     fn collection_suggestion_by_id(
@@ -4114,10 +4155,6 @@ impl CatalogStore {
                 vector,
             ));
         }
-        let mut buckets = BTreeMap::<String, Vec<usize>>::new();
-        for (index, profile) in profiles.iter().enumerate() {
-            buckets.entry(profile.5.clone()).or_default().push(index);
-        }
         transaction
             .execute(
                 "DELETE FROM file_relations WHERE relation_type IN ('semantic_related','contains_or_summarizes') AND review_status = 'suggested' AND model_version = ?1",
@@ -4125,77 +4162,96 @@ impl CatalogStore {
             )
             .map_err(|error| storage_error("SEMANTIC_RELATION_REFRESH_FAILED", error, true))?;
         let now = Utc::now().to_rfc3339();
+        // 种子扩展（替代桶内两两全比较）：每个种子按相似度取 top-12 未消费邻居成组，
+        // 组间互斥。星形边（seed→成员）保留「成员经 seed 连通」的分组能力；
+        // 冗余两两边消失，边数变小是预期（evaluate_local 只记录不设门槛）。
+        let mut seed_profiles = Vec::with_capacity(profiles.len());
+        let mut profile_index = HashMap::<Uuid, usize>::new();
+        for (index, profile) in profiles.iter().enumerate() {
+            profile_index.insert(profile.0, index);
+            seed_profiles.push(SeedProfile {
+                file_id: profile.0,
+                revision_id: profile.1,
+                title: profile.2.clone(),
+                vector: profile.6.clone(),
+                bucket: profile.5.clone(),
+            });
+        }
         let mut semantic_pairs = 0_u64;
         let mut contains_pairs = 0_u64;
         let mut touched_files = HashSet::new();
-        for indices in buckets.values() {
-            let bounded = indices.iter().copied().take(96).collect::<Vec<_>>();
-            for left_position in 0..bounded.len() {
-                let mut neighbors = 0_u8;
-                for right_position in (left_position + 1)..bounded.len() {
-                    if neighbors >= 12 {
-                        break;
-                    }
-                    let left = &profiles[bounded[left_position]];
-                    let right = &profiles[bounded[right_position]];
-                    if left.6.len() != right.6.len() {
-                        continue;
-                    }
-                    let similarity = left.6.iter().zip(&right.6).map(|(a, b)| a * b).sum::<f32>();
-                    if similarity < 0.78 {
-                        continue;
-                    }
-                    neighbors += 1;
-                    let left_summary = is_summary_like_name(&left.2);
-                    let right_summary = is_summary_like_name(&right.2);
-                    let size_ratio =
-                        (left.4.min(right.4) as f64) / (left.4.max(right.4).max(1) as f64);
-                    let contains = similarity >= 0.84
-                        && ((left_summary != right_summary) || size_ratio <= 0.42);
-                    let relation_type = if contains {
-                        RelationType::ContainsOrSummarizes
+        let groups = seed_expand_semantic_groups(&seed_profiles, &HashSet::new(), 0.78, 12, 96);
+        for group in &groups {
+            let Some(&seed_index) = profile_index.get(&group.seed_file_id) else {
+                continue;
+            };
+            for member in &group.members {
+                let Some(&member_index) = profile_index.get(&member.file_id) else {
+                    continue;
+                };
+                let left_profile = &profiles[seed_index];
+                let right_profile = &profiles[member_index];
+                let similarity = member.similarity;
+                let left_summary = is_summary_like_name(&left_profile.2);
+                let right_summary = is_summary_like_name(&right_profile.2);
+                let size_ratio = (left_profile.4.min(right_profile.4) as f64)
+                    / (left_profile.4.max(right_profile.4).max(1) as f64);
+                let contains = similarity >= 0.84
+                    && ((left_summary != right_summary) || size_ratio <= 0.42);
+                let relation_type = if contains {
+                    RelationType::ContainsOrSummarizes
+                } else {
+                    RelationType::SemanticRelated
+                };
+                let direction_reason = if contains {
+                    let (summary, source) = if left_summary || left_profile.4 <= right_profile.4 {
+                        (&left_profile.2, &right_profile.2)
                     } else {
-                        RelationType::SemanticRelated
+                        (&right_profile.2, &left_profile.2)
                     };
-                    let direction_reason = if contains {
-                        let (summary, source) = if left_summary || left.4 <= right.4 {
-                            (&left.2, &right.2)
-                        } else {
-                            (&right.2, &left.2)
-                        };
-                        format!("《{summary}》可能是《{source}》的摘要、提纲或派生资料")
+                    format!("《{summary}》可能是《{source}》的摘要、提纲或派生资料")
+                } else {
+                    format!(
+                        "两份资料的文档级语义相似度为 {:.0}%",
+                        f64::from(similarity) * 100.0
+                    )
+                };
+                let (left_id, right_id, left_revision, right_revision) =
+                    if left_profile.0 < right_profile.0 {
+                        (
+                            left_profile.0,
+                            right_profile.0,
+                            left_profile.1,
+                            right_profile.1,
+                        )
                     } else {
-                        format!(
-                            "两份资料的文档级语义相似度为 {:.0}%",
-                            f64::from(similarity) * 100.0
+                        (
+                            right_profile.0,
+                            left_profile.0,
+                            right_profile.1,
+                            left_profile.1,
                         )
                     };
-                    let (left_id, right_id, left_revision, right_revision) = if left.0 < right.0 {
-                        (left.0, right.0, left.1, right.1)
-                    } else {
-                        (right.0, left.0, right.1, left.1)
-                    };
-                    let reasons = vec![
-                        direction_reason,
-                        format!(
-                            "共同内容候选桶 {}，文件类型 {} / {}",
-                            left.5, left.3, right.3
-                        ),
-                    ];
-                    let reasons_json = serde_json::to_string(&reasons).map_err(|error| {
-                        AppError::new("RELATION_DATA_INVALID", error.to_string(), false)
-                    })?;
-                    transaction.execute(
-                        "INSERT INTO file_relations (relation_id, left_file_id, right_file_id, relation_type, confidence, reasons_json, review_status, created_at, updated_at, algorithm_version, model_version, left_revision_id, right_revision_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'suggested', ?7, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(left_file_id, right_file_id, relation_type) DO UPDATE SET confidence = excluded.confidence, reasons_json = excluded.reasons_json, review_status = CASE WHEN file_relations.algorithm_version IS NOT excluded.algorithm_version OR file_relations.model_version IS NOT excluded.model_version OR file_relations.left_revision_id IS NOT excluded.left_revision_id OR file_relations.right_revision_id IS NOT excluded.right_revision_id THEN 'suggested' ELSE file_relations.review_status END, algorithm_version = excluded.algorithm_version, model_version = excluded.model_version, left_revision_id = excluded.left_revision_id, right_revision_id = excluded.right_revision_id, updated_at = excluded.updated_at",
-                        params![Uuid::now_v7().to_string(), left_id.to_string(), right_id.to_string(), relation_type.as_storage(), f64::from(similarity), reasons_json, now, ALGORITHM_VERSION, model_artifact_id, left_revision.to_string(), right_revision.to_string()],
-                    ).map_err(|error| storage_error("SEMANTIC_RELATION_WRITE_FAILED", error, true))?;
-                    touched_files.insert(left_id);
-                    touched_files.insert(right_id);
-                    if contains {
-                        contains_pairs += 1;
-                    } else {
-                        semantic_pairs += 1;
-                    }
+                let reasons = vec![
+                    direction_reason,
+                    format!(
+                        "共同内容候选桶 {}，文件类型 {} / {}",
+                        left_profile.5, left_profile.3, right_profile.3
+                    ),
+                ];
+                let reasons_json = serde_json::to_string(&reasons).map_err(|error| {
+                    AppError::new("RELATION_DATA_INVALID", error.to_string(), false)
+                })?;
+                transaction.execute(
+                    "INSERT INTO file_relations (relation_id, left_file_id, right_file_id, relation_type, confidence, reasons_json, review_status, created_at, updated_at, algorithm_version, model_version, left_revision_id, right_revision_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'suggested', ?7, ?7, ?8, ?9, ?10, ?11) ON CONFLICT(left_file_id, right_file_id, relation_type) DO UPDATE SET confidence = excluded.confidence, reasons_json = excluded.reasons_json, review_status = CASE WHEN file_relations.algorithm_version IS NOT excluded.algorithm_version OR file_relations.model_version IS NOT excluded.model_version OR file_relations.left_revision_id IS NOT excluded.left_revision_id OR file_relations.right_revision_id IS NOT excluded.right_revision_id THEN 'suggested' ELSE file_relations.review_status END, algorithm_version = excluded.algorithm_version, model_version = excluded.model_version, left_revision_id = excluded.left_revision_id, right_revision_id = excluded.right_revision_id, updated_at = excluded.updated_at",
+                    params![Uuid::now_v7().to_string(), left_id.to_string(), right_id.to_string(), relation_type.as_storage(), f64::from(similarity), reasons_json, now, ALGORITHM_VERSION, model_artifact_id, left_revision.to_string(), right_revision.to_string()],
+                ).map_err(|error| storage_error("SEMANTIC_RELATION_WRITE_FAILED", error, true))?;
+                touched_files.insert(left_id);
+                touched_files.insert(right_id);
+                if contains {
+                    contains_pairs += 1;
+                } else {
+                    semantic_pairs += 1;
                 }
             }
         }
@@ -4999,6 +5055,160 @@ impl CatalogStore {
             .map_err(|error| storage_error("FILE_QUERY_FAILED", error, true))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| storage_error("FILE_QUERY_FAILED", error, true))
+    }
+
+    /// 只领取 ocr_pending 文件的图片理解资产,供 VLM 消费端处理。
+    /// 与 claim_pending_image_understanding 的区别:附带 f.parse_status='ocr_pending' 过滤,
+    /// 避免把已 parsed 文件的图片理解资产(纯增强)也拉进评测必需的 OCR 补齐流程。
+    pub fn claim_pending_ocr_image_understanding(
+        &self,
+        model_artifact_id: &str,
+    ) -> Result<Option<PendingImageUnderstanding>, AppError> {
+        if model_artifact_id.trim().is_empty() {
+            return Err(AppError::new(
+                "VISION_MODEL_INVALID",
+                "图片理解任务缺少模型标识",
+                false,
+            ));
+        }
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| storage_error("IMAGE_UNDERSTANDING_CLAIM_FAILED", error, true))?;
+        let sql = format!(
+            "SELECT ia.asset_id, ia.file_id, ia.revision_id, ia.cache_path, ia.mime_type, ia.size_bytes, ia.sha256, ia.locator_json, ia.ocr_text, ia.attempt_count FROM image_assets ia JOIN files f ON f.file_id = ia.file_id WHERE ia.status = 'pending_understanding' AND f.current_revision_id = ia.revision_id AND f.availability = 'present' AND f.parse_status = 'ocr_pending' AND {AUTHORIZED_FILE_SQL} ORDER BY ia.updated_at, ia.asset_id LIMIT 1"
+        );
+        let row = transaction
+            .query_row(&sql, [], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, u64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, u32>(9)?,
+                ))
+            })
+            .optional()
+            .map_err(|error| storage_error("IMAGE_UNDERSTANDING_CLAIM_FAILED", error, true))?;
+        let Some((
+            asset_id,
+            file_id,
+            revision_id,
+            cache_path,
+            mime_type,
+            size_bytes,
+            sha256,
+            locator_json,
+            ocr_text,
+            attempt_count,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let asset_id = parse_uuid_value(&asset_id)?;
+        let file_id = parse_uuid_value(&file_id)?;
+        let revision_id = parse_uuid_value(&revision_id)?;
+        let locator = serde_json::from_str::<SourceLocator>(&locator_json)
+            .map_err(|error| AppError::new("IMAGE_ASSET_INVALID", error.to_string(), false))?;
+        let path = PathBuf::from(&cache_path);
+        let metadata = fs::metadata(&path)
+            .map_err(|error| AppError::new("IMAGE_ASSET_UNAVAILABLE", error.to_string(), true))?;
+        if !metadata.is_file() || metadata.len() != size_bytes || hash_file_sha256(&path)? != sha256
+        {
+            transaction
+                .execute(
+                    "UPDATE image_assets SET status = 'failed', error_json = ?1, updated_at = ?2 WHERE asset_id = ?3",
+                    params![serde_json::to_string(&AppError::new("IMAGE_ASSET_CACHE_INVALID", "图片缓存大小或哈希已经变化，需要重新解析源文件", false)).expect("serialize static error"), Utc::now().to_rfc3339(), asset_id.to_string()],
+                )
+                .map_err(|error| storage_error("IMAGE_UNDERSTANDING_CLAIM_FAILED", error, true))?;
+            transaction
+                .commit()
+                .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))?;
+            return Ok(None);
+        }
+        let idempotency_key = format!("vision:v1:{model_artifact_id}:{sha256}");
+        let now = Utc::now().to_rfc3339();
+        let changed = transaction
+            .execute(
+                "UPDATE image_assets SET status = 'processing', attempt_count = attempt_count + 1, error_json = NULL, idempotency_key = ?1, started_at = ?2, completed_at = NULL, updated_at = ?2 WHERE asset_id = ?3 AND status = 'pending_understanding'",
+                params![idempotency_key, now, asset_id.to_string()],
+            )
+            .map_err(|error| storage_error("IMAGE_UNDERSTANDING_CLAIM_FAILED", error, true))?;
+        if changed != 1 {
+            return Err(AppError::new(
+                "IMAGE_UNDERSTANDING_ALREADY_CLAIMED",
+                "图片理解任务已由另一个后台执行器领取",
+                true,
+            ));
+        }
+        transaction
+            .commit()
+            .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))?;
+        Ok(Some(PendingImageUnderstanding {
+            asset_id,
+            file_id,
+            revision_id,
+            cache_path,
+            mime_type,
+            size_bytes,
+            sha256,
+            locator,
+            ocr_text,
+            attempt_count: attempt_count.saturating_add(1),
+            idempotency_key,
+        }))
+    }
+
+    /// 文件级翻转:当 ocr_pending 文件的全部图片资产都已决(至少一个 ready、且无
+    /// pending_understanding/processing 在途),把文件提升为 parsed。
+    /// 全部资产 failed 的文件不翻转——VLM 未能补全内容,仍应停留在 ocr_pending 可重试。
+    /// 列出当前所有 ocr_pending 文件（用于批量提升扫描，如 --promote-only）。
+    pub fn list_ocr_pending_files(&self) -> Result<Vec<Uuid>, AppError> {
+        let connection = self.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT file_id FROM files
+                 WHERE availability = 'present'
+                   AND current_revision_id IS NOT NULL
+                   AND parse_status = 'ocr_pending'
+                   AND EXISTS (
+                     SELECT 1 FROM file_root_memberships frm
+                     JOIN roots r ON r.root_id = frm.root_id
+                     WHERE frm.file_id = files.file_id AND r.enabled = 1
+                   )
+                 ORDER BY last_seen_at, file_id",
+            )
+            .map_err(|error| storage_error("OCR_PENDING_LIST_FAILED", error, true))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| storage_error("OCR_PENDING_LIST_FAILED", error, true))?;
+        let mut file_ids = Vec::new();
+        for row in rows {
+            let raw =
+                row.map_err(|error| storage_error("OCR_PENDING_LIST_FAILED", error, true))?;
+            file_ids.push(parse_uuid_value(&raw)?);
+        }
+        Ok(file_ids)
+    }
+
+    pub fn promote_ocr_pending_file_when_assets_ready(
+        &self,
+        file_id: &Uuid,
+    ) -> Result<bool, AppError> {
+        let _permit = self.acquire_write(WritePriority::Background);
+        let connection = self.connect()?;
+        let sql = format!(
+            "UPDATE files AS f SET parse_status = 'parsed', processing_reason_code = NULL WHERE f.file_id = ?1 AND f.parse_status = 'ocr_pending' AND f.availability = 'present' AND f.current_revision_id IS NOT NULL AND EXISTS (SELECT 1 FROM image_assets ia WHERE ia.file_id = ?1 AND ia.revision_id = f.current_revision_id AND ia.status = 'ready') AND NOT EXISTS (SELECT 1 FROM image_assets ia WHERE ia.file_id = ?1 AND ia.revision_id = f.current_revision_id AND ia.status IN ('pending_understanding', 'processing')) AND {AUTHORIZED_FILE_SQL}"
+        );
+        let changed = connection
+            .execute(&sql, [file_id.to_string()])
+            .map_err(|error| storage_error("OCR_PROMOTE_UPDATE_FAILED", error, true))?;
+        Ok(changed == 1)
     }
 
     pub fn retry_ocr(&self, file_id: &Uuid) -> Result<(), AppError> {
@@ -8157,15 +8367,6 @@ fn query_manual_collection_files(
         .map_err(|error| storage_error("COLLECTION_QUERY_FAILED", error, true))
 }
 
-#[derive(Debug, Clone)]
-struct ProfileCandidate {
-    file_id: Uuid,
-    revision_id: Uuid,
-    title: String,
-    vector: Vec<f32>,
-    bucket: String,
-}
-
 type ProfileAggregate = (String, String, Vec<String>, Vec<Vec<f32>>);
 
 fn query_suggestion_members(
@@ -10237,6 +10438,455 @@ mod tests {
                 ocr_pages: 2,
             }
         );
+    }
+
+    /// 造一个「已解析 + 已嵌入」的文件：files/revisions/root 归属/节点/chunk/embedding 全链。
+    /// 单 chunk → 文档向量即该 chunk 向量（mean_normalized_vector 归一化后 cosine 不变）。
+    /// 返回 (file_id, revision_id)。
+    fn seed_embedded_file(
+        connection: &Connection,
+        root_id: &Uuid,
+        name: &str,
+        size_bytes: u64,
+        vector: &[f32],
+        text: &str,
+    ) -> (Uuid, Uuid) {
+        let file_id = Uuid::now_v7();
+        let revision_id = Uuid::now_v7();
+        let node_id = Uuid::now_v7();
+        let chunk_id = Uuid::now_v7();
+        let now = Utc::now().to_rfc3339();
+        let path = format!("C:\\Users\\Test\\Documents\\{name}");
+        let path_key = path.to_ascii_lowercase();
+        connection
+            .execute(
+                "INSERT INTO files (file_id, canonical_path, path_key, name, extension, size_bytes, modified_at, discovered_at, availability, volume_id, display_name, mime_type, current_revision_id, parse_status, first_seen_at, last_seen_at) VALUES (?1, ?2, ?3, ?4, 'pdf', ?5, ?6, ?6, 'present', 'vol-test', ?4, 'application/pdf', ?7, 'parsed', ?6, ?6)",
+                params![file_id.to_string(), path, path_key, name, size_bytes, now, revision_id.to_string()],
+            )
+            .expect("insert file");
+        connection
+            .execute(
+                "INSERT INTO file_revisions (revision_id, file_id, size_bytes, fs_modified_at, metadata_fingerprint, created_at, parse_status) VALUES (?1, ?2, ?3, ?4, ?5, ?4, 'parsed')",
+                params![revision_id.to_string(), file_id.to_string(), size_bytes, now, format!("{size_bytes}:{name}")],
+            )
+            .expect("insert revision");
+        connection
+            .execute(
+                "INSERT INTO file_root_memberships (file_id, root_id, relative_path, is_primary) VALUES (?1, ?2, ?3, 1)",
+                params![file_id.to_string(), root_id.to_string(), name],
+            )
+            .expect("insert membership");
+        connection
+            .execute(
+                "INSERT INTO document_nodes (node_id, revision_id, ordinal, node_type, locator_json, heading_path_json, text) VALUES (?1, ?2, 0, 'ocr_line', ?3, '[]', ?4)",
+                params![node_id.to_string(), revision_id.to_string(), serde_json::json!({"page_no": 1}).to_string(), text],
+            )
+            .expect("insert node");
+        connection
+            .execute(
+                "INSERT INTO chunks (chunk_id, file_id, revision_id, node_id, ordinal, text, normalized_text, token_count, content_hash, language, locator_json) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, 4, ?1, 'zh', '{}')",
+                params![chunk_id.to_string(), file_id.to_string(), revision_id.to_string(), node_id.to_string(), text],
+            )
+            .expect("insert chunk");
+        connection
+            .execute(
+                "INSERT INTO chunk_embeddings (chunk_id, model_artifact_id, file_id, revision_id, dimension, vector_blob, created_at) VALUES (?1, 'embedding-test', ?2, ?3, ?4, ?5, ?6)",
+                params![chunk_id.to_string(), file_id.to_string(), revision_id.to_string(), vector.len() as u32, encode_vector(vector), now],
+            )
+            .expect("insert embedding");
+        (file_id, revision_id)
+    }
+
+    /// 关系分析走星形种子扩展：1 种子 + 3 语义成员（cos≈0.88/0.83/0.80，成员互 <0.78）
+    /// + 1「摘要」名小文件（与种子 cos≈0.85 → contains 边）+ 1 远文件（cos≈0.75 不组）。
+    /// 应只产生种子→成员的星形边，成员间无直连边，摘要方向正确，远文件无边。
+    #[test]
+    fn semantic_relations_use_star_seed_expansion() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+        let root = store
+            .upsert_root(&test_root_registration())
+            .expect("insert root");
+        // 6 维全正卦限 → 同一语义桶（种子与成员同桶才比较）；成员彼此夹角 >38.7°（互 cos<0.78）。
+        let seed_vector = [1.0, 0.3, 0.3, 0.3, 0.3, 0.3];
+        let member_a = [1.0, 1.1, 0.3, 0.3, 0.3, 0.3]; // cos(种子)≈0.876
+        let member_b = [1.0, 0.3, 1.3, 0.3, 0.3, 0.3]; // ≈0.832
+        let member_c = [1.0, 0.3, 0.3, 1.45, 0.3, 0.3]; // ≈0.801
+        let summary_d = [1.0, 0.3, 0.3, 0.3, 1.2, 0.3]; // ≈0.854（摘要名 + 小文件）
+        // 远文件：增强第 6 维（与各成员主方向正交），与种子 ≈0.753、与成员全部 <0.78
+        let far_e = [1.0, 0.3, 0.3, 0.3, 0.3, 1.7]; // ≈0.753（不组）
+        let connection = store.connect().expect("connect");
+        let seed = seed_embedded_file(
+            &connection,
+            &root.root_id,
+            "季度财务报告.pdf",
+            2_000,
+            &seed_vector,
+            "财务季度报告全文内容",
+        );
+        let a = seed_embedded_file(
+            &connection,
+            &root.root_id,
+            "财务数据明细.pdf",
+            1_800,
+            &member_a,
+            "财务数据明细内容",
+        );
+        let b = seed_embedded_file(
+            &connection,
+            &root.root_id,
+            "年度预算说明.pdf",
+            1_900,
+            &member_b,
+            "年度预算编制说明内容",
+        );
+        let c = seed_embedded_file(
+            &connection,
+            &root.root_id,
+            "审计意见书.pdf",
+            1_700,
+            &member_c,
+            "审计意见与结论内容",
+        );
+        let d = seed_embedded_file(
+            &connection,
+            &root.root_id,
+            "财务报告摘要.pdf",
+            120,
+            &summary_d,
+            "季度财务报告要点摘要",
+        );
+        let e = seed_embedded_file(
+            &connection,
+            &root.root_id,
+            "员工手册.pdf",
+            3_000,
+            &far_e,
+            "员工手册内容",
+        );
+        drop(connection);
+
+        let (semantic_pairs, contains_pairs) = store
+            .refresh_semantic_file_relations("embedding-test", 100)
+            .expect("refresh semantic relations");
+        assert_eq!((semantic_pairs, contains_pairs), (3, 1));
+
+        let connection = store.connect().expect("connect");
+        let rows = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT left_file_id, right_file_id, relation_type, confidence FROM file_relations WHERE model_version = 'embedding-test'",
+                )
+                .expect("prepare relation query");
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, f64>(3)?,
+                    ))
+                })
+                .expect("query relations")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect relations")
+        };
+        drop(connection);
+        assert_eq!(rows.len(), 4, "星形边总数应为 4（种子→A/B/C/D）");
+        let seed_id = seed.0.to_string();
+        let member_ids = [a.0, b.0, c.0, d.0].map(|id| id.to_string());
+        let far_id = e.0.to_string();
+        for (left, right, relation_type, confidence) in &rows {
+            // 每条边都以种子为一端；成员间无直连边；远文件不参与
+            assert!(
+                left == &seed_id || right == &seed_id,
+                "非星形边 {left}-{right}"
+            );
+            assert!(
+                !member_ids.contains(left) || !member_ids.contains(right),
+                "成员间直连边 {left}-{right}"
+            );
+            assert!(left != &far_id && right != &far_id, "远文件不该有边");
+            assert!((0.75..=1.0).contains(confidence), "相似度置信度异常 {confidence}");
+            assert!(
+                relation_type == "semantic_related" || relation_type == "contains_or_summarizes",
+                "意外的边类型 {relation_type}"
+            );
+        }
+        let semantic = rows
+            .iter()
+            .filter(|(_, _, relation_type, _)| relation_type == "semantic_related")
+            .count();
+        let contains = rows
+            .iter()
+            .filter(|(_, _, relation_type, _)| relation_type == "contains_or_summarizes")
+            .count();
+        assert_eq!(semantic, 3);
+        assert_eq!(contains, 1);
+        // 摘要边：D（摘要名+小文件）与种子，confidence≈0.854，方向为「摘要可能是源文件的摘要」
+        let (_, _, _, confidence) = rows
+            .iter()
+            .find(|(_, _, relation_type, _)| relation_type == "contains_or_summarizes")
+            .expect("contains edge");
+        assert!((confidence - 0.854).abs() < 0.01, "contains 置信度 {confidence}");
+    }
+
+    /// 集合建议种子扩展 + 消费 + 修剪全流程：两簇各 4 文件（簇 1 全正卦限、簇 2 全负卦限，
+    /// 不同语义桶 → 跨簇不组）。首批 2 条建议、成员互斥、种子身份回传；重复刷新不重现
+    /// （成员已消费）；confirm 后仍不重现；prune 剪成员 → 幂等键重算 + inbox 清理；
+    /// 剪到 <2 → 整条作废。
+    #[test]
+    fn collection_suggestions_seed_expansion_consumption_and_prune_flow() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+        let root = store
+            .upsert_root(&test_root_registration())
+            .expect("insert root");
+        // 簇 1（财务）：全正卦限桶；簇 2（人力）：全负卦限桶（桶不同，跨簇不组）
+        let connection = store.connect().expect("connect");
+        let s1 = seed_embedded_file(
+            &connection,
+            &root.root_id,
+            "财务季度报告.pdf",
+            2_000,
+            &[1.0, 0.3, 0.3, 0.3, 0.3, 0.3],
+            "财务季度报告全文内容",
+        );
+        seed_embedded_file(
+            &connection,
+            &root.root_id,
+            "财务数据明细.pdf",
+            1_800,
+            &[1.0, 1.1, 0.3, 0.3, 0.3, 0.3],
+            "财务数据明细内容",
+        );
+        seed_embedded_file(
+            &connection,
+            &root.root_id,
+            "年度预算说明.pdf",
+            1_900,
+            &[1.0, 0.3, 1.3, 0.3, 0.3, 0.3],
+            "年度预算编制说明内容",
+        );
+        seed_embedded_file(
+            &connection,
+            &root.root_id,
+            "审计意见书.pdf",
+            1_700,
+            &[1.0, 0.3, 0.3, 1.45, 0.3, 0.3],
+            "审计意见与结论内容",
+        );
+        let s2 = seed_embedded_file(
+            &connection,
+            &root.root_id,
+            "招聘制度汇编.pdf",
+            2_000,
+            &[-1.0, -0.3, -0.3, -0.3, -0.3, -0.3],
+            "招聘制度汇编内容",
+        );
+        seed_embedded_file(
+            &connection,
+            &root.root_id,
+            "薪酬管理办法.pdf",
+            1_800,
+            &[-1.0, -1.1, -0.3, -0.3, -0.3, -0.3],
+            "薪酬管理办法内容",
+        );
+        seed_embedded_file(
+            &connection,
+            &root.root_id,
+            "考勤管理制度.pdf",
+            1_900,
+            &[-1.0, -0.3, -1.3, -0.3, -0.3, -0.3],
+            "考勤管理制度内容",
+        );
+        seed_embedded_file(
+            &connection,
+            &root.root_id,
+            "绩效评估细则.pdf",
+            1_700,
+            &[-1.0, -0.3, -0.3, -1.45, -0.3, -0.3],
+            "绩效评估细则内容",
+        );
+        drop(connection);
+
+        // 首批：两簇各成一组，created=2，种子身份回传与 suggestion_ids 一一对应
+        let first = store
+            .refresh_collection_suggestions("embedding-test", 500)
+            .expect("first refresh");
+        assert_eq!(first.topic_groups, 2);
+        assert_eq!(first.created_suggestions, 2);
+        assert_eq!(first.suggestion_ids.len(), 2);
+        assert_eq!(first.seed_file_id_by_suggestion.len(), 2);
+        let mut seeds = first
+            .suggestion_ids
+            .iter()
+            .map(|id| first.seed_file_id_by_suggestion[id])
+            .collect::<Vec<_>>();
+        let mut expected_seeds = [s1.0, s2.0];
+        seeds.sort();
+        expected_seeds.sort();
+        assert_eq!(seeds, expected_seeds, "种子身份回传应恰好是两簇的核文件");
+
+        // 成员互斥：8 文件无重叠；每组 3 个成员（种子是组的核，不进成员表）
+        let connection = store.connect().expect("connect");
+        let member_count: u64 = connection
+            .query_row("SELECT COUNT(*) FROM collection_suggested_members", [], |row| {
+                row.get(0)
+            })
+            .expect("member count");
+        let distinct_count: u64 = connection
+            .query_row(
+                "SELECT COUNT(DISTINCT file_id) FROM collection_suggested_members",
+                [],
+                |row| row.get(0),
+            )
+            .expect("distinct member count");
+        let per_group = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT COUNT(*) FROM collection_suggested_members GROUP BY suggestion_id",
+                )
+                .expect("prepare group counts");
+            statement
+                .query_map([], |row| row.get::<_, u64>(0))
+                .expect("query group counts")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect group counts")
+        };
+        assert_eq!(member_count, 6, "8 文件 - 2 种子 = 6 个组成员");
+        assert_eq!(distinct_count, 6, "无文件同时属于两个建议（互斥）");
+        assert_eq!(per_group, vec![3, 3], "每组成员数为 3（种子是组的核不进成员表）");
+        drop(connection);
+
+        // 重复刷新：档案已最新且成员全消费 → 无新建议（幂等不重现）
+        let second = store
+            .refresh_collection_suggestions("embedding-test", 500)
+            .expect("second refresh");
+        assert_eq!(second.topic_groups, 0);
+        assert_eq!(second.created_suggestions, 0);
+        assert!(second.suggestion_ids.is_empty());
+        assert!(second.seed_file_id_by_suggestion.is_empty());
+
+        // confirm 一条后再次刷新：已确认建议的成员仍在 consumed 集 → 仍不重现
+        store
+            .confirm_collection_suggestion(&first.suggestion_ids[0])
+            .expect("confirm first suggestion");
+        let third = store
+            .refresh_collection_suggestions("embedding-test", 500)
+            .expect("third refresh");
+        assert_eq!(third.topic_groups, 0);
+        assert_eq!(third.created_suggestions, 0);
+
+        // prune 流：对「种子为 s2 的建议」剪掉 1 个成员 → 存活，幂等键重算，inbox 只删被剪成员的。
+        // 注意 suggestion_ids 的顺序取决于 UUID v7 随机位，必须按 seed map 定位建议，
+        // 并从成员表取实际成员，不能假设「第一个建议 = 簇 1」。
+        let suggestion_two = first
+            .suggestion_ids
+            .iter()
+            .copied()
+            .find(|id| first.seed_file_id_by_suggestion[id] == s2.0)
+            .expect("种子为 s2 的建议");
+        let connection = store.connect().expect("connect");
+        let group_members = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT file_id FROM collection_suggested_members WHERE suggestion_id = ?1 ORDER BY file_id",
+                )
+                .expect("prepare member query");
+            statement
+                .query_map([suggestion_two.to_string()], |row| {
+                    row.get::<_, String>(0)
+                })
+                .expect("query members")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect members")
+        };
+        assert_eq!(group_members.len(), 3, "s2 组的成员数应为 3");
+        let prune_one = Uuid::parse_str(&group_members[0]).expect("member uuid");
+        let prune_rest = group_members[1..]
+            .iter()
+            .map(|value| Uuid::parse_str(value).expect("member uuid"))
+            .collect::<Vec<_>>();
+        let key_before: String = connection
+            .query_row(
+                "SELECT idempotency_key FROM collection_suggestions WHERE suggestion_id = ?1",
+                [suggestion_two.to_string()],
+                |row| row.get(0),
+            )
+            .expect("idempotency key before prune");
+        let pruned_event_before: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM inbox_events WHERE dedupe_key = ?1",
+                [format!("collection_suggestion:{suggestion_two}:{prune_one}")],
+                |row| row.get(0),
+            )
+            .expect("pruned member inbox before prune");
+        drop(connection);
+        assert_eq!(pruned_event_before, 1);
+
+        let survived = store
+            .prune_collection_suggestion_members(&suggestion_two, &[prune_one])
+            .expect("prune one member");
+        assert!(survived, "剩 2 个成员应存活");
+        let connection = store.connect().expect("connect");
+        let key_after: String = connection
+            .query_row(
+                "SELECT idempotency_key FROM collection_suggestions WHERE suggestion_id = ?1",
+                [suggestion_two.to_string()],
+                |row| row.get(0),
+            )
+            .expect("idempotency key after prune");
+        let pruned_event_after: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM inbox_events WHERE dedupe_key = ?1",
+                [format!("collection_suggestion:{suggestion_two}:{prune_one}")],
+                |row| row.get(0),
+            )
+            .expect("pruned member inbox after prune");
+        let kept_event_after: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM inbox_events WHERE dedupe_key = ?1",
+                [format!("collection_suggestion:{suggestion_two}:{}", prune_rest[0])],
+                |row| row.get(0),
+            )
+            .expect("kept member inbox after prune");
+        drop(connection);
+        assert_ne!(key_before, key_after, "修剪后幂等键必须重算");
+        assert_eq!(pruned_event_after, 0, "被剪成员的 inbox 事件删除");
+        assert_eq!(kept_event_after, 1, "存活成员的事件保留");
+
+        // 剩余 2 个成员再剪光 → 整条作废（建议行+成员行+inbox 全清）
+        let survived = store
+            .prune_collection_suggestion_members(&suggestion_two, &prune_rest)
+            .expect("prune to zero");
+        assert!(!survived, "成员不足 2 个应作废整条建议");
+        let connection = store.connect().expect("connect");
+        let suggestion_rows: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM collection_suggestions WHERE suggestion_id = ?1",
+                [suggestion_two.to_string()],
+                |row| row.get(0),
+            )
+            .expect("suggestion rows");
+        let member_rows: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM collection_suggested_members WHERE suggestion_id = ?1",
+                [suggestion_two.to_string()],
+                |row| row.get(0),
+            )
+            .expect("member rows");
+        let inbox_rows: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM inbox_events WHERE dedupe_key LIKE ?1",
+                [format!("collection_suggestion:{suggestion_two}:%")],
+                |row| row.get(0),
+            )
+            .expect("inbox rows");
+        drop(connection);
+        assert_eq!(suggestion_rows, 0);
+        assert_eq!(member_rows, 0);
+        assert_eq!(inbox_rows, 0);
     }
 
     #[test]

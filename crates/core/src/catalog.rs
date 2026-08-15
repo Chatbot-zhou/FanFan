@@ -766,6 +766,23 @@ impl CatalogService {
         self.store.reject_collection_suggestion(suggestion_id)
     }
 
+    pub fn collection_suggestion_member_summaries(
+        &self,
+        suggestion_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, String>, AppError> {
+        self.store
+            .collection_suggestion_member_summaries(suggestion_ids)
+    }
+
+    pub fn prune_collection_suggestion_members(
+        &self,
+        suggestion_id: &Uuid,
+        removed_file_ids: &[Uuid],
+    ) -> Result<bool, AppError> {
+        self.store
+            .prune_collection_suggestion_members(suggestion_id, removed_file_ids)
+    }
+
     pub fn refresh_file_relations(
         &self,
         max_files: u32,
@@ -874,6 +891,26 @@ impl CatalogService {
     ) -> Result<Option<PendingImageUnderstanding>, AppError> {
         self.store
             .claim_pending_image_understanding(model_artifact_id)
+    }
+
+    pub fn claim_pending_ocr_image_understanding(
+        &self,
+        model_artifact_id: &str,
+    ) -> Result<Option<PendingImageUnderstanding>, AppError> {
+        self.store
+            .claim_pending_ocr_image_understanding(model_artifact_id)
+    }
+
+    pub fn promote_ocr_pending_file_when_assets_ready(
+        &self,
+        file_id: &Uuid,
+    ) -> Result<bool, AppError> {
+        self.store
+            .promote_ocr_pending_file_when_assets_ready(file_id)
+    }
+
+    pub fn list_ocr_pending_files(&self) -> Result<Vec<Uuid>, AppError> {
+        self.store.list_ocr_pending_files()
     }
 
     pub fn commit_image_understanding(

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -491,6 +491,8 @@ pub struct CollectionSuggestionRefreshResult {
     pub remaining_topic_groups: u64,
     pub created_suggestions: u64,
     pub suggestion_ids: Vec<Uuid>,
+    /// 每条实际创建的建议 → 其种子文件（种子扩展聚类中组的核心文件）。
+    pub seed_file_id_by_suggestion: HashMap<Uuid, Uuid>,
     pub algorithm_version: String,
     pub model_version: String,
 }
@@ -918,6 +920,162 @@ pub(crate) fn cluster_relation_edges(
     groups
 }
 
+/// 种子扩展聚类的输入档案：文档级向量 + 所属候选桶。
+#[derive(Debug, Clone)]
+pub(crate) struct SeedProfile {
+    pub file_id: Uuid,
+    pub revision_id: Uuid,
+    pub title: String,
+    pub vector: Vec<f32>,
+    pub bucket: String,
+}
+
+/// 种子组内成员：与种子的 cosine 相似度（已过阈值）。
+#[derive(Debug, Clone)]
+pub(crate) struct SemanticSeedMember {
+    pub file_id: Uuid,
+    pub revision_id: Uuid,
+    pub title: String,
+    pub similarity: f32,
+}
+
+/// 一个种子扩展组：种子 + 与其最相近的未消费成员。
+#[derive(Debug, Clone)]
+pub(crate) struct SemanticSeedGroup {
+    pub seed_file_id: Uuid,
+    /// 组置信度 = 成员边相似度均值
+    pub confidence: f64,
+    pub members: Vec<SemanticSeedMember>,
+}
+
+/// 归一化向量点积：向量已 L2 归一化时即 cosine 相似度。
+fn normalized_dot(left: &[f32], right: &[f32]) -> f32 {
+    if left.len() != right.len() {
+        return 0.0;
+    }
+    left.iter().zip(right).map(|(l, r)| l * r).sum()
+}
+
+/// 种子扩展贪心聚类：每个种子取相似度最高的未消费邻居成组，组间互斥。
+///
+/// - 按 candidate bucket 分桶（不同桶永不成组），桶内取前 bucket_cap 个参与
+///   （按调用方传入顺序，与存储侧「按 updated_at 排序 LIMIT」的窗口一致）；
+/// - 已消费文件既不作种子也不作成员；
+/// - 种子按簇核心度排序：top-1 邻居相似度降序 → 邻居平均相似度降序 → file_id 升序，
+///   先成组的往往是最核心的簇，弱归属让给后面的组；
+/// - 成员取「相似度降序、≥ threshold、未消费、≤ top_k」；
+/// - 组置信度 = 成员边相似度均值（与连通分量聚类的口径一致）。
+///
+/// 纯函数、确定性：相同输入必得相同分组，便于幂等键与测试。
+pub(crate) fn seed_expand_semantic_groups(
+    profiles: &[SeedProfile],
+    consumed: &HashSet<Uuid>,
+    threshold: f32,
+    top_k: usize,
+    bucket_cap: usize,
+) -> Vec<SemanticSeedGroup> {
+    // 按桶分组，桶内保留传入顺序；不同桶向量不可比，永不成组
+    let mut buckets = BTreeMap::<String, Vec<&SeedProfile>>::new();
+    for profile in profiles {
+        if consumed.contains(&profile.file_id) {
+            continue;
+        }
+        buckets
+            .entry(profile.bucket.clone())
+            .or_default()
+            .push(profile);
+    }
+    let mut groups = Vec::new();
+    let mut consumed = consumed.clone();
+    for profiles in buckets.values_mut() {
+        profiles.truncate(bucket_cap);
+        if profiles.len() < 2 {
+            continue;
+        }
+        // 桶内两两相似度预计算，统计每文件的 top-1 与邻居均值（不设阈值，
+        // 只描述「与同类接近程度」；邻居是否入选由贪心时再判定）
+        let mut seed_order = Vec::with_capacity(profiles.len());
+        for (index, profile) in profiles.iter().enumerate() {
+            let mut top1 = f32::MIN;
+            let mut sum = 0.0_f32;
+            let mut count = 0_usize;
+            for (other_index, other) in profiles.iter().enumerate() {
+                if index == other_index {
+                    continue;
+                }
+                let similarity = normalized_dot(&profile.vector, &other.vector);
+                top1 = top1.max(similarity);
+                sum += similarity;
+                count += 1;
+            }
+            let avg = if count == 0 { 0.0 } else { sum / count as f32 };
+            seed_order.push((top1, avg, profile.file_id, index));
+        }
+        // 簇核心度排序：top-1 相似度降序 → 邻居均值降序 → file_id 升序（确定性）
+        seed_order.sort_by(|left, right| {
+            right
+                .0
+                .partial_cmp(&left.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    right
+                        .1
+                        .partial_cmp(&left.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| left.2.cmp(&right.2))
+        });
+        for &(_, _, _, seed_index) in &seed_order {
+            let seed = profiles[seed_index];
+            if consumed.contains(&seed.file_id) {
+                continue;
+            }
+            // 邻居：相似度降序、≥ threshold、未消费、≤ top_k
+            let mut neighbors = Vec::new();
+            for (other_index, other) in profiles.iter().enumerate() {
+                if other_index == seed_index || consumed.contains(&other.file_id) {
+                    continue;
+                }
+                let similarity = normalized_dot(&seed.vector, &other.vector);
+                if similarity >= threshold {
+                    neighbors.push((other_index, similarity));
+                }
+            }
+            neighbors.sort_by(|left, right| {
+                right
+                    .1
+                    .partial_cmp(&left.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| profiles[left.0].file_id.cmp(&profiles[right.0].file_id))
+            });
+            neighbors.truncate(top_k);
+            if neighbors.is_empty() {
+                continue;
+            }
+            let mut members = Vec::with_capacity(neighbors.len());
+            let mut sum = 0.0_f64;
+            for (other_index, similarity) in neighbors {
+                let other = profiles[other_index];
+                members.push(SemanticSeedMember {
+                    file_id: other.file_id,
+                    revision_id: other.revision_id,
+                    title: other.title.clone(),
+                    similarity,
+                });
+                consumed.insert(other.file_id);
+                sum += f64::from(similarity);
+            }
+            consumed.insert(seed.file_id);
+            groups.push(SemanticSeedGroup {
+                seed_file_id: seed.file_id,
+                confidence: sum / members.len() as f64,
+                members,
+            });
+        }
+    }
+    groups
+}
+
 pub(crate) fn normalized_version_key(name: &str) -> String {
     let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
     let lowered = stem.to_lowercase();
@@ -1146,5 +1304,152 @@ mod tests {
         );
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].group_type, RelationGroupType::Mixed);
+    }
+
+    // ---- seed_expand_semantic_groups ----
+
+    fn seed_profile(id: u64, x: f32, y: f32, bucket: &str) -> SeedProfile {
+        SeedProfile {
+            file_id: Uuid::from_u128(u128::from(id)),
+            revision_id: Uuid::from_u128((u128::from(id) << 64) | 1),
+            title: format!("文件{id}"),
+            vector: vec![x, y],
+            bucket: bucket.into(),
+        }
+    }
+
+    #[test]
+    fn seed_ranking_orders_by_top1_then_avg_then_id() {
+        // 排序规则：top-1 相似度降序 → 邻居均值降序 → file_id 升序
+        // - a 与 s1 的 top-1 相同（0.99），但 a 是桶中心（邻居均值 0.5675 > 0.5225）→ a 先组
+        // - s2 的 top-1（0.954）高于 b 的（0.80），尽管 b 的邻居均值（0.1438）高于 s2（0.1238）
+        //   → s2 组先于 b（b 的候选邻居全被先组消费，最终无组）
+        // - x 与 s2 的 top-1 相同（0.954），x 的邻居均值更高 → x 先组
+        let profiles = vec![
+            seed_profile(1, 1.0, 0.0, "b"),     // s1
+            seed_profile(2, 0.99, 0.141, "b"),  // a（0.99 与 s1，桶中心）
+            seed_profile(3, 0.8, -0.6, "b"),    // b（0.80 与 s1，与 a 仅 0.7074）
+            seed_profile(4, 0.0, 1.0, "b"),     // s2
+            seed_profile(5, 0.3, 0.954, "b"),   // x（0.954 与 s2，与 s1 仅 0.3）
+        ];
+        let groups = seed_expand_semantic_groups(&profiles, &HashSet::new(), 0.78, 12, 96);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].seed_file_id, Uuid::from_u128(2)); // a 先组
+        assert_eq!(groups[0].members.len(), 1);
+        assert_eq!(groups[0].members[0].file_id, Uuid::from_u128(1));
+        assert!((groups[0].members[0].similarity - 0.99).abs() < 1e-5);
+        assert_eq!(groups[1].seed_file_id, Uuid::from_u128(5)); // x 组
+        assert_eq!(groups[1].members.len(), 1);
+        assert_eq!(groups[1].members[0].file_id, Uuid::from_u128(4));
+    }
+
+    #[test]
+    fn seed_expansion_truncates_members_to_top_k() {
+        // 种子 + 20 个相似度 0.98..0.79 的邻居排成连续弧：任意两两都 ≥0.78。
+        // 最核心的组（由弧中间的邻居成种子）也最多收 12 个成员 → 任何组成员数 ≤ top_k，
+        // 且 21 个文件全部被组覆盖
+        let mut profiles = vec![seed_profile(1, 1.0, 0.0, "b")];
+        for index in 0..20 {
+            let cosine = 0.98 - index as f32 * 0.01;
+            let y = (1.0 - cosine * cosine).sqrt();
+            profiles.push(seed_profile(2 + index as u64, cosine, y, "b"));
+        }
+        let groups = seed_expand_semantic_groups(&profiles, &HashSet::new(), 0.78, 12, 96);
+        assert!(groups.iter().all(|group| group.members.len() <= 12));
+        let covered = groups
+            .iter()
+            .flat_map(|group| {
+                std::iter::once(group.seed_file_id)
+                    .chain(group.members.iter().map(|member| member.file_id))
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(covered.len(), 21);
+    }
+
+    #[test]
+    fn seed_expansion_respects_threshold() {
+        // 0.77 的邻居低于阈值 0.78，被排除；0.80 的入选
+        // （0.77 的邻居放种子另一侧，与 0.80 的成员互不相近）
+        let y = (1.0 - 0.77_f32 * 0.77).sqrt();
+        let profiles = vec![
+            seed_profile(1, 1.0, 0.0, "b"),
+            seed_profile(2, 0.8, 0.6, "b"),
+            seed_profile(3, 0.77, -y, "b"),
+        ];
+        let groups = seed_expand_semantic_groups(&profiles, &HashSet::new(), 0.78, 12, 96);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].members.len(), 1);
+        assert_eq!(groups[0].members[0].file_id, Uuid::from_u128(2));
+    }
+
+    #[test]
+    fn seed_expansion_skips_consumed_files() {
+        // consumed 中的文件既不作种子也不作成员
+        let profiles = vec![
+            seed_profile(1, 1.0, 0.0, "b"),
+            seed_profile(2, 0.8, 0.6, "b"),
+            seed_profile(3, 0.0, 1.0, "b"),
+            seed_profile(4, 0.435, 0.90, "b"),
+        ];
+        let consumed = HashSet::from([Uuid::from_u128(3), Uuid::from_u128(4)]);
+        let groups = seed_expand_semantic_groups(&profiles, &consumed, 0.78, 12, 96);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].seed_file_id, Uuid::from_u128(1));
+        assert_eq!(groups[0].members.len(), 1);
+        assert_eq!(groups[0].members[0].file_id, Uuid::from_u128(2));
+    }
+
+    #[test]
+    fn seed_expansion_groups_are_mutually_exclusive() {
+        // s2（90°）的 top-1（x: 0.940）高于 s1（0°）的 top-1（y: 0.906），
+        // s2 先成组独占 x，之后 s1 组只能拿 y —— 每个文件至多出现在一组；
+        // x 与 y 相距 45°（0.707 < 0.78），不会互相争抢
+        let profiles = vec![
+            seed_profile(1, 1.0, 0.0, "b"),     // s1
+            seed_profile(2, 0.0, 1.0, "b"),     // s2
+            seed_profile(3, 0.105, 0.995, "b"), // x（0.995 与 s2，0.105 与 s1，与 y 0.515）
+            seed_profile(4, 0.906, 0.423, "b"), // y（0.906 与 s1，0.423 与 s2，与 x 0.515）
+        ];
+        let groups = seed_expand_semantic_groups(&profiles, &HashSet::new(), 0.78, 12, 96);
+        assert_eq!(groups.len(), 2);
+        let mut seen = HashSet::new();
+        for group in &groups {
+            assert!(seen.insert(group.seed_file_id));
+            for member in &group.members {
+                assert!(seen.insert(member.file_id));
+            }
+        }
+        assert_eq!(seen.len(), 4); // 4 个文件全部被组覆盖且无重复（insert 重复会 panic）
+    }
+
+    #[test]
+    fn seed_expansion_isolated_profiles_form_no_group() {
+        // 两两夹角 120°，cosine = -0.5，全部低于阈值
+        let profiles = vec![
+            seed_profile(1, 1.0, 0.0, "b"),
+            seed_profile(2, -0.5, 0.866, "b"),
+            seed_profile(3, -0.5, -0.866, "b"),
+        ];
+        let groups = seed_expand_semantic_groups(&profiles, &HashSet::new(), 0.78, 12, 96);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn seed_expansion_confidence_is_mean_of_member_similarities() {
+        // 种子两侧各一个 0.866 的成员（夹角 60°，互不相近）：
+        // 组置信度 = (0.866 + 0.866) / 2；b2 桶同向量文件跨桶不成组
+        let profiles = vec![
+            seed_profile(1, 1.0, 0.0, "b1"),
+            seed_profile(2, 0.866, 0.5, "b1"),
+            seed_profile(3, 0.866, -0.5, "b1"),
+            // 与 b1 桶的种子同向量但不同桶：跨桶永不成组
+            seed_profile(4, 1.0, 0.0, "b2"),
+        ];
+        let groups = seed_expand_semantic_groups(&profiles, &HashSet::new(), 0.78, 12, 96);
+        assert_eq!(groups.len(), 1);
+        let group = &groups[0];
+        assert_eq!(group.seed_file_id, Uuid::from_u128(1));
+        assert_eq!(group.members.len(), 2);
+        assert!((group.confidence - 0.866).abs() < 1e-5);
     }
 }

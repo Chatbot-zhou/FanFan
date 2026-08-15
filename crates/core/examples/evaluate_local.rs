@@ -15,7 +15,7 @@ use fanfan_core::{
     ModelRegistryState, ModelRole, ParseStatus, RagEvaluationCase, RagQualityMetrics,
     RelationEvaluationCase, RelationQuery, RelationType, ScopeFilter, SearchEvaluationCase,
     SearchMode, SearchRequest, SearchSort, SemanticQuery, SpeechRecognitionRequest,
-    SpeechSynthesisRequest, WorkerClient, apply_grounded_generation,
+    SpeechSynthesisRequest, WorkerClient, WorkerRole, apply_grounded_generation,
     create_encrypted_evaluation_snapshot, generation_prompt, grounded_answer_json_schema,
     inspect_runtime_log_privacy, materialize_evaluation_snapshot, persist_evaluation_run,
     score_rag_cases, score_relation_cases, score_search_cases,
@@ -142,6 +142,11 @@ fn run() -> Result<(), fanfan_core::AppError> {
     } else {
         WorkerClient::from_environment(repository_root.join("services/worker"))
     };
+    // worker 按角色拒绝不匹配的操作（service.py supports()），评测需为每种
+    // 角色派生独立进程：embedding→onnx、OCR→ocr、语音→speech。
+    let worker_onnx = worker.isolated().with_role(WorkerRole::Onnx);
+    let worker_ocr = worker.isolated().with_role(WorkerRole::Ocr);
+    let worker_speech = worker.isolated().with_role(WorkerRole::Speech);
     let mut scored_cases = Vec::with_capacity(private_cases.len());
     let mut query_vectors = HashMap::<String, Vec<f32>>::new();
     let mut unauthorized_results = 0_u64;
@@ -156,7 +161,7 @@ fn run() -> Result<(), fanfan_core::AppError> {
                 )
             })
             .collect::<Vec<_>>();
-        let response = worker.encode_embeddings(&EmbeddingRequest {
+        let response = worker_onnx.encode_embeddings(&EmbeddingRequest {
             model_path: embedding.local_path.clone(),
             tokenizer_path: Some(tokenizer.to_string_lossy().into_owned()),
             texts,
@@ -217,7 +222,7 @@ fn run() -> Result<(), fanfan_core::AppError> {
             })?;
         let rag_metrics = run_rag_evaluation(
             &catalog,
-            &worker,
+            &worker_onnx,
             &private_cases,
             &query_vectors,
             &authorized_ids,
@@ -241,7 +246,7 @@ fn run() -> Result<(), fanfan_core::AppError> {
         not_evaluated_component("relations_and_collections", 10.0)
     };
     let media_component = if argument_present("--with-media") {
-        evaluate_ocr_asr_tts(&worker, &manager)?
+        evaluate_ocr_asr_tts(&worker_ocr, &worker_speech, &manager)?
     } else {
         not_evaluated_component("ocr_asr_tts", 10.0)
     };
@@ -317,7 +322,8 @@ fn run() -> Result<(), fanfan_core::AppError> {
 }
 
 fn evaluate_ocr_asr_tts(
-    worker: &WorkerClient,
+    worker_ocr: &WorkerClient,
+    worker_speech: &WorkerClient,
     manager: &ModelManager,
 ) -> Result<EvaluationComponentScore, fanfan_core::AppError> {
     let mut earned = 0.0;
@@ -332,7 +338,7 @@ fn evaluate_ocr_asr_tts(
         match (det, cls, dictionary) {
             (Some(det), Some(cls), Some(dictionary)) => {
                 samples += 1;
-                worker
+                worker_ocr
                     .self_test_ocr(
                         artifact.local_path.clone(),
                         det.to_string_lossy().into_owned(),
@@ -361,7 +367,7 @@ fn evaluate_ocr_asr_tts(
             match (tokens, vad) {
                 (Some(tokens), Some(vad)) => {
                     samples += 2;
-                    let ready = worker
+                    let ready = worker_speech
                         .self_test_asr(
                             artifact.local_path.clone(),
                             tokens.to_string_lossy().into_owned(),
@@ -370,7 +376,7 @@ fn evaluate_ocr_asr_tts(
                         )
                         .is_ok_and(|result| result.status == "ready");
                     let silence_safe = ready
-                        && worker
+                        && worker_speech
                             .recognize_speech(&SpeechRecognitionRequest {
                                 model_path: artifact.local_path.clone(),
                                 tokens_path: tokens.to_string_lossy().into_owned(),
@@ -407,7 +413,7 @@ fn evaluate_ocr_asr_tts(
             match (tokens, lexicon) {
                 (Some(tokens), Some(lexicon)) => {
                     samples += 2;
-                    let ready = worker
+                    let ready = worker_speech
                         .self_test_tts(
                             artifact.local_path.clone(),
                             tokens.to_string_lossy().into_owned(),
@@ -416,7 +422,7 @@ fn evaluate_ocr_asr_tts(
                         )
                         .is_ok_and(|result| result.status == "ready");
                     let generated = ready
-                        && worker
+                        && worker_speech
                             .synthesize_speech(&SpeechSynthesisRequest {
                                 model_path: artifact.local_path.clone(),
                                 tokens_path: tokens.to_string_lossy().into_owned(),
@@ -537,8 +543,10 @@ fn evaluate_relations_and_collections(
     let refresh = catalog.refresh_file_relations(20_000)?;
     let (semantic_pairs, contains_pairs) =
         catalog.refresh_semantic_file_relations(embedding_artifact_id, 20_000)?;
+    // refresh_collection_suggestions 单批上限 2000;语料仅千余个已解析文件,
+    // 2000 即覆盖全部待刷新目标。
     let suggestion_refresh =
-        catalog.refresh_collection_suggestions(embedding_artifact_id, 20_000)?;
+        catalog.refresh_collection_suggestions(embedding_artifact_id, 2_000)?;
     let files = catalog.list_files()?;
     let file_names = files
         .iter()

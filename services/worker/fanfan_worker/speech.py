@@ -118,13 +118,28 @@ def synthesize_speech(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, W
 
 
 def self_test_asr(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, WorkerError | None]:
-    probe = dict(payload)
-    probe["sample_rate"] = 16_000
-    probe["samples"] = [0.0] * 4_000
-    result, error = recognize_speech(probe)
-    if error is not None:
-        return None, WorkerError("MODEL_SELF_TEST_FAILED", error.message, error.retryable)
-    return {"status": "ready", "engine": "sherpa_onnx", "probe": "silence_250ms"}, None
+    # 注意：不能走 recognize_speech 的静音探针——VAD 判定无语音会早退，
+    # 识别器根本不会被初始化，API 不匹配会静默漏过（曾因 1.13.4 特征配置
+    # 名不匹配造成假阳性）。这里直接初始化识别器并在静音上跑一次推理，
+    # 真实验证模型加载、特征提取与解码链路可用。
+    try:
+        model = _required_file(payload, "model_path", ".onnx")
+        tokens = _required_file(payload, "tokens_path", ".txt")
+        threads = _bounded_int(payload.get("threads", 1), "threads", 1, 4)
+        recognizer = _get_asr(model, tokens, threads)
+        stream = recognizer.create_stream()
+        stream.accept_waveform(16_000, [0.0] * 4_000)
+        recognizer.decode_stream(stream)
+        _ = stream.result
+        return {"status": "ready", "engine": "sherpa_onnx", "probe": "silence_250ms"}, None
+    except ImportError:
+        return None, WorkerError(
+            "SPEECH_RUNTIME_UNAVAILABLE",
+            "语音运行时尚未安装完整，请重新安装翻翻的本地语音组件",
+            False,
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        return None, WorkerError("MODEL_SELF_TEST_FAILED", str(error), True)
 
 
 def self_test_tts(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, WorkerError | None]:
@@ -219,23 +234,18 @@ def _get_asr(model: Path, tokens: Path, threads: int) -> Any:
         if cached is not None:
             cached.last_used = now
             return cached.engine
-    config = sherpa_onnx.OfflineRecognizerConfig(
-        feat_config=sherpa_onnx.OfflineFeatureExtractorConfig(
-            sampling_rate=16_000,
-            feature_dim=80,
-        ),
-        model_config=sherpa_onnx.OfflineModelConfig(
-            paraformer=sherpa_onnx.OfflineParaformerModelConfig(model=str(model)),
-            tokens=str(tokens),
-            num_threads=threads,
-            debug=False,
-            provider="cpu",
-        ),
+    # sherpa-onnx 1.13.4（规划书锁定版本）：OfflineRecognizer 是各架构工厂
+    # 方法的命名空间类，无通用构造函数；Paraformer 模型走 from_paraformer。
+    # （2.x 起改为 OfflineRecognizerConfig + 构造函数，特征配置名也改为
+    # OfflineFeatureExtractorConfig。按锁定版本取 1.13.4 的 API。）
+    engine = sherpa_onnx.OfflineRecognizer.from_paraformer(
+        paraformer=str(model),
+        tokens=str(tokens),
+        num_threads=threads,
         decoding_method="greedy_search",
+        debug=False,
+        provider="cpu",
     )
-    if not config.validate():
-        raise ValueError("ASR模型配置校验失败")
-    engine = sherpa_onnx.OfflineRecognizer(config)
     with _lock:
         _asr_sessions.clear()
         _asr_sessions[key] = SpeechSession(engine=engine, last_used=now, threads=threads)

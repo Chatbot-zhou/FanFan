@@ -3291,6 +3291,10 @@ fn default_suggestion_refresh_limit() -> u32 {
     500
 }
 
+/// rerank 精排修剪阈值（sigmoid 中点）：成员与种子同主题的 logit ≥0 才保留。
+/// 种子永不修剪；低分成员剔除后成员 <2 的整条建议作废。
+const COLLECTION_RERANK_PRUNE_THRESHOLD: f32 = 0.5;
+
 #[tauri::command(async)]
 pub fn collection_suggestion_refresh(
     request: CollectionSuggestionRefreshRequest,
@@ -3298,6 +3302,8 @@ pub fn collection_suggestion_refresh(
     catalog: State<'_, CatalogServiceState>,
     models: State<'_, ModelServiceState>,
     generation: State<'_, GenerationServiceState>,
+    worker: State<'_, WorkerServiceState>,
+    runtime_manager: State<'_, RuntimeManagerState>,
 ) -> Result<CollectionSuggestionRefreshResult, AppError> {
     let correlation_id = Uuid::now_v7().to_string();
     let started = Instant::now();
@@ -3358,11 +3364,146 @@ pub fn collection_suggestion_refresh(
             page_size: 100,
             status: Some("suggested".into()),
         })?;
+        let new_suggestions = candidates
+            .items
+            .into_iter()
+            .filter(|item| new_ids.contains(&item.suggestion_id))
+            .collect::<Vec<_>>();
+        // 成员档案摘要（260 字内容片段）：rerank 的 query/documents 与命名 prompt 共用
+        let summaries = catalog.collection_suggestion_member_summaries(&result.suggestion_ids)?;
+        // 1. rerank 精排修剪：query=种子摘要，documents=成员摘要。
+        //    低分成员剔除（种子永不修剪）；剔除后成员 <2 的整条作废。
+        //    未配置 reranker / 降级 / 任何失败一律 fail-open：不修剪。
+        let mut discarded = HashSet::<Uuid>::new();
+        if catalog.maintenance_snapshot()?.degradation_level == "full"
+            && let Some(reranker) = models.active_artifact(ModelRole::Reranker)?
+            && reranker.format == ModelFormat::Onnx
+        {
+            let tokenizer_path = PathBuf::from(&reranker.local_path)
+                .parent()
+                .map(|parent| parent.join("tokenizer.json"))
+                .filter(|path| path.is_file());
+            if let Some(tokenizer_path) = tokenizer_path {
+                for suggestion in &new_suggestions {
+                    let Some(seed_file_id) = result
+                        .seed_file_id_by_suggestion
+                        .get(&suggestion.suggestion_id)
+                        .copied()
+                    else {
+                        continue;
+                    };
+                    let Some(seed_summary) = summaries.get(&seed_file_id) else {
+                        continue;
+                    };
+                    let member_pairs = suggestion
+                        .members
+                        .iter()
+                        .filter(|member| member.file.file_id != seed_file_id)
+                        .map(|member| {
+                            (
+                                member.file.file_id,
+                                summaries
+                                    .get(&member.file.file_id)
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    if member_pairs.is_empty() {
+                        continue;
+                    }
+                    let _ = app.emit(
+                        "collection:suggestion_phase",
+                        json!({"suggestion_id": suggestion.suggestion_id, "phase": "reranking"}),
+                    );
+                    let rerank_started = Instant::now();
+                    let mut rerank_runtime_request = RuntimeTaskRequest::interactive(
+                        RuntimeTaskKind::Rerank,
+                        RuntimeBackendKind::OnnxRuntime,
+                    );
+                    rerank_runtime_request.cpu_threads = 2;
+                    rerank_runtime_request.timeout = Duration::from_secs(10);
+                    rerank_runtime_request.model_id = Some(reranker.artifact_id.to_string());
+                    let Ok(rerank_runtime_lease) =
+                        runtime_manager.0.acquire(rerank_runtime_request)
+                    else {
+                        continue;
+                    };
+                    let rerank_result = worker.client.rerank(&RerankRequest {
+                        model_path: reranker.local_path.clone(),
+                        tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
+                        query: seed_summary.clone(),
+                        documents: member_pairs
+                            .iter()
+                            .map(|(_, summary)| summary.clone())
+                            .collect::<Vec<_>>(),
+                        max_length: reranker.max_length.unwrap_or(512),
+                        threads: 2,
+                    });
+                    rerank_runtime_lease.complete();
+                    let Ok(response) = rerank_result else {
+                        continue;
+                    };
+                    if response.scores.len() != member_pairs.len()
+                        || !response.scores.iter().all(|score| score.is_finite())
+                    {
+                        continue; // 条数/数值校验失败 fail-open
+                    }
+                    let removed = member_pairs
+                        .iter()
+                        .zip(&response.scores)
+                        .filter(|(_, score)| **score < COLLECTION_RERANK_PRUNE_THRESHOLD)
+                        .map(|((file_id, _), _)| *file_id)
+                        .collect::<Vec<_>>();
+                    let discarded_this = if removed.is_empty() {
+                        false
+                    } else {
+                        match catalog.prune_collection_suggestion_members(
+                            &suggestion.suggestion_id,
+                            &removed,
+                        ) {
+                            Ok(true) => false,
+                            Ok(false) => true,
+                            Err(_) => false, // fail-open：保留原样
+                        }
+                    };
+                    if discarded_this {
+                        discarded.insert(suggestion.suggestion_id);
+                    }
+                    trace_node(
+                        &catalog,
+                        "collection",
+                        "reranking",
+                        &correlation_id,
+                        None,
+                        Some(&suggestion.suggestion_id.to_string()),
+                        &json!({
+                            "seed_file_id": seed_file_id,
+                            "query": seed_summary,
+                            "document_count": member_pairs.len(),
+                            "documents": member_pairs
+                                .iter()
+                                .map(|(file_id, summary)| {
+                                    json!({"file_id": file_id, "summary": compact_for_prompt(summary, 600)})
+                                })
+                                .collect::<Vec<_>>(),
+                        }),
+                        &json!({
+                            "scores": response.scores,
+                            "removed_count": removed.len(),
+                            "discarded": discarded_this,
+                        }),
+                        "ok",
+                        Some(rerank_started.elapsed().as_millis() as u64),
+                    );
+                }
+            }
+        }
+        // 2. 生成模型命名润色（作废的建议跳过）：只改名称和说明，成员分组不变。
         if let Some(generation_artifact) = generation_artifact {
-            for suggestion in candidates
-                .items
+            for suggestion in new_suggestions
                 .into_iter()
-                .filter(|item| new_ids.contains(&item.suggestion_id))
+                .filter(|item| !discarded.contains(&item.suggestion_id))
             {
                 let _ = app.emit(
                     "collection:suggestion_phase",
@@ -3377,6 +3518,7 @@ pub fn collection_suggestion_refresh(
                                 "file_id": member.file.file_id,
                                 "title": member.file.display_name,
                                 "confidence": member.confidence,
+                                "summary": summaries.get(&member.file.file_id).cloned().unwrap_or_default(),
                             })
                         })
                         .collect::<Vec<_>>(),
@@ -3390,7 +3532,7 @@ pub fn collection_suggestion_refresh(
                     generation.0.as_ref(),
                     &generation_artifact,
                     "你是本地文档集合命名助手。只根据给定分组内的资料命名，不得增删成员。名称必须概括成员的共同主题、文档类型和用途，禁止直接复制任一文件名，也禁止使用‘相关资料’‘文档集合’等空泛名称。只输出JSON对象：{\"suggested_name\":\"不超过40字\",\"description\":\"不超过200字的说明\"}。",
-                    &format!("请给这个同主题资料分组起名并写说明：\n{candidate_json}"),
+                    &format!("请给这个同主题资料分组起名并写说明，可参考每个成员的内容片段：\n{candidate_json}"),
                     320,
                     &cancelled,
                 );
@@ -3428,7 +3570,13 @@ pub fn collection_suggestion_refresh(
                 );
             }
         }
-        // 分组判断完全由 Embedding 聚类完成，建议一经写入即为创建成功。
+        // 3. 收敛结果：rerank 作废的建议从返回值剔除，与库内状态一致。
+        result
+            .suggestion_ids
+            .retain(|id| !discarded.contains(id));
+        result
+            .seed_file_id_by_suggestion
+            .retain(|id, _| !discarded.contains(id));
         result.created_suggestions = result.suggestion_ids.len() as u64;
     }
     let _ = app.emit("collection:suggestions_changed", &result);

@@ -75,9 +75,16 @@ impl WorkerRole {
 /// 更新即判定进程失联（Python 主循环卡死等）并受控终止。
 const HEARTBEAT_STALE_SECONDS: u64 = 8;
 
+/// 冷启动宽限：PyInstaller 解包 + onnxruntime/sherpa_onnx 等重导入在
+/// 高负载下（下载、磁盘饱和、BELOW_NORMAL 优先级）实测可超过 8s。
+/// spawn 后前 STARTUP_GRACE_SECONDS 秒内放宽到 STARTUP_STALE_SECONDS，
+/// 只覆盖首次启动；主循环就绪后恢复稳态 8s 严格判定。
+const STARTUP_GRACE_SECONDS: u64 = 30;
+const STARTUP_STALE_SECONDS: u64 = 60;
+
 /// 心跳判定：文件缺失或 mtime 距今超过阈值即失联。
-fn heartbeat_stale(now_ms: u64, heartbeat_ms: u64) -> bool {
-    heartbeat_ms == 0 || now_ms.saturating_sub(heartbeat_ms) / 1000 > HEARTBEAT_STALE_SECONDS
+fn heartbeat_stale(now_ms: u64, heartbeat_ms: u64, stale_seconds: u64) -> bool {
+    heartbeat_ms == 0 || now_ms.saturating_sub(heartbeat_ms) / 1000 > stale_seconds
 }
 
 /// 空闲判定：距上次请求超过角色空闲阈值即回收（0 表示尚未发起过请求）。
@@ -306,9 +313,12 @@ impl WorkerClient {
         empty_client(self.launch.clone(), self.role)
     }
 
-    pub fn with_role(mut self, role: WorkerRole) -> Self {
-        self.role = role;
-        self
+    /// 返回同一启动方式下、拥有独立进程槽位的角色客户端。
+    /// 注意：派生 Clone 会共享 runtime/active_pid 等 Arc 状态，跨角色客户端
+    /// 必须经本方法重建，否则所有角色会挤进同一个 worker 进程、其余角色
+    /// 的请求被该进程按自身角色拒绝（OPERATION_UNSUPPORTED）。
+    pub fn with_role(self, role: WorkerRole) -> Self {
+        empty_client(self.launch.clone(), role)
     }
 
     pub fn role(&self) -> WorkerRole {
@@ -656,6 +666,12 @@ impl WorkerClient {
             .spawn()
             .map_err(|error| AppError::new("WORKER_START_FAILED", error.to_string(), true))?;
         self.active_pid.store(child.id(), Ordering::Release);
+        // 启动竞态：worker 冷启动（PyInstaller 解包 + sherpa_onnx/onnxruntime 等
+        // 重导入）可能超过 watchdog 首个观测点（spawn 后 2s）。此时心跳文件尚
+        // 未由 worker 侧创建，缺失即被判失联误杀（TTS 自检曾因此连续两次被杀）。
+        // 由 Rust 侧在 spawn 成功后立即落一条新鲜心跳，把 8s 失联窗口从进程创建
+        // 开始计时；worker 主循环就绪后每 2s 自行覆盖，语义不变。
+        let _ = std::fs::write(&heartbeat_file, "spawned");
         // 加入全局 Job Object：app 进程退出时（含崩溃）级联回收全部 sidecar，
         // 并统一以低于正常的优先级运行，避免后台索引与前台交互抢 CPU。
         if let Err(error) = assign_to_sidecar_job(child.id()) {
@@ -675,7 +691,7 @@ impl WorkerClient {
             .take()
             .ok_or_else(|| AppError::new("WORKER_IO_FAILED", "无法打开Worker标准输出", true))?;
         let pid = child.id();
-        self.spawn_watchdog(pid, heartbeat_file);
+        self.spawn_watchdog(pid, heartbeat_file, unix_time_ms());
         Ok(WorkerProcess {
             child,
             stdin: BufWriter::new(stdin),
@@ -688,7 +704,7 @@ impl WorkerClient {
     /// - 心跳文件超时未更新（Python 主循环卡死）→ 受控终止；
     /// - 空闲超过角色阈值 → 主动终止（完整休眠，下次请求自动重启）；
     /// - 通过 GetProcessMemoryInfo 观测真实内存，供运行时状态展示。
-    fn spawn_watchdog(&self, pid: u32, heartbeat_file: PathBuf) {
+    fn spawn_watchdog(&self, pid: u32, heartbeat_file: PathBuf, spawned_at_ms: u64) {
         let role = self.role;
         let active_pid = Arc::clone(&self.active_pid);
         let last_request_at_ms = Arc::clone(&self.last_request_at_ms);
@@ -720,12 +736,21 @@ impl WorkerClient {
                     if heartbeat_ms > 0 {
                         heartbeat_at_ms.store(heartbeat_ms, Ordering::Release);
                     }
-                    if heartbeat_stale(now_ms, heartbeat_ms) {
+                    // 冷启动宽限：spawn 后 30s 内用 60s 阈值，避免高负载下
+                    // 重导入未完成就被误杀；稳态后恢复 8s 严格判定。
+                    let stale_seconds = if now_ms.saturating_sub(spawned_at_ms) / 1000
+                        < STARTUP_GRACE_SECONDS
+                    {
+                        STARTUP_STALE_SECONDS
+                    } else {
+                        HEARTBEAT_STALE_SECONDS
+                    };
+                    if heartbeat_stale(now_ms, heartbeat_ms, stale_seconds) {
                         eprintln!(
                             "[worker] sidecar {} (pid {}) 心跳丢失超过 {}s，判定失联并终止",
                             role.as_str(),
                             pid,
-                            HEARTBEAT_STALE_SECONDS
+                            stale_seconds
                         );
                         active_pid.store(0, Ordering::Release);
                         terminate_process_by_id(pid);
@@ -1109,10 +1134,12 @@ mod tests {
     #[test]
     fn heartbeat_stale_requires_fresh_file() {
         let now = 1_000_000;
-        assert!(heartbeat_stale(now, 0), "缺失心跳文件视为失联");
-        assert!(heartbeat_stale(now, now - 9_000), "超过 8 秒未更新视为失联");
-        assert!(!heartbeat_stale(now, now - 4_000), "4 秒内的心跳视为存活");
-        assert!(!heartbeat_stale(now, now), "刚更新的心跳视为存活");
+        assert!(heartbeat_stale(now, 0, 8), "缺失心跳文件视为失联");
+        assert!(heartbeat_stale(now, now - 9_000, 8), "超过 8 秒未更新视为失联");
+        assert!(!heartbeat_stale(now, now - 4_000, 8), "4 秒内的心跳视为存活");
+        assert!(!heartbeat_stale(now, now, 8), "刚更新的心跳视为存活");
+        assert!(!heartbeat_stale(now, now - 30_000, 60), "宽限窗口内 30 秒未更新仍视为存活");
+        assert!(heartbeat_stale(now, now - 61_000, 60), "宽限窗口超过 60 秒仍未更新视为失联");
     }
 
     #[test]
