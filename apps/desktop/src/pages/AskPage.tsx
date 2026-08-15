@@ -282,16 +282,22 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
           pendingUser = "";
         } else if (message.error) {
           failedQuestion = pendingUser || failedQuestion;
-          setError(`${message.error.message}（${message.error.code}）`);
           pendingUser = "";
         }
+      }
+      // 只有最近一次消息是失败时才恢复红色警告与重试记录；
+      // 历史失败（其后已有成功问答）不复活弹窗，避免"成功问答后弹窗仍在"。
+      const lastMessage = page.items.at(-1);
+      const lastIsFailure = lastMessage !== undefined && lastMessage.error !== null;
+      if (lastIsFailure) {
+        setError(`${lastMessage.error!.message}（${lastMessage.error!.code}）`);
       }
       setAskOperationId(null);
       setLoading(false);
       setStreamedAnswer("");
       setActivePhase("queued");
       setTurns(loadedTurns);
-      setLastFailedQuestion(failedQuestion);
+      setLastFailedQuestion(lastIsFailure ? failedQuestion : null);
       setActiveSessionId(sessionId);
       setPendingQuestion(null);
       setPreview(null);
