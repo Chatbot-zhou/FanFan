@@ -630,7 +630,16 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
   return (
     <section className="page page--ask">
       <div className="ask-session-toolbar">
-        <AppSelect ariaLabel="最近问答会话" value={activeSessionId ?? ""} onChange={(value) => value ? void loadSession(value) : startNewSession()} options={[
+        <AppSelect ariaLabel="最近问答会话" value={activeSessionId ?? ""} onChange={(value) => value ? void loadSession(value) : startNewSession()} labelRender={({ value }) => {
+          // 选中项标题兜底：活动会话不在已加载列表（刷新失败或分页截断）时，
+          // 防止 antd 直接把 session_id 显示出来；标题与后端一致取首问文本
+          if (value === "") return "新对话";
+          const session = sessions.find((item) => item.session_id === value);
+          if (session) return <span className="session-option__title">{session.title}</span>;
+          const firstTurn = turns[0];
+          if (firstTurn?.answer.session_id === value) return <span className="session-option__title">{firstTurn.question}</span>;
+          return <span className="session-option__title">当前会话</span>;
+        }} options={[
           { value: "", label: "新对话" },
           ...sessions.map((session) => ({
             value: session.session_id,
