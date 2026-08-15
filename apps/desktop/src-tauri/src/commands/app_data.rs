@@ -37,7 +37,7 @@ use fanfan_core::{
     SpeechSynthesisResult, TriageStatus, WorkerClient, AskMessage, chat_prompt,
     chat_prompt_mini, intent_routing_prompt, intent_routing_prompt_mini,
     is_natural_language_query,
-    is_pure_greeting, parse_intent_verdict, parse_query_intent, parse_rewritten_queries,
+    parse_intent_verdict, parse_query_intent, parse_rewritten_queries,
     query_rewrite_prompt, query_understanding_prompt, strip_long_path_prefix,
 };
 use serde::{Deserialize, Serialize};
@@ -5580,10 +5580,11 @@ fn compute_answer(
     }
 }
 
-/// 意图路由：LLM 直路由。纯寒暄白名单分流后，生成模型按 5+5 对话历史判断
-/// 走检索还是闲聊（≤32 token 的 JSON 补全，模型在 ask 租约阶段已加载）。
+/// 意图路由：LLM 直路由。生成模型按 5+5 对话历史判断走检索还是闲聊
+/// （≤32 token 的 JSON 补全，模型在 ask 租约阶段已加载）。
 /// 解析失败或调用失败默认 Chat——闲聊答错无副作用，检索答错会把资料库内容
 /// 当答案胡说（0.6B 仲裁失败的教训）。返回路由 LLM 原始输出供节点追踪复盘。
+/// 回复内容一律由模型生成，不做任何关键词/白名单规则分流。
 fn route_question(
     request: &AskRequest,
     history: &[AskMessage],
@@ -5591,19 +5592,6 @@ fn route_question(
     generation_artifact: &ModelArtifact,
     cancelled: &AtomicBool,
 ) -> Result<(RouteDecision, Option<String>), AppError> {
-    // 纯寒暄白名单：整句精确匹配直接 Chat，零模型调用。
-    // 寒暄句是最高频场景且小模型对寒暄有检索偏置，必须在最前面分流。
-    if is_pure_greeting(&request.question) {
-        return Ok((
-            RouteDecision {
-                intent: Intent::Chat,
-                top_category: Intent::Chat,
-                top_score: 0.0,
-                margin: 0.0,
-            },
-            None,
-        ));
-    }
     let fallback_chat = RouteDecision {
         intent: Intent::Chat,
         top_category: Intent::Chat,
@@ -5717,6 +5705,7 @@ fn run_chat_answer(
         &json!({}),
         &json!({
             "answer_mode": result.answer_mode,
+            "answer": result.answer,
             "claim_count": result.claims.len(),
             "grounding_status": format!("{:?}", result.grounding_status),
             "insufficient_evidence": result.insufficient_evidence,
@@ -5932,6 +5921,7 @@ fn run_retrieval_answer(
             &json!({}),
             &json!({
                 "answer_mode": "rag_refusal",
+                "answer": extractive.answer,
                 "claim_count": 0,
                 "grounding_status": format!("{:?}", extractive.grounding_status),
                 "insufficient_evidence": true,
@@ -5946,6 +5936,8 @@ fn run_retrieval_answer(
     }
     let mut reranker_applied = false;
     let mut claims_before_truncate = 0usize;
+    // rerank 的完整候选文档（截断前构建，节点追踪要看全部输入）
+    let mut rerank_documents: Vec<String> = Vec::new();
     if maintenance.degradation_level == "full"
         && let Some(reranker) = models.active_artifact(ModelRole::Reranker)?
         && reranker.format == ModelFormat::Onnx
@@ -5956,7 +5948,7 @@ fn run_retrieval_answer(
             .parent()
             .map(|parent| parent.join("tokenizer.json"));
         if let Some(tokenizer_path) = tokenizer_path.filter(|path| path.is_file()) {
-            let documents = extractive
+            rerank_documents = extractive
                 .claims
                 .iter()
                 .map(|claim| compact_for_prompt(&claim.text, 12_000))
@@ -5975,7 +5967,7 @@ fn run_retrieval_answer(
                     // rerank 一律用用户原始问题排序（改写只服务检索召回，
                     // 排序要贴近用户真实意图，与最终生成的依据一致）。
                     query: request.question.trim().to_owned(),
-                    documents,
+                    documents: rerank_documents.clone(),
                     max_length: reranker.max_length.unwrap_or(512),
                     threads: 2,
                 })
@@ -5999,7 +5991,14 @@ fn run_retrieval_answer(
                         &correlation_id,
                         session_id_ref,
                         None,
-                        &json!({}),
+                        &json!({
+                            "query": request.question,
+                            "document_count": rerank_documents.len(),
+                            "documents": rerank_documents
+                                .iter()
+                                .map(|document| compact_for_prompt(document, 600))
+                                .collect::<Vec<_>>(),
+                        }),
                         &json!({
                             "fallback": "rerank_chat",
                             "top_score": top_score,
@@ -6036,7 +6035,14 @@ fn run_retrieval_answer(
         &correlation_id,
         session_id_ref,
         None,
-        &json!({}),
+        &json!({
+            "query": request.question,
+            "document_count": rerank_documents.len(),
+            "documents": rerank_documents
+                .iter()
+                .map(|document| compact_for_prompt(document, 600))
+                .collect::<Vec<_>>(),
+        }),
         &json!({
             "applied": reranker_applied,
             "claims_before_truncate": claims_before_truncate,
@@ -6147,13 +6153,13 @@ fn run_retrieval_answer(
     if grounded.is_none() {
         phase("citation_structure_repair", 0.9);
         let repair_prompt = format!(
-            "下面的输出没有满足结构约束。只修复JSON结构和citation_ids，不得增加、删除或改写事实，不得引入新的S编号。只输出符合指定JSON Schema的对象。\n\n原输出：\n{}",
+            "下面的输出没有满足结构约束。请保持原有事实、措辞与S编号完全不变，只修正JSON结构和citation_ids的格式，使输出符合指定JSON Schema。\n\n原输出：\n{}",
             compact_for_prompt(&generated, 12_000)
         );
         let repaired = complete_json_with_model(
             generation,
             &generation_artifact,
-            "你是结构化引用修复器。不得引入新事实或新来源编号。",
+            "你是结构化引用修复器。保持原有事实、措辞与S编号不变，只修正JSON结构和citation_ids格式。",
             &repair_prompt,
             640,
             &answer_schema,
@@ -6207,6 +6213,7 @@ fn run_retrieval_answer(
             &json!({}),
             &json!({
                 "answer_mode": degraded.answer_mode,
+                "answer": degraded.answer,
                 "claim_count": 0,
                 "grounding_status": format!("{:?}", degraded.grounding_status),
                 "insufficient_evidence": degraded.insufficient_evidence,
@@ -6247,8 +6254,11 @@ fn run_retrieval_answer(
             let verification = complete_with_model(
                 generation,
                 &generation_artifact,
-                "你是严格的中文证据核验器。判断事实句是否完全由给定原文证据支持，只输出SUPPORTED或UNSUPPORTED。",
-                &format!("事实句：{}\n\n原文证据：\n{}", claim.text, evidence),
+                "你是严格的中文证据核验员。判断「事实句」是否完全由「原文证据」支持：事实句的每个要点都要能在证据中找到对应文字，证据里没有的内容不能算支持。只输出一个词：SUPPORTED 或 UNSUPPORTED，不要输出解释、标点或多余文字。",
+                &format!(
+                    "【示例一】\n事实句：公司的报销流程是先填单再审批\n原文证据：\n[E1] 报销需先填写报销单，经部门主管审批后方可发放\n输出：SUPPORTED\n\n【示例二】\n事实句：公司的报销上限是五千元\n原文证据：\n[E1] 员工报销需提供正规发票\n输出：UNSUPPORTED\n\n【正式任务】\n事实句：{}\n\n原文证据：\n{}",
+                    claim.text, evidence
+                ),
                 32,
                 cancelled,
             )?;
@@ -6315,6 +6325,7 @@ fn run_retrieval_answer(
             &json!({}),
             &json!({
                 "answer_mode": degraded.answer_mode,
+                "answer": degraded.answer,
                 "claim_count": 0,
                 "grounding_status": format!("{:?}", degraded.grounding_status),
                 "insufficient_evidence": degraded.insufficient_evidence,
@@ -6363,6 +6374,7 @@ fn run_retrieval_answer(
         &json!({}),
         &json!({
             "answer_mode": grounded.answer_mode,
+            "answer": grounded.answer,
             "claim_count": grounded.claims.len(),
             "grounding_status": format!("{:?}", grounded.grounding_status),
             "insufficient_evidence": grounded.insufficient_evidence,
