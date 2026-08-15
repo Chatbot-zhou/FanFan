@@ -2,49 +2,32 @@ import { DeleteOutlined, FolderOpenOutlined, ReloadOutlined } from "@ant-design/
 import { isTauri } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { bridge } from "../bridge";
 import { confirmAction } from "../components/AppConfirm";
-import {
-  formatModelDownloadBytes,
-  modelDownloadIsActive,
-  summarizeModelDownloads,
-  visibleModelDownloadJobs,
-} from "../features/model-downloads/model-downloads";
-import { useAppStore } from "../state/app-store";
+import { ModelManagementPanel } from "../features/model-management/ModelManagementPanel";
+import { useAppStore, type SettingsTab } from "../state/app-store";
 import { useThemePreference } from "../features/theme/ThemeProvider";
 import { errorMessage } from "../utils/app-error";
 
 const bytes = (value: number) => value < 1024 * 1024 ? `${Math.round(value / 1024)} KB` : value < 1024 * 1024 * 1024 ? `${(value / 1024 / 1024).toFixed(1)} MB` : `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`;
 
-const CAPABILITY_LABELS = [
-  ["generation", "问答"],
-  ["embedding", "Embedding"],
-  ["vision", "多模态"],
-  ["reranker", "Rerank"],
-  ["tts", "语音合成"],
-  ["asr", "语音识别"],
-  ["ocr", "OCR"],
-] as const;
-
-export function SettingsPage() {
-  const navigate = useAppStore((state) => state.navigate);
+/** initialTab：外部（如原 model_setup 入口）希望直接定位到的设置 tab。 */
+export function SettingsPage({ initialTab }: { initialTab?: SettingsTab }) {
   const tab = useAppStore((state) => state.settings_tab);
   const setTab = useAppStore((state) => state.set_settings_tab);
+  useEffect(() => {
+    if (initialTab) setTab(initialTab);
+    // 仅在挂载时定位一次，后续用户在设置页内的切换不受影响。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const theme = useThemePreference();
   const queryClient = useQueryClient();
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const roots = useQuery({ queryKey: ["settings-roots"], queryFn: () => bridge.root_list() });
-  const models = useQuery({ queryKey: ["settings-models"], queryFn: async () => ({ state: await bridge.model_state_get(), artifacts: await bridge.model_artifact_list() }) });
   const modelStore = useQuery({ queryKey: ["model-store-status"], queryFn: () => bridge.model_store_status_get(), enabled: tab === "index" });
-  const modelDownloads = useQuery({
-    queryKey: ["model-downloads"],
-    queryFn: () => bridge.model_download_list(),
-    enabled: tab === "models",
-    refetchInterval: (query) => query.state.data?.some((job) => job.status === "queued" || job.status === "running") ? 500 : false,
-  });
   const maintenance = useQuery({ queryKey: ["maintenance"], queryFn: () => bridge.maintenance_get() });
   const storage = useQuery({ queryKey: ["storage-usage"], queryFn: () => bridge.storage_usage_get(), enabled: tab === "index" });
   const storageLocation = useQuery({ queryKey: ["storage-location"], queryFn: () => bridge.storage_location_get(), enabled: tab === "index" });
@@ -68,13 +51,6 @@ export function SettingsPage() {
   });
   const traceItems = traces.data?.pages.flatMap((page) => page.items) ?? [];
   const [expandedTrace, setExpandedTrace] = useState<string | null>(null);
-  const visibleDownloads = useMemo(() => visibleModelDownloadJobs(modelDownloads.data ?? []), [modelDownloads.data]);
-  const downloadSummary = useMemo(() => summarizeModelDownloads(visibleDownloads), [visibleDownloads]);
-  const activeCapabilities = useMemo(() => {
-    const caps = models.data?.state.capabilities;
-    if (!caps) return null;
-    return CAPABILITY_LABELS.filter(([key]) => caps[key]).map(([, label]) => label);
-  }, [models.data?.state.capabilities]);
 
   const addRoot = async (volumeOnly: boolean) => {
     setError(null); setMessage(null);
@@ -205,11 +181,7 @@ export function SettingsPage() {
             <section><h2>资料目录</h2><div className="settings-actions"><button type="button" disabled={busy} onClick={() => void addRoot(false)}><FolderOpenOutlined /> 添加文件夹</button><button type="button" disabled={busy} onClick={() => void addRoot(true)}><FolderOpenOutlined /> 添加整个磁盘</button></div></section>
             <section><h2>已授权位置</h2><div className="settings-list">{roots.data?.map((root) => <div key={root.root_id}><span><strong>{root.label}</strong><small>{root.path}</small></span><em>{root.enabled ? `${root.file_count} 个文件` : "已停用"}</em><button type="button" className="text-button" disabled={busy} onClick={() => void disableRoot(root.root_id, root.label)}>从翻翻移除</button></div>)}{!roots.isLoading && roots.data?.length === 0 && <p>当前没有资料目录。添加前翻翻不会读取本地文件。</p>}</div></section>
           </>}
-          {tab === "models" && <>
-            {(visibleDownloads.some(modelDownloadIsActive) || downloadSummary.attention_count > 0) && <section><h2>模型下载</h2><div className="setting-row model-download-overview"><div><strong>{downloadSummary.attention_count > 0 ? `${downloadSummary.attention_count} 项需要处理` : downloadSummary.active_count > 0 ? `${downloadSummary.active_count} 个任务正在进行` : `${downloadSummary.visible_count} 个任务已结束`}</strong><small>{downloadSummary.active_count > 0 ? `${downloadSummary.progress == null ? "正在准备下载" : `总体 ${Math.round(downloadSummary.progress * 100)}%`} · ${formatModelDownloadBytes(downloadSummary.downloaded_bytes)} / ${formatModelDownloadBytes(downloadSummary.total_bytes)}` : "完成和取消记录仅保留到本次应用会话结束"}</small></div><button type="button" onClick={() => navigate("model_setup")}>查看全部任务</button></div></section>}
-            <section><h2>模型配置</h2><div className="setting-row"><div className="capability-list">{activeCapabilities === null ? "正在读取" : activeCapabilities.length > 0 ? activeCapabilities.join(" · ") : "尚未启用本地模型"}</div><button type="button" onClick={() => navigate("model_setup")}>管理模型</button></div></section>
-            <section><h2>已导入组件</h2><div className="settings-list">{models.data?.artifacts.map((artifact) => <div key={artifact.artifact_id}><span><strong>{artifact.model_id}</strong><small>{artifact.role} · {artifact.format.toUpperCase()} · {bytes(artifact.size_bytes)}</small></span><em>{artifact.embedding_dimension ? `已自检 · ${artifact.embedding_dimension}维` : artifact.status}</em></div>)}{models.data?.artifacts.length === 0 && <p>还没有导入本地模型。基础搜索不受影响。</p>}</div></section>
-          </>}
+          {tab === "models" && <ModelManagementPanel />}
           {tab === "index" && <><section><h2>索引状态</h2><div className="metric-strip"><span><strong>{maintenance.data?.indexed_files ?? "—"}</strong>已索引文件</span><span><strong>{maintenance.data?.searchable_chunks ?? "—"}</strong>全文块</span><span><strong>{maintenance.data?.embedded_chunks ?? "—"}</strong>向量块</span><span><strong>{maintenance.data ? bytes(maintenance.data.database_size_bytes) : "—"}</strong>数据库</span></div></section><section><h2>存储分类</h2><p>只允许清理明确标记为缓存的内容；模型断点、索引与源文件不会作为缓存删除。</p><div className="settings-list">{storage.data?.categories.map((category) => <div key={category.key}><span><strong>{category.label}</strong><small>{category.detail}</small></span><em>{bytes(category.size_bytes)}</em>{category.clearable && <button type="button" className="text-button" disabled={busy || category.size_bytes === 0} onClick={() => void clearCache(category.key as "temporary_cache" | "failed_downloads", category.label)}>清理</button>}</div>)}</div></section><section><h2>自动检查站</h2><div className="health-list">{maintenance.data?.checks.map((check) => <div key={check.key} className={`health-${check.status}`}><i /><span><strong>{check.label}</strong><small>{check.detail}</small></span></div>)}</div><div className="settings-actions"><button type="button" disabled={busy} onClick={() => void checkDatabase("quick")}><ReloadOutlined /> {busy ? "检查中" : "快速检查"}</button><button type="button" disabled={busy} onClick={() => void checkDatabase("full")}><ReloadOutlined /> {busy ? "检查中" : "完整检查"}</button><button type="button" className="danger-button" disabled={busy} onClick={() => void rebuild()}><DeleteOutlined /> 重建派生索引</button></div></section></>}
           {tab === "appearance" && <section><h2>显示与动效</h2><p>默认跟随Windows深浅色；你也可以固定使用白天渐变或夜晚暗黑。系统启用减少动态效果后，翻翻会关闭非必要动画。</p><div className="theme-options" role="radiogroup" aria-label="主题"><button type="button" role="radio" aria-checked={theme.preference === "system"} className={theme.preference === "system" ? "selected" : ""} onClick={() => void theme.setPreference("system")}><strong>跟随系统</strong><small>随Windows自动切换</small></button><button type="button" role="radio" aria-checked={theme.preference === "day_gradient"} className={theme.preference === "day_gradient" ? "selected" : ""} onClick={() => void theme.setPreference("day_gradient")}><strong>白天渐变</strong><small>雾蓝 · 浅紫 · 淡粉</small></button><button type="button" role="radio" aria-checked={theme.preference === "night_dark"} className={theme.preference === "night_dark" ? "selected" : ""} onClick={() => void theme.setPreference("night_dark")}><strong>夜晚暗黑</strong><small>黑底 · 白字</small></button></div><div className="readonly-note">当前显示：{theme.effective_theme === "night_dark" ? "夜晚暗黑" : "白天渐变"}</div></section>}
           {tab === "logs" && <><section><h2>体验日志与诊断包</h2><div className="settings-actions"><button type="button" disabled={busy} onClick={() => void exportDiagnostics()}>导出诊断包</button></div><small>复现问题后请尽量不要清除日志，直接导出诊断包，并记下大致时间、操作步骤、预期结果和实际现象。</small></section><section><h2>本地诊断日志</h2><p>日志只保存在电脑中，按大小自动轮转。当前可查看 {maintenance.data?.log_events ?? 0} 条。</p><div className="log-list">{logItems.map((log) => <div key={log.log_id} className={`log-level--${log.level}`}><time>{new Date(log.created_at).toLocaleString("zh-CN")}</time><strong>{log.level.toUpperCase()} · {log.component} · {log.event_name}</strong><code>{JSON.stringify(log.fields)}</code></div>)}{logItems.length === 0 && <p>当前没有诊断日志。</p>}</div>{logs.hasNextPage && <button type="button" className="load-more-button" disabled={logs.isFetchingNextPage} onClick={() => void logs.fetchNextPage()}>{logs.isFetchingNextPage ? "正在加载" : "加载更多日志"}</button>}<button type="button" className="danger-button" disabled={busy || logItems.length === 0} onClick={() => void clearLogs()}><DeleteOutlined /> 清除日志</button></section><section><h2>重置应用数据</h2><p>重置会清理翻翻的数据库、索引、缓存、设置和日志；独立模型仓库及所有已下载模型永久保留。下次启动前会先移动到时间戳隔离目录，资料源文件始终不动。</p><button type="button" className="danger-button" disabled={busy} onClick={() => void resetApplicationData()}><DeleteOutlined /> 重置并重新启动</button></section></>}

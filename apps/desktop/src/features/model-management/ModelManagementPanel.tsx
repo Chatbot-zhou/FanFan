@@ -4,18 +4,17 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useRef, useState } from "react";
 import { Modal } from "antd";
-import { bridge, type ImportCandidate, type ModelDownloadJob, type ModelRole } from "../bridge";
-import { recordDiagnosticEvent } from "../bridge/observed-bridge";
-import { confirmAction } from "../components/AppConfirm";
-import { AppSelect } from "../components/AppSelect";
-import { ModelDownloadList, type ModelDownloadAction } from "../features/model-downloads/ModelDownloadList";
+import { bridge, type ImportCandidate, type ModelDownloadJob, type ModelRole } from "../../bridge";
+import { recordDiagnosticEvent } from "../../bridge/observed-bridge";
+import { confirmAction } from "../../components/AppConfirm";
+import { AppSelect } from "../../components/AppSelect";
+import { ModelDownloadList, type ModelDownloadAction } from "../model-downloads/ModelDownloadList";
 import {
   modelDownloadIsActive,
   summarizeModelDownloads,
   visibleModelDownloadJobs,
-} from "../features/model-downloads/model-downloads";
-import { useAppStore } from "../state/app-store";
-import { errorMessage, normalizeAppError } from "../utils/app-error";
+} from "../model-downloads/model-downloads";
+import { errorMessage, normalizeAppError } from "../../utils/app-error";
 
 type SetupStep = "main" | "import";
 
@@ -23,9 +22,9 @@ const formatBytes = (value: number) => value >= 1024 ** 3
   ? `${(value / 1024 ** 3).toFixed(2)} GB`
   : `${(value / 1024 ** 2).toFixed(value < 1024 ** 2 ? 2 : 0)} MB`;
 
-export function ModelSetupPage() {
+/** 本地模型管理面板：下载任务、按角色配置、模型选择池、导入与本地组件（嵌入设置页「本地模型」tab）。 */
+export function ModelManagementPanel() {
   const queryClient = useQueryClient();
-  const goBack = useAppStore((state) => state.go_back);
   const [step, setStep] = useState<SetupStep>("main");
   const [source] = useState<"huggingface" | "modelscope">("huggingface");
   const [selectedRole, setSelectedRole] = useState<ModelRole>("generation");
@@ -185,12 +184,7 @@ export function ModelSetupPage() {
   };
 
   return (
-    <section className="page page--model">
-      <header className="page-heading model-heading">
-        <button type="button" className="back-button" aria-label="返回上一页" onClick={() => step === "main" ? goBack() : setStep("main")}><ArrowLeftOutlined /></button>
-        <div><h1>本地模型配置</h1><p>模型包完整安装并自检后才会启用；推理、索引和资料始终留在本地。</p></div>
-      </header>
-
+    <div className="model-management">
       {(visibleDownloads.some(modelDownloadIsActive) || downloadSummary.attention_count > 0) && (
         <section className="model-download-section" aria-label="模型下载任务">
           <header>
@@ -218,7 +212,6 @@ export function ModelSetupPage() {
               {active && config.role !== "ocr" && <button type="button" className="text-button" onClick={() => void disableRole(config.role)}>停用</button>}
             </article>;
           })}</div>
-          {disable.isError && <p role="alert" className="inline-error">{errorMessage(disable.error)}</p>}
         </section>
         <section ref={poolRef} className="role-model-pool" aria-label="已验证模型选择池">
           <header><div><h2>{selectedRole === "generation" ? "问答基础模型" : selectedRole === "embedding" ? "Embedding 模型" : selectedRole === "vision" ? "多模态模型" : selectedRole === "ocr" ? "OCR 模型" : selectedRole === "tts" ? "语音合成模型" : selectedRole === "asr" ? "语音识别模型" : "Rerank 模型"}</h2></div><button type="button" onClick={() => setStep("import")}>导入本地模型</button></header>
@@ -256,6 +249,7 @@ export function ModelSetupPage() {
       </>}
 
       {step === "import" && <div className="import-panel">
+        <button type="button" className="back-button model-import-back" aria-label="返回模型选择" onClick={() => setStep("main")}><ArrowLeftOutlined /></button>
         <FolderOpenOutlined /><h2>导入常见格式模型</h2>
         <p>支持生成与多模态模型 GGUF，向量、重排、语音合成与语音识别模型 ONNX，以及 JSON、tokenizer.json 和 SentencePiece 配置。OCR 继续使用 Windows 本地运行时。</p>
         <div className="import-panel__actions"><button type="button" className="primary-button" disabled={scanImport.isPending} onClick={() => void chooseModels(false)}>选择模型文件</button><button type="button" disabled={scanImport.isPending} onClick={() => void chooseModels(true)}>选择模型目录</button></div>
@@ -267,6 +261,16 @@ export function ModelSetupPage() {
         </div>}
         <small>翻翻不会执行模型目录中的 Python、Shell 或远程自定义代码。</small>
       </div>}
+
+      {(artifacts.data?.length ?? 0) > 0 && <section className="managed-models">
+        <h2>本地模型组件</h2>
+        {artifacts.data?.map((artifact) => {
+          const activatable = ((artifact.role === "embedding" || artifact.role === "reranker" || artifact.role === "tts" || artifact.role === "asr") && artifact.format === "onnx") || ((artifact.role === "generation" || artifact.role === "vision") && artifact.format === "gguf");
+          const roleName = artifact.role === "generation" ? "问答基础模型" : artifact.role === "embedding" ? "Embedding" : artifact.role === "vision" ? "多模态模型" : artifact.role === "reranker" ? "Rerank" : artifact.role === "tts" ? "语音合成" : artifact.role === "asr" ? "语音识别" : "OCR";
+          return <article key={artifact.artifact_id}><div><strong>{artifact.model_id}</strong><small>{roleName} · {artifact.format.toUpperCase()} · {(artifact.size_bytes / 1024 / 1024).toFixed(1)} MB{artifact.embedding_dimension ? ` · ${artifact.embedding_dimension}维` : ""}</small></div>{activatable ? <button type="button" disabled={activate.isPending} onClick={() => void activateModel(artifact.artifact_id, artifact.role)}>{activate.isPending ? "正在加载与自检" : artifact.role === "generation" ? "加载并启用" : artifact.role === "vision" ? "自检并启用图片理解" : artifact.role === "reranker" ? "自检并启用重排" : artifact.role === "tts" || artifact.role === "asr" ? "自检并启用" : artifact.embedding_dimension ? "重建并切换索引" : "自检并建立索引"}</button> : <span>{artifact.role === "ocr" ? "使用 Windows OCR" : "当前格式不受支持"}</span>}</article>;
+        })}
+        {activate.isError && <p role="alert" className="inline-error">{errorMessage(activate.error)}</p>}
+      </section>}
 
       <Modal
         open={installTarget !== null}
@@ -288,16 +292,6 @@ export function ModelSetupPage() {
           </div>
         </div>
       </Modal>
-
-      {(artifacts.data?.length ?? 0) > 0 && <section className="managed-models">
-        <h2>本地模型组件</h2>
-        {artifacts.data?.map((artifact) => {
-          const activatable = ((artifact.role === "embedding" || artifact.role === "reranker" || artifact.role === "tts" || artifact.role === "asr") && artifact.format === "onnx") || ((artifact.role === "generation" || artifact.role === "vision") && artifact.format === "gguf");
-          const roleName = artifact.role === "generation" ? "问答基础模型" : artifact.role === "embedding" ? "Embedding" : artifact.role === "vision" ? "多模态模型" : artifact.role === "reranker" ? "Rerank" : artifact.role === "tts" ? "语音合成" : artifact.role === "asr" ? "语音识别" : "OCR";
-          return <article key={artifact.artifact_id}><div><strong>{artifact.model_id}</strong><small>{roleName} · {artifact.format.toUpperCase()} · {(artifact.size_bytes / 1024 / 1024).toFixed(1)} MB{artifact.embedding_dimension ? ` · ${artifact.embedding_dimension}维` : ""}</small></div>{activatable ? <button type="button" disabled={activate.isPending} onClick={() => void activateModel(artifact.artifact_id, artifact.role)}>{activate.isPending ? "正在加载与自检" : artifact.role === "generation" ? "加载并启用" : artifact.role === "vision" ? "自检并启用图片理解" : artifact.role === "reranker" ? "自检并启用重排" : artifact.role === "tts" || artifact.role === "asr" ? "自检并启用" : artifact.embedding_dimension ? "重建并切换索引" : "自检并建立索引"}</button> : <span>{artifact.role === "ocr" ? "使用 Windows OCR" : "当前格式不受支持"}</span>}</article>;
-        })}
-        {activate.isError && <p role="alert" className="inline-error">{errorMessage(activate.error)}</p>}
-      </section>}
-    </section>
+    </div>
   );
 }

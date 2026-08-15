@@ -8,7 +8,6 @@ import { CollectionsPage } from "../../pages/CollectionsPage";
 import { HomePage } from "../../pages/HomePage";
 import { InboxPage } from "../../pages/InboxPage";
 import { LibraryPage } from "../../pages/LibraryPage";
-import { ModelSetupPage } from "../../pages/ModelSetupPage";
 import { SearchPage } from "../../pages/SearchPage";
 import { SettingsPage } from "../../pages/SettingsPage";
 import { Sidebar } from "./Sidebar";
@@ -198,7 +197,8 @@ export function AppShell({ startup_notice }: AppShellProps) {
     collections: <CollectionsPage />,
     inbox: <InboxPage />,
     settings: <SettingsPage />,
-    model_setup: <ModelSetupPage />,
+    // model_setup 兼容入口：直接落在设置页「本地模型」tab（下载通知、状态中心等沿用该路由名）。
+    model_setup: <SettingsPage initialTab="models" />,
   }[route];
 
   return (
