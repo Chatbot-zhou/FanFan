@@ -264,7 +264,12 @@ export function ModelManagementPanel() {
 
       {(artifacts.data?.length ?? 0) > 0 && <section className="managed-models">
         <h2>本地模型组件</h2>
-        {artifacts.data?.map((artifact) => {
+        {/* 正在使用的模型排前面，未使用的排后面；启用/停用后随数据刷新自动重排。 */}
+        {[...(artifacts.data ?? [])].sort((left, right) => {
+          const leftInUse = roleConfigs.data?.some((config) => config.active_artifact_id === left.artifact_id) ?? false;
+          const rightInUse = roleConfigs.data?.some((config) => config.active_artifact_id === right.artifact_id) ?? false;
+          return Number(rightInUse) - Number(leftInUse);
+        }).map((artifact) => {
           const activatable = ((artifact.role === "embedding" || artifact.role === "reranker" || artifact.role === "tts" || artifact.role === "asr") && artifact.format === "onnx") || ((artifact.role === "generation" || artifact.role === "vision") && artifact.format === "gguf");
           const roleName = artifact.role === "generation" ? "问答基础模型" : artifact.role === "embedding" ? "Embedding" : artifact.role === "vision" ? "多模态模型" : artifact.role === "reranker" ? "Rerank" : artifact.role === "tts" ? "语音合成" : artifact.role === "asr" ? "语音识别" : "OCR";
           const inUse = roleConfigs.data?.some((config) => config.active_artifact_id === artifact.artifact_id) ?? false;
