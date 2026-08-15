@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "翻翻",
+  "productName": "FanFan",
   "version": "0.2.0",
   "identifier": "com.fanfan.desktop",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "翻翻",
+        "title": "FanFan",
         "width": 1100,
         "height": 720,
         "minWidth": 900,
@@ -62,7 +62,7 @@
         "compression": "lzma",
         "installerIcon": "icons/icon.ico",
         "uninstallerIcon": "icons/icon.ico",
-        "startMenuFolder": "翻翻"
+        "startMenuFolder": "FanFan"
       }
     }
   }

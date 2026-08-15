@@ -124,8 +124,8 @@ export function CollectionsPage() {
   });
   const confirmSuggestion = useMutation({
     mutationFn: (suggestionId: string) => bridge.collection_suggestion_confirm(suggestionId),
-    onSuccess: async (collection) => {
-      setSelectedId(collection.collection_id);
+    // 确认后不自动打开详情区；用户点击集合卡片或「编辑集合」时才展示
+    onSuccess: async () => {
       await Promise.all([queryClient.invalidateQueries({ queryKey: ["collections"] }), queryClient.invalidateQueries({ queryKey: ["collection-suggestions"] })]);
     },
   });
@@ -217,26 +217,6 @@ export function CollectionsPage() {
       {collectionTask.status === "error" && collectionTask.finished_at !== null && collectionTask.finished_at > Date.now() - 2 * 60_000 && collectionTask.error && <p role="alert" className="page-heading__feedback inline-error">AI分析未完成：{collectionTask.error}</p>}
       {(confirmSuggestion.isError || rejectSuggestion.isError || updateSuggestion.isError || deleteCollection.isError || removeFile.isError) && <p role="alert" className="page-heading__feedback inline-error">{errorMessage(confirmSuggestion.error ?? rejectSuggestion.error ?? updateSuggestion.error ?? deleteCollection.error ?? removeFile.error)}</p>}
       {suggestions.isError && <p role="alert" className="inline-error">AI集合建议暂时无法读取：{errorMessage(suggestions.error)}</p>}
-      {(suggestions.data?.items.length ?? 0) > 0 && <section className="ai-suggestions">
-        <header><div><h2>AI 集合建议</h2><p>建议需确认后才会成为正式虚拟集合；每批最多 5 条，确认或拒绝后可继续分析下一批。你可以先改名或移除误判成员。</p></div><strong>{suggestions.data?.total} 条待确认</strong></header>
-        {suggestions.data?.items.map((suggestion) => <article key={suggestion.suggestion_id}>
-          <div className="ai-suggestion__summary">
-            {editingSuggestionId === suggestion.suggestion_id ? <input value={suggestionName} maxLength={40} onChange={(event) => setSuggestionName(event.target.value)} /> : <h3>{suggestion.suggested_name}</h3>}
-            <p>{suggestion.description}</p><small>整体置信度 {Math.round(suggestion.confidence * 100)}% · {suggestion.members.length} 份资料 · {suggestion.algorithm_version}</small>
-          </div>
-          <div className="ai-suggestion__members">
-            {suggestion.members.slice(0, SUGGESTION_MEMBER_DISPLAY_CAP).map((member) => {
-              const selected = editingSuggestionId !== suggestion.suggestion_id || suggestionMemberIds.includes(member.file.file_id);
-              return <label key={member.file.file_id} className={selected ? "" : "excluded"}>{editingSuggestionId === suggestion.suggestion_id && <input type="checkbox" checked={selected} onChange={() => setSuggestionMemberIds((current) => current.includes(member.file.file_id) ? current.filter((id) => id !== member.file.file_id) : [...current, member.file.file_id])} />}<span><strong>{member.file.display_name}</strong><small>{member.rationale} · {Math.round(member.confidence * 100)}%</small></span></label>;
-            })}
-            {suggestion.members.length > SUGGESTION_MEMBER_DISPLAY_CAP && <span className="ai-suggestion__members-more">+{suggestion.members.length - SUGGESTION_MEMBER_DISPLAY_CAP} 份同主题资料（确认后一并加入集合）</span>}
-          </div>
-          <div className="ai-suggestion__actions">
-            {editingSuggestionId === suggestion.suggestion_id ? <><button type="button" onClick={() => setEditingSuggestionId(null)}>取消编辑</button><button type="button" className="primary-button" disabled={!suggestionName.trim() || suggestionMemberIds.length < 2 || updateSuggestion.isPending} onClick={() => updateSuggestion.mutate(suggestion.suggestion_id)}>保存建议</button></> : <button type="button" onClick={() => { setEditingSuggestionId(suggestion.suggestion_id); setSuggestionName(suggestion.suggested_name); setSuggestionMemberIds(suggestion.members.map((member) => member.file.file_id)); }}>编辑成员</button>}
-            <button type="button" className="danger-button" disabled={rejectSuggestion.isPending} onClick={() => rejectSuggestion.mutate(suggestion.suggestion_id)}>拒绝</button><button type="button" className="primary-button" disabled={confirmSuggestion.isPending} onClick={() => confirmSuggestion.mutate(suggestion.suggestion_id)}>确认虚拟集合</button>
-          </div>
-        </article>)}
-      </section>}
       {creating && <form className="collection-create" onSubmit={submit}>
         <h2>{editingId ? "编辑集合" : "新建集合"}</h2>
         <label>集合名称<input required maxLength={40} value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：求职资料" /></label>
@@ -289,6 +269,26 @@ export function CollectionsPage() {
           {collectionVirtualizer.getVirtualItems().map((virtualRow) => { const file = collectionItems[virtualRow.index]!; return <div key={file.file_id} style={{ position: "absolute", transform: `translateY(${virtualRow.start}px)`, width: "100%", height: `${virtualRow.size}px` }}><button type="button" onClick={() => void bridge.file_open(file.file_id)}><strong>{file.display_name}</strong><small>{displayPath(file.display_path)}</small></button>{selectedCollection?.kind !== "rule" && <button type="button" className="text-button" disabled={removeFile.isPending} onClick={() => removeFile.mutate(file.file_id)}>{selectedCollection?.kind === "ai" ? "人工排除" : "移出集合"}</button>}</div>; })}
         </div></div>
         {files.hasNextPage && <button type="button" className="load-more-button" disabled={files.isFetchingNextPage} onClick={() => void files.fetchNextPage()}>{files.isFetchingNextPage ? "正在加载" : "加载更多"}</button>}
+      </section>}
+      {(suggestions.data?.items.length ?? 0) > 0 && <section className="ai-suggestions">
+        <header><div><h2>AI 集合建议</h2><p>建议需确认后才会成为正式虚拟集合；每批最多 5 条，确认或拒绝后可继续分析下一批。你可以先改名或移除误判成员。</p></div><strong>{suggestions.data?.total} 条待确认</strong></header>
+        {suggestions.data?.items.map((suggestion) => <article key={suggestion.suggestion_id}>
+          <div className="ai-suggestion__summary">
+            {editingSuggestionId === suggestion.suggestion_id ? <input value={suggestionName} maxLength={40} onChange={(event) => setSuggestionName(event.target.value)} /> : <h3>{suggestion.suggested_name}</h3>}
+            <p>{suggestion.description}</p><small>整体置信度 {Math.round(suggestion.confidence * 100)}% · {suggestion.members.length} 份资料 · {suggestion.algorithm_version}</small>
+          </div>
+          <div className="ai-suggestion__members">
+            {suggestion.members.slice(0, SUGGESTION_MEMBER_DISPLAY_CAP).map((member) => {
+              const selected = editingSuggestionId !== suggestion.suggestion_id || suggestionMemberIds.includes(member.file.file_id);
+              return <label key={member.file.file_id} className={selected ? "" : "excluded"}>{editingSuggestionId === suggestion.suggestion_id && <input type="checkbox" checked={selected} onChange={() => setSuggestionMemberIds((current) => current.includes(member.file.file_id) ? current.filter((id) => id !== member.file.file_id) : [...current, member.file.file_id])} />}<span><strong>{member.file.display_name}</strong><small>{member.rationale} · {Math.round(member.confidence * 100)}%</small></span></label>;
+            })}
+            {suggestion.members.length > SUGGESTION_MEMBER_DISPLAY_CAP && <span className="ai-suggestion__members-more">+{suggestion.members.length - SUGGESTION_MEMBER_DISPLAY_CAP} 份同主题资料（确认后一并加入集合）</span>}
+          </div>
+          <div className="ai-suggestion__actions">
+            {editingSuggestionId === suggestion.suggestion_id ? <><button type="button" onClick={() => setEditingSuggestionId(null)}>取消编辑</button><button type="button" className="primary-button" disabled={!suggestionName.trim() || suggestionMemberIds.length < 2 || updateSuggestion.isPending} onClick={() => updateSuggestion.mutate(suggestion.suggestion_id)}>保存建议</button></> : <button type="button" onClick={() => { setEditingSuggestionId(suggestion.suggestion_id); setSuggestionName(suggestion.suggested_name); setSuggestionMemberIds(suggestion.members.map((member) => member.file.file_id)); }}>编辑成员</button>}
+            <button type="button" className="danger-button" disabled={rejectSuggestion.isPending} onClick={() => rejectSuggestion.mutate(suggestion.suggestion_id)}>拒绝</button><button type="button" className="primary-button" disabled={confirmSuggestion.isPending} onClick={() => confirmSuggestion.mutate(suggestion.suggestion_id)}>确认虚拟集合</button>
+          </div>
+        </article>)}
       </section>}
     </section>
   );

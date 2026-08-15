@@ -1,12 +1,22 @@
 import { CloseOutlined, MinusOutlined } from "@ant-design/icons";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { recordDiagnosticEvent } from "../bridge/observed-bridge";
 
 async function callWindow(action: "minimize" | "toggleMaximize" | "close") {
   if (!window.__TAURI_INTERNALS__) {
     if (action === "close") window.close();
     return;
   }
-  const { getCurrentWindow } = await import("@tauri-apps/api/window");
-  await getCurrentWindow()[action]();
+  try {
+    await getCurrentWindow()[action]();
+  } catch (error) {
+    recordDiagnosticEvent({
+      level: "error",
+      component: "frontend.window_controls",
+      event_name: "window_control.failed",
+      fields: { action, error: error instanceof Error ? error.message : String(error) },
+    });
+  }
 }
 
 export function WindowControls() {
