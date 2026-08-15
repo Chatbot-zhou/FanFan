@@ -118,9 +118,6 @@ pub fn search_index(
         .and_then(|meta| meta.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH);
     let mut cache = INDEX_CACHE.lock().expect("index cache poisoned");
-    let cached = cache
-        .as_ref()
-        .is_some_and(|entry| entry.path == index_path && entry.modified == modified);
     let index = match cache.as_ref() {
         Some(entry) if entry.path == index_path && entry.modified == modified => &entry.index,
         _ => {
