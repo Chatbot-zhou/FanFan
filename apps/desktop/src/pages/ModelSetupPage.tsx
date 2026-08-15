@@ -218,22 +218,22 @@ export function ModelSetupPage() {
         <section ref={poolRef} className="role-model-pool" aria-label="已验证模型选择池">
           <header><div><h2>{selectedRole === "generation" ? "问答基础模型" : selectedRole === "embedding" ? "Embedding 模型" : selectedRole === "vision" ? "多模态模型" : selectedRole === "ocr" ? "OCR 模型" : selectedRole === "tts" ? "语音合成模型" : selectedRole === "asr" ? "语音识别模型" : "Rerank 模型"}</h2></div><button type="button" onClick={() => setStep("import")}>导入本地模型</button></header>
           <div className="role-model-grid">{(() => {
-            // 每个模型家族一张卡片，家族内所有尺寸/量化版本聚合成版本按钮：
-            // 家族名取 name 中“ · ”前段的第一个 token（如 “Qwen3 0.6B · …” → “Qwen3”），
-            // 尺寸取“ · ”前段去掉家族名的部分，量化取 model_id 最后一个 “-” 后的段。
+            // 每个模型家族一张卡片（family 由后端 catalog 定义，如 “Qwen3.5”/“Gemma 4”/“BGE”），
+            // 家族内所有尺寸/量化版本聚合成版本按钮：
+            // 尺寸取 name 中“ · ”前段去掉家族名的部分，量化取 model_id 最后一个 “-” 后的段。
             const entries = roleCatalog.data?.filter((item) => item.role === selectedRole) ?? [];
             const series = new Map<string, typeof entries>();
             for (const item of entries) {
-              const family = (item.name.split(" · ")[0] ?? item.name).split(/\s+/)[0] ?? item.name;
+              const family = item.family || item.name;
               const group = series.get(family);
               if (group) { group.push(item); } else { series.set(family, [item]); }
             }
             return [...series.entries()].map(([familyName, versions]) => {
-              const selected = versions.find((item) => item.catalog_id === selectedCardId) ?? versions[0];
+              const selected = versions.find((item) => item.catalog_id === selectedCardId) ?? versions[0]!;
               const isSelected = versions.some((item) => item.catalog_id === selectedCardId);
-              const sizeOf = (item: typeof entries[number]) => (item.name.split(" · ")[0] ?? item.name).replace(familyName, "").trim();
+              const sizeOf = (item: typeof entries[number]) => (item.name.split(" · ")[0] ?? item.name).replace(familyName, "").trim().replace(/^[-·\s]+/, "");
               const quantOf = (item: typeof entries[number]) => item.model_id.split("-").at(-1) ?? "";
-              return <article key={familyName} className={isSelected ? "selected" : ""} onClick={versions.length === 1 ? () => setSelectedCardId(versions[0].catalog_id) : undefined}>
+              return <article key={familyName} className={isSelected ? "selected" : ""} onClick={versions.length === 1 ? () => setSelectedCardId(versions[0]!.catalog_id) : undefined}>
                 <div className="role-model-card__heading"><strong>{familyName}</strong></div>
                 {versions.some((item) => item.recommended) && <em className="role-model-card__badge">推荐</em>}
                 <p>{selected.description}</p>

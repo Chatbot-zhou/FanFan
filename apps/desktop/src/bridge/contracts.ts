@@ -403,6 +403,7 @@ export interface ModelEdition {
 export interface ModelCatalogEntry {
   catalog_id: string;
   role: ModelRole;
+  family: string;
   name: string;
   model_id: string;
   description: string;

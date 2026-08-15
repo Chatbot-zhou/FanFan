@@ -223,17 +223,18 @@ const demoModelPresets: ModelPreset[] = [
   { preset_id: "standard", name: "推荐质量组合", description: "Qwen3 4B + BGE-small", recommended_memory_gb: 12, role_catalog_ids: ["qwen3-4b-q4", "bge-small-zh-int8"], edition_id: "standard" },
 ];
 const demoRoleCatalog: ModelCatalogEntry[] = [
-  ["qwen3-0.6b-q8", "generation", "Qwen3 0.6B · 省内存", "Qwen3-0.6B-Q8_0", "低资源设备上的基础中文证据问答。", 639_446_688, 2, 1.2, "较快", true, "8GB 内存可用", "generation_qwen3_0_6b", ["huggingface", "modelscope"]],
-  ["qwen3-1.7b-q8", "generation", "Qwen3 1.7B · 均衡", "Qwen3-1.7B-Q8_0", "回答质量与资源占用之间更均衡。", 1_834_426_016, 4, 2.4, "中等", true, "当前设备优先推荐", "generation_qwen3_1_7b", ["huggingface"]],
-  ["qwen3-4b-q4", "generation", "Qwen3 4B · 质量优先", "Qwen3-4B-Q4_K_M", "更擅长跨文件综合和复杂追问。", 2_497_280_256, 7, 4.5, "较慢", false, "建议 12GB 以上内存", "generation_qwen3_4b", ["huggingface", "modelscope"]],
-  ["bge-small-zh-int8", "embedding", "BGE-small-zh-v1.5 · 默认", "bge-small-zh-v1.5-onnx-int8", "中文资料检索的轻量向量模型。", 24_304_813, 1, null, "快", true, "所有受支持设备均推荐", "embedding_bge_small", ["huggingface", "modelscope"]],
-  ["bge-base-zh", "embedding", "BGE-base-zh-v1.5 · 精度优先", "bge-base-zh-v1.5-onnx", "更大的中文向量模型。", null, 2.5, null, "中等", false, "远程构建完成基准前仅支持本地导入", null, []],
-  ["qwen3-vl-2b-q4", "vision", "Qwen3-VL 2B · 省显存", "Qwen3VL-2B-Instruct-Q4_K_M", "理解图片、图表和文档内嵌图片。", 1_552_463_168, 5, 3.2, "较慢", true, "4GB 显存优先选择", "vision_qwen3_vl_2b_q4", ["huggingface"]],
-  ["qwen3-vl-2b-q8", "vision", "Qwen3-VL 2B · 质量优先", "Qwen3VL-2B-Instruct-Q8_0", "保留更多视觉细节。", 2_279_480_640, 7, 5, "慢", false, "建议显存高于 6GB", "vision_qwen3_vl_2b_q8", ["huggingface"]],
-  ["bge-reranker-base-int8", "reranker", "BGE Reranker Base · 可选", "bge-reranker-base-onnx-int8", "对少量混合召回候选做相关性复核。", 296_335_457, 2, null, "中等", false, "更重视速度时可不配置", "reranker_bge_base_int8", ["huggingface"]],
-].map(([catalog_id, role, name, model_id, description, download_size_bytes, estimated_memory_gb, estimated_vram_gb, cpu_speed, recommended, device_guidance, install_edition_id, supported_sources]) => ({
+  ["qwen3-0.6b-q8", "generation", "Qwen3", "Qwen3 0.6B · 省内存", "Qwen3-0.6B-Q8_0", "低资源设备上的基础中文证据问答。", 639_446_688, 2, 1.2, "较快", true, "8GB 内存可用", "generation_qwen3_0_6b", ["huggingface", "modelscope"]],
+  ["qwen3-1.7b-q8", "generation", "Qwen3", "Qwen3 1.7B · 均衡", "Qwen3-1.7B-Q8_0", "回答质量与资源占用之间更均衡。", 1_834_426_016, 4, 2.4, "中等", true, "当前设备优先推荐", "generation_qwen3_1_7b", ["huggingface"]],
+  ["qwen3-4b-q4", "generation", "Qwen3", "Qwen3 4B · 质量优先", "Qwen3-4B-Q4_K_M", "更擅长跨文件综合和复杂追问。", 2_497_280_256, 7, 4.5, "较慢", false, "建议 12GB 以上内存", "generation_qwen3_4b", ["huggingface", "modelscope"]],
+  ["bge-small-zh-int8", "embedding", "BGE", "BGE-small-zh-v1.5 · 默认", "bge-small-zh-v1.5-onnx-int8", "中文资料检索的轻量向量模型。", 24_304_813, 1, null, "快", true, "所有受支持设备均推荐", "embedding_bge_small", ["huggingface", "modelscope"]],
+  ["bge-base-zh", "embedding", "BGE", "BGE-base-zh-v1.5 · 精度优先", "bge-base-zh-v1.5-onnx", "更大的中文向量模型。", null, 2.5, null, "中等", false, "远程构建完成基准前仅支持本地导入", null, []],
+  ["qwen3-vl-2b-q4", "vision", "Qwen3-VL", "Qwen3-VL 2B · 省显存", "Qwen3VL-2B-Instruct-Q4_K_M", "理解图片、图表和文档内嵌图片。", 1_552_463_168, 5, 3.2, "较慢", true, "4GB 显存优先选择", "vision_qwen3_vl_2b_q4", ["huggingface"]],
+  ["qwen3-vl-2b-q8", "vision", "Qwen3-VL", "Qwen3-VL 2B · 质量优先", "Qwen3VL-2B-Instruct-Q8_0", "保留更多视觉细节。", 2_279_480_640, 7, 5, "慢", false, "建议显存高于 6GB", "vision_qwen3_vl_2b_q8", ["huggingface"]],
+  ["bge-reranker-base-int8", "reranker", "BGE Reranker", "BGE Reranker Base · 可选", "bge-reranker-base-onnx-int8", "对少量混合召回候选做相关性复核。", 296_335_457, 2, null, "中等", false, "更重视速度时可不配置", "reranker_bge_base_int8", ["huggingface"]],
+].map(([catalog_id, role, family, name, model_id, description, download_size_bytes, estimated_memory_gb, estimated_vram_gb, cpu_speed, recommended, device_guidance, install_edition_id, supported_sources]) => ({
   catalog_id: catalog_id as string,
   role: role as ModelCatalogEntry["role"],
+  family: family as string,
   name: name as string,
   model_id: model_id as string,
   description: description as string,
