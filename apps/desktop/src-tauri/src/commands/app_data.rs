@@ -34,10 +34,10 @@ use fanfan_core::{
     RuntimeBackendKind, RuntimeCapability, RuntimeManager, RuntimeResourceBudget, RuntimeTaskKind,
     RuntimeTaskRequest, ScopeFilter, SearchMode, SearchRequest, SearchSession, SemanticQuery,
     SpeechRecognitionRequest, SpeechRecognitionResult, SpeechSynthesisRequest,
-    SpeechSynthesisResult, TriageStatus, WorkerClient, chat_examples, chat_prompt,
-    intent_arbitration_prompt, is_natural_language_query, is_pure_greeting, parse_intent_verdict,
-    parse_query_intent, query_understanding_prompt, retrieval_examples, route_query,
-    strip_long_path_prefix, truncate_text,
+    SpeechSynthesisResult, TriageStatus, WorkerClient, AskMessage, chat_prompt,
+    intent_routing_prompt, intent_routing_prompt_mini, is_natural_language_query,
+    is_pure_greeting, parse_intent_verdict, parse_query_intent, parse_rewritten_queries,
+    query_rewrite_prompt, query_understanding_prompt, strip_long_path_prefix,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -3958,6 +3958,12 @@ const INDEX_STATS_CACHE_TTL: Duration = Duration::from_secs(10);
 /// 未配置 Rerank 时不截断，保持全部证据进生成的既有行为。
 const RERANK_TOP_EVIDENCE: usize = 3;
 
+/// 证据门控阈值：rerank（sigmoid 0-1 概率）top-1 低于此值视为候选证据与
+/// 用户原始问题无关，判定为路由误判（闲聊被判检索）→ 转闲聊直接回复，
+/// 杜绝「检索答错把资料库内容当答案」。阈值可依据 trace 中 reranking
+/// 节点记录的每候选 score 实测调优。
+const RERANK_CHAT_FALLBACK_THRESHOLD: f32 = 0.1;
+
 fn cached_index_activity_stats(
     catalog: &CatalogService,
 ) -> Result<IndexActivityStats, AppError> {
@@ -5376,7 +5382,6 @@ fn compute_answer(
         return Err(AppError::new("OPERATION_CANCELLED", "问答已取消", false));
     }
     phase("intent_routing", 0.05);
-    let embedding = models.active_artifact(ModelRole::Embedding)?;
     let generation_artifact = models.active_artifact(ModelRole::Generation)?;
     let maintenance = catalog.maintenance_snapshot()?;
     let generation_artifact = generation_artifact.ok_or_else(|| {
@@ -5386,14 +5391,19 @@ fn compute_answer(
             false,
         )
     })?;
+    // 路由前加载一次会话历史（最多 20 条，覆盖路由/闲聊/检索生成的 5+5 需要），
+    // 三个环节共用同一份；当前轮次问答在 record_ask_exchange 之后才落库，不含本轮。
+    let history = request
+        .session_id
+        .map(|session_id| catalog.load_ask_history(&session_id, 20))
+        .transpose()?
+        .unwrap_or_default();
     let routing_started = Instant::now();
-    let (routing, routed_vector, arbitration_raw) = route_question(
+    let (routing, routing_raw) = route_question(
         request,
-        embedding.as_ref(),
+        &history,
         generation,
         &generation_artifact,
-        worker,
-        runtime_manager,
         cancelled,
     )?;
     let session_id = request.session_id.map(|id| id.to_string());
@@ -5406,12 +5416,13 @@ fn compute_answer(
         None,
         &json!({ "question": request.question }),
         &json!({
+            "router": "llm",
             "intent": format!("{:?}", routing.intent),
             "top_category": format!("{:?}", routing.top_category),
             "top_score": routing.top_score,
             "margin": routing.margin,
             "router_active": routing.top_score > 0.0,
-            "arbitration_raw": arbitration_raw,
+            "arbitration_raw": routing_raw,
         }),
         "ok",
         Some(routing_started.elapsed().as_millis() as u64),
@@ -5423,45 +5434,46 @@ fn compute_answer(
             generation,
             &generation_artifact,
             &maintenance,
+            &history,
             operation_id,
             cancelled,
             phase,
         ),
-        _ => run_retrieval_answer(
-            request,
-            catalog,
-            models,
-            worker,
-            runtime_manager,
-            generation,
-            generation_artifact,
-            embedding,
-            maintenance,
-            routed_vector,
-            operation_id,
-            cancelled,
-            (phase, verified_claim),
-        ),
+        _ => {
+            // Embedding 只被检索分支需要：闲聊在缺 Embedding 时正常工作。
+            let embedding = models.active_artifact(ModelRole::Embedding)?;
+            run_retrieval_answer(
+                request,
+                catalog,
+                models,
+                worker,
+                runtime_manager,
+                generation,
+                generation_artifact,
+                embedding,
+                maintenance,
+                &history,
+                operation_id,
+                cancelled,
+                (phase, verified_claim),
+            )
+        }
     }
 }
 
-/// 意图路由：编码提问 + 24 条 few-shot 示例句（一次批量 ≤ worker 上限 32），
-/// 余弦 argmax 判定；低置信（Ambiguous）交给生成模型仲裁，仲裁失败静默落 RAG。
-/// Router 未启用（无 Embedding）或编码失败 → 默认 Retrieval（行为等同现状）。
-/// Retrieval 决策时返回问题向量，可复用于语义检索（省一次编码）。
-/// 第三返回值是仲裁模型的原始输出（无仲裁时为 None），供节点追踪复盘。
+/// 意图路由：LLM 直路由。纯寒暄白名单分流后，生成模型按 5+5 对话历史判断
+/// 走检索还是闲聊（≤32 token 的 JSON 补全，模型在 ask 租约阶段已加载）。
+/// 解析失败或调用失败默认 Chat——闲聊答错无副作用，检索答错会把资料库内容
+/// 当答案胡说（0.6B 仲裁失败的教训）。返回路由 LLM 原始输出供节点追踪复盘。
 fn route_question(
     request: &AskRequest,
-    embedding: Option<&ModelArtifact>,
+    history: &[AskMessage],
     generation: &Mutex<LocalGenerationRuntime>,
     generation_artifact: &ModelArtifact,
-    worker: &WorkerClient,
-    runtime_manager: &RuntimeManager,
     cancelled: &AtomicBool,
-) -> Result<(RouteDecision, Option<Vec<f32>>, Option<String>), AppError> {
-    // 纯寒暄白名单：整句精确匹配直接 Chat，不消耗一次编码/仲裁。
-    // 寒暄句的 BGE 向量与检索示例更近（实测「你好」chat top1 0.466），
-    // 语义路由和 0.6B 仲裁都会把寒暄误判为检索，必须在最前面分流。
+) -> Result<(RouteDecision, Option<String>), AppError> {
+    // 纯寒暄白名单：整句精确匹配直接 Chat，零模型调用。
+    // 寒暄句是最高频场景且小模型对寒暄有检索偏置，必须在最前面分流。
     if is_pure_greeting(&request.question) {
         return Ok((
             RouteDecision {
@@ -5471,112 +5483,40 @@ fn route_question(
                 margin: 0.0,
             },
             None,
-            None,
         ));
     }
-    let fallback = RouteDecision {
-        intent: Intent::Retrieval,
-        top_category: Intent::Retrieval,
+    let fallback_chat = RouteDecision {
+        intent: Intent::Chat,
+        top_category: Intent::Chat,
         top_score: 0.0,
         margin: 0.0,
     };
-    let Some(embedding) = embedding else {
-        return Ok((fallback, None, None));
+    // 档位自适应：0.6B 用词级两字输出的迷你版 prompt（词级续写是它的强项，
+    // JSON 输出与长 prompt 分类是它误判的放大器）；更强模型用完整定义版。
+    let (system, user) = if generation_artifact
+        .model_id
+        .to_lowercase()
+        .contains("0.6b")
+    {
+        intent_routing_prompt_mini(request.question.trim(), history)
+    } else {
+        intent_routing_prompt(request.question.trim(), history)
     };
-    let Some(vectors) = encode_routing_batch(request, embedding, worker, runtime_manager)? else {
-        return Ok((fallback, None, None));
+    let raw = match complete_with_model(generation, generation_artifact, &system, &user, 32, cancelled)
+    {
+        Ok(raw) => raw,
+        Err(_) => return Ok((fallback_chat, None)),
     };
-    let mut decision = route_query(
-        &vectors[0],
-        &vectors[1..13],
-        &vectors[13..25],
-    );
-    let mut arbitration_raw = None;
-    if decision.intent == Intent::Ambiguous {
-        // 兜底反转：仲裁成功按裁定走；仲裁失败（模型输出非法/调用失败）默认
-        // Chat 而不是 Retrieval——闲聊答错无副作用，检索答错会把资料库内容
-        // 当答案胡说。之前 0.6B 仲裁失败静默落 RAG 是答非所问的入口之一。
-        match arbitrate_intent(request, generation, generation_artifact, cancelled) {
-            Some((arbitrated, raw)) => {
-                decision.intent = arbitrated;
-                arbitration_raw = Some(raw);
-            }
-            None => decision.intent = Intent::Chat,
-        }
-    }
-    let vector = (decision.intent == Intent::Retrieval).then(|| vectors[0].clone());
-    Ok((decision, vector, arbitration_raw))
-}
-
-/// 一次批量编码提问（带 query_prefix）+ 12 条闲聊示例 + 12 条检索示例。
-/// 示例句不加 query_prefix（与 RAG 文档侧一致）。任何失败 → None（路由软降级）。
-fn encode_routing_batch(
-    request: &AskRequest,
-    embedding: &ModelArtifact,
-    worker: &WorkerClient,
-    runtime_manager: &RuntimeManager,
-) -> Result<Option<Vec<Vec<f32>>>, AppError> {
-    let tokenizer_path = PathBuf::from(&embedding.local_path)
-        .parent()
-        .map(|parent| parent.join("tokenizer.json"))
-        .ok_or_else(|| {
-            AppError::new(
-                "EMBEDDING_TOKENIZER_MISSING",
-                "Embedding 模型目录无效",
-                false,
-            )
-        })?;
-    if !tokenizer_path.is_file() {
-        return Ok(None);
-    }
-    let question = truncate_text(request.question.trim());
-    let mut texts = Vec::with_capacity(25);
-    texts.push(format!(
-        "{}{}",
-        embedding.query_prefix.as_deref().unwrap_or(""),
-        question
-    ));
-    texts.extend(chat_examples().iter().map(|example| example.to_string()));
-    texts.extend(retrieval_examples().iter().map(|example| example.to_string()));
-    let mut embedding_runtime_request = RuntimeTaskRequest::interactive(
-        RuntimeTaskKind::Embedding,
-        RuntimeBackendKind::OnnxRuntime,
-    );
-    embedding_runtime_request.cpu_threads = 2;
-    embedding_runtime_request.timeout = Duration::from_secs(10);
-    embedding_runtime_request.model_id = Some(embedding.artifact_id.to_string());
-    let Ok(embedding_runtime_lease) = runtime_manager.acquire(embedding_runtime_request) else {
-        return Ok(None);
+    let decision = match parse_intent_verdict(&raw) {
+        Some(intent) => RouteDecision {
+            intent,
+            top_category: intent,
+            top_score: 0.0,
+            margin: 0.0,
+        },
+        None => fallback_chat,
     };
-    let Ok(response) = worker.encode_embeddings(&EmbeddingRequest {
-        model_path: embedding.local_path.clone(),
-        tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
-        texts,
-        max_length: embedding.max_length.unwrap_or(512),
-        threads: 2,
-    }) else {
-        return Ok(None);
-    };
-    embedding_runtime_lease.complete();
-    if response.vectors.len() != 25 {
-        return Ok(None);
-    }
-    Ok(Some(response.vectors))
-}
-
-/// 低置信路由的 LLM 仲裁：few-shot JSON 意图分类（镜像查询理解模式）。
-/// 任何失败 → None（调用方静默落 RAG，不新增错误码）。
-/// 返回 (裁定意图, 模型原始输出)，原始输出供节点追踪复盘。
-fn arbitrate_intent(
-    request: &AskRequest,
-    generation: &Mutex<LocalGenerationRuntime>,
-    generation_artifact: &ModelArtifact,
-    cancelled: &AtomicBool,
-) -> Option<(Intent, String)> {
-    let (system, user) = intent_arbitration_prompt(request.question.trim());
-    let raw = complete_with_model(generation, generation_artifact, &system, &user, 32, cancelled)
-        .ok()?;
-    parse_intent_verdict(&raw).map(|intent| (intent, raw))
+    Ok((decision, Some(raw)))
 }
 
 /// 闲聊分支：跳过检索/索引 gate，直接用生成模型对话（带会话历史）。
@@ -5586,6 +5526,7 @@ fn run_chat_answer(
     generation: &Mutex<LocalGenerationRuntime>,
     generation_artifact: &ModelArtifact,
     maintenance: &MaintenanceSnapshot,
+    history: &[AskMessage],
     operation_id: Uuid,
     cancelled: &AtomicBool,
     phase: &dyn Fn(&str, f64),
@@ -5598,12 +5539,7 @@ fn run_chat_answer(
         ));
     }
     phase("chat_generating", 0.7);
-    let history = request
-        .session_id
-        .map(|session_id| catalog.load_ask_history(&session_id, 8))
-        .transpose()?
-        .unwrap_or_default();
-    let (system, user) = chat_prompt(request, &history);
+    let (system, user) = chat_prompt(request, history);
     let started_at = Instant::now();
     let answer = complete_with_model(
         generation,
@@ -5664,7 +5600,7 @@ fn run_retrieval_answer(
     generation_artifact: ModelArtifact,
     embedding: Option<ModelArtifact>,
     maintenance: MaintenanceSnapshot,
-    routed_vector: Option<Vec<f32>>,
+    history: &[AskMessage],
     operation_id: Uuid,
     cancelled: &AtomicBool,
     progress: AskProgressCallbacks<'_>,
@@ -5702,48 +5638,31 @@ fn run_retrieval_answer(
             true,
         ));
     }
-    let history = request
-        .session_id
-        .map(|session_id| catalog.load_ask_history(&session_id, 8))
-        .transpose()?
-        .unwrap_or_default();
-    let retrieval_question = if history.is_empty() {
-        request.question.trim().to_owned()
-    } else {
-        let history_text = history
-            .iter()
-            .map(|message| {
-                format!(
-                    "{}：{}",
-                    message.role,
-                    compact_for_prompt(&message.content, 500)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let prompt = format!(
-            "对话历史：\n{history_text}\n\n当前追问：{}\n\n把当前追问改写成可独立检索的问题。只输出改写后的问题，不回答。",
-            request.question.trim()
-        );
+    // 改写：无条件尝试（空泛/一题多问/指代上文都交给模型决定，行式输出
+    // 每行一个问题；已明确单一的问题模型会原样复读）。解析失败/为空 →
+    // 回退用户原始问题，不中断检索（0.6B 改写质量波动时保证不劣于现状）。
+    let rewritten_queries = {
+        let (system, user) = query_rewrite_prompt(request.question.trim(), history);
         let rewritten = complete_with_model(
             generation,
             &generation_artifact,
-            "你负责将连续追问改写为独立的中文检索问题，不得引入历史中不存在的事实。",
-            &prompt,
+            &system,
+            &user,
             160,
             cancelled,
         )?;
-        let rewritten = rewritten.trim();
-        if rewritten.is_empty() {
-            return Err(AppError::new(
-                "RAG_QUERY_REWRITE_FAILED",
-                "追问改写没有产生有效检索问题",
-                true,
-            ));
-        }
-        compact_for_prompt(rewritten, 2_000)
+        parse_rewritten_queries(&rewritten)
+    };
+    let retrieval_questions = if rewritten_queries.is_empty() {
+        vec![request.question.trim().to_owned()]
+    } else {
+        rewritten_queries
     };
     let history_count = history.len();
+    let rewritten_marked = retrieval_questions.len() > 1
+        || retrieval_questions
+            .first()
+            .is_some_and(|question| question != request.question.trim());
     trace_node(
         catalog,
         "ask",
@@ -5752,7 +5671,10 @@ fn run_retrieval_answer(
         session_id_ref,
         None,
         &json!({ "question": request.question, "history_count": history_count }),
-        &json!({ "rewritten_query": retrieval_question, "rewritten": history_count > 0 }),
+        &json!({
+            "rewritten_queries": &retrieval_questions,
+            "rewritten": rewritten_marked,
+        }),
         "ok",
         None,
     );
@@ -5777,56 +5699,57 @@ fn run_retrieval_answer(
             true,
         ));
     }
-    // 复用路由阶段的问题向量：无历史（问题未改写）且未超长截断时直接使用，省一次编码。
-    // 改写后的追问或超长问题需按最终检索文本重新编码。
-    let vector = match routed_vector.filter(|_| {
-        retrieval_question == truncate_text(&retrieval_question)
-    }) {
-        Some(vector) => vector,
-        None => {
-            let embedding_text = format!(
+    // 路由改为 LLM 直路由后不再产生问题向量，恒按检索问题（改写拆分后的
+    // 多个问题批量编码一次，分别检索后合并）自行编码。
+    let embedding_texts = retrieval_questions
+        .iter()
+        .map(|question| {
+            format!(
                 "{}{}",
                 embedding.query_prefix.as_deref().unwrap_or(""),
-                retrieval_question
-            );
-            let mut embedding_runtime_request = RuntimeTaskRequest::interactive(
-                RuntimeTaskKind::Embedding,
-                RuntimeBackendKind::OnnxRuntime,
-            );
-            embedding_runtime_request.cpu_threads = 2;
-            embedding_runtime_request.timeout = Duration::from_secs(10);
-            embedding_runtime_request.model_id = Some(embedding.artifact_id.to_string());
-            let embedding_runtime_lease = runtime_manager.acquire(embedding_runtime_request)?;
-            let response = worker.encode_embeddings(&EmbeddingRequest {
-                model_path: embedding.local_path.clone(),
-                tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
-                texts: vec![embedding_text],
-                max_length: embedding.max_length.unwrap_or(512),
-                threads: 2,
-            })?;
-            embedding_runtime_lease.complete();
-            response.vectors.first().ok_or_else(|| {
-                AppError::new(
-                    "EMBEDDING_EMPTY",
-                    "Embedding 运行时没有返回查询向量",
-                    true,
-                )
-            })?
-            .clone()
-        }
-    };
-    let mut retrieval_request = request.clone();
-    retrieval_request.question = retrieval_question;
-    retrieval_request.retrieval_limit = retrieval_request.retrieval_limit.min(10);
-    retrieval_request.max_source_files = retrieval_request.max_source_files.min(6);
+                question
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut embedding_runtime_request = RuntimeTaskRequest::interactive(
+        RuntimeTaskKind::Embedding,
+        RuntimeBackendKind::OnnxRuntime,
+    );
+    embedding_runtime_request.cpu_threads = 2;
+    embedding_runtime_request.timeout = Duration::from_secs(10);
+    embedding_runtime_request.model_id = Some(embedding.artifact_id.to_string());
+    let embedding_runtime_lease = runtime_manager.acquire(embedding_runtime_request)?;
+    let response = worker.encode_embeddings(&EmbeddingRequest {
+        model_path: embedding.local_path.clone(),
+        tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
+        texts: embedding_texts,
+        max_length: embedding.max_length.unwrap_or(512),
+        threads: 2,
+    })?;
+    embedding_runtime_lease.complete();
+    if response.vectors.len() != retrieval_questions.len() {
+        return Err(AppError::new(
+            "EMBEDDING_EMPTY",
+            "Embedding 运行时没有返回全部查询向量",
+            true,
+        ));
+    }
     let artifact_id = embedding.artifact_id.to_string();
-    let mut extractive = catalog.answer_extractively(
-        &retrieval_request,
-        Some(SemanticQuery {
-            model_artifact_id: &artifact_id,
-            vector: &vector,
-        }),
-    )?;
+    let mut sub_results = Vec::with_capacity(retrieval_questions.len());
+    for (question, vector) in retrieval_questions.iter().zip(response.vectors.iter()) {
+        let mut sub_request = request.clone();
+        sub_request.question = question.clone();
+        sub_request.retrieval_limit = sub_request.retrieval_limit.min(10);
+        sub_request.max_source_files = sub_request.max_source_files.min(6);
+        sub_results.push(catalog.answer_extractively(
+            &sub_request,
+            Some(SemanticQuery {
+                model_artifact_id: &artifact_id,
+                vector,
+            }),
+        )?);
+    }
+    let mut extractive = merge_extractive_results(sub_results);
     extractive.index_coverage = index_coverage;
     extractive.retrieval_channels = vec![
         "filename".into(),
@@ -5842,7 +5765,7 @@ fn run_retrieval_answer(
         &correlation_id,
         session_id_ref,
         None,
-        &json!({ "question": retrieval_request.question, "retrieval_limit": retrieval_request.retrieval_limit }),
+        &json!({ "questions": &retrieval_questions, "sub_query_count": retrieval_questions.len() }),
         &json!({
             "channels": extractive.retrieval_channels,
             "insufficient_evidence": extractive.insufficient_evidence,
@@ -5907,7 +5830,9 @@ fn run_retrieval_answer(
                 && let Ok(response) = worker.rerank(&RerankRequest {
                     model_path: reranker.local_path,
                     tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
-                    query: retrieval_request.question.clone(),
+                    // rerank 一律用用户原始问题排序（改写只服务检索召回，
+                    // 排序要贴近用户真实意图，与最终生成的依据一致）。
+                    query: request.question.trim().to_owned(),
                     documents,
                     max_length: reranker.max_length.unwrap_or(512),
                     threads: 2,
@@ -5915,6 +5840,44 @@ fn run_retrieval_answer(
                 && apply_rerank_scores(&mut extractive, &response.scores).is_ok()
             {
                 rerank_runtime_lease.complete();
+                // 证据门控：rerank 后 top-1 分数过低 → 候选证据与用户原始
+                // 问题无关，大概率路由误判（闲聊被判检索）→ 转闲聊直接回复，
+                // 杜绝「检索答错把资料库内容当答案」。阈值据 trace 实测调优。
+                let top_score = extractive
+                    .claims
+                    .first()
+                    .and_then(|claim| claim.citations.first())
+                    .map(|citation| citation.retrieval_score)
+                    .unwrap_or(0.0);
+                if top_score < RERANK_CHAT_FALLBACK_THRESHOLD {
+                    trace_node(
+                        catalog,
+                        "ask",
+                        "reranking",
+                        &correlation_id,
+                        session_id_ref,
+                        None,
+                        &json!({}),
+                        &json!({
+                            "fallback": "rerank_chat",
+                            "top_score": top_score,
+                            "threshold": RERANK_CHAT_FALLBACK_THRESHOLD,
+                        }),
+                        "ok",
+                        None,
+                    );
+                    return run_chat_answer(
+                        request,
+                        catalog,
+                        generation,
+                        &generation_artifact,
+                        &maintenance,
+                        history,
+                        operation_id,
+                        cancelled,
+                        phase,
+                    );
+                }
                 // 重排后只把相关性最高的前 N 条证据片段交给生成模型，
                 // 其余丢弃（生成 prompt 只能引用保留的 S1..SN）。
                 claims_before_truncate = extractive.claims.len();
@@ -6271,6 +6234,35 @@ fn run_retrieval_answer(
     catalog.record_ask_exchange(request, &grounded)?;
     phase("completed", 1.0);
     Ok(grounded)
+}
+
+/// 合并多个子查询的检索结果（一题多问改写拆分后的分别检索）：
+/// claims 按 (text, file_id) 去重保留首个；insufficient_evidence 为所有
+/// 子查询均无证据；elapsed_ms 求和；来源文件合并。results 至少含一项。
+fn merge_extractive_results(mut results: Vec<AnswerResult>) -> AnswerResult {
+    let mut merged = results.remove(0);
+    for mut other in results {
+        let mut seen = HashSet::new();
+        for claim in &merged.claims {
+            seen.insert((
+                claim.text.clone(),
+                claim.citations.first().map(|citation| citation.file_id),
+            ));
+        }
+        for claim in other.claims.drain(..) {
+            let key = (
+                claim.text.clone(),
+                claim.citations.first().map(|citation| citation.file_id),
+            );
+            if seen.insert(key) {
+                merged.claims.push(claim);
+            }
+        }
+        merged.insufficient_evidence = merged.insufficient_evidence && other.insufficient_evidence;
+        merged.elapsed_ms = merged.elapsed_ms.saturating_add(other.elapsed_ms);
+        merged.source_files.extend(other.source_files);
+    }
+    merged
 }
 
 fn apply_rerank_scores(result: &mut AnswerResult, scores: &[f32]) -> Result<(), AppError> {
