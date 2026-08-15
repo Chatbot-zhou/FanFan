@@ -456,7 +456,7 @@ html.is-scrolling *::-webkit-scrollbar-thumb,*:hover::-webkit-scrollbar-thumb { 
   .sidebar-item { padding: 0 11px; gap: 10px; font-size: 14px; }
   .status-bar { padding-left: 168px; }
   .page { padding: 30px 22px 46px; }
-  .metric-grid, .home-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .home-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
   .collection-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
   .candidate-panel { grid-template-columns: 1fr; }
   .app-status-panel__compact-grid { grid-template-columns: 1fr 1fr; }
