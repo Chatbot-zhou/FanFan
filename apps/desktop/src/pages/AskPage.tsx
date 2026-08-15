@@ -74,17 +74,24 @@ function AnswerReferences({ answer, question, expanded, activeFile, onToggleRefs
           <FileTextOutlined /> 引用了 {files.length} 个文件
         </button>
       ) : (
-        files.map((source) => (
-          <button
-            key={source.file_id}
-            type="button"
-            className={`source-chip${activeFile === source.file_id ? " source-chip--active" : ""}`}
-            title={source.display_path}
-            onClick={() => onSelectFile(activeFile === source.file_id ? null : source.file_id)}
-          >
-            <FileTextOutlined /> {source.display_name}
-          </button>
-        ))
+        <>
+          {files.length > REFS_COLLAPSE_THRESHOLD && (
+            <button type="button" className="source-chip source-chip--collapse" onClick={onToggleRefs} title="折叠引用文件">
+              <FileTextOutlined /> 引用了 {files.length} 个文件
+            </button>
+          )}
+          {files.map((source) => (
+            <button
+              key={source.file_id}
+              type="button"
+              className={`source-chip${activeFile === source.file_id ? " source-chip--active" : ""}`}
+              title={source.display_path}
+              onClick={() => onSelectFile(activeFile === source.file_id ? null : source.file_id)}
+            >
+              <FileTextOutlined /> {source.display_name}
+            </button>
+          ))}
+        </>
       )}
       {activeFile !== null && (
         <div className="answer-ref-detail">
