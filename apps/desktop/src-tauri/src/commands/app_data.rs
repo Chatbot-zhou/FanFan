@@ -185,6 +185,32 @@ impl Drop for ForegroundActivityGuard<'_> {
 
 pub struct GenerationServiceState(pub Arc<Mutex<LocalGenerationRuntime>>);
 
+/// 带时限的生成运行时锁。VLM/LLM 推理持锁期间可达数十秒（模型加载 + 推理），
+/// 若所有获取方都无限期等锁，app_status_get 等查询会排队几十秒、close 流程
+/// 会永久卡死（实测 close_requested 后进程 10 分钟不退出）。获取方必须在
+/// 时限内拿到锁，否则放弃本次操作留给后续重试。Poisoned 与 `if let Ok` 语义
+/// 一致：只绕过错锁保护，锁本身仍可用。
+pub(crate) fn try_lock_generation_until<T>(
+    mutex: &Mutex<T>,
+    timeout: Duration,
+) -> Option<std::sync::MutexGuard<'_, T>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                return Some(poisoned.into_inner());
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RuntimeManagerState(pub RuntimeManager);
 
@@ -699,18 +725,9 @@ pub fn environment_detect(
     // 探测由启动阶段的后台线程负责（lib.rs background_probe_generation_runtime），
     // 完成前如实返回当前 runtime 状态，绝不在此同步启动 llama-server --list-devices
     //（冷 GPU 可达数十秒）；显卡信息回退到落盘缓存（上次成功结果）。
-    let runtime_capability = generation
-        .0
-        .lock()
-        .map_err(|_| {
-            AppError::new(
-                "GENERATION_RUNTIME_LOCK_FAILED",
-                "生成运行时状态已损坏",
-                true,
-            )
-        })?
-        .current_capability()
-        .cloned();
+    // 锁带 500ms 时限：推理持锁期间状态轮询直接回退缓存，不排队（曾因此被拖 43s）。
+    let runtime_capability = try_lock_generation_until(&generation.0, Duration::from_millis(500))
+        .and_then(|runtime| runtime.current_capability().cloned());
     let cached_gpu = read_environment_cache(&environment.data_directory);
     let check = detect_environment(
         &environment.data_directory,
@@ -2482,13 +2499,36 @@ fn default_inference_runtime_state() -> InferenceRuntimeState {
 pub(crate) fn inference_runtime_state(
     generation: &GenerationServiceState,
 ) -> Result<InferenceRuntimeState, AppError> {
-    let mut runtime = generation.0.lock().map_err(|_| {
-        AppError::new(
-            "GENERATION_RUNTIME_LOCK_FAILED",
-            "生成运行时状态已损坏",
-            true,
-        )
-    })?;
+    // 纯读状态：VLM/LLM 推理持锁期间可达数十秒，状态轮询绝不能排队等锁
+    //（app_status_get/model_state_get 曾因此被拖 43s）。拿不到锁就按
+    // 「探测未完成 / CPU 生效中」回退，model:state 事件会驱动前端刷新。
+    let mut runtime = match try_lock_generation_until(&generation.0, Duration::from_millis(500)) {
+        Some(runtime) => runtime,
+        None => {
+            let hardware = current_hardware_profile(&[]);
+            let budget = current_inference_budget(hardware.memory_total_bytes);
+            return Ok(InferenceRuntimeState {
+                backend: "cpu".into(),
+                device_names: Vec::new(),
+                gpu_available: false,
+                gpu_offload_layers: None,
+                gpu_offload_mode: "disabled".into(),
+                thread_budget: interactive_inference_threads(),
+                batch_thread_budget: background_inference_threads(),
+                active: false,
+                pressure_reason: None,
+                hardware,
+                runtime_package: RuntimeBackendPackage {
+                    backend: "cpu".into(),
+                    device_count: 0,
+                    gpu_capable: false,
+                    cpu_fallback_available: false,
+                    validated: true,
+                },
+                budget,
+            });
+        }
+    };
     let active = runtime.is_active();
     // 探测由启动阶段的后台线程负责；探测完成前如实返回当前 runtime 状态
     //（CPU 生效中），绝不在此同步启动 llama-server --list-devices——冷 GPU
@@ -5158,7 +5198,8 @@ pub fn search_start(
             .ok()
             .flatten()
             .and_then(|artifact| {
-                generation.0.lock().ok().and_then(|mut runtime| {
+                try_lock_generation_until(&generation.0, Duration::from_millis(500))
+                    .and_then(|mut runtime| {
                     let threads = background_inference_threads();
                     let _ = runtime
                         .activate(&artifact.local_path, 4096, threads)
@@ -7782,14 +7823,27 @@ pub(crate) fn spawn_image_understanding_pending(app: AppHandle, catalog: Arc<Cat
                     "attempt": pending.attempt_count,
                 }),
             );
+            // 推理锁带时限：VLM 推理可能被其他推理长时间占用，拿不到锁就跳过
+            // 本张图（下个 cycle 重试），绝不无限期阻塞等锁的查询与 close。
+            let runtime_guard = match try_lock_generation_until(
+                &generation.0,
+                Duration::from_millis(2_000),
+            ) {
+                Some(guard) => guard,
+                None => {
+                    crate::runtime_log::event(
+                        "info",
+                        "vision",
+                        "vision.runtime_busy",
+                        Some(&cycle_id),
+                        &json!({ "reason": "generation_runtime_locked" }),
+                    );
+                    runtime_lease.complete();
+                    break;
+                }
+            };
             let operation = (|| {
-                let mut runtime = generation.0.lock().map_err(|_| {
-                    AppError::new(
-                        "VISION_RUNTIME_LOCK_FAILED",
-                        "图片理解运行时状态已损坏",
-                        true,
-                    )
-                })?;
+                let mut runtime = runtime_guard;
                 if runtime.active_model_path() != Some(artifact.local_path.as_str())
                     || runtime.active_mmproj_path() != Some(projector_path.as_str())
                     || !runtime.is_active()
@@ -7879,7 +7933,8 @@ pub(crate) fn spawn_image_understanding_pending(app: AppHandle, catalog: Arc<Cat
             }
             thread::yield_now();
         }
-        if let Ok(mut runtime) = generation.0.lock()
+        if let Some(mut runtime) =
+            try_lock_generation_until(&generation.0, Duration::from_millis(2_000))
             && runtime.active_model_path() == Some(artifact.local_path.as_str())
             && runtime.active_mmproj_path() == Some(projector_path.as_str())
         {
@@ -8171,14 +8226,18 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
             );
             let _ = app.emit("embedding:index_phase", "building");
             let generation = catalog.rebuild_vector_generation(&model_artifact_id, dimension)?;
+            // 校验阈值必须与上面的 needs_rebuild（95%）同口径，不能用 0.999999：
+            // 增量嵌入滞后时总有几个 chunk 尚无当前模型向量，全量重建后 coverage
+            // 稳定差这几条而永远失败，active 永不切换 → 每个 cycle 都触发 19.9 万条
+            // 全量重建，CPU 打满、UI 冻结，close 时 shutdown 路径被拖死。
             if generation.status != "active"
                 || generation.dimension != dimension
                 || generation.item_count == 0
-                || generation.coverage < 0.999_999
+                || generation.coverage < 0.95
             {
                 return Err(AppError::new(
                     "VECTOR_INDEX_INCOMPLETE",
-                    "新语义索引未覆盖当前全部有效分块，未切换活动 Embedding",
+                    "新语义索引未覆盖当前有效分块（缺口大于 5%），未切换活动 Embedding",
                     true,
                 ));
             }
@@ -8206,11 +8265,11 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
             })?;
             if generation.dimension != dimension
                 || generation.item_count == 0
-                || generation.coverage < 0.999_999
+                || generation.coverage < 0.95
             {
                 return Err(AppError::new(
                     "VECTOR_INDEX_INCOMPLETE",
-                    "新语义索引尚未通过覆盖率校验，未切换活动 Embedding",
+                    "新语义索引尚未通过覆盖率校验（缺口大于 5%），未切换活动 Embedding",
                     true,
                 ));
             }

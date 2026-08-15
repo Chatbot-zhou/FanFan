@@ -63,6 +63,15 @@ pub fn run() {
                     None,
                     &serde_json::json!({ "window": "main" }),
                 );
+                // 兜底：下面的清理步骤都可能在后台线程持锁卡死时永久阻塞
+                // （实测 close_requested 后进程 10 分钟不退出、窗口关不掉）。
+                // 启动 watchdog，若 5 秒内进程仍未退出则直接强杀；数据库写入
+                // 均为同步事务，强杀不会丢失已提交数据，干净退出标记缺失由
+                // 下次启动的崩溃检测兜底。
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    std::process::exit(0);
+                });
                 window
                     .app_handle()
                     .state::<ModelDownloadCoordinatorState>()
@@ -1542,21 +1551,36 @@ fn background_probe_generation_runtime(
     });
     match &best {
         Some((gpu, capability)) => {
-            let swapped = match generation.lock() {
-                Ok(mut guard) => {
-                    if guard.is_active() {
-                        false
-                    } else {
-                        *guard = LocalGenerationRuntime::new_with_fallback_and_capability(
-                            gpu.clone(),
-                            cpu_executable,
-                            capability.clone(),
-                        );
-                        true
+            // 带时限拿锁：推理线程持锁可达数十秒，swap 只是换后续激活的运行时，
+            // 没必要无限期等锁——等锁期间 app_status_get 等查询会排队几十秒。
+            let swapped =
+                match crate::commands::app_data::try_lock_generation_until(
+                    &generation,
+                    std::time::Duration::from_secs(3),
+                ) {
+                    Some(mut guard) => {
+                        if guard.is_active() {
+                            false
+                        } else {
+                            *guard = LocalGenerationRuntime::new_with_fallback_and_capability(
+                                gpu.clone(),
+                                cpu_executable,
+                                capability.clone(),
+                            );
+                            true
+                        }
                     }
-                }
-                Err(_) => false,
-            };
+                    None => {
+                        runtime_log::event(
+                            "warn",
+                            "model.runtime",
+                            "probe.swap_skipped",
+                            None,
+                            &serde_json::json!({ "reason": "generation_runtime_locked" }),
+                        );
+                        false
+                    }
+                };
             fields["backend"] = capability.backend.clone().into();
             fields["devices"] = capability.devices.clone().into();
             fields["error_code"] = capability.error_code.clone().into();
