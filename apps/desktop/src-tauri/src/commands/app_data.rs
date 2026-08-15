@@ -8147,12 +8147,16 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
         let existing_generation = catalog.active_vector_generation(&model_artifact_id)?;
         // 除新增分块外，active 代际覆盖不足（如上次构建被中断后残留的过期索引）也必须重建，
         // 否则过期索引会一直保持 active，语义检索/RAG 持续命中陈旧子集。
-        let needs_rebuild = searchable_chunks > 0
-            && (committed_total > 0
-                || existing_generation.as_ref().is_none_or(|generation| {
-                    generation.dimension != dimension
-                        || generation.item_count < searchable_chunks
-                }));
+        // 注意：不能把 item_count 与 searchable_chunks 直接比较——searchable 会随新增
+        // 嵌入持续增长，直接比较会让每次启动（即使只嵌入几十个 chunk）都触发 19.9 万条
+        // 全量重建，期间 CPU 打满、全部页面查询排队 10-38s。覆盖缺口 <5%（约 1 万
+        // chunk）时继续用旧索引，搜索最多短暂 miss 新入库内容，积累到阈值后自动补齐。
+        let stale_generation = existing_generation.as_ref().is_none_or(|generation| {
+            generation.dimension != dimension
+                || generation.item_count == 0
+                || (generation.item_count as f64) < (searchable_chunks as f64 * 0.95)
+        });
+        let needs_rebuild = searchable_chunks > 0 && stale_generation;
         if needs_rebuild {
             crate::runtime_log::event(
                 "info",

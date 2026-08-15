@@ -80,8 +80,11 @@ pub fn build_index_refs(
     };
     let index = Index::new(&options)
         .map_err(|error| vector_error("VECTOR_INDEX_CREATE_FAILED", error.to_string(), false))?;
+    // 限制构建线程数：usearch 默认用满所有核，19.9 万条全量重建会打满 CPU，
+    // 饿死桌面端全部页面查询（观察：构建期间命令排队 10-38s）。2 线程足够
+    // 快速完成，同时把大部分核留给交互。
     index
-        .reserve(entries.len())
+        .reserve_capacity_and_threads(entries.len(), 2)
         .map_err(|error| vector_error("VECTOR_INDEX_RESERVE_FAILED", error.to_string(), true))?;
     for (key, vector) in entries {
         index

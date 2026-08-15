@@ -352,6 +352,25 @@ impl ModelManager {
             };
             for expected in locked.companion_files {
                 let target = parent.join(&expected.file_name);
+                // 快速路径：目标已存在且大小与包清单一致 → 无需恢复。包清单是
+                // 下载/导入/自检时对实际文件的 SHA 记录，与 refresh_package_manifests
+                // 快速路径同一原则；否则每次启动都会对全部配套文件（本机约
+                // 3.9GB，含 2.5GB 视觉主模型）做全量 SHA-256，实测卡住启动 21s。
+                // 文件被同大小替换的情况由模型加载失败与自检兜底。
+                let manifest_matches = artifact
+                    .package_manifest
+                    .as_ref()
+                    .is_some_and(|manifest| {
+                        manifest.files.iter().any(|file| {
+                            file.file_name == expected.file_name
+                                && fs::metadata(&target).is_ok_and(|meta| {
+                                    meta.is_file() && meta.len() == file.size_bytes
+                                })
+                        })
+                    });
+                if manifest_matches {
+                    continue;
+                }
                 if package_file_matches(&target, &expected)? {
                     continue;
                 }
