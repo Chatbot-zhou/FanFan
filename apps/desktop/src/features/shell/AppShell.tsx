@@ -64,7 +64,7 @@ export function AppShell({ startup_notice }: AppShellProps) {
   const home = useQuery({
     queryKey: ["home-summary", new Date().toLocaleDateString("sv-SE")],
     queryFn: () => bridge.home_get_summary(new Date().toLocaleDateString("sv-SE")),
-    refetchInterval: (query) => query.state.data?.scan_progress ? 1500 : 10_000,
+    refetchInterval: (query) => query.state.data?.scan_progress ? 1500 : 30_000,
     enabled: backendReady,
   });
   const roots = useQuery({

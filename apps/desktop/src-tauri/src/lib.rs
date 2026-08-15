@@ -227,8 +227,10 @@ pub fn run() {
                 &serde_json::json!({ "candidate_count": gpu_candidates.len() }),
             );
             let probe_generation = Arc::clone(&generation_inner);
+            let probe_app = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {
                 background_probe_generation_runtime(
+                    probe_app,
                     gpu_candidates.to_vec(),
                     cpu_executable,
                     probe_generation,
@@ -1504,6 +1506,7 @@ fn initialize_background_services(
 /// skipped if a CPU instance is already serving so in-flight work is never
 /// interrupted; the new runtime only affects subsequent activations.
 fn background_probe_generation_runtime(
+    app: tauri::AppHandle,
     gpu_candidates: Vec<PathBuf>,
     cpu_executable: PathBuf,
     generation: Arc<Mutex<LocalGenerationRuntime>>,
@@ -1524,7 +1527,7 @@ fn background_probe_generation_runtime(
         "duration_ms": started.elapsed().as_millis() as u64,
         "gpu_available": best.is_some(),
     });
-    match best {
+    match &best {
         Some((gpu, capability)) => {
             let swapped = match generation.lock() {
                 Ok(mut guard) => {
@@ -1532,7 +1535,7 @@ fn background_probe_generation_runtime(
                         false
                     } else {
                         *guard = LocalGenerationRuntime::new_with_fallback_and_capability(
-                            gpu,
+                            gpu.clone(),
                             cpu_executable,
                             capability.clone(),
                         );
@@ -1552,6 +1555,29 @@ fn background_probe_generation_runtime(
         }
     }
     runtime_log::event("info", "model.runtime", "probe.completed", None, &fields);
+    // 探测完成：刷新环境状态（环境页/模型推荐拿到 GPU 信息并落盘），并广播
+    // model:state 事件驱动前端刷新——前端监听该事件后重拉 model-runtime，显示
+    // 与后端保持一致；探测失败也广播一次，让前端拿到"CPU 生效"的最终状态。
+    if let Some((_, capability)) = &best {
+        app_data::refresh_environment_after_probe(&app, capability);
+    }
+    let models = app.state::<ModelServiceState>().get().ok();
+    let catalog = app.state::<CatalogServiceState>().get().ok();
+    let generation = app.state::<GenerationServiceState>();
+    let runtime_state = app_data::inference_runtime_state(&generation).ok();
+    if let (Some(models), Some(catalog)) = (models, catalog)
+        && let Ok(state) = app_data::model_state_from_manager(&models, Some(catalog.as_ref()), runtime_state)
+    {
+        let _ = app.emit("model:state", state);
+    } else {
+        runtime_log::event(
+            "info",
+            "model.runtime",
+            "probe.emit_skipped",
+            None,
+            &serde_json::json!({ "reason": "catalog_not_ready" }),
+        );
+    }
 }
 
 #[cfg(test)]

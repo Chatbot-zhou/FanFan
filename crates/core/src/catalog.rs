@@ -812,6 +812,10 @@ impl CatalogService {
         self.store.list_file_relations(limit)
     }
 
+    pub fn count_exact_duplicate_relations(&self) -> Result<u64, AppError> {
+        self.store.count_exact_duplicate_relations()
+    }
+
     pub fn query_file_relations(&self, request: &RelationQuery) -> Result<RelationPage, AppError> {
         self.store.query_file_relations(request)
     }

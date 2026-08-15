@@ -29,13 +29,14 @@ use fanfan_core::{
     ModelRoleConfig, ModelSource, ModelStoreStatus, NodeTracePage, NodeTraceQuery, OcrRuntimeConfig,
     ParseMetrics, ParseOutcome, ParseRequest, ParseResult, PendingEmbeddingActivation,
     RagReadiness, RelationGroupPage, RelationGroupQuery, RelationPage, RelationQuery,
-    RelationRefreshResult, RelationType, RerankRequest,
+    RelationRefreshResult, RerankRequest,
     RootRecord, RouteDecision,
     RuntimeBackendKind, RuntimeCapability, RuntimeManager, RuntimeResourceBudget, RuntimeTaskKind,
     RuntimeTaskRequest, ScopeFilter, SearchMode, SearchRequest, SearchSession, SemanticQuery,
     SpeechRecognitionRequest, SpeechRecognitionResult, SpeechSynthesisRequest,
     SpeechSynthesisResult, TriageStatus, WorkerClient, AskMessage, chat_prompt,
-    intent_routing_prompt, intent_routing_prompt_mini, is_natural_language_query,
+    chat_prompt_mini, intent_routing_prompt, intent_routing_prompt_mini,
+    is_natural_language_query,
     is_pure_greeting, parse_intent_verdict, parse_query_intent, parse_rewritten_queries,
     query_rewrite_prompt, query_understanding_prompt, strip_long_path_prefix,
 };
@@ -444,10 +445,17 @@ pub struct ModelCapabilities {
 fn detect_environment(
     data_directory: &Path,
     runtime_capability: Option<&RuntimeCapability>,
+    cached_gpu: Option<(Option<String>, Option<u64>)>,
 ) -> EnvironmentCheck {
     let memory_total_gb = memory_total_gb();
     let disk_available_gb = disk_available_gb(data_directory);
-    let (gpu_name, gpu_memory_gb) = gpu_details();
+    // 显卡信息优先取 llama.cpp --list-devices 探测结果（比 PowerShell WMI 更接近
+    // 运行时实际能力）；后台探测未完成时回退到落盘缓存（上次成功结果）。
+    let (gpu_name, gpu_memory_gb) =
+        match gpu_details_from_devices(runtime_capability.map(|c| c.devices.as_slice())) {
+            Some(details) => details,
+            None => cached_gpu.unwrap_or((None, None)),
+        };
     let mut warnings = Vec::new();
     if memory_total_gb.is_none() {
         warnings.push("无法读取系统内存信息".to_owned());
@@ -552,43 +560,97 @@ fn disk_space_bytes(_path: &Path) -> Option<(u64, u64)> {
     None
 }
 
-#[cfg(windows)]
-fn gpu_details() -> (Option<String>, Option<u64>) {
-    let mut command = Command::new("powershell.exe");
-    command.args([
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "$gpu=Get-CimInstance Win32_VideoController | Where-Object {$_.Name -notmatch 'Microsoft Basic'} | Sort-Object AdapterRAM -Descending | Select-Object -First 1 Name,AdapterRAM; if($gpu){$gpu | ConvertTo-Json -Compress}",
-    ]);
-    hide_process_window(&mut command);
-    let Ok(output) = command.output() else {
-        return (None, None);
-    };
-    if !output.status.success() {
-        return (None, None);
+/// 从 llama.cpp `--list-devices` 探测结果解析 GPU 名称与显存（替代 PowerShell
+/// WMI 探测：每次启动跑 powershell.exe 1-3s，发布后用户机器上一样执行）。
+/// 设备行形如 `CUDA0: NVIDIA GeForce RTX 3060 Laptop GPU: 6144 MiB`。
+fn gpu_details_from_devices(devices: Option<&[String]>) -> Option<(Option<String>, Option<u64>)> {
+    let line = devices?
+        .iter()
+        .find(|line| {
+            let normalized = line.to_ascii_lowercase();
+            normalized.contains("cuda")
+                || normalized.contains("vulkan")
+                || normalized.contains("metal")
+                || normalized.contains("nvidia")
+        })?
+        .trim();
+    // 行尾显存：" 6144 MiB" / " 6.0 GB" / " 6.0 GiB"；解析失败仍保留名称。
+    let mut name = line;
+    let mut memory_gb = None;
+    for (unit, multiplier_gb) in [
+        (" MiB", 1.0 / 1024.0),
+        (" MB", 1.0 / 1024.0),
+        (" GiB", 1.0),
+        (" GB", 1.0),
+    ] {
+        if let Some(pos) = line.rfind(unit) {
+            let amount = &line[..pos];
+            let digit_start = amount
+                .rfind(|character: char| !character.is_ascii_digit() && character != '.')
+                .map(|index| index + 1)
+                .unwrap_or(0);
+            if let Ok(value) = amount[digit_start..].trim().parse::<f64>() {
+                name = amount[..digit_start].trim_end_matches([' ', ':', '\t']);
+                memory_gb = Some((value * multiplier_gb) as u64);
+            }
+            break;
+        }
     }
-    let Ok(value) = serde_json::from_slice::<Value>(&output.stdout) else {
-        return (None, None);
-    };
-    let name = value
-        .get("Name")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned);
-    let memory = value
-        .get("AdapterRAM")
-        .and_then(Value::as_u64)
-        .map(|bytes| bytes / 1024 / 1024 / 1024)
-        .filter(|value| *value > 0);
-    (name, memory)
+    // 剥掉 backend 前缀："CUDA0: " → 纯显卡名
+    let name = name.split_once(':').map(|(_, rest)| rest.trim()).unwrap_or(name);
+    Some(((!name.is_empty()).then(|| name.to_owned()), memory_gb))
 }
 
-#[cfg(not(windows))]
-fn gpu_details() -> (Option<String>, Option<u64>) {
-    (None, None)
+const ENVIRONMENT_CACHE_FILE: &str = "environment-cache.json";
+/// 显卡型号/显存几乎不变；llama 探测失败时回退到上次成功结果，7 天内不重测。
+const ENVIRONMENT_CACHE_TTL: chrono::Duration = chrono::Duration::days(7);
+
+fn environment_cache_path(data_directory: &Path) -> PathBuf {
+    data_directory.join(ENVIRONMENT_CACHE_FILE)
+}
+
+fn read_environment_cache(data_directory: &Path) -> Option<(Option<String>, Option<u64>)> {
+    let content = fs::read_to_string(environment_cache_path(data_directory)).ok()?;
+    let value = serde_json::from_str::<Value>(&content).ok()?;
+    let checked_at = chrono::DateTime::parse_from_rfc3339(value.get("checked_at")?.as_str()?)
+        .ok()?
+        .with_timezone(&Utc);
+    if Utc::now().signed_duration_since(checked_at) > ENVIRONMENT_CACHE_TTL {
+        return None;
+    }
+    Some((
+        value.get("gpu_name").and_then(Value::as_str).map(str::to_owned),
+        value.get("gpu_memory_gb").and_then(Value::as_u64),
+    ))
+}
+
+fn write_environment_cache(data_directory: &Path, check: &EnvironmentCheck) {
+    let path = environment_cache_path(data_directory);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(content) = serde_json::to_string_pretty(&json!(check)) {
+        let _ = fs::write(path, content);
+    }
+}
+
+/// 后台 GPU 探测完成后刷新环境状态并落盘：环境页与模型推荐立即拿到探测
+/// 结果（探测完成前 model_state/environment 如实显示 CPU 状态，前后端一致）。
+pub(crate) fn refresh_environment_after_probe(
+    app: &AppHandle,
+    runtime_capability: &RuntimeCapability,
+) {
+    let environment = app.state::<EnvironmentServiceState>();
+    let cached_gpu = read_environment_cache(&environment.data_directory);
+    let check = detect_environment(
+        &environment.data_directory,
+        Some(runtime_capability),
+        cached_gpu,
+    );
+    if let Ok(mut latest) = environment.latest.lock() {
+        *latest = Some(check.clone());
+    }
+    write_environment_cache(&environment.data_directory, &check);
 }
 
 #[tauri::command(async)]
@@ -624,6 +686,9 @@ pub fn environment_detect(
     {
         return Ok(cached.clone());
     }
+    // 探测由启动阶段的后台线程负责（lib.rs background_probe_generation_runtime），
+    // 完成前如实返回当前 runtime 状态，绝不在此同步启动 llama-server --list-devices
+    //（冷 GPU 可达数十秒）；显卡信息回退到落盘缓存（上次成功结果）。
     let runtime_capability = generation
         .0
         .lock()
@@ -634,8 +699,14 @@ pub fn environment_detect(
                 true,
             )
         })?
-        .probe_capability();
-    let check = detect_environment(&environment.data_directory, Some(&runtime_capability));
+        .current_capability()
+        .cloned();
+    let cached_gpu = read_environment_cache(&environment.data_directory);
+    let check = detect_environment(
+        &environment.data_directory,
+        runtime_capability.as_ref(),
+        cached_gpu,
+    );
     crate::runtime_log::event(
         if check.status == "ready" {
             "info"
@@ -657,6 +728,7 @@ pub fn environment_detect(
     );
     *latest = Some(check.clone());
     drop(latest);
+    write_environment_cache(&environment.data_directory, &check);
     if let Some((level, triggers)) = environment_degradation(&check) {
         catalog
             .get()?
@@ -818,10 +890,15 @@ pub fn model_role_catalog_list(
     let check = match cached {
         Some(check) => check,
         None => {
-            let detected = detect_environment(&environment.data_directory, None);
+            let detected = detect_environment(
+                &environment.data_directory,
+                None,
+                read_environment_cache(&environment.data_directory),
+            );
             if let Ok(mut latest) = environment.latest.lock() {
                 *latest = Some(detected.clone());
             }
+            write_environment_cache(&environment.data_directory, &detected);
             detected
         }
     };
@@ -2380,7 +2457,7 @@ fn default_inference_runtime_state() -> InferenceRuntimeState {
     }
 }
 
-fn inference_runtime_state(
+pub(crate) fn inference_runtime_state(
     generation: &GenerationServiceState,
 ) -> Result<InferenceRuntimeState, AppError> {
     let mut runtime = generation.0.lock().map_err(|_| {
@@ -2391,10 +2468,20 @@ fn inference_runtime_state(
         )
     })?;
     let active = runtime.is_active();
-    let capability = runtime
-        .current_capability()
-        .cloned()
-        .unwrap_or_else(|| runtime.probe_capability());
+    // 探测由启动阶段的后台线程负责；探测完成前如实返回当前 runtime 状态
+    //（CPU 生效中），绝不在此同步启动 llama-server --list-devices——冷 GPU
+    // 可达数十秒，曾导致标题栏/模型页整窗卡死。后台探测完成会发 model:state
+    // 事件驱动前端刷新，前后端状态始终一致。
+    let capability = runtime.current_capability().cloned().unwrap_or_else(|| {
+        RuntimeCapability {
+            executable_available: true,
+            backend: "cpu".into(),
+            devices: Vec::new(),
+            gpu_available: false,
+            checked_at: chrono::Utc::now(),
+            error_code: None,
+        }
+    });
     let device_names = runtime
         .active_device()
         .map(|device| vec![device.to_owned()])
@@ -2475,7 +2562,7 @@ fn current_inference_budget(memory_total_bytes: Option<u64>) -> InferenceBudget 
     }
 }
 
-fn model_state_from_manager(
+pub(crate) fn model_state_from_manager(
     models: &ModelManager,
     catalog: Option<&CatalogService>,
     inference_runtime: Option<InferenceRuntimeState>,
@@ -2571,9 +2658,28 @@ pub fn home_get_summary(
     catalog: State<'_, CatalogServiceState>,
 ) -> Result<Value, AppError> {
     let catalog = catalog.get()?;
+    // 扫描进行中必须直查（进度环接近实时）；无扫描时命中缓存则整体跳过 8 个查询。
+    let active_scan = catalog.latest_active_scan_job()?;
+    if active_scan.is_none() {
+        let hit = {
+            let cache = HOME_SUMMARY_CACHE
+                .get_or_init(|| Mutex::new((Instant::now(), String::new(), Value::Null)))
+                .lock()
+                .ok();
+            cache
+                .as_deref()
+                .filter(|(cached_at, cached_date, _)| {
+                    *cached_date == request.local_date
+                        && cached_at.elapsed() < HOME_SUMMARY_CACHE_TTL
+                })
+                .map(|(_, _, summary)| summary.clone())
+        };
+        if let Some(summary) = hit {
+            return Ok(summary);
+        }
+    }
     let (today_added, recent) = catalog.home_file_summary(&request.local_date)?;
     let candidates = catalog.list_candidate_roots()?;
-    let active_scan = catalog.latest_active_scan_job()?;
     let new_inbox = catalog.query_inbox(&InboxQuery {
         status: TriageStatus::New,
         event_types: vec![],
@@ -2592,15 +2698,13 @@ pub fn home_get_summary(
         cursor: None,
         page_size: 200,
     })?;
-    let relations = catalog.list_file_relations(500)?;
     let collections = catalog.list_collections()?;
-    let index_stats = catalog.index_activity_stats()?;
+    // 与状态栏共享 10s TTL 缓存，避免首页轮询重复触发 5 个 COUNT(DISTINCT) 全表扫描
+    let index_stats = cached_index_activity_stats(&catalog)?;
     let failed = error_inbox.items.len();
     let awaiting_confirmation = new_inbox.items.len();
-    let possible_duplicates = relations
-        .iter()
-        .filter(|relation| relation.relation_type == RelationType::ExactDuplicate)
-        .count();
+    // SQL COUNT 替代拉 500 行再在内存里数
+    let possible_duplicates = catalog.count_exact_duplicate_relations()?;
     let recent_files = recent
         .iter()
         .map(|file| {
@@ -2613,7 +2717,7 @@ pub fn home_get_summary(
             })
         })
         .collect::<Vec<_>>();
-    let scan_progress = active_scan.map(|job| {
+    let scan_progress = active_scan.as_ref().map(|job| {
         json!({
             "scan_job_id": job.job_id,
             "status": job.status,
@@ -2625,7 +2729,7 @@ pub fn home_get_summary(
             "progress": job.progress,
         })
     });
-    Ok(json!({
+    let summary = json!({
         "local_date": request.local_date,
         "metrics": [
             { "key": "today_added", "label": "今日新增", "value": today_added },
@@ -2646,7 +2750,16 @@ pub fn home_get_summary(
             })
         }).collect::<Vec<_>>(),
         "candidate_roots": candidates
-    }))
+    });
+    if active_scan.is_none() {
+        if let Ok(mut cache) = HOME_SUMMARY_CACHE
+            .get_or_init(|| Mutex::new((Instant::now(), String::new(), Value::Null)))
+            .lock()
+        {
+            *cache = (Instant::now(), request.local_date.clone(), summary.clone());
+        }
+    }
+    Ok(summary)
 }
 
 #[derive(Debug, Deserialize)]
@@ -3953,6 +4066,12 @@ pub fn maintenance_get(
 /// 索引内容分钟级才变化，10s 缓存足够，把真实查询频次降到 1/6。
 static INDEX_STATS_CACHE: OnceLock<Mutex<(Instant, IndexActivityStats)>> = OnceLock::new();
 const INDEX_STATS_CACHE_TTL: Duration = Duration::from_secs(10);
+
+/// home_get_summary 的进程内缓存：前端无扫描时 30s 兜底轮询 + 事件驱动刷新，
+/// 命中缓存时 8 个查询整体跳过。扫描进行中跳过缓存直查（进度环要接近实时）。
+/// TTL 保持 5s：事件 invalidate 后的下一次请求最多迟到 5s 旧值。
+static HOME_SUMMARY_CACHE: OnceLock<Mutex<(Instant, String, Value)>> = OnceLock::new();
+const HOME_SUMMARY_CACHE_TTL: Duration = Duration::from_secs(5);
 
 /// Rerank 重排后只把相关性最高的前 N 条证据片段交给生成模型；
 /// 未配置 Rerank 时不截断，保持全部证据进生成的既有行为。
@@ -5539,16 +5658,39 @@ fn run_chat_answer(
         ));
     }
     phase("chat_generating", 0.7);
-    let (system, user) = chat_prompt(request, history);
+    // 档位自适应：0.6B 用示例复读版 prompt + 更高采样温度（0.1 下只会复读
+    // system 自我介绍或套「你好！…？」模板复读问题，日志实测）；强模型
+    // 维持完整 prompt + 0.1 不变。
+    let is_mini = generation_artifact
+        .model_id
+        .to_lowercase()
+        .contains("0.6b");
+    let (system, user) = if is_mini {
+        chat_prompt_mini(request.question.trim(), history)
+    } else {
+        chat_prompt(request, history)
+    };
     let started_at = Instant::now();
-    let answer = complete_with_model(
-        generation,
-        generation_artifact,
-        &system,
-        &user,
-        512,
-        cancelled,
-    )?;
+    let answer = if is_mini {
+        complete_chat_with_model(
+            generation,
+            generation_artifact,
+            &system,
+            &user,
+            512,
+            0.6,
+            cancelled,
+        )?
+    } else {
+        complete_with_model(
+            generation,
+            generation_artifact,
+            &system,
+            &user,
+            512,
+            cancelled,
+        )?
+    };
     let result = AnswerResult {
         session_id: request.session_id.unwrap_or_else(Uuid::now_v7),
         message_id: Uuid::now_v7(),
@@ -6313,6 +6455,31 @@ fn complete_with_model(
         runtime.activate(&artifact.local_path, 4096, threads)?;
     }
     runtime.complete_cancellable(system_prompt, prompt, max_tokens, cancelled)
+}
+
+/// 闲聊专用：允许更高的采样温度（0.6B 在 0.1 下只会复读模板开场白）。
+/// 路由/改写/检索等稳定输出场景继续走 complete_with_model（0.1）。
+fn complete_chat_with_model(
+    generation: &Mutex<LocalGenerationRuntime>,
+    artifact: &ModelArtifact,
+    system_prompt: &str,
+    prompt: &str,
+    max_tokens: u32,
+    temperature: f32,
+    cancelled: &AtomicBool,
+) -> Result<String, AppError> {
+    let mut runtime = generation.lock().map_err(|_| {
+        AppError::new(
+            "GENERATION_RUNTIME_LOCK_FAILED",
+            "生成运行时状态已损坏",
+            true,
+        )
+    })?;
+    let threads = interactive_inference_threads();
+    if runtime.active_model_path() != Some(artifact.local_path.as_str()) || !runtime.is_active() {
+        runtime.activate(&artifact.local_path, 4096, threads)?;
+    }
+    runtime.complete_chat_cancellable(system_prompt, prompt, max_tokens, temperature, cancelled)
 }
 
 fn complete_json_with_model(
@@ -7955,12 +8122,42 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn environment_detection_reads_real_memory_and_disk() {
-        let check = detect_environment(Path::new("."), None);
+        let check = detect_environment(Path::new("."), None, None);
 
         assert!(check.memory_total_gb.is_some_and(|value| value > 0));
         assert!(check.disk_available_gb.is_some());
         assert!(matches!(check.status, "ready" | "degraded"));
         assert!(check.recommended_edition.is_some());
+    }
+
+    #[test]
+    fn gpu_details_parses_llama_device_lines() {
+        // CUDA 设备：剥离 backend 前缀与显存后缀，MiB 折算为 GB
+        let cuda = vec!["CUDA0: NVIDIA GeForce RTX 3060 Laptop GPU: 6144 MiB".to_owned()];
+        let (name, memory) = gpu_details_from_devices(Some(&cuda)).expect("cuda device found");
+        assert_eq!(name.as_deref(), Some("NVIDIA GeForce RTX 3060 Laptop GPU"));
+        assert_eq!(memory, Some(6));
+
+        // Vulkan：GB 后缀与多位小数
+        let vulkan =
+            vec!["Vulkan0: Intel(R) Arc(TM) A770: 16.0 GB".to_owned()];
+        let (name, memory) = gpu_details_from_devices(Some(&vulkan)).expect("vulkan device found");
+        assert_eq!(name.as_deref(), Some("Intel(R) Arc(TM) A770"));
+        assert_eq!(memory, Some(16));
+
+        // CPU 行不是 GPU 设备：应整体跳过
+        let cpu_only = vec!["CPU: 32768 MiB".to_owned()];
+        assert!(gpu_details_from_devices(Some(&cpu_only)).is_none());
+
+        // 无显存字段（如早期 llama.cpp 格式）：名称保留、显存为空
+        let no_vram = vec!["CUDA0: NVIDIA GeForce RTX 4090".to_owned()];
+        let (name, memory) = gpu_details_from_devices(Some(&no_vram)).expect("device found");
+        assert_eq!(name.as_deref(), Some("NVIDIA GeForce RTX 4090"));
+        assert_eq!(memory, None);
+
+        // 空设备列表
+        assert!(gpu_details_from_devices(Some(&[])).is_none());
+        assert!(gpu_details_from_devices(None).is_none());
     }
 
     #[test]

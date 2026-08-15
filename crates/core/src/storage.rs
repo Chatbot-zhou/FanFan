@@ -4004,6 +4004,24 @@ impl CatalogStore {
         .map(|page| page.items)
     }
 
+    /// 精确重复关系总数（首页指标）。首页只需计数，原实现拉 500 行再在内存里数，
+    /// 每次轮询都全表读；过滤条件与 query_file_relations 的默认过滤保持一致
+    ///（排除 rejected、只统计仍属于已启用根目录的文件）。
+    pub fn count_exact_duplicate_relations(&self) -> Result<u64, AppError> {
+        let connection = self.connect()?;
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM file_relations r
+                 WHERE relation_type = 'exact_duplicate'
+                   AND review_status <> 'rejected'
+                   AND EXISTS (SELECT 1 FROM file_root_memberships m JOIN roots rt ON rt.root_id = m.root_id WHERE m.file_id = r.left_file_id AND rt.enabled = 1)
+                   AND EXISTS (SELECT 1 FROM file_root_memberships m JOIN roots rt ON rt.root_id = m.root_id WHERE m.file_id = r.right_file_id AND rt.enabled = 1)",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(|error| storage_error("RELATION_COUNT_FAILED", error, true))
+    }
+
     pub fn refresh_semantic_file_relations(
         &self,
         model_artifact_id: &str,
