@@ -9,7 +9,11 @@ import { recordDiagnosticEvent } from "../bridge/observed-bridge";
 import { confirmAction } from "../components/AppConfirm";
 import { AppSelect } from "../components/AppSelect";
 import { ModelDownloadList, type ModelDownloadAction } from "../features/model-downloads/ModelDownloadList";
-import { visibleModelDownloadJobs } from "../features/model-downloads/model-downloads";
+import {
+  modelDownloadIsActive,
+  summarizeModelDownloads,
+  visibleModelDownloadJobs,
+} from "../features/model-downloads/model-downloads";
 import { useAppStore } from "../state/app-store";
 import { errorMessage, normalizeAppError } from "../utils/app-error";
 
@@ -50,6 +54,7 @@ export function ModelSetupPage() {
     refetchInterval: (query) => query.state.data?.some((job) => job.status === "queued" || job.status === "running") ? 500 : false,
   });
   const visibleDownloads = useMemo(() => visibleModelDownloadJobs(downloads.data ?? []), [downloads.data]);
+  const downloadSummary = useMemo(() => summarizeModelDownloads(visibleDownloads), [visibleDownloads]);
 
   const refreshModels = async () => {
     await Promise.all([
@@ -186,7 +191,7 @@ export function ModelSetupPage() {
         <div><h1>本地模型配置</h1><p>模型包完整安装并自检后才会启用；推理、索引和资料始终留在本地。</p></div>
       </header>
 
-      {visibleDownloads.length > 0 && (
+      {(visibleDownloads.some(modelDownloadIsActive) || downloadSummary.attention_count > 0) && (
         <section className="model-download-section" aria-label="模型下载任务">
           <header>
             <div><h2>模型下载</h2></div>
