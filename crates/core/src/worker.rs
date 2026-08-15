@@ -1,11 +1,11 @@
 use std::{
     ffi::OsString,
     io::{BufRead, BufReader, BufWriter, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -13,6 +13,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use uuid::Uuid;
 
 use crate::{AppError, ParseRequest, ParseResult};
 
@@ -27,11 +28,91 @@ pub fn strip_long_path_prefix(path: &str) -> String {
     }
 }
 
+/// Sidecar 角色：每个角色一个独立 worker 进程，只加载自己的依赖。
+/// parse 承载文档解析/导出（无模型）；onnx 承载 embedding/rerank；
+/// ocr 承载 RapidOCR；speech 承载 sherpa-onnx ASR/TTS。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WorkerRole {
+    Parse,
+    Onnx,
+    Ocr,
+    Speech,
+}
+
+impl WorkerRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Parse => "parse",
+            Self::Onnx => "onnx",
+            Self::Ocr => "ocr",
+            Self::Speech => "speech",
+        }
+    }
+
+    /// 进程空闲多久后由 watchdog 主动终止（下次请求自动重启）。
+    /// parse 无模型缓存，与 llama.cpp 的 300 秒休眠一致；其余角色与
+    /// worker 内模型会话缓存 60 秒回收保持一致。
+    pub fn idle_timeout(self) -> Duration {
+        match self {
+            Self::Parse => Duration::from_secs(300),
+            Self::Onnx | Self::Ocr | Self::Speech => Duration::from_secs(60),
+        }
+    }
+
+    /// 稳定的实例 UUID（不随进程重启变化），供 RuntimeManager 覆盖注册。
+    pub fn instance_uuid(self) -> Uuid {
+        let base = match self {
+            Self::Parse => 0x6f59_0000_0000_0000_0000_0000_0000_0001u128,
+            Self::Onnx => 0x6f59_0000_0000_0000_0000_0000_0000_0002u128,
+            Self::Ocr => 0x6f59_0000_0000_0000_0000_0000_0000_0003u128,
+            Self::Speech => 0x6f59_0000_0000_0000_0000_0000_0000_0004u128,
+        };
+        Uuid::from_u128(base)
+    }
+}
+
+/// watchdog 心跳阈值：worker 每 2 秒写心跳文件，连续超过该时长没有
+/// 更新即判定进程失联（Python 主循环卡死等）并受控终止。
+const HEARTBEAT_STALE_SECONDS: u64 = 8;
+
+/// 心跳判定：文件缺失或 mtime 距今超过阈值即失联。
+fn heartbeat_stale(now_ms: u64, heartbeat_ms: u64) -> bool {
+    heartbeat_ms == 0 || now_ms.saturating_sub(heartbeat_ms) / 1000 > HEARTBEAT_STALE_SECONDS
+}
+
+/// 空闲判定：距上次请求超过角色空闲阈值即回收（0 表示尚未发起过请求）。
+fn idle_expired(now_ms: u64, last_request_ms: u64, idle_timeout_seconds: u64) -> bool {
+    last_request_ms > 0 && now_ms.saturating_sub(last_request_ms) / 1000 >= idle_timeout_seconds
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkerClient {
     launch: WorkerLaunch,
+    role: WorkerRole,
     runtime: Arc<Mutex<WorkerRuntime>>,
     active_pid: Arc<AtomicU32>,
+    /// 最近一次请求开始时间（Unix 毫秒），watchdog 据此做空闲回收。
+    last_request_at_ms: Arc<AtomicU64>,
+    /// watchdog 观测到的心跳文件 mtime（Unix 毫秒）。
+    heartbeat_at_ms: Arc<AtomicU64>,
+    /// watchdog 通过 GetProcessMemoryInfo 观测的真实工作集内存（字节）。
+    observed_memory_bytes: Arc<AtomicU64>,
+    /// watchdog 通过 GetProcessMemoryInfo 观测的私有提交内存（字节）。
+    observed_private_bytes: Arc<AtomicU64>,
+    /// 每个活动进程一个 watchdog 线程，进程终止后自行退出。
+    supervisor: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SidecarSnapshot {
+    pub role: &'static str,
+    pub pid: u32,
+    pub alive: bool,
+    pub working_set_bytes: u64,
+    pub private_bytes: u64,
+    pub last_request_at_ms: u64,
+    pub heartbeat_at_ms: u64,
+    pub idle_timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -206,24 +287,42 @@ pub struct ExportResult {
     pub sha256: String,
 }
 
+fn empty_client(launch: WorkerLaunch, role: WorkerRole) -> WorkerClient {
+    WorkerClient {
+        launch,
+        role,
+        runtime: Arc::new(Mutex::new(WorkerRuntime::default())),
+        active_pid: Arc::new(AtomicU32::new(0)),
+        last_request_at_ms: Arc::new(AtomicU64::new(0)),
+        heartbeat_at_ms: Arc::new(AtomicU64::new(0)),
+        observed_memory_bytes: Arc::new(AtomicU64::new(0)),
+        observed_private_bytes: Arc::new(AtomicU64::new(0)),
+        supervisor: Arc::new(Mutex::new(None)),
+    }
+}
+
 impl WorkerClient {
     pub fn isolated(&self) -> Self {
-        Self {
-            launch: self.launch.clone(),
-            runtime: Arc::new(Mutex::new(WorkerRuntime::default())),
-            active_pid: Arc::new(AtomicU32::new(0)),
-        }
+        empty_client(self.launch.clone(), self.role)
+    }
+
+    pub fn with_role(mut self, role: WorkerRole) -> Self {
+        self.role = role;
+        self
+    }
+
+    pub fn role(&self) -> WorkerRole {
+        self.role
     }
 
     pub fn new(python_executable: impl Into<OsString>, worker_root: impl Into<PathBuf>) -> Self {
-        Self {
-            launch: WorkerLaunch::PythonModule {
+        empty_client(
+            WorkerLaunch::PythonModule {
                 python_executable: python_executable.into(),
                 worker_root: worker_root.into(),
             },
-            runtime: Arc::new(Mutex::new(WorkerRuntime::default())),
-            active_pid: Arc::new(AtomicU32::new(0)),
-        }
+            WorkerRole::Parse,
+        )
     }
 
     pub fn from_environment(worker_root: impl Into<PathBuf>) -> Self {
@@ -239,14 +338,13 @@ impl WorkerClient {
             .parent()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
-        Self {
-            launch: WorkerLaunch::Executable {
+        empty_client(
+            WorkerLaunch::Executable {
                 executable,
                 working_directory,
             },
-            runtime: Arc::new(Mutex::new(WorkerRuntime::default())),
-            active_pid: Arc::new(AtomicU32::new(0)),
-        }
+            WorkerRole::Parse,
+        )
     }
 
     pub fn parse_document(&self, request: &ParseRequest) -> Result<ParseResult, AppError> {
@@ -365,6 +463,8 @@ impl WorkerClient {
         R: DeserializeOwned + Send + 'static,
     {
         self.validate_launch_target()?;
+        self.last_request_at_ms
+            .store(unix_time_ms(), Ordering::Release);
         let envelope = WorkerRequestEnvelope {
             request_id: uuid::Uuid::now_v7().to_string(),
             operation,
@@ -463,6 +563,7 @@ impl WorkerClient {
         let pid = self.active_pid.swap(0, Ordering::AcqRel);
         if pid != 0 {
             terminate_process_by_id(pid);
+            remove_heartbeat_file(self.role, pid);
         }
         if let Ok(mut runtime) = self.runtime.lock() {
             runtime.stop();
@@ -471,6 +572,24 @@ impl WorkerClient {
 
     pub fn cancel_active(&self) {
         self.terminate_active_worker();
+    }
+
+    /// watchdog 最近一次观测快照；进程未启动时返回 None。
+    pub fn supervisor_snapshot(&self) -> Option<SidecarSnapshot> {
+        let pid = self.active_pid.load(Ordering::Acquire);
+        if pid == 0 {
+            return None;
+        }
+        Some(SidecarSnapshot {
+            role: self.role.as_str(),
+            pid,
+            alive: process_alive(pid),
+            working_set_bytes: self.observed_memory_bytes.load(Ordering::Acquire),
+            private_bytes: self.observed_private_bytes.load(Ordering::Acquire),
+            last_request_at_ms: self.last_request_at_ms.load(Ordering::Acquire),
+            heartbeat_at_ms: self.heartbeat_at_ms.load(Ordering::Acquire),
+            idle_timeout_seconds: self.role.idle_timeout().as_secs(),
+        })
     }
 
     fn validate_launch_target(&self) -> Result<(), AppError> {
@@ -494,6 +613,10 @@ impl WorkerClient {
     }
 
     fn start_process(&self) -> Result<WorkerProcess, AppError> {
+        // 心跳文件按角色固定命名：每个角色同时只有一个进程，spawn 前清掉
+        // 上次崩溃残留的旧文件，避免 watchdog 误判新进程仍然存活。
+        let heartbeat_file = heartbeat_file_path(self.role);
+        let _ = std::fs::remove_file(&heartbeat_file);
         let mut command = match &self.launch {
             WorkerLaunch::PythonModule {
                 python_executable,
@@ -502,6 +625,10 @@ impl WorkerClient {
                 let mut command = Command::new(python_executable);
                 command
                     .args(["-m", "fanfan_worker"])
+                    .arg("--role")
+                    .arg(self.role.as_str())
+                    .arg("--heartbeat-file")
+                    .arg(&heartbeat_file)
                     .current_dir(worker_root)
                     .env("PYTHONUTF8", "1")
                     .env("PYTHONIOENCODING", "utf-8");
@@ -512,7 +639,12 @@ impl WorkerClient {
                 working_directory,
             } => {
                 let mut command = Command::new(executable);
-                command.current_dir(working_directory);
+                command
+                    .arg("--role")
+                    .arg(self.role.as_str())
+                    .arg("--heartbeat-file")
+                    .arg(&heartbeat_file)
+                    .current_dir(working_directory);
                 command
             }
         };
@@ -524,6 +656,16 @@ impl WorkerClient {
             .spawn()
             .map_err(|error| AppError::new("WORKER_START_FAILED", error.to_string(), true))?;
         self.active_pid.store(child.id(), Ordering::Release);
+        // 加入全局 Job Object：app 进程退出时（含崩溃）级联回收全部 sidecar，
+        // 并统一以低于正常的优先级运行，避免后台索引与前台交互抢 CPU。
+        if let Err(error) = assign_to_sidecar_job(child.id()) {
+            eprintln!(
+                "[worker] 角色 {} pid {} 加入 Job Object 失败: {}",
+                self.role.as_str(),
+                child.id(),
+                error
+            );
+        }
         let stdin = child
             .stdin
             .take()
@@ -532,11 +674,88 @@ impl WorkerClient {
             .stdout
             .take()
             .ok_or_else(|| AppError::new("WORKER_IO_FAILED", "无法打开Worker标准输出", true))?;
+        let pid = child.id();
+        self.spawn_watchdog(pid, heartbeat_file);
         Ok(WorkerProcess {
             child,
             stdin: BufWriter::new(stdin),
             stdout: BufReader::new(stdout),
         })
+    }
+
+    /// 每 2 秒执行一次进程级心跳观测：
+    /// - 意外退出（未被主动终止）→ 清理 active_pid，下次请求自动重启；
+    /// - 心跳文件超时未更新（Python 主循环卡死）→ 受控终止；
+    /// - 空闲超过角色阈值 → 主动终止（完整休眠，下次请求自动重启）；
+    /// - 通过 GetProcessMemoryInfo 观测真实内存，供运行时状态展示。
+    fn spawn_watchdog(&self, pid: u32, heartbeat_file: PathBuf) {
+        let role = self.role;
+        let active_pid = Arc::clone(&self.active_pid);
+        let last_request_at_ms = Arc::clone(&self.last_request_at_ms);
+        let heartbeat_at_ms = Arc::clone(&self.heartbeat_at_ms);
+        let observed_memory_bytes = Arc::clone(&self.observed_memory_bytes);
+        let observed_private_bytes = Arc::clone(&self.observed_private_bytes);
+        let handle = thread::Builder::new()
+            .name(format!("sidecar-watchdog-{}", role.as_str()))
+            .spawn(move || {
+                let idle_timeout = role.idle_timeout().as_secs();
+                loop {
+                    thread::sleep(Duration::from_millis(2000));
+                    if active_pid.load(Ordering::Acquire) != pid {
+                        return; // 已被主动终止或替换
+                    }
+                    if let Some(exit) = try_wait(pid) {
+                        eprintln!(
+                            "[worker] sidecar {} (pid {}) 意外退出，状态码 {:?}",
+                            role.as_str(),
+                            pid,
+                            exit
+                        );
+                        active_pid.store(0, Ordering::Release);
+                        remove_heartbeat_file(role, pid);
+                        return;
+                    }
+                    let now_ms = unix_time_ms();
+                    let heartbeat_ms = heartbeat_file_mtime_ms(&heartbeat_file);
+                    if heartbeat_ms > 0 {
+                        heartbeat_at_ms.store(heartbeat_ms, Ordering::Release);
+                    }
+                    if heartbeat_stale(now_ms, heartbeat_ms) {
+                        eprintln!(
+                            "[worker] sidecar {} (pid {}) 心跳丢失超过 {}s，判定失联并终止",
+                            role.as_str(),
+                            pid,
+                            HEARTBEAT_STALE_SECONDS
+                        );
+                        active_pid.store(0, Ordering::Release);
+                        terminate_process_by_id(pid);
+                        remove_heartbeat_file(role, pid);
+                        return;
+                    }
+                    let last_request = last_request_at_ms.load(Ordering::Acquire);
+                    if idle_expired(now_ms, last_request, idle_timeout) {
+                        eprintln!(
+                            "[worker] sidecar {} (pid {}) 空闲超过 {}s，休眠回收",
+                            role.as_str(),
+                            pid,
+                            idle_timeout
+                        );
+                        active_pid.store(0, Ordering::Release);
+                        terminate_process_by_id(pid);
+                        remove_heartbeat_file(role, pid);
+                        return;
+                    }
+                    if let Some((working_set, private_bytes)) = process_memory(pid) {
+                        observed_memory_bytes.store(working_set, Ordering::Release);
+                        observed_private_bytes.store(private_bytes, Ordering::Release);
+                    }
+                }
+            });
+        if let Ok(handle) = handle {
+            if let Ok(mut supervisor) = self.supervisor.lock() {
+                *supervisor = Some(handle);
+            }
+        }
     }
 }
 
@@ -581,6 +800,177 @@ fn hide_child_console(command: &mut Command) {
 
 #[cfg(not(windows))]
 fn hide_child_console(_command: &mut Command) {}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 心跳文件按角色固定命名（每个角色同一时刻只有一个进程；
+/// spawn 前会删除上次崩溃的残留文件，避免误判存活）。
+fn heartbeat_file_path(role: WorkerRole) -> PathBuf {
+    std::env::temp_dir().join(format!("fanfan-{}.heartbeat", role.as_str()))
+}
+
+fn remove_heartbeat_file(role: WorkerRole, _pid: u32) {
+    let _ = std::fs::remove_file(heartbeat_file_path(role));
+}
+
+/// 心跳文件 mtime（Unix 毫秒）；文件不存在返回 0。
+fn heartbeat_file_mtime_ms(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(windows)]
+fn try_wait(pid: u32) -> Option<u32> {
+    use windows::Win32::{
+        Foundation::{CloseHandle, WAIT_OBJECT_0},
+        System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject},
+    };
+
+    let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(handle) => handle,
+        Err(_) => return Some(0), // 打开失败视为已退出
+    };
+    let result = unsafe { WaitForSingleObject(handle, 0) };
+    let _ = unsafe { CloseHandle(handle) };
+    (result == WAIT_OBJECT_0).then_some(0)
+}
+
+#[cfg(not(windows))]
+fn try_wait(_pid: u32) -> Option<u32> {
+    None
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    try_wait(pid).is_none()
+}
+
+#[cfg(not(windows))]
+fn process_alive(_pid: u32) -> bool {
+    false
+}
+
+/// 通过 GetProcessMemoryInfo 观测真实内存（工作集 + 私有提交量）。
+#[cfg(windows)]
+fn process_memory(pid: u32) -> Option<(u64, u64)> {
+    use std::mem::size_of;
+    use windows::Win32::{
+        Foundation::CloseHandle,
+        System::{
+            ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX},
+            Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+        },
+    };
+
+    let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(handle) => handle,
+        Err(_) => return None,
+    };
+    let mut counters = PROCESS_MEMORY_COUNTERS_EX::default();
+    // windows crate 的包装只暴露 PROCESS_MEMORY_COUNTERS 类型，但底层按 cb
+    // 大小区分：EX 版布局为兼容超集，强转传指针是标准做法（官方文档允许）。
+    let ok = unsafe {
+        GetProcessMemoryInfo(
+            handle,
+            &mut counters as *mut PROCESS_MEMORY_COUNTERS_EX as *mut PROCESS_MEMORY_COUNTERS,
+            size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        )
+    };
+    let _ = unsafe { CloseHandle(handle) };
+    ok.is_ok()
+        .then_some((counters.WorkingSetSize as u64, counters.PrivateUsage as u64))
+}
+
+#[cfg(not(windows))]
+fn process_memory(_pid: u32) -> Option<(u64, u64)> {
+    None
+}
+
+/// 全局 Job Object：KILL_ON_JOB_CLOSE 让所有 sidecar 随 app 进程树级联回收
+/// （包括 app 崩溃/被杀时），进程级优先级统一低于正常。
+#[cfg(windows)]
+fn assign_to_sidecar_job(pid: u32) -> Result<(), AppError> {
+    use windows::Win32::{
+        Foundation::{CloseHandle, HANDLE},
+        System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+            JobObjectBasicLimitInformation, JobObjectExtendedLimitInformation,
+            JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        },
+        System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE},
+    };
+
+    // 进程级 Job 单例：app 存活期间始终持有 handle（进程退出时由 OS 回收），
+    // 因此整个进程生命周期内只有一个 Job 实例，无需释放。Windows 句柄在
+    // 进程内可安全跨线程使用，仅此处持有并复用，手动实现 Send/Sync 是安全的。
+    struct JobHandle(HANDLE);
+    unsafe impl Send for JobHandle {}
+    unsafe impl Sync for JobHandle {}
+    static JOB: std::sync::Mutex<Option<JobHandle>> = std::sync::Mutex::new(None);
+    let mut job_guard = JOB
+        .lock()
+        .map_err(|_| AppError::new("JOB_OBJECT_UNAVAILABLE", "Job Object 锁已损坏", true))?;
+    let job = if let Some(JobHandle(job)) = *job_guard {
+        job
+    } else {
+        let job = unsafe { CreateJobObjectW(None, None) }
+            .map_err(|error| AppError::new("JOB_OBJECT_CREATE_FAILED", error.to_string(), true))?;
+        let mut extended = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        extended.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &extended as *const _ as *const _,
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        }
+        .map_err(|error| AppError::new("JOB_OBJECT_CONFIGURE_FAILED", error.to_string(), true))?;
+        let mut basic = JOBOBJECT_BASIC_LIMIT_INFORMATION::default();
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+        basic.PriorityClass = BELOW_NORMAL_PRIORITY_CLASS;
+        unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectBasicLimitInformation,
+                &basic as *const _ as *const _,
+                size_of::<JOBOBJECT_BASIC_LIMIT_INFORMATION>() as u32,
+            )
+        }
+        .map_err(|error| AppError::new("JOB_OBJECT_CONFIGURE_FAILED", error.to_string(), true))?;
+        *job_guard = Some(JobHandle(job));
+        job
+    };
+
+    let process = match unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid) } {
+        Ok(process) => process,
+        Err(_) => {
+            return Err(AppError::new(
+                "JOB_OBJECT_OPEN_PROCESS_FAILED",
+                "无法打开sidecar进程句柄",
+                true,
+            ))
+        }
+    };
+    let result = unsafe { AssignProcessToJobObject(job, process) };
+    let _ = unsafe { CloseHandle(process) };
+    result.map_err(|error| AppError::new("JOB_OBJECT_ASSIGN_FAILED", error.to_string(), true))
+}
+
+#[cfg(not(windows))]
+fn assign_to_sidecar_job(_pid: u32) -> Result<(), AppError> {
+    Ok(())
+}
 
 impl WorkerProcess {
     fn request(&mut self, request_json: &[u8]) -> Result<String, AppError> {
@@ -701,6 +1091,38 @@ mod tests {
         );
         let response = read_worker_protocol_response(&mut input).expect("skip native noise");
         assert!(response.contains("\"ok\":true"));
+    }
+
+    #[test]
+    fn sidecar_roles_have_stable_instances_and_idle_timeouts() {
+        assert_eq!(WorkerRole::Parse.as_str(), "parse");
+        assert_eq!(WorkerRole::Onnx.as_str(), "onnx");
+        assert_eq!(WorkerRole::Ocr.as_str(), "ocr");
+        assert_eq!(WorkerRole::Speech.as_str(), "speech");
+        assert_eq!(WorkerRole::Parse.idle_timeout(), Duration::from_secs(300));
+        assert_eq!(WorkerRole::Onnx.idle_timeout(), Duration::from_secs(60));
+        // 实例 UUID 跨调用稳定（RuntimeManager 覆盖注册依赖此性质）。
+        assert_eq!(WorkerRole::Onnx.instance_uuid(), WorkerRole::Onnx.instance_uuid());
+        assert_ne!(WorkerRole::Onnx.instance_uuid(), WorkerRole::Ocr.instance_uuid());
+    }
+
+    #[test]
+    fn heartbeat_stale_requires_fresh_file() {
+        let now = 1_000_000;
+        assert!(heartbeat_stale(now, 0), "缺失心跳文件视为失联");
+        assert!(heartbeat_stale(now, now - 9_000), "超过 8 秒未更新视为失联");
+        assert!(!heartbeat_stale(now, now - 4_000), "4 秒内的心跳视为存活");
+        assert!(!heartbeat_stale(now, now), "刚更新的心跳视为存活");
+    }
+
+    #[test]
+    fn idle_expired_respects_timeout_and_unused_state() {
+        let now = 1_000_000;
+        assert!(!idle_expired(now, 0, 60), "从未请求过不回收");
+        assert!(!idle_expired(now, now - 30_000, 60), "30 秒未超 60 秒阈值");
+        assert!(idle_expired(now, now - 61_000, 60), "超过阈值回收");
+        assert!(idle_expired(now, now - 400_000, 300), "parse 300 秒阈值");
+        assert!(!idle_expired(now, now - 100_000, 300));
     }
 
     #[test]

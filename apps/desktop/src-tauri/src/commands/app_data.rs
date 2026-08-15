@@ -31,10 +31,11 @@ use fanfan_core::{
     RagReadiness, RelationGroupPage, RelationGroupQuery, RelationPage, RelationQuery,
     RelationRefreshResult, RerankRequest,
     RootRecord, RouteDecision,
-    RuntimeBackendKind, RuntimeCapability, RuntimeManager, RuntimeResourceBudget, RuntimeTaskKind,
+    RuntimeBackendKind, RuntimeCapability, RuntimeInstanceState, RuntimeManager,
+    RuntimeResourceBudget, RuntimeTaskKind,
     RuntimeTaskRequest, ScopeFilter, SearchMode, SearchRequest, SearchSession, SemanticQuery,
     SpeechRecognitionRequest, SpeechRecognitionResult, SpeechSynthesisRequest,
-    SpeechSynthesisResult, TriageStatus, WorkerClient, AskMessage, chat_prompt,
+    SpeechSynthesisResult, TriageStatus, WorkerClient, WorkerRole, AskMessage, chat_prompt,
     chat_prompt_mini, intent_routing_prompt, intent_routing_prompt_mini,
     is_natural_language_query,
     parse_intent_verdict, parse_query_intent, parse_rewritten_queries,
@@ -126,6 +127,15 @@ pub struct WorkerServiceState {
 
 #[derive(Clone)]
 pub struct SpeechWorkerState(pub WorkerClient);
+
+/// ONNX（embedding/rerank）与 OCR 独立 sidecar 的注册表。
+/// parse 角色由 WorkerServiceState.client 承载；speech 由 SpeechWorkerState 承载。
+pub struct SidecarClients {
+    pub onnx: WorkerClient,
+    pub ocr: WorkerClient,
+}
+
+pub struct SidecarRegistryState(pub Arc<SidecarClients>);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SpeechRecognitionSession {
@@ -929,7 +939,7 @@ pub async fn model_download_start(
     catalog: State<'_, CatalogServiceState>,
     models: State<'_, ModelServiceState>,
     downloads: State<'_, ModelDownloadCoordinatorState>,
-    worker: State<'_, WorkerServiceState>,
+    sidecars: State<'_, SidecarRegistryState>,
     generation: State<'_, GenerationServiceState>,
 ) -> Result<ModelDownloadJob, AppError> {
     if !request.confirmed {
@@ -944,7 +954,7 @@ pub async fn model_download_start(
         catalog.get()?,
         models.get()?,
         downloads.inner().clone(),
-        worker.client.isolated(),
+        Arc::clone(&sidecars.0),
         Arc::clone(&generation.0),
         &request.edition_id,
         &request.source,
@@ -956,7 +966,7 @@ fn begin_model_download(
     catalog: Arc<CatalogService>,
     manager: Arc<ModelManager>,
     downloads: ModelDownloadCoordinatorState,
-    worker: WorkerClient,
+    sidecars: Arc<SidecarClients>,
     generation: Arc<Mutex<LocalGenerationRuntime>>,
     edition_id: &str,
     source: &str,
@@ -990,7 +1000,7 @@ fn begin_model_download(
         edition,
         job.job_id,
         downloads,
-        worker,
+        sidecars,
         generation,
     )?;
     let updated = manager.download_job(&job.job_id)?;
@@ -1007,14 +1017,14 @@ pub(crate) fn queue_evaluation_model_download(
 ) -> Result<ModelDownloadJob, AppError> {
     let manager = app.state::<ModelServiceState>().get()?;
     let downloads = app.state::<ModelDownloadCoordinatorState>().inner().clone();
-    let worker = app.state::<WorkerServiceState>().client.isolated();
+    let sidecars = Arc::clone(&app.state::<SidecarRegistryState>().0);
     let generation = Arc::clone(&app.state::<GenerationServiceState>().0);
     begin_model_download(
         app.clone(),
         catalog,
         manager,
         downloads,
-        worker,
+        sidecars,
         generation,
         edition_id,
         source,
@@ -1167,7 +1177,7 @@ pub async fn model_download_resume(
     catalog: State<'_, CatalogServiceState>,
     models: State<'_, ModelServiceState>,
     downloads: State<'_, ModelDownloadCoordinatorState>,
-    worker: State<'_, WorkerServiceState>,
+    sidecars: State<'_, SidecarRegistryState>,
     generation: State<'_, GenerationServiceState>,
 ) -> Result<ModelDownloadJob, AppError> {
     let manager = models.get()?;
@@ -1200,7 +1210,7 @@ pub async fn model_download_resume(
         catalog.get()?,
         manager,
         downloads.inner().clone(),
-        worker.client.isolated(),
+        Arc::clone(&sidecars.0),
         Arc::clone(&generation.0),
         previous,
         None,
@@ -1215,7 +1225,7 @@ pub async fn model_download_retry(
     catalog: State<'_, CatalogServiceState>,
     models: State<'_, ModelServiceState>,
     downloads: State<'_, ModelDownloadCoordinatorState>,
-    worker: State<'_, WorkerServiceState>,
+    sidecars: State<'_, SidecarRegistryState>,
     generation: State<'_, GenerationServiceState>,
 ) -> Result<ModelDownloadJob, AppError> {
     let manager = models.get()?;
@@ -1232,7 +1242,7 @@ pub async fn model_download_retry(
         catalog.get()?,
         manager,
         downloads.inner().clone(),
-        worker.client.isolated(),
+        Arc::clone(&sidecars.0),
         Arc::clone(&generation.0),
         previous,
         None,
@@ -1247,7 +1257,7 @@ pub async fn model_download_switch_source(
     catalog: State<'_, CatalogServiceState>,
     models: State<'_, ModelServiceState>,
     downloads: State<'_, ModelDownloadCoordinatorState>,
-    worker: State<'_, WorkerServiceState>,
+    sidecars: State<'_, SidecarRegistryState>,
     generation: State<'_, GenerationServiceState>,
 ) -> Result<ModelDownloadJob, AppError> {
     let manager = models.get()?;
@@ -1280,7 +1290,7 @@ pub async fn model_download_switch_source(
         catalog.get()?,
         manager,
         downloads.inner().clone(),
-        worker.client.isolated(),
+        Arc::clone(&sidecars.0),
         Arc::clone(&generation.0),
         previous,
         Some(target_source),
@@ -1325,7 +1335,7 @@ fn restart_existing_download(
     catalog: Arc<CatalogService>,
     manager: Arc<ModelManager>,
     downloads: ModelDownloadCoordinatorState,
-    worker: WorkerClient,
+    sidecars: Arc<SidecarClients>,
     generation: Arc<Mutex<LocalGenerationRuntime>>,
     mut job: ModelDownloadJob,
     source: Option<ModelSource>,
@@ -1373,7 +1383,7 @@ fn restart_existing_download(
         edition,
         job.job_id,
         downloads,
-        worker,
+        sidecars,
         generation,
     )?;
     manager.download_job(&job.job_id)
@@ -1418,7 +1428,7 @@ fn spawn_model_download(
     edition: ModelEdition,
     job_id: Uuid,
     coordinator: ModelDownloadCoordinatorState,
-    worker: WorkerClient,
+    sidecars: Arc<SidecarClients>,
     generation: Arc<Mutex<LocalGenerationRuntime>>,
 ) -> Result<(), AppError> {
     let Some(control) = coordinator.begin(job_id)? else {
@@ -1432,7 +1442,7 @@ fn spawn_model_download(
             &edition,
             job_id,
             &control,
-            &worker,
+            &sidecars,
             &generation,
         );
         coordinator.finish(&job_id);
@@ -1448,7 +1458,7 @@ fn run_model_download(
     edition: &ModelEdition,
     job_id: Uuid,
     control: &AtomicU8,
-    worker: &WorkerClient,
+    sidecars: &Arc<SidecarClients>,
     generation: &Mutex<LocalGenerationRuntime>,
 ) {
     let result = (|| {
@@ -1543,8 +1553,17 @@ fn run_model_download(
         if embedding.is_none() || generation_artifact.is_none() {
             job.phase = "activating".into();
             persist_download_job(app, models, &mut job)?;
+            let speech_worker = app.state::<SpeechWorkerState>().0.clone();
             let embedding_indexing = self_test_and_activate_downloaded_roles(
-                app, catalog, models, worker, generation, &installed, job.job_id,
+                app,
+                catalog,
+                models,
+                &sidecars.onnx,
+                &sidecars.ocr,
+                &speech_worker,
+                generation,
+                &installed,
+                job.job_id,
             )?;
             for artifact in &edition.artifacts {
                 if let Ok(staging) = models.download_artifact_staging_directory(
@@ -1585,7 +1604,7 @@ fn run_model_download(
             .ok_or_else(|| {
                 AppError::new("EMBEDDING_TOKENIZER_UNAVAILABLE", "语义模型目录无效", false)
             })?;
-        let embedding_test = worker.encode_embeddings(&EmbeddingRequest {
+        let embedding_test = sidecars.onnx.encode_embeddings(&EmbeddingRequest {
             model_path: embedding.local_path.clone(),
             tokenizer_path: Some(tokenizer.to_string_lossy().into_owned()),
             texts: vec!["拾起散落的信息，连接过去的自己".into()],
@@ -1742,7 +1761,9 @@ fn self_test_and_activate_downloaded_roles(
     app: &AppHandle,
     catalog: &Arc<CatalogService>,
     models: &ModelManager,
-    worker: &WorkerClient,
+    onnx: &WorkerClient,
+    ocr: &WorkerClient,
+    speech: &WorkerClient,
     generation: &Mutex<LocalGenerationRuntime>,
     installed: &[ModelArtifact],
     download_job_id: Uuid,
@@ -1781,7 +1802,7 @@ fn self_test_and_activate_downloaded_roles(
                     .ok_or_else(|| {
                         AppError::new("EMBEDDING_TOKENIZER_UNAVAILABLE", "语义模型目录无效", false)
                     })?;
-                let response = worker.encode_embeddings(&EmbeddingRequest {
+                let response = onnx.encode_embeddings(&EmbeddingRequest {
                     model_path: artifact.local_path.clone(),
                     tokenizer_path: Some(tokenizer.to_string_lossy().into_owned()),
                     texts: vec!["拾起散落的信息，连接过去的自己".into()],
@@ -1833,7 +1854,7 @@ fn self_test_and_activate_downloaded_roles(
                     .ok_or_else(|| {
                         AppError::new("RERANK_TOKENIZER_UNAVAILABLE", "模型目录无效", false)
                     })?;
-                let response = worker.rerank(&RerankRequest {
+                let response = onnx.rerank(&RerankRequest {
                     model_path: artifact.local_path.clone(),
                     tokenizer_path: Some(tokenizer.to_string_lossy().into_owned()),
                     query: "哪段资料描述了本地知识库？".into(),
@@ -1857,7 +1878,7 @@ fn self_test_and_activate_downloaded_roles(
                 models.activate_artifact(&artifact.artifact_id, None)?;
             }
             (ModelRole::Ocr, ModelFormat::Onnx) => {
-                worker.self_test_ocr(
+                ocr.self_test_ocr(
                     artifact.local_path.clone(),
                     model_companion_path(artifact, "ch_PP-OCRv5_mobile_det.onnx")?,
                     model_companion_path(artifact, "ch_ppocr_mobile_v2.0_cls_infer.onnx")?,
@@ -1867,7 +1888,7 @@ fn self_test_and_activate_downloaded_roles(
                 models.activate_artifact(&artifact.artifact_id, None)?;
             }
             (ModelRole::Tts, ModelFormat::Onnx) => {
-                worker.self_test_tts(
+                speech.self_test_tts(
                     artifact.local_path.clone(),
                     model_companion_path(artifact, "tokens.txt")?,
                     model_companion_path(artifact, "lexicon.txt")?,
@@ -1876,7 +1897,7 @@ fn self_test_and_activate_downloaded_roles(
                 models.activate_artifact(&artifact.artifact_id, None)?;
             }
             (ModelRole::Asr, ModelFormat::Onnx) => {
-                worker.self_test_asr(
+                speech.self_test_asr(
                     artifact.local_path.clone(),
                     model_companion_path(artifact, "tokens.txt")?,
                     model_companion_path(artifact, "silero_vad.onnx")?,
@@ -2246,7 +2267,8 @@ pub fn model_artifact_activate(
     app: AppHandle,
     catalog: State<'_, CatalogServiceState>,
     models: State<'_, ModelServiceState>,
-    worker: State<'_, WorkerServiceState>,
+    sidecars: State<'_, SidecarRegistryState>,
+    speech: State<'_, SpeechWorkerState>,
     generation: State<'_, GenerationServiceState>,
 ) -> Result<ModelRuntimeState, AppError> {
     let models = models.get()?;
@@ -2274,7 +2296,7 @@ pub fn model_artifact_activate(
                 .ok_or_else(|| {
                     AppError::new("EMBEDDING_TOKENIZER_UNAVAILABLE", "模型目录无效", false)
                 })?;
-            let response = worker.client.encode_embeddings(&EmbeddingRequest {
+            let response = sidecars.0.onnx.encode_embeddings(&EmbeddingRequest {
                 model_path: artifact.local_path.clone(),
                 tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
                 texts: vec!["拾起散落的信息，连接过去的自己".into()],
@@ -2354,7 +2376,7 @@ pub fn model_artifact_activate(
                 .ok_or_else(|| {
                     AppError::new("RERANK_TOKENIZER_UNAVAILABLE", "模型目录无效", false)
                 })?;
-            let response = worker.client.rerank(&RerankRequest {
+            let response = sidecars.0.onnx.rerank(&RerankRequest {
                 model_path: artifact.local_path.clone(),
                 tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
                 query: "哪段资料描述了本地知识库？".into(),
@@ -2378,7 +2400,7 @@ pub fn model_artifact_activate(
             models.activate_artifact(&artifact_id, None)?;
         }
         (ModelRole::Ocr, ModelFormat::Onnx) => {
-            worker.client.self_test_ocr(
+            sidecars.0.ocr.self_test_ocr(
                 artifact.local_path.clone(),
                 model_companion_path(&artifact, "ch_PP-OCRv5_mobile_det.onnx")?,
                 model_companion_path(&artifact, "ch_ppocr_mobile_v2.0_cls_infer.onnx")?,
@@ -2388,7 +2410,7 @@ pub fn model_artifact_activate(
             models.activate_artifact(&artifact_id, None)?;
         }
         (ModelRole::Tts, ModelFormat::Onnx) => {
-            worker.client.self_test_tts(
+            speech.0.self_test_tts(
                 artifact.local_path.clone(),
                 model_companion_path(&artifact, "tokens.txt")?,
                 model_companion_path(&artifact, "lexicon.txt")?,
@@ -2397,7 +2419,7 @@ pub fn model_artifact_activate(
             models.activate_artifact(&artifact_id, None)?;
         }
         (ModelRole::Asr, ModelFormat::Onnx) => {
-            worker.client.self_test_asr(
+            speech.0.self_test_asr(
                 artifact.local_path.clone(),
                 model_companion_path(&artifact, "tokens.txt")?,
                 model_companion_path(&artifact, "silero_vad.onnx")?,
@@ -4159,10 +4181,65 @@ pub fn app_status_get(
     })
 }
 
+/// sidecar 角色 → 运行时后端展示名（设置页「运行时状态」实例列表）。
+fn backend_for_role(role: WorkerRole) -> RuntimeBackendKind {
+    match role {
+        WorkerRole::Parse => RuntimeBackendKind::Parser,
+        WorkerRole::Onnx => RuntimeBackendKind::OnnxRuntime,
+        WorkerRole::Ocr => RuntimeBackendKind::PaddleOcr,
+        WorkerRole::Speech => RuntimeBackendKind::SherpaOnnx,
+    }
+}
+
+/// 把 4 个 sidecar 进程的 watchdog 观测（真实工作集内存/存活）同步进
+/// RuntimeManager 实例列表：进程存活则覆盖注册/更新观测，失联则移除。
+/// 固定 role UUID 保证进程重启后仍是同一实例（loaded_at 保持首次加载）。
+fn sync_sidecar_instances(
+    manager: &RuntimeManager,
+    sidecars: &[(WorkerRole, &WorkerClient)],
+) -> Result<(), AppError> {
+    let now = Utc::now();
+    for (role, client) in sidecars {
+        let instance_id = role.instance_uuid();
+        match client.supervisor_snapshot() {
+            Some(snapshot) if snapshot.alive => {
+                manager.sync_instance(RuntimeInstanceState {
+                    instance_id,
+                    backend: backend_for_role(*role),
+                    model_id: None,
+                    device: "cpu".to_string(),
+                    status: "running".to_string(),
+                    memory_bytes: snapshot.working_set_bytes,
+                    gpu_memory_bytes: 0,
+                    idle_timeout_seconds: snapshot.idle_timeout_seconds,
+                    loaded_at: now,
+                    last_used_at: now,
+                })?;
+            }
+            _ => {
+                let _ = manager.unregister_instance(&instance_id)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command(async)]
 pub fn runtime_state_get(
     runtime_manager: State<'_, RuntimeManagerState>,
+    worker: State<'_, WorkerServiceState>,
+    sidecars: State<'_, SidecarRegistryState>,
+    speech: State<'_, SpeechWorkerState>,
 ) -> Result<AiRuntimeSnapshot, AppError> {
+    sync_sidecar_instances(
+        &runtime_manager.0,
+        &[
+            (WorkerRole::Parse, &worker.client),
+            (WorkerRole::Onnx, &sidecars.0.onnx),
+            (WorkerRole::Ocr, &sidecars.0.ocr),
+            (WorkerRole::Speech, &speech.0),
+        ],
+    )?;
     runtime_manager.0.snapshot()
 }
 
@@ -4892,6 +4969,7 @@ pub fn search_start(
     catalog: State<'_, CatalogServiceState>,
     models: State<'_, ModelServiceState>,
     worker: State<'_, WorkerServiceState>,
+    sidecars: State<'_, SidecarRegistryState>,
     generation: State<'_, GenerationServiceState>,
     runtime_manager: State<'_, RuntimeManagerState>,
 ) -> Result<SearchSession, AppError> {
@@ -5016,7 +5094,7 @@ pub fn search_start(
             .map(|parent| parent.join("tokenizer.json"));
         if embedding_runtime_lease.is_some()
             && let Some(tokenizer_path) = tokenizer_path
-            && let Ok(response) = worker.client.encode_embeddings(&EmbeddingRequest {
+            && let Ok(response) = sidecars.0.onnx.encode_embeddings(&EmbeddingRequest {
                 model_path: artifact.local_path,
                 tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
                 texts: vec![request.query.clone()],
@@ -5135,7 +5213,7 @@ pub fn ask_start(
     app: AppHandle,
     catalog: State<'_, CatalogServiceState>,
     models: State<'_, ModelServiceState>,
-    worker: State<'_, WorkerServiceState>,
+    sidecars: State<'_, SidecarRegistryState>,
     generation: State<'_, GenerationServiceState>,
     runtime_manager: State<'_, RuntimeManagerState>,
 ) -> Result<OperationHandle, AppError> {
@@ -5165,7 +5243,7 @@ pub fn ask_start(
         }),
     );
     let cancelled = Arc::new(AtomicBool::new(false));
-    let ask_worker = worker.client.isolated();
+    let ask_worker = sidecars.0.onnx.isolated();
     let handle = OperationHandle {
         operation_id,
         kind: "ask",
@@ -7836,7 +7914,8 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
                     return Ok(false);
                 }
             };
-            let response = match worker.client.encode_embeddings(&EmbeddingRequest {
+            let onnx_worker = app.state::<SidecarRegistryState>().0.onnx.clone();
+            let response = match onnx_worker.encode_embeddings(&EmbeddingRequest {
                 model_path: artifact.local_path.clone(),
                 tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
                 texts: chunks.iter().map(|chunk| chunk.text.clone()).collect(),

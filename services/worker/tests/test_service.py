@@ -37,6 +37,63 @@ class WorkerServiceTests(unittest.TestCase):
         self.assertIn("speech", response.result["runtime"])
         self.assertIn("ocr", response.result["runtime"])
 
+    def test_sidecar_roles_only_support_their_operations(self) -> None:
+        # 每个角色进程只注册本角色需要的操作：ONNX sidecar 不得 import
+        # sherpa/paddle，解析 sidecar 不得加载模型缓存。
+        cases = [
+            ("parse", ["health.check", "document.probe", "document.parse", "export.write"]),
+            ("onnx", ["health.check", "embedding.encode", "rerank.score"]),
+            ("ocr", ["health.check", "ocr.self_test", "ocr.recognize"]),
+            ("speech", ["health.check", "speech.asr_self_test", "speech.recognize",
+                        "speech.tts_self_test", "speech.synthesize"]),
+        ]
+        for role, supported in cases:
+            service = WorkerService(role)
+            for operation in supported:
+                self.assertTrue(
+                    service.supports(operation),
+                    f"{role} 应支持 {operation}",
+                )
+            for operation in ["document.parse", "embedding.encode", "ocr.recognize",
+                              "speech.recognize", "rerank.score"]:
+                if operation not in supported:
+                    self.assertFalse(
+                        service.supports(operation),
+                        f"{role} 不应支持 {operation}",
+                    )
+                    response = service.handle(WorkerRequest(REQUEST_IDS[0], operation))
+                    self.assertFalse(response.ok)
+                    self.assertEqual(response.error.code, "OPERATION_UNSUPPORTED")
+
+    def test_sidecar_roles_probe_only_their_backend(self) -> None:
+        # 角色进程只探测自己的运行库（无论本机是否安装成功）：
+        # onnx → 仅 onnxruntime；speech → 仅 sherpa_onnx；ocr → 仅 rapidocr。
+        # 后端未安装时 ok=False 且 code 固定，已安装时 loaded 只含本角色包。
+        cases = {
+            "onnx": {"onnxruntime"},
+            "speech": {"sherpa_onnx"},
+            "ocr": {"rapidocr"},
+        }
+        for role, expected_packages in cases.items():
+            service = WorkerService(role)
+            response = service.handle(WorkerRequest(REQUEST_IDS[0], "runtime.backend_probe"))
+            self.assertIn(response.ok, (True, False))
+            if response.ok:
+                self.assertEqual(set(response.result["loaded"]), expected_packages)
+            else:
+                self.assertEqual(response.error.code, "RUNTIME_BACKEND_UNAVAILABLE")
+
+    def test_unknown_role_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "未知 worker 角色"):
+            WorkerService("generation")
+        response = self.service.handle(WorkerRequest(REQUEST_IDS[0], "health.check"))
+        self.assertTrue(response.ok)
+        self.assertEqual(response.result["status"], "ready")
+        self.assertEqual(response.result["protocol_version"], "1.2")
+        self.assertIn("onnx", response.result["runtime"])
+        self.assertIn("speech", response.result["runtime"])
+        self.assertIn("ocr", response.result["runtime"])
+
     def test_probe_is_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "资料.txt"

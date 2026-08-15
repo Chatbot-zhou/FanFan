@@ -15,8 +15,8 @@ use commands::{
     app_data::{
         self, AskCoordinatorState, CatalogServiceState, EnvironmentServiceState,
         GenerationServiceState, ModelDownloadCoordinatorState, ModelServiceState,
-        RuntimeManagerState, ScanCoordinatorState, SpeechWorkerState, WatcherServiceState,
-        WorkerServiceState,
+        RuntimeManagerState, ScanCoordinatorState, SidecarClients, SidecarRegistryState,
+        SpeechWorkerState, WatcherServiceState, WorkerServiceState,
     },
     startup::{StartupServiceState, StartupState},
     theme::ThemeServiceState,
@@ -24,7 +24,7 @@ use commands::{
 };
 use fanfan_core::{
     CatalogService, IncrementalWatchManager, LocalGenerationRuntime, ModelManager,
-    RuntimeCapability, ThemeService, WelcomeService, WorkerClient,
+    RuntimeCapability, ThemeService, WelcomeService, WorkerClient, WorkerRole,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -69,6 +69,9 @@ pub fn run() {
                     .pause_all();
                 let worker = window.app_handle().state::<WorkerServiceState>();
                 worker.client.cancel_active();
+                let sidecars = window.app_handle().state::<SidecarRegistryState>();
+                sidecars.0.onnx.cancel_active();
+                sidecars.0.ocr.cancel_active();
                 let speech_worker = window.app_handle().state::<SpeechWorkerState>();
                 speech_worker.0.cancel_active();
                 let runtime_manager = window.app_handle().state::<RuntimeManagerState>();
@@ -163,15 +166,25 @@ pub fn run() {
                     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../services/worker");
                 WorkerClient::from_environment(worker_root)
             };
-            let speech_worker = worker_client.isolated();
+            // 独立 sidecar：parse（文档解析/导出）由 WorkerServiceState 承载，
+            // onnx（embedding/rerank）/ocr（RapidOCR）/speech（sherpa-onnx）
+            // 各用一个独立进程，崩溃互不拖累、按角色独立回收。
+            let parse_worker = worker_client.clone().with_role(WorkerRole::Parse);
+            let onnx_worker = worker_client.clone().with_role(WorkerRole::Onnx);
+            let ocr_worker = worker_client.clone().with_role(WorkerRole::Ocr);
+            let speech_worker = worker_client.with_role(WorkerRole::Speech);
             app.manage(WorkerServiceState {
-                client: worker_client,
+                client: parse_worker,
                 running: AtomicBool::new(false),
                 embedding_running: AtomicBool::new(false),
                 embedding_reschedule: AtomicBool::new(false),
                 vision_running: AtomicBool::new(false),
                 foreground_activity: std::sync::atomic::AtomicU32::new(0),
             });
+            app.manage(SidecarRegistryState(Arc::new(SidecarClients {
+                onnx: onnx_worker,
+                ocr: ocr_worker,
+            })));
             app.manage(SpeechWorkerState(speech_worker));
             let runtime_manager: RuntimeManagerState = app_data::create_runtime_manager_state();
             let runtime_event_manager = runtime_manager.0.clone();

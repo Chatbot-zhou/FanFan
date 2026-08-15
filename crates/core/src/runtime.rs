@@ -392,6 +392,26 @@ impl RuntimeManager {
         Ok(())
     }
 
+    /// 同步 sidecar 进程的实时观测（内存/存活），已存在的实例只更新
+    /// 观测字段并保持首次加载时间；进程死亡时用 unregister 清除。
+    pub fn sync_instance(&self, instance: RuntimeInstanceState) -> Result<(), AppError> {
+        let mut state = self.inner.state.lock().map_err(|_| runtime_lock_error())?;
+        if let Some(existing) = state.instances.get_mut(&instance.instance_id) {
+            existing.memory_bytes = instance.memory_bytes;
+            existing.gpu_memory_bytes = instance.gpu_memory_bytes;
+            existing.status = instance.status;
+            existing.last_used_at = Utc::now();
+            return Ok(());
+        }
+        state.instances.insert(instance.instance_id, instance);
+        Ok(())
+    }
+
+    pub fn unregister_instance(&self, instance_id: &Uuid) -> Result<bool, AppError> {
+        let mut state = self.inner.state.lock().map_err(|_| runtime_lock_error())?;
+        Ok(state.instances.remove(instance_id).is_some())
+    }
+
     pub fn touch_instance(&self, instance_id: &Uuid) -> Result<bool, AppError> {
         let mut state = self.inner.state.lock().map_err(|_| runtime_lock_error())?;
         let Some(instance) = state.instances.get_mut(instance_id) else {
@@ -675,5 +695,60 @@ mod tests {
             manager.reap_idle_instances(Utc::now()).unwrap(),
             vec![instance_id]
         );
+    }
+
+    #[test]
+    fn sync_instance_updates_observations_but_keeps_loaded_at() {
+        let manager = manager();
+        let instance_id = Uuid::now_v7();
+        let loaded_at = Utc::now() - chrono::Duration::minutes(5);
+        let mut instance = RuntimeInstanceState {
+            instance_id,
+            backend: RuntimeBackendKind::OnnxRuntime,
+            model_id: None,
+            device: "cpu".into(),
+            status: "running".into(),
+            memory_bytes: 1,
+            gpu_memory_bytes: 0,
+            idle_timeout_seconds: 60,
+            loaded_at,
+            last_used_at: loaded_at,
+        };
+        manager.register_instance(instance.clone()).expect("register");
+        instance.memory_bytes = 2_000_000_000;
+        instance.status = "idle".into();
+        manager.sync_instance(instance.clone()).expect("sync");
+        let snapshot = manager.snapshot().expect("snapshot");
+        let found = snapshot
+            .instances
+            .iter()
+            .find(|entry| entry.instance_id == instance_id)
+            .expect("instance exists");
+        assert_eq!(found.memory_bytes, 2_000_000_000);
+        assert_eq!(found.status, "idle");
+        assert_eq!(found.loaded_at, loaded_at);
+    }
+
+    #[test]
+    fn unregister_instance_removes_entry() {
+        let manager = manager();
+        let instance_id = Uuid::now_v7();
+        manager
+            .register_instance(RuntimeInstanceState {
+                instance_id,
+                backend: RuntimeBackendKind::SherpaOnnx,
+                model_id: None,
+                device: "cpu".into(),
+                status: "running".into(),
+                memory_bytes: 1,
+                gpu_memory_bytes: 0,
+                idle_timeout_seconds: 60,
+                loaded_at: Utc::now(),
+                last_used_at: Utc::now(),
+            })
+            .expect("register");
+        assert!(manager.unregister_instance(&instance_id).unwrap());
+        assert!(!manager.unregister_instance(&instance_id).unwrap());
+        assert!(manager.snapshot().unwrap().instances.is_empty());
     }
 }

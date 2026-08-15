@@ -27,9 +27,46 @@ from .paddle_ocr import (
 
 
 class WorkerService:
-    """只执行已注册、无副作用的最小操作。"""
+    """只执行已注册、无副作用的最小操作。
+
+    sidecar 角色（parse/onnx/ocr/speech）只注册本角色需要的操作，让各进程
+    只 import 自己的依赖：ONNX sidecar 不加载 sherpa/paddle，崩溃互不拖累，
+    模型缓存内存互不共享、各自回收。
+    """
+
+    ROLES = ("parse", "onnx", "ocr", "speech")
+
+    def __init__(self, role: str | None = None) -> None:
+        if role is not None and role not in self.ROLES:
+            raise ValueError(f"未知 worker 角色: {role}")
+        self.role = role
+
+    def supports(self, operation: str) -> bool:
+        if self.role is None:
+            return True
+        if operation in {"health.check"}:
+            return True
+        if operation.startswith("document.") or operation == "export.write":
+            return self.role == "parse"
+        if operation in {"embedding.encode", "rerank.score"}:
+            return self.role == "onnx"
+        if operation.startswith("ocr."):
+            return self.role == "ocr"
+        if operation.startswith("speech."):
+            return self.role == "speech"
+        if operation.startswith("runtime."):
+            # runtime.cache_* 只清理本角色进程内持有的会话缓存。
+            return True
+        return False
 
     def handle(self, request: WorkerRequest) -> WorkerResponse:
+        if not self.supports(request.operation):
+            return WorkerResponse(
+                request_id=request.request_id,
+                ok=False,
+                result=None,
+                error=WorkerError("OPERATION_UNSUPPORTED", "操作未注册", False),
+            )
         if request.operation == "health.check":
             return WorkerResponse(
                 request_id=request.request_id,
@@ -37,11 +74,8 @@ class WorkerService:
                 result={
                     "status": "ready",
                     "protocol_version": "1.2",
-                    "runtime": {
-                        "onnx": cache_snapshot(),
-                        "speech": speech_cache_snapshot(),
-                        "ocr": ocr_cache_snapshot(),
-                    },
+                    "role": self.role,
+                    "runtime": self._runtime_snapshot(),
                 },
                 error=None,
             )
@@ -49,7 +83,7 @@ class WorkerService:
             return WorkerResponse(
                 request_id=request.request_id,
                 ok=True,
-                result=cache_snapshot(),
+                result=self._cache_snapshot_by_role(),
                 error=None,
             )
         if request.operation == "runtime.backend_probe":
@@ -58,7 +92,7 @@ class WorkerService:
             return WorkerResponse(
                 request_id=request.request_id,
                 ok=True,
-                result={"cleared_sessions": clear_sessions() + clear_speech_sessions() + clear_ocr_session()},
+                result={"cleared_sessions": self._clear_sessions_by_role()},
                 error=None,
             )
         if request.operation == "speech.asr_self_test":
@@ -173,13 +207,61 @@ class WorkerService:
             error=None,
         )
 
-    @staticmethod
-    def _runtime_backend_probe(request: WorkerRequest) -> WorkerResponse:
-        packages = {
-            "onnxruntime": "onnxruntime",
-            "rapidocr": "rapidocr",
-            "sherpa_onnx": "sherpa-onnx",
+    def _runtime_snapshot(self) -> dict:
+        if self.role == "onnx":
+            return {"onnx": cache_snapshot()}
+        if self.role == "ocr":
+            return {"ocr": ocr_cache_snapshot()}
+        if self.role == "speech":
+            return {"speech": speech_cache_snapshot()}
+        if self.role == "parse":
+            return {}
+        return {
+            "onnx": cache_snapshot(),
+            "speech": speech_cache_snapshot(),
+            "ocr": ocr_cache_snapshot(),
         }
+
+    def _cache_snapshot_by_role(self) -> dict:
+        if self.role == "onnx":
+            return cache_snapshot()
+        if self.role == "ocr":
+            return ocr_cache_snapshot()
+        if self.role == "speech":
+            return speech_cache_snapshot()
+        if self.role == "parse":
+            return {"backend": "parse", "session_count": 0}
+        return {
+            "onnx": cache_snapshot(),
+            "speech": speech_cache_snapshot(),
+            "ocr": ocr_cache_snapshot(),
+        }
+
+    def _clear_sessions_by_role(self) -> int:
+        if self.role == "onnx":
+            return clear_sessions()
+        if self.role == "ocr":
+            return clear_ocr_session()
+        if self.role == "speech":
+            return clear_speech_sessions()
+        if self.role == "parse":
+            return 0
+        return clear_sessions() + clear_speech_sessions() + clear_ocr_session()
+
+    def _runtime_backend_probe(self, request: WorkerRequest) -> WorkerResponse:
+        packages: dict[str, str] = {}
+        if self.role is None:
+            packages = {
+                "onnxruntime": "onnxruntime",
+                "rapidocr": "rapidocr",
+                "sherpa_onnx": "sherpa-onnx",
+            }
+        elif self.role == "onnx":
+            packages = {"onnxruntime": "onnxruntime"}
+        elif self.role == "ocr":
+            packages = {"rapidocr": "rapidocr"}
+        elif self.role == "speech":
+            packages = {"sherpa_onnx": "sherpa-onnx"}
         loaded: dict[str, dict[str, str]] = {}
         try:
             for module_name, distribution_name in packages.items():
