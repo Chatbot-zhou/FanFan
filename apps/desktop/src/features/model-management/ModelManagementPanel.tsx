@@ -44,6 +44,8 @@ export function ModelManagementPanel() {
   const [installSource, setInstallSource] = useState<"huggingface" | "modelscope">("huggingface");
   const [pendingDownloadActions, setPendingDownloadActions] = useState<Record<string, ModelDownloadAction>>({});
   const [downloadActionErrors, setDownloadActionErrors] = useState<Record<string, string>>({});
+  // 当前正在加载/自检的组件 id：只让被点击的那个模型按钮进入忙碌状态，其他模型保持可用。
+  const [activatingId, setActivatingId] = useState<string | null>(null);
   const artifacts = useQuery({ queryKey: ["model-artifacts"], queryFn: () => bridge.model_artifact_list() });
   const roleConfigs = useQuery({ queryKey: ["model-role-configs"], queryFn: () => bridge.model_role_config_list() });
   const roleCatalog = useQuery({ queryKey: ["model-role-catalog"], queryFn: () => bridge.model_role_catalog_list() });
@@ -161,7 +163,10 @@ export function ModelManagementPanel() {
         if (!await confirmAction({ actionKey: "embedding_replace_confirm", title: "再次确认更换 Embedding", description: "重建可能持续较长时间并占用额外磁盘；只有新索引完整校验通过后才会原子切换，失败会保留旧索引。", confirmLabel: "确认更换", danger: true, confirmPhrase: "REBUILD_EMBEDDING_INDEX" })) return;
       } else if (!await confirmAction({ actionKey: "embedding_activate", title: "启用这个 Embedding？", description: "翻翻会在后台建立语义索引；期间文件名、全文搜索和预览继续可用。", confirmLabel: "启用并建立索引" })) return;
     }
-    activate.mutate(artifactId);
+    setActivatingId(artifactId);
+    activate.mutate(artifactId, {
+      onSettled: () => setActivatingId(null),
+    });
   };
 
   const openInstallDialog = (entry: NonNullable<typeof roleCatalog.data>[number]) => {
@@ -273,7 +278,7 @@ export function ModelManagementPanel() {
           const activatable = ((artifact.role === "embedding" || artifact.role === "reranker" || artifact.role === "tts" || artifact.role === "asr") && artifact.format === "onnx") || ((artifact.role === "generation" || artifact.role === "vision") && artifact.format === "gguf");
           const roleName = artifact.role === "generation" ? "问答基础模型" : artifact.role === "embedding" ? "Embedding" : artifact.role === "vision" ? "多模态模型" : artifact.role === "reranker" ? "Rerank" : artifact.role === "tts" ? "语音合成" : artifact.role === "asr" ? "语音识别" : "OCR";
           const inUse = roleConfigs.data?.some((config) => config.active_artifact_id === artifact.artifact_id) ?? false;
-          return <article key={artifact.artifact_id}><span className={`model-status-dot${inUse ? " model-status-dot--active" : ""}`} title={inUse ? "正在使用" : "未使用"} /><div><strong>{artifact.model_id}</strong><small>{roleName} · {artifact.format.toUpperCase()} · {(artifact.size_bytes / 1024 / 1024).toFixed(1)} MB{artifact.embedding_dimension ? ` · ${artifact.embedding_dimension}维` : ""}</small></div>{activatable ? <button type="button" disabled={activate.isPending} onClick={() => void activateModel(artifact.artifact_id, artifact.role)}>{activate.isPending ? "正在加载与自检" : artifact.role === "generation" ? "加载并启用" : artifact.role === "vision" ? "自检并启用图片理解" : artifact.role === "reranker" ? "自检并启用重排" : artifact.role === "tts" || artifact.role === "asr" ? "自检并启用" : artifact.embedding_dimension ? "重建并切换索引" : "自检并建立索引"}</button> : <span>{artifact.role === "ocr" ? "使用 Windows OCR" : "当前格式不受支持"}</span>}</article>;
+          return <article key={artifact.artifact_id}><span className={`model-status-dot${inUse ? " model-status-dot--active" : ""}`} title={inUse ? "正在使用" : "未使用"} /><div><strong>{artifact.model_id}</strong><small>{roleName} · {artifact.format.toUpperCase()} · {(artifact.size_bytes / 1024 / 1024).toFixed(1)} MB{artifact.embedding_dimension ? ` · ${artifact.embedding_dimension}维` : ""}</small></div>{activatable ? <button type="button" disabled={activatingId === artifact.artifact_id} onClick={() => void activateModel(artifact.artifact_id, artifact.role)}>{activatingId === artifact.artifact_id ? "正在加载与自检" : artifact.role === "generation" ? "加载并启用" : artifact.role === "vision" ? "自检并启用图片理解" : artifact.role === "reranker" ? "自检并启用重排" : artifact.role === "tts" || artifact.role === "asr" ? "自检并启用" : artifact.embedding_dimension ? "重建并切换索引" : "自检并建立索引"}</button> : <span>{artifact.role === "ocr" ? "使用 Windows OCR" : "当前格式不受支持"}</span>}</article>;
         })}
         {activate.isError && <p role="alert" className="inline-error">{errorMessage(activate.error)}</p>}
       </section>}
