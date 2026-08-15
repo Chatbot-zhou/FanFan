@@ -167,11 +167,13 @@ export function SettingsPage({ initialTab }: { initialTab?: SettingsTab }) {
 
   return (
     <section className="page">
-      <header className="page-heading"><div><h1>设置</h1><p>管理资料位置、本地模型、索引和异常恢复。</p></div></header>
       {error && <p role="alert" className="inline-error">{error}</p>}{message && <p className="inline-success">{message}</p>}
       <div className="settings-grid">
-        <aside className="settings-nav">
-          <button type="button" className={tab === "roots" ? "active" : ""} onClick={() => setTab("roots")}>资料目录</button><button type="button" className={tab === "models" ? "active" : ""} onClick={() => setTab("models")}>本地模型</button><button type="button" className={tab === "index" ? "active" : ""} onClick={() => setTab("index")}>索引与存储</button><button type="button" className={tab === "appearance" ? "active" : ""} onClick={() => setTab("appearance")}>外观与辅助功能</button><button type="button" className={tab === "logs" ? "active" : ""} onClick={() => setTab("logs")}>日志与恢复</button><button type="button" className={tab === "node-traces" ? "active" : ""} onClick={() => setTab("node-traces")}>节点追踪</button>
+        <aside className="settings-side">
+          <header className="page-heading settings-side__heading"><h1>设置</h1></header>
+          <nav className="settings-nav">
+            <button type="button" className={tab === "roots" ? "active" : ""} onClick={() => setTab("roots")}>资料目录</button><button type="button" className={tab === "models" ? "active" : ""} onClick={() => setTab("models")}>本地模型</button><button type="button" className={tab === "index" ? "active" : ""} onClick={() => setTab("index")}>索引与存储</button><button type="button" className={tab === "appearance" ? "active" : ""} onClick={() => setTab("appearance")}>外观与辅助功能</button><button type="button" className={tab === "logs" ? "active" : ""} onClick={() => setTab("logs")}>日志与恢复</button><button type="button" className={tab === "node-traces" ? "active" : ""} onClick={() => setTab("node-traces")}>节点追踪</button>
+          </nav>
         </aside>
         <div className="settings-content">
           {tab === "index" && <section><h2>自适应存储空间</h2><p>翻翻根据当前磁盘容量自动计算软配额（容量的10%，最低10GB、最高50GB），无需手动设置。达到配额后会暂停可恢复的后台增强任务，搜索和预览仍可使用。</p><div className="metric-strip"><span><strong>{storage.data ? bytes(storage.data.total_bytes) : "—"}</strong>当前占用</span><span><strong>{storage.data ? bytes(storage.data.soft_quota_bytes) : "—"}</strong>自适应配额</span><span><strong>{storage.data?.disk_available_bytes != null ? bytes(storage.data.disk_available_bytes) : "—"}</strong>磁盘可用</span></div>{storage.data?.notice && <p role="status" className="inline-error">{storage.data.notice}</p>}<small>应用管理目录：{storage.data?.data_directory ?? "正在读取"}</small></section>}
