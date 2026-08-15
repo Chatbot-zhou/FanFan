@@ -27,21 +27,38 @@ pub struct TimeHint {
 
 /// 构建查询改写 prompt。只输出 JSON，不输出其他内容。
 pub fn query_understanding_prompt(query: &str, today: &str) -> (String, String) {
+    // 手册要点：字段规则 + 完整输出示例（模型复读示例比读字段定义可靠）。
+    // 示例用「去年的报表」覆盖时间指代与口语词去除两种最常出错的改写。
     let system =
-        "你是查询理解助手。只输出JSON，不要输出其他任何文字、解释或 markdown 标记。".into();
+        "你是查询理解助手。把自然语言查询转成检索参数，只输出JSON，不要解释或多余文字。".into();
     let user = format!(
-        r#"将自然语言问题转换为结构化检索参数。只输出JSON：
+        r#"【输出格式】
 {{"rewritten_query":"核心关键词","time_hint":null或{{"from":"YYYY-MM-DD","to":"YYYY-MM-DD"}},"extension_hints":["docx","pdf"]}}
-- rewritten_query: 去除口语词（"那个""在哪里""帮我找"），保留核心检索关键词
-- time_hint: 解析时间指代（"去年""上个月""2025年"），以当前日期 {today} 为基准，仅当明确时才设置
-- extension_hints: 用户提到的文件格式（"word文档"→docx,"excel表格"→xlsx,"ppt"→pptx,"pdf"→pdf）
-若查询已经是关键词则照写 rewritten_query，未提及的字段用 null 或空数组。
+- rewritten_query：去除口语词（"那个""在哪里""帮我找"），保留核心检索关键词
+- time_hint：解析时间指代（"去年""上个月""2025年"），以当前日期 {today} 为基准，仅当明确时才设置
+- extension_hints：用户提到的文件格式（"word文档"→docx，"excel表格"→xlsx，"ppt"→pptx，"pdf"→pdf）
+查询已经是关键词则 rewritten_query 照写；未提及的字段用 null 或空数组。
+
+【示例】
+查询：帮我找找去年那个财务的报表
+输出：{{"rewritten_query":"财务报表","time_hint":{{"from":"{last_year}","to":"{today}"}},"extension_hints":["xlsx","pdf"]}}
 
 查询：{query}"#,
         today = today,
+        last_year = last_year_of(today),
         query = query
     );
     (system, user)
+}
+
+/// 计算 today（YYYY-MM-DD）对应的去年同日，仅用于查询理解示例。
+/// 解析失败回退 today（示例不参与实际检索，只展示 JSON 形状）。
+fn last_year_of(today: &str) -> String {
+    let year = today.split('-').next().and_then(|part| part.parse::<i32>().ok());
+    match year {
+        Some(year) => format!("{}-{}", year - 1, today.get(5..).unwrap_or("01-01")),
+        None => today.to_owned(),
+    }
 }
 
 /// 解析生成模型返回的 JSON 为 QueryIntent，失败时用原始查询回退
@@ -507,21 +524,32 @@ pub fn generation_prompt(
         })
         .collect::<Vec<_>>()
         .join("\n");
+    // 结构化分区（手册：标题/分隔符区分不同部分，避免指令与示例混淆）。
+    // 输出约束用编号列成要点，正面指令优先；示例放最后紧邻输出位置。
     let mut prompt = String::new();
     let folded = fold_recent_history(history, 5, 5);
     if !folded.is_empty() {
         prompt.push_str(&format!(
-            "对话历史（仅作理解前文，不能作为新证据；回答中出现的来源编号只对应当前问题的可用证据）：\n{folded}\n\n"
+            "【对话历史】\n{folded}\n\
+             说明：历史仅作理解前文，不能作为新证据；回答中出现的来源编号只对应当前问题的可用证据。\n\n"
         ));
     }
     prompt.push_str(&format!(
-        "问题：{}\n\n可用证据：\n{}\n\n\
-把证据整理成一段通顺、自然的中文回答，直接回答用户的问题。用自己的话改写证据内容，不要照抄原文；回答按逻辑分成 2-8 条 claim（每条一到两句），每条 claim 在 citation_ids 中列出直接支持它的 S 编号。改写时保留关键数字和专有名词。回答中出现的每个事实都必须能从可用证据中找到依据，不得凭空编造或补充外部知识。不得使用不存在的编号，不得把对话历史当作证据。每条证据中的【上文】/【下文】只是命中块在原文中的邻近文本，仅用于帮助你理解正文证据的语境，不得作为引用来源。证据不足时 claims 为空，并在 refusal 中说明“当前资料中未找到足够依据”。只输出符合指定 JSON Schema 的对象，不要输出 Markdown、代码块或解释。\n\n\
-参考示例一（证据充足时的润色输出）：\n\
+        "【问题】\n{}\n\n【可用证据】\n{}\n\n\
+【回答要求】\n\
+1. 把证据整理成一段通顺、自然的中文回答，直接回答用户的问题；用自己的话改写证据内容，不要照抄原文。\n\
+2. 回答按逻辑分成 2-8 条 claim（每条一到两句），每条 claim 在 citation_ids 中列出直接支持它的 S 编号。\n\
+3. 改写时保留关键数字和专有名词。\n\
+4. 回答中出现的每个事实都必须能从可用证据中找到依据，不得凭空编造或补充外部知识。\n\
+5. 不得使用不存在的编号，不得把对话历史当作证据。每条证据中的【上文】/【下文】只是命中块在原文中的邻近文本，仅用于帮助你理解正文证据的语境，不得作为引用来源。\n\
+6. 证据不足时 claims 为空，并在 refusal 中说明“当前资料中未找到足够依据”。\n\
+7. 只输出符合指定 JSON Schema 的对象，不要输出 Markdown、代码块或解释。\n\n\
+【参考示例】\n\
+示例一（证据充足时的润色输出）：\n\
 问题：公司年假政策是什么？\n\
 可用证据：\n[S1] 入职满一年后每年享有 5 天带薪年假，工龄每增加一年增加 1 天，上限 15 天。\n[S2] 年假需在每年 3 月底前休完，未休部分可顺延至次年 6 月，但最多顺延 5 天。\n\
 输出：{{\"claims\":[{{\"text\":\"入职满一年后，员工每年可享受 5 天带薪年假，工龄每增加一年就多 1 天，最多不超过 15 天。\",\"citation_ids\":[\"S1\"]}},{{\"text\":\"年假原则上需在次年 3 月底前用完，未休完的部分最多可顺延 5 天至次年 6 月。\",\"citation_ids\":[\"S1\",\"S2\"]}}],\"refusal\":null}}\n\n\
-参考示例二（证据不足时的拒绝输出）：\n\
+示例二（证据不足时的拒绝输出）：\n\
 问题：公司加班补贴标准是多少？\n\
 可用证据：\n[S1] 本周三下午三点在会议室三召开部门季度总结会。\n\
 输出：{{\"claims\":[],\"refusal\":\"当前资料中未找到足够依据\"}}\n\n\
@@ -673,10 +701,15 @@ pub fn intent_routing_prompt(question: &str, history: &[AskMessage]) -> (String,
     let mut user = String::new();
     let folded = fold_recent_history(history, 5, 5);
     if !folded.is_empty() {
-        user.push_str(&format!("最近的对话（用于判断当前问题是否延续上文）：\n{folded}\n\n"));
+        user.push_str(&format!(
+            "【对话历史】以下是最近 5 条对话的历史记录（用于判断当前问题是否延续上文），不是用户现在说的话：\n{folded}\n\n"
+        ));
     }
     user.push_str(&format!(
-        r#"判断用户这句话是想「检索本地资料库」还是「闲聊」。
+        r#"【当前问题】下面这一句才是用户刚刚说的最新一句话，请只根据这一句判断意图：
+用户说：{question}
+
+判断用户这句话是想「检索本地资料库」还是「闲聊」。
 
 检索资料（retrieval）：想找文档、查数据、问制度流程、需要引用本地材料作答，或对之前检索过的资料继续追问。判断为检索时，将执行：检索本地资料库 → 按用户问题精排（Rerank）→ 结合检索结果与对话历史给出带引用的回答。例如：
 - 公司的报销流程是什么
@@ -691,8 +724,6 @@ pub fn intent_routing_prompt(question: &str, history: &[AskMessage]) -> (String,
 - 你最近怎么样
 
 只凭以上两类定义和这条消息本身判断，不要犹豫。如果无法确定，或更接近寒暄/延续闲聊，输出 {{"intent":"chat"}}。宁可闲聊也绝不误检索。
-
-用户说：{question}
 
 只输出：{{"intent":"retrieval"}} 或 {{"intent":"chat"}}"#,
         question = question.trim()
@@ -737,10 +768,15 @@ pub fn intent_routing_prompt_mini(question: &str, history: &[AskMessage]) -> (St
     let mut user = String::new();
     let folded = fold_recent_history(history, 5, 5);
     if !folded.is_empty() {
-        user.push_str(&format!("最近的对话：\n{folded}\n\n"));
+        user.push_str(&format!(
+            "【对话历史】以下是最近 5 条对话的历史记录，不是用户现在说的话：\n{folded}\n\n"
+        ));
     }
     user.push_str(&format!(
-        r#"判断用户这句话要不要查本地资料库：
+        r#"【当前问题】下面这一句才是用户刚刚说的最新一句话，只判断这一句：
+用户说：{question}
+
+判断用户这句话要不要查本地资料库：
 - 想查本地文档、资料、制度、流程、数据、合同、方案 → 检索
 - 其他一切（寒暄、闲聊、知识问答、天气、自我介绍、心情） → 闲聊
 
@@ -750,8 +786,6 @@ pub fn intent_routing_prompt_mini(question: &str, history: &[AskMessage]) -> (St
 - 今天天气怎么样 → 闲聊
 - 你是什么模型 → 闲聊
 
-用户说：{question}
-
 只输出：检索 或 闲聊。无法确定时输出闲聊。宁可闲聊也绝不误检索。"#,
         question = question.trim()
     ));
@@ -760,22 +794,34 @@ pub fn intent_routing_prompt_mini(question: &str, history: &[AskMessage]) -> (St
 
 /// 构建追问改写 prompt（极简，0.6B 友好）：历史折叠 5+5 段（非空时），
 /// 输出约束为行式——每行一个可直接检索的中文问题；已明确单一则原样输出。
-/// 0.6B 对行式续写比 JSON 数组格式容错更高。
+/// 0.6B 对行式续写比 JSON 数组格式容错更高。三类改写情形（指代补全/多问题
+/// 拆分/原样）各给一个示例——示例复读是 0.6B 的强项，光讲规则它做不到。
 pub fn query_rewrite_prompt(question: &str, history: &[AskMessage]) -> (String, String) {
-    let system = "你是问题改写助手。只输出问题，不要解释或多余文字。".into();
+    let system = "你是问题改写助手。把用户的话改写成能直接查资料的中文问题，一行一个，只输出问题，不要解释或多余文字。"
+        .into();
     let mut user = String::new();
     let folded = fold_recent_history(history, 5, 5);
     if !folded.is_empty() {
-        user.push_str(&format!("最近的对话：\n{folded}\n\n"));
+        user.push_str(&format!("【对话历史】\n{folded}\n\n"));
     }
+    user.push_str(
+        "【规则】\n\
+         - 一句话包含多个问题 → 每个问题各写一行\n\
+         - 问题指代了上文（如「那金额上限呢」）→ 补全成完整问题\n\
+         - 问题已经清楚明确 → 原样写一遍\n\
+         - 只输出问题行，不要解释\n\n\
+         【示例】\n\
+         用户：那金额上限呢？\n\
+         改写：报销金额的上限是多少？\n\n\
+         用户：讲讲报销流程和请假规定\n\
+         改写：报销流程是什么？\n\
+         请假规定有哪些？\n\n\
+         用户：去年的财务报表数据\n\
+         改写：去年的财务报表数据\n\n",
+    );
     user.push_str(&format!(
-        r#"把当前问题改写成可以直接查资料的中文问题。
-如果它包含多个问题，每行写一个。如果它引用了上文（如"那金额上限呢"），补全成完整问题。
-如果已经清楚明确，原样写一遍。
-只输出问题行，不要解释。
-
-当前问题：{question}"#,
-        question = question.trim()
+        "【当前问题】\n用户：{}\n改写：",
+        question.trim()
     ));
     (system, user)
 }
@@ -791,6 +837,12 @@ pub fn parse_rewritten_queries(raw: &str) -> Vec<String> {
             .trim_start_matches(|ch| matches!(ch, '-' | '•' | '·' | '#' | ' ' | '\t'))
             .trim_start_matches(|ch: char| ch.is_ascii_digit())
             .trim_start_matches(|ch| matches!(ch, '.' | '、' | ')' | '）' | ' '));
+        // 0.6B 复读「改写：」前缀时剥掉，只留问题本身
+        let line = line
+            .strip_prefix("改写：")
+            .or_else(|| line.strip_prefix("改写:"))
+            .unwrap_or(line)
+            .trim();
         if line.is_empty() || !seen.insert(line.to_owned()) {
             continue;
         }
@@ -806,13 +858,16 @@ pub fn parse_rewritten_queries(raw: &str) -> Vec<String> {
 /// 历史格式与 generation_prompt 一致（「用户：/翻翻：」，每条约 400 字），
 /// 最多折叠 5 轮（5 条用户 + 5 条模型回复）。
 pub fn chat_prompt(request: &AskRequest, history: &[AskMessage]) -> (String, String) {
-    let system =
-        "你是翻翻，用户本地资料库中的中文智能助手。当前是闲聊场景，不涉及资料检索，直接自然对话即可。回答简短、自然、友好。".to_owned();
+    // 角色 + 场景 + 行为三步（手册「角色+场景+结构」三要素）：
+    // 角色（翻翻/本地助手）→ 场景（闲聊、不检索）→ 行为（正面指令：直接
+    // 回答；约束：简短自然、不复读问题、不以「你好！我是翻翻」开场）。
+    let system = "你是翻翻，用户本地资料库中的中文智能助手。当前是闲聊场景，不涉及资料检索，直接自然对话即可。回答简短、自然、口语化，直接回答用户的问题，不要重复用户的话。".to_owned();
     let mut user = String::new();
     let folded = fold_recent_history(history, 5, 5);
     if !folded.is_empty() {
-        user.push_str(&format!("对话历史：\n{folded}\n\n"));
+        user.push_str(&format!("【对话历史】\n{folded}\n\n"));
     }
+    user.push_str("【当前问题】\n");
     user.push_str(&format!("用户：{}", request.question.trim()));
     (system, user)
 }
@@ -823,15 +878,19 @@ pub fn chat_prompt(request: &AskRequest, history: &[AskMessage]) -> (String, Str
 /// 5+5 历史后接 4 条「用户：/翻翻：」示例（直接对应实测失败句与寒暄高频
 /// 场景），示例紧邻输出位置，最后以「用户：{q}\n翻翻：」结尾引导续写。
 pub fn chat_prompt_mini(question: &str, history: &[AskMessage]) -> (String, String) {
-    let system = "你是翻翻，一个中文助手。直接回答用户的问题，不要重复用户说的话，不要说「你好！我是翻翻」。"
-        .to_owned();
+    // 正面指令优先（手册：说「要做什么」比「不要做什么」有效）：
+    // 只定义「直接回答」，不罗列「不要复读/不要自我介绍」等否定项。
+    let system =
+        "你是翻翻，一个中文助手。用简短、自然、口语化的话直接回答用户的问题，一两句就好。".to_owned();
     let mut user = String::new();
     let folded = fold_recent_history(history, 5, 5);
     if !folded.is_empty() {
-        user.push_str(&format!("对话历史：\n{folded}\n\n"));
+        user.push_str(&format!("【对话历史】\n{folded}\n\n"));
     }
+    // 示例紧邻输出位置，明确引用（「照下面示例的方式」），长度与语气约束
+    // 都通过示例本身表达——0.6B 复读示例比读指令更可靠。
     user.push_str(
-        "示例：\n\
+        "【示例】照下面示例的方式回答：\n\
          用户：你好\n\
          翻翻：你好呀，有什么想聊的？\n\
          用户：你是谁\n\
@@ -839,7 +898,8 @@ pub fn chat_prompt_mini(question: &str, history: &[AskMessage]) -> (String, Stri
          用户：今天天气怎么样\n\
          翻翻：这我还真不知道，我没有联网看天气的能力，你打开手机天气App看看更准。\n\
          用户：你别学我说话\n\
-         翻翻：好好好，不学你了。你有别的事想问我吗？\n\n",
+         翻翻：好好好，不学你了。你有别的事想问我吗？\n\n\
+         【现在】\n",
     );
     user.push_str(&format!("用户：{}\n翻翻：", question.trim()));
     (system, user)
@@ -1111,10 +1171,12 @@ mod tests {
         assert!(user.contains("今天天气怎么样 → 闲聊"));
         assert!(user.contains("你是什么模型 → 闲聊"));
         assert!(user.contains("公司的报销流程是什么 → 检索"));
-        // 5+5 历史段 + 当前问题 + 兜底句
-        assert!(user.contains("最近的对话"));
+        // 5+5 历史段（【对话历史】标记） + 当前问题（【当前问题】标记）+ 兜底句
+        assert!(user.contains("【对话历史】"));
+        assert!(user.contains("不是用户现在说的话"));
         assert!(user.contains("用户：你好"));
         assert!(user.contains("翻翻：你好！"));
+        assert!(user.contains("【当前问题】"));
         assert!(user.contains("用户说：报销流程是什么"));
         assert!(user.contains("宁可闲聊也绝不误检索"));
     }
@@ -1122,7 +1184,8 @@ mod tests {
     #[test]
     fn intent_routing_prompt_mini_empty_history_has_no_history_section() {
         let (_, user) = intent_routing_prompt_mini("今天天气怎么样", &[]);
-        assert!(!user.contains("最近的对话"));
+        assert!(!user.contains("【对话历史】"));
+        assert!(user.contains("【当前问题】"));
         assert!(user.contains("用户说：今天天气怎么样"));
     }
 
@@ -1131,13 +1194,16 @@ mod tests {
         let history = vec![message("user", "报销流程是什么"), message("assistant", "报销分三步。")];
         let (system, user) = query_rewrite_prompt("那金额上限呢", &history);
         assert!(system.contains("只输出问题"));
-        assert!(user.contains("最近的对话"));
-        assert!(user.contains("每行写一个"));
+        assert!(user.contains("【对话历史】"));
+        assert!(user.contains("每个问题各写一行"));
         assert!(user.contains("那金额上限呢"));
         assert!(user.contains("补全成完整问题"));
+        // 三类示例齐全（指代补全/多问题拆分/原样）——0.6B 靠示例复读而非读规则
+        assert!(user.contains("报销金额的上限是多少？"));
+        assert!(user.contains("讲讲报销流程和请假规定"));
         // 无历史时不带历史段
         let (_, user2) = query_rewrite_prompt("报销流程是什么", &[]);
-        assert!(!user2.contains("最近的对话"));
+        assert!(!user2.contains("【对话历史】"));
         assert!(user2.contains("原样写一遍"));
     }
 
@@ -1181,19 +1247,21 @@ mod tests {
         // 无历史时不出现历史段
         let (_, user2) = chat_prompt(&request(), &[]);
         assert!(!user2.contains("对话历史"));
-        assert!(user2.starts_with("用户："));
+        assert!(user2.starts_with("【当前问题】"));
     }
 
     #[test]
     fn chat_prompt_mini_has_examples_and_continuation_tail() {
         let history = vec![message("user", "你好"), message("assistant", "你好呀")];
         let (system, user) = chat_prompt_mini("今天天气怎么样", &history);
-        // system 不再有会被 0.6B 转述成自我介绍的长角色设定
+        // system 不再有会被 0.6B 转述成自我介绍的长角色设定；
+        // 按手册「正面指令优先」：说「直接回答」而非罗列否定项
         assert!(!system.contains("本地资料库"));
         assert!(!system.contains("中文智能助手"));
-        assert!(system.contains("不要重复用户说的话"));
+        assert!(system.contains("直接回答用户的问题"));
+        assert!(!system.contains("不要"));
         // 5+5 历史段保留
-        assert!(user.contains("对话历史："));
+        assert!(user.contains("【对话历史】"));
         assert!(user.contains("翻翻：你好呀"));
         // 4 条示例直接对应实测失败句（你是谁/天气/学我说话）与寒暄
         assert!(user.contains("用户：你是谁"));
@@ -1303,10 +1371,13 @@ mod tests {
         assert!(user.contains("Rerank"));
         assert!(user.contains("闲聊（chat）"));
         assert!(user.contains("直接自然对话回复，不检索"));
-        // 5+5 历史段（角色标注）
-        assert!(user.contains("最近的对话"));
+        // 5+5 历史段（【对话历史】标记，明确不是当前输入）+ 当前问题（【当前问题】标记）
+        assert!(user.contains("【对话历史】"));
+        assert!(user.contains("不是用户现在说的话"));
         assert!(user.contains("用户：你好"));
         assert!(user.contains("翻翻：你好！"));
+        assert!(user.contains("【当前问题】"));
+        assert!(user.contains("只根据这一句判断意图"));
         // JSON 输出约束与兜底句
         assert!(user.contains(r#"{"intent":"retrieval"}"#));
         assert!(user.contains(r#"{"intent":"chat"}"#));
@@ -1317,9 +1388,10 @@ mod tests {
     #[test]
     fn intent_routing_prompt_empty_history_has_no_history_section() {
         let (_, user) = intent_routing_prompt("今天天气怎么样", &[]);
-        // 历史段头部只在有历史时出现（「延续上文」为该段独有的标记）
+        // 历史段头部只在有历史时出现（【对话历史】为该段独有的标记）
+        assert!(!user.contains("【对话历史】"));
         assert!(!user.contains("延续上文"));
-        assert!(!user.contains("最近的对话"));
+        assert!(user.contains("【当前问题】"));
         assert!(user.contains("用户说：今天天气怎么样"));
     }
 
