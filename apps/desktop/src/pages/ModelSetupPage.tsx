@@ -217,16 +217,35 @@ export function ModelSetupPage() {
         </section>
         <section ref={poolRef} className="role-model-pool" aria-label="已验证模型选择池">
           <header><div><h2>{selectedRole === "generation" ? "问答基础模型" : selectedRole === "embedding" ? "Embedding 模型" : selectedRole === "vision" ? "多模态模型" : selectedRole === "ocr" ? "OCR 模型" : selectedRole === "tts" ? "语音合成模型" : selectedRole === "asr" ? "语音识别模型" : "Rerank 模型"}</h2></div><button type="button" onClick={() => setStep("import")}>导入本地模型</button></header>
-          <div className="role-model-grid">{roleCatalog.data?.filter((item) => item.role === selectedRole).map((item) => <article key={item.catalog_id} className={selectedCardId === item.catalog_id ? "selected" : ""} onClick={() => setSelectedCardId(item.catalog_id)}>
-            <div className="role-model-card__heading"><strong>{item.name}</strong></div>
-            {item.recommended && <em className="role-model-card__badge">推荐</em>}
-            <p>{item.description}</p>
-            <dl><div><dt>下载</dt><dd>{item.download_size_bytes ? formatBytes(item.download_size_bytes) : "本地导入"}</dd></div><div><dt>预计内存</dt><dd>{item.estimated_memory_gb} GB</dd></div><div><dt>预计显存</dt><dd>{item.estimated_vram_gb ? `${item.estimated_vram_gb} GB` : "不依赖"}</dd></div><div><dt>CPU速度</dt><dd>{item.cpu_speed}</dd></div></dl>
-            <ul>{item.strengths.map((value) => <li key={value}>{value}</li>)}</ul>
-            <small>{item.limitations.join("；")} · {item.license_name}</small>
-            <p className="role-model-card__fit">{item.device_guidance}</p>
-            <button type="button" className={selectedCardId === item.catalog_id ? "primary-button" : ""} disabled={startDownload.isPending} onClick={() => openInstallDialog(item)}>{item.install_edition_id ? "联网安装并自检" : "选择本地文件"}</button>
-          </article>)}</div>
+          <div className="role-model-grid">{(() => {
+            // 每个模型家族一张卡片，家族内所有尺寸/量化版本聚合成版本按钮：
+            // 家族名取 name 中“ · ”前段的第一个 token（如 “Qwen3 0.6B · …” → “Qwen3”），
+            // 尺寸取“ · ”前段去掉家族名的部分，量化取 model_id 最后一个 “-” 后的段。
+            const entries = roleCatalog.data?.filter((item) => item.role === selectedRole) ?? [];
+            const series = new Map<string, typeof entries>();
+            for (const item of entries) {
+              const family = (item.name.split(" · ")[0] ?? item.name).split(/\s+/)[0] ?? item.name;
+              const group = series.get(family);
+              if (group) { group.push(item); } else { series.set(family, [item]); }
+            }
+            return [...series.entries()].map(([familyName, versions]) => {
+              const selected = versions.find((item) => item.catalog_id === selectedCardId) ?? versions[0];
+              const isSelected = versions.some((item) => item.catalog_id === selectedCardId);
+              const sizeOf = (item: typeof entries[number]) => (item.name.split(" · ")[0] ?? item.name).replace(familyName, "").trim();
+              const quantOf = (item: typeof entries[number]) => item.model_id.split("-").at(-1) ?? "";
+              return <article key={familyName} className={isSelected ? "selected" : ""} onClick={versions.length === 1 ? () => setSelectedCardId(versions[0].catalog_id) : undefined}>
+                <div className="role-model-card__heading"><strong>{familyName}</strong></div>
+                {versions.some((item) => item.recommended) && <em className="role-model-card__badge">推荐</em>}
+                <p>{selected.description}</p>
+                {versions.length > 1 && <div className="role-model-card__versions">{versions.map((item) => <button key={item.catalog_id} type="button" className={item.catalog_id === selected.catalog_id ? "selected" : ""} onClick={() => setSelectedCardId(item.catalog_id)}>{[sizeOf(item), quantOf(item)].filter(Boolean).join(" · ")}{item.recommended && <em>推荐</em>}</button>)}</div>}
+                <dl><div><dt>下载</dt><dd>{selected.download_size_bytes ? formatBytes(selected.download_size_bytes) : "本地导入"}</dd></div><div><dt>预计内存</dt><dd>{selected.estimated_memory_gb} GB</dd></div><div><dt>预计显存</dt><dd>{selected.estimated_vram_gb ? `${selected.estimated_vram_gb} GB` : "不依赖"}</dd></div><div><dt>CPU速度</dt><dd>{selected.cpu_speed}</dd></div></dl>
+                <ul>{selected.strengths.map((value) => <li key={value}>{value}</li>)}</ul>
+                <small>{selected.limitations.join("；")} · {selected.license_name}</small>
+                <p className="role-model-card__fit">{selected.device_guidance}</p>
+                <button type="button" className={isSelected ? "primary-button" : ""} disabled={startDownload.isPending} onClick={() => openInstallDialog(selected)}>{selected.install_edition_id ? "联网安装并自检" : "选择本地文件"}</button>
+              </article>;
+            });
+          })()}</div>
           {roleCatalog.isError && <p role="alert" className="inline-error">{errorMessage(roleCatalog.error)}</p>}
         </section>
       </>}

@@ -198,6 +198,24 @@ fn recommend_for_role(
 pub fn built_in_model_catalog() -> Vec<ModelCatalogEntry> {
     vec![
         catalog_entry(
+            "qwen3-0.6b-q4",
+            ModelRole::Generation,
+            "Qwen3 0.6B · 更省内存",
+            "Qwen3-0.6B-Q4_K_M",
+            "最省内存的入门档，低配置设备也能流畅问答。",
+            &["下载最小", "CPU 响应最快", "低配设备首选"],
+            &["回答质量略低于 Q8_0 版本"],
+            Some(396_704_416),
+            1.5,
+            Some(0.9),
+            "快",
+            "Apache-2.0",
+            false,
+            "8GB 内存即可流畅运行；低配设备作为默认起点",
+            Some("generation_qwen3_0_6b_q4"),
+            &["huggingface", "modelscope"],
+        ),
+        catalog_entry(
             "qwen3-0.6b-q8",
             ModelRole::Generation,
             "Qwen3 0.6B · 省内存",
@@ -214,6 +232,24 @@ pub fn built_in_model_catalog() -> Vec<ModelCatalogEntry> {
             "8GB 内存可用；GPU 可进一步降低 CPU 占用",
             Some("generation_qwen3_0_6b"),
             &["huggingface", "modelscope"],
+        ),
+        catalog_entry(
+            "qwen3-1.7b-q4",
+            ModelRole::Generation,
+            "Qwen3 1.7B · 均衡省内存",
+            "Qwen3-1.7B-Q4_K_M",
+            "均衡档的更省内存选择，占用更低、响应更流畅。",
+            &["比 Q8_0 省约 40% 内存", "中文组织能力好"],
+            &["综合能力略低于 Q8_0", "仅提供 Hugging Face 下载源"],
+            Some(1_107_409_472),
+            3.0,
+            Some(1.8),
+            "中等",
+            "Apache-2.0",
+            false,
+            "10GB 内存优先；CUDA 可用时自动卸载到 GPU",
+            Some("generation_qwen3_1_7b_q4"),
+            &["huggingface"],
         ),
         catalog_entry(
             "qwen3-1.7b-q8",
@@ -249,6 +285,60 @@ pub fn built_in_model_catalog() -> Vec<ModelCatalogEntry> {
             false,
             "建议 12GB 以上内存；4GB 显存采用部分 GPU 卸载",
             Some("generation_qwen3_4b"),
+            &["huggingface", "modelscope"],
+        ),
+        catalog_entry(
+            "qwen3-4b-q8",
+            ModelRole::Generation,
+            "Qwen3 4B · 极致质量",
+            "Qwen3-4B-Q8_0",
+            "本地可用的最高质量档，适合内存充足的设备。",
+            &["质量最佳", "复杂综合与长答案更强"],
+            &["下载与内存占用大", "CPU 推理明显变慢"],
+            Some(4_280_404_704),
+            12.0,
+            Some(7.5),
+            "慢",
+            "Apache-2.0",
+            false,
+            "建议 16GB 以上内存；显存低于 8GB 时部分卸载到 CPU",
+            Some("generation_qwen3_4b_q8"),
+            &["huggingface", "modelscope"],
+        ),
+        catalog_entry(
+            "qwen3-8b-q4",
+            ModelRole::Generation,
+            "Qwen3 8B · 高质量省内存",
+            "Qwen3-8B-Q4_K_M",
+            "大参数模型的质量档，适合内存充足的设备。",
+            &["复杂推理质量高", "长文档综合更强"],
+            &["下载较大", "内存占用高"],
+            Some(5_027_783_488),
+            14.0,
+            Some(9.0),
+            "较慢",
+            "Apache-2.0",
+            false,
+            "建议 16GB 以上内存；显存低于 12GB 时部分卸载到 CPU",
+            Some("generation_qwen3_8b_q4"),
+            &["huggingface", "modelscope"],
+        ),
+        catalog_entry(
+            "qwen3-8b-q8",
+            ModelRole::Generation,
+            "Qwen3 8B · 极致质量",
+            "Qwen3-8B-Q8_0",
+            "本地可用的最高质量档，适合大内存工作站。",
+            &["本地最强问答质量", "长上下文组织最好"],
+            &["下载 8.7GB", "需要 24GB 以上内存"],
+            Some(8_709_518_112),
+            24.0,
+            Some(14.0),
+            "慢",
+            "Apache-2.0",
+            false,
+            "建议 32GB 内存；需要较大显存或依赖 CPU 卸载",
+            Some("generation_qwen3_8b_q8"),
             &["huggingface", "modelscope"],
         ),
         catalog_entry(
@@ -457,8 +547,13 @@ pub fn locked_download_artifact(model_id: &str, source: ModelSource) -> Option<D
     };
     [
         "generation_qwen3_0_6b",
+        "generation_qwen3_0_6b_q4",
         "generation_qwen3_1_7b",
+        "generation_qwen3_1_7b_q4",
         "generation_qwen3_4b",
+        "generation_qwen3_4b_q8",
+        "generation_qwen3_8b_q4",
+        "generation_qwen3_8b_q8",
         "embedding_bge_small",
         "vision_qwen3_vl_2b_q4",
         "vision_qwen3_vl_2b_q8",
@@ -502,6 +597,99 @@ fn resolved_model_edition(edition_id: &str, source: &str) -> Result<ModelEdition
                 file_name: "Qwen3-0.6B-Q8_0.gguf",
                 sha256: "e150ed544dfe6016930c026a93913a5e3184181ebfe6ab2223ae01dd0491784c",
                 size_bytes: 639_447_744,
+            },
+        )
+    };
+    let qwen_06_q4 = || {
+        generation_artifact(
+            source,
+            "Qwen3-0.6B-Q4_K_M",
+            DownloadSourceSpec {
+                repository_id: "Qwen/Qwen3-0.6B-GGUF",
+                revision: "1eaf4d9657fe65ad10a51eab76a8db5b363bddaa",
+                file_name: "Qwen3-0.6B-Q4_K_M.gguf",
+                sha256: "b0638f08417a2d3c8652760462eb5407c6e30173cf9608ad0820757a281eea0e",
+                size_bytes: 396_704_416,
+            },
+            DownloadSourceSpec {
+                repository_id: "unsloth/Qwen3-0.6B-GGUF",
+                revision: "6091bc857fe0dffa19c581a7ccc7def1b126ff54",
+                file_name: "Qwen3-0.6B-Q4_K_M.gguf",
+                sha256: "ac2d97712095a558e31573f62f466a3f9d93990898b0ec79d7c974c1780d524a",
+                size_bytes: 396_705_472,
+            },
+        )
+    };
+    let qwen_17_q4 = || {
+        generation_artifact_from_spec(
+            source,
+            "Qwen3-1.7B-Q4_K_M",
+            DownloadSourceSpec {
+                repository_id: "unsloth/Qwen3-1.7B-GGUF",
+                revision: "d7f544eead698dbd1f15126ef60b45a1e1933222",
+                file_name: "Qwen3-1.7B-Q4_K_M.gguf",
+                sha256: "b139949c5bd74937ad8ed8c8cf3d9ffb1e99c866c823204dc42c0d91fa181897",
+                size_bytes: 1_107_409_472,
+            },
+        )
+    };
+    let qwen_8_q4 = || {
+        generation_artifact(
+            source,
+            "Qwen3-8B-Q4_K_M",
+            DownloadSourceSpec {
+                repository_id: "Qwen/Qwen3-8B-GGUF",
+                revision: "7c41481f57cb95916b40956ab2f0b139b296d974",
+                file_name: "Qwen3-8B-Q4_K_M.gguf",
+                sha256: "d98cdcbd03e17ce47681435b5150e34c1417f50b5c0019dd560e4882c5745785",
+                size_bytes: 5_027_783_488,
+            },
+            DownloadSourceSpec {
+                repository_id: "unsloth/Qwen3-8B-GGUF",
+                revision: "baaddd6fb19e702c1d54c5bb2a5746012c122619",
+                file_name: "Qwen3-8B-Q4_K_M.gguf",
+                sha256: "120307ba529eb2439d6c430d94104dabd578497bc7bfe7e322b5d9933b449bd4",
+                size_bytes: 5_027_784_512,
+            },
+        )
+    };
+    let qwen_8_q8 = || {
+        generation_artifact(
+            source,
+            "Qwen3-8B-Q8_0",
+            DownloadSourceSpec {
+                repository_id: "Qwen/Qwen3-8B-GGUF",
+                revision: "7c41481f57cb95916b40956ab2f0b139b296d974",
+                file_name: "Qwen3-8B-Q8_0.gguf",
+                sha256: "408b955510e196121c1c375201744783b5c9a43c7956d73fc78df54c66e883d6",
+                size_bytes: 8_709_518_112,
+            },
+            DownloadSourceSpec {
+                repository_id: "unsloth/Qwen3-8B-GGUF",
+                revision: "baaddd6fb19e702c1d54c5bb2a5746012c122619",
+                file_name: "Qwen3-8B-Q8_0.gguf",
+                sha256: "0cfbf745760f07a76ddeb358dd025a27f2e11d1ca9c9a4169a373d52990fe86e",
+                size_bytes: 8_709_519_168,
+            },
+        )
+    };
+    let qwen_4_q8 = || {
+        generation_artifact(
+            source,
+            "Qwen3-4B-Q8_0",
+            DownloadSourceSpec {
+                repository_id: "Qwen/Qwen3-4B-GGUF",
+                revision: "a9a60d009fa7ff9606305047c2bf77ac25dbec49",
+                file_name: "Qwen3-4B-Q8_0.gguf",
+                sha256: "8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300",
+                size_bytes: 4_280_404_704,
+            },
+            DownloadSourceSpec {
+                repository_id: "unsloth/Qwen3-4B-128K-GGUF",
+                revision: "b88bdf30994e2cfec7e8a46ecd7f55d7fd20738b",
+                file_name: "Qwen3-4B-128K-Q8_0.gguf",
+                sha256: "70406550575ba36264119d8b54fe0593e46e82a2bf19ad40f3eecc497e7728cf",
+                size_bytes: 4_280_405_984,
             },
         )
     };
@@ -550,6 +738,14 @@ fn resolved_model_edition(edition_id: &str, source: &str) -> Result<ModelEdition
             vec![qwen_06()],
             &["generation"],
         )),
+        "generation_qwen3_0_6b_q4" => Ok(edition(
+            edition_id,
+            "Qwen3 0.6B 更省内存",
+            "仅安装并切换 Q4_K_M 量化的入门问答基础模型。",
+            8,
+            vec![qwen_06_q4()],
+            &["generation"],
+        )),
         "generation_qwen3_1_7b" => {
             require_huggingface(source)?;
             Ok(edition(
@@ -571,12 +767,49 @@ fn resolved_model_edition(edition_id: &str, source: &str) -> Result<ModelEdition
                 &["generation"],
             ))
         }
+        // Qwen3 1.7B 官方仓库只有 Q8_0 一个量化，省内存档走 unsloth 仓库，
+        // 两者都仅提供 Hugging Face 源（与 Q8_0 版本保持一致）。
+        "generation_qwen3_1_7b_q4" => {
+            require_huggingface(source)?;
+            Ok(edition(
+                edition_id,
+                "Qwen3 1.7B 均衡省内存",
+                "仅安装并切换 Q4_K_M 量化的均衡问答基础模型。",
+                10,
+                vec![qwen_17_q4()],
+                &["generation"],
+            ))
+        }
         "generation_qwen3_4b" => Ok(edition(
             edition_id,
             "Qwen3 4B",
             "仅安装并切换质量优先的问答基础模型。",
             12,
             vec![qwen_4()],
+            &["generation"],
+        )),
+        "generation_qwen3_4b_q8" => Ok(edition(
+            edition_id,
+            "Qwen3 4B 极致质量",
+            "仅安装并切换 Q8_0 量化的最高质量问答基础模型。",
+            16,
+            vec![qwen_4_q8()],
+            &["generation"],
+        )),
+        "generation_qwen3_8b_q4" => Ok(edition(
+            edition_id,
+            "Qwen3 8B 高质量省内存",
+            "仅安装并切换 Q4_K_M 量化的大参数问答基础模型。",
+            16,
+            vec![qwen_8_q4()],
+            &["generation"],
+        )),
+        "generation_qwen3_8b_q8" => Ok(edition(
+            edition_id,
+            "Qwen3 8B 极致质量",
+            "仅安装并切换 Q8_0 量化的本地最高质量问答基础模型。",
+            24,
+            vec![qwen_8_q8()],
             &["generation"],
         )),
         "embedding_bge_small" => Ok(edition(
@@ -1098,17 +1331,17 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "qwen3-4b-q4".to_owned(),
+                "qwen3-4b-q8".to_owned(),
                 "bge-small-zh-int8".to_owned(),
                 "qwen3-vl-2b-q8".to_owned(),
             ]
         );
-        // 4 GB RAM: nothing fits, fall back to the lightest generation entry.
+        // 4 GB RAM: 1.7B Q4_K_M now fits (3.0*1.3 <= 4), so the mid tier wins.
         let ids = recommended_catalog_ids(&catalog, Some(4), None);
         assert_eq!(
             ids,
             vec![
-                "qwen3-0.6b-q8".to_owned(),
+                "qwen3-1.7b-q4".to_owned(),
                 "bge-small-zh-int8".to_owned(),
                 "qwen3-vl-2b-q4".to_owned(),
             ]
