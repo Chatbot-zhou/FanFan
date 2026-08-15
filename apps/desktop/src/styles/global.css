@@ -112,7 +112,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
 .sidebar__navigation { flex: 1; }
 .sidebar__group { display: grid; gap: 5px; }
 .sidebar__divider { height: 1px; margin: 18px 12px; background: var(--line); }
-.sidebar-item { width: 100%; height: 47px; padding: 0 15px; border: 0; border-radius: 13px; display: flex; align-items: center; gap: 14px; background: transparent; font-size: 16px; text-align: left; cursor: pointer; transition: background .16s ease, color .16s ease; }
+.sidebar-item { width: 100%; height: 47px; padding: 0 15px; border: 0; border-radius: 13px; display: flex; align-items: center; gap: 14px; background: transparent; font-size: 16px; text-align: left; white-space: nowrap; cursor: pointer; transition: background .16s ease, color .16s ease; }
 .sidebar-item:hover { background: rgba(104, 92, 190, .06); }
 .sidebar-item--active { color: #292078; background: linear-gradient(110deg, rgba(217, 210, 246, .66), rgba(233, 219, 242, .48)); font-weight: 650; }
 .sidebar-item__icon { width: 23px; display: grid; place-items: center; font-size: 21px; }
@@ -456,7 +456,7 @@ html.is-scrolling *::-webkit-scrollbar-thumb,*:hover::-webkit-scrollbar-thumb { 
   .sidebar-item { padding: 0 11px; gap: 10px; font-size: 14px; }
   .status-bar { padding-left: 168px; }
   .page { padding: 30px 22px 46px; }
-  .home-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .metric-grid, .home-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
   .collection-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }
   .candidate-panel { grid-template-columns: 1fr; }
   .app-status-panel__compact-grid { grid-template-columns: 1fr 1fr; }
