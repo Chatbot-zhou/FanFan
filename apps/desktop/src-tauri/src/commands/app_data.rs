@@ -5782,7 +5782,23 @@ fn run_retrieval_answer(
             160,
             cancelled,
         )?;
-        parse_rewritten_queries(&rewritten)
+        let parsed = parse_rewritten_queries(&rewritten);
+        // 防复读校验：0.6B 改写时会把历史里最后一条助手回复整句复读成改写
+        // 结果（历史标记若未生效）。与历史任一助手消息相同的输出视为改写
+        // 失败 → 回退用户原始问题，避免拿聊天回复去检索。
+        let echoes_history = parsed.iter().any(|query| {
+            history
+                .iter()
+                .filter(|message| message.role != "user")
+                .any(|message| {
+                    message.content.split_whitespace().collect::<Vec<_>>().join(" ") == *query
+                })
+        });
+        if echoes_history {
+            Vec::new()
+        } else {
+            parsed
+        }
     };
     let retrieval_questions = if rewritten_queries.is_empty() {
         vec![request.question.trim().to_owned()]

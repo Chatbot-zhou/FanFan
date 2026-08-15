@@ -792,20 +792,24 @@ pub fn intent_routing_prompt_mini(question: &str, history: &[AskMessage]) -> (St
     (system, user)
 }
 
-/// 构建追问改写 prompt（极简，0.6B 友好）：历史折叠 5+5 段（非空时），
-/// 输出约束为行式——每行一个可直接检索的中文问题；已明确单一则原样输出。
+/// 构建追问改写 prompt（极简，0.6B 友好）：输入按「history」与「question」
+/// 两个字段分开给模型——history 是最近 5+5 段历史（仅作理解上文的参考，
+/// 明确标注"不是改写对象、严禁复读"），question 是用户当前刚说的那句
+/// （唯一改写对象）。输出约束为行式——每行一个可直接检索的中文问题。
 /// 0.6B 对行式续写比 JSON 数组格式容错更高。三类改写情形（指代补全/多问题
 /// 拆分/原样）各给一个示例——示例复读是 0.6B 的强项，光讲规则它做不到。
 pub fn query_rewrite_prompt(question: &str, history: &[AskMessage]) -> (String, String) {
-    let system = "你是问题改写助手。把用户的话改写成能直接查资料的中文问题，一行一个，只输出问题，不要解释或多余文字。"
+    let system = "你是问题改写助手。把字段 question 中的用户输入改写成能直接查资料的中文问题，一行一个，只输出问题，不要解释或多余文字。"
         .into();
     let mut user = String::new();
     let folded = fold_recent_history(history, 5, 5);
     if !folded.is_empty() {
-        user.push_str(&format!("【对话历史】\n{folded}\n\n"));
+        user.push_str(&format!(
+            "【历史记录】（字段 history，最近 5 条对话，仅作理解上文的参考，不是改写对象，严禁复读或引用其中的任何内容）：\n{folded}\n\n"
+        ));
     }
     user.push_str(
-        "【规则】\n\
+        "【规则】（只改写字段 question，history 只是参考）：\n\
          - 一句话包含多个问题 → 每个问题各写一行\n\
          - 问题指代了上文（如「那金额上限呢」）→ 补全成完整问题\n\
          - 问题已经清楚明确 → 原样写一遍\n\
@@ -820,7 +824,7 @@ pub fn query_rewrite_prompt(question: &str, history: &[AskMessage]) -> (String, 
          改写：去年的财务报表数据\n\n",
     );
     user.push_str(&format!(
-        "【当前问题】\n用户：{}\n改写：",
+        "【当前输入】（字段 question，用户刚刚说的话，只改写这一条，不要复读历史里的任何句子）：\n{}\n\n改写：",
         question.trim()
     ));
     (system, user)
@@ -1194,7 +1198,15 @@ mod tests {
         let history = vec![message("user", "报销流程是什么"), message("assistant", "报销分三步。")];
         let (system, user) = query_rewrite_prompt("那金额上限呢", &history);
         assert!(system.contains("只输出问题"));
-        assert!(user.contains("【对话历史】"));
+        assert!(system.contains("字段 question"));
+        // history 与 question 两个字段分开，history 明确标注不是改写对象
+        assert!(user.contains("【历史记录】"));
+        assert!(user.contains("字段 history"));
+        assert!(user.contains("不是改写对象"));
+        assert!(user.contains("严禁复读"));
+        assert!(user.contains("【当前输入】"));
+        assert!(user.contains("字段 question"));
+        assert!(user.contains("用户刚刚说的话"));
         assert!(user.contains("每个问题各写一行"));
         assert!(user.contains("那金额上限呢"));
         assert!(user.contains("补全成完整问题"));
@@ -1203,7 +1215,7 @@ mod tests {
         assert!(user.contains("讲讲报销流程和请假规定"));
         // 无历史时不带历史段
         let (_, user2) = query_rewrite_prompt("报销流程是什么", &[]);
-        assert!(!user2.contains("【对话历史】"));
+        assert!(!user2.contains("【历史记录】"));
         assert!(user2.contains("原样写一遍"));
     }
 
