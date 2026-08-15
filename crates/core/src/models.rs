@@ -414,7 +414,32 @@ impl ModelManager {
                         "pending".into()
                     }
                 });
-            let mut manifest = build_package_manifest(artifact)?;
+            // 快速路径：manifest 已 ready 且所有文件大小仍匹配 → 复用，跳过全量
+            // SHA-256（5GB 模型每次启动哈希约 55s）。SHA 在导入/下载/自检时强制
+            // 校验；文件被替换但大小相同的情况由模型加载失败与自检兜底。
+            let already_ready = artifact
+                .package_manifest
+                .as_ref()
+                .is_some_and(|manifest| {
+                    manifest.integrity_status == "ready"
+                        && manifest.files.iter().all(|file| {
+                            Path::new(&artifact.local_path)
+                                .parent()
+                                .is_some_and(|parent| {
+                                    fs::metadata(parent.join(&file.file_name)).is_ok_and(
+                                        |metadata| {
+                                            metadata.is_file()
+                                                && metadata.len() == file.size_bytes
+                                        },
+                                    )
+                                })
+                        })
+                });
+            let mut manifest = if already_ready {
+                artifact.package_manifest.clone().expect("checked above")
+            } else {
+                build_package_manifest(artifact)?
+            };
             manifest.self_test_status = previous_self_test;
             artifact.status = match (
                 manifest.integrity_status.as_str(),

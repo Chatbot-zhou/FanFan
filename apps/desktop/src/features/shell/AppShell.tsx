@@ -99,6 +99,14 @@ export function AppShell({ startup_notice }: AppShellProps) {
 
   useEffect(() => {
     if (!backendReady) return;
+    // 启动就绪前 mount 的页面（如 AskPage）可能在 STARTUP_NOT_READY 失败后
+    // 不再重试；backendReady 翻转时全局失效一次，让所有查询自动重新加载，
+    // 无需用户手动切页。
+    void queryClient.invalidateQueries();
+  }, [backendReady, queryClient]);
+
+  useEffect(() => {
+    if (!backendReady) return;
     void bridge.environment_detect().then(() => {
       void queryClient.invalidateQueries({ queryKey: ["environment"] });
     }).catch(() => undefined);
