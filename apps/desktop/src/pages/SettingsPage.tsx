@@ -1,7 +1,7 @@
 import { DeleteOutlined, FolderOpenOutlined, ReloadOutlined } from "@ant-design/icons";
 import { isTauri } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { bridge } from "../bridge";
 import { confirmAction } from "../components/AppConfirm";
@@ -22,7 +22,6 @@ export function SettingsPage({ initialTab }: { initialTab?: SettingsTab }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   const theme = useThemePreference();
-  const queryClient = useQueryClient();
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -31,16 +30,6 @@ export function SettingsPage({ initialTab }: { initialTab?: SettingsTab }) {
   const maintenance = useQuery({ queryKey: ["maintenance"], queryFn: () => bridge.maintenance_get() });
   const storage = useQuery({ queryKey: ["storage-usage"], queryFn: () => bridge.storage_usage_get(), enabled: tab === "index" });
   const storageLocation = useQuery({ queryKey: ["storage-location"], queryFn: () => bridge.storage_location_get(), enabled: tab === "index" });
-  const logs = useInfiniteQuery({
-    queryKey: ["maintenance-logs"],
-    initialPageParam: null as string | null,
-    queryFn: ({ pageParam }) => bridge.maintenance_log_query({ cursor: pageParam, page_size: 100 }),
-    getNextPageParam: (page) => page.next_cursor,
-    enabled: tab === "logs",
-    refetchInterval: tab === "logs" ? 3_000 : false,
-  });
-  const logItems = logs.data?.pages.flatMap((page) => page.items) ?? [];
-
   const addRoot = async (volumeOnly: boolean) => {
     setError(null); setMessage(null);
     if (!isTauri()) { setError("浏览器预览不调用系统目录选择器，请在桌面程序中使用。"); return; }
@@ -66,7 +55,7 @@ export function SettingsPage({ initialTab }: { initialTab?: SettingsTab }) {
   const clearLogs = async () => {
     if (!await confirmAction({ actionKey: "diagnostic_logs_clear", title: "清除本地诊断日志？", description: "此操作不会影响资料和索引，但会删除当前用于排查体验问题的记录。", confirmLabel: "清除日志", danger: true })) return;
     setBusy(true); setError(null);
-    try { const count = await bridge.maintenance_logs_clear(); setMessage(`已清除 ${count} 条本地诊断日志。`); await Promise.all([logs.refetch(), maintenance.refetch()]); }
+    try { const count = await bridge.maintenance_logs_clear(); setMessage(`已清除 ${count} 条本地诊断日志。`); await maintenance.refetch(); }
     catch (actionError) { setError(errorMessage(actionError)); }
     finally { setBusy(false); }
   };
@@ -161,7 +150,7 @@ export function SettingsPage({ initialTab }: { initialTab?: SettingsTab }) {
           {tab === "models" && <ModelManagementPanel />}
           {tab === "index" && <><section><h2>索引状态</h2><div className="metric-strip"><span><strong>{maintenance.data?.indexed_files ?? "—"}</strong>已索引文件</span><span><strong>{maintenance.data?.searchable_chunks ?? "—"}</strong>全文块</span><span><strong>{maintenance.data?.embedded_chunks ?? "—"}</strong>向量块</span><span><strong>{maintenance.data ? bytes(maintenance.data.database_size_bytes) : "—"}</strong>数据库</span></div></section><section><h2>存储分类</h2><p>只允许清理明确标记为缓存的内容；模型断点、索引与源文件不会作为缓存删除。</p><div className="settings-list">{storage.data?.categories.map((category) => <div key={category.key}><span><strong>{category.label}</strong><small>{category.detail}</small></span><em>{bytes(category.size_bytes)}</em>{category.clearable && <button type="button" className="text-button" disabled={busy || category.size_bytes === 0} onClick={() => void clearCache(category.key as "temporary_cache" | "failed_downloads", category.label)}>清理</button>}</div>)}</div></section><section><h2>自动检查站</h2><div className="health-list">{maintenance.data?.checks.map((check) => <div key={check.key} className={`health-${check.status}`}><i /><span><strong>{check.label}</strong><small>{check.detail}</small></span></div>)}</div><div className="settings-actions"><button type="button" disabled={busy} onClick={() => void checkDatabase("quick")}><ReloadOutlined /> {busy ? "检查中" : "快速检查"}</button><button type="button" disabled={busy} onClick={() => void checkDatabase("full")}><ReloadOutlined /> {busy ? "检查中" : "完整检查"}</button><button type="button" className="danger-button" disabled={busy} onClick={() => void rebuild()}><DeleteOutlined /> 重建派生索引</button></div></section></>}
           {tab === "appearance" && <section><h2>显示与动效</h2><p>默认跟随Windows深浅色；你也可以固定使用白天渐变或夜晚暗黑。系统启用减少动态效果后，翻翻会关闭非必要动画。</p><div className="theme-options" role="radiogroup" aria-label="主题"><button type="button" role="radio" aria-checked={theme.preference === "system"} className={theme.preference === "system" ? "selected" : ""} onClick={() => void theme.setPreference("system")}><strong>跟随系统</strong><small>随Windows自动切换</small></button><button type="button" role="radio" aria-checked={theme.preference === "day_gradient"} className={theme.preference === "day_gradient" ? "selected" : ""} onClick={() => void theme.setPreference("day_gradient")}><strong>白天渐变</strong><small>雾蓝 · 浅紫 · 淡粉</small></button><button type="button" role="radio" aria-checked={theme.preference === "night_dark"} className={theme.preference === "night_dark" ? "selected" : ""} onClick={() => void theme.setPreference("night_dark")}><strong>夜晚暗黑</strong><small>黑底 · 白字</small></button></div><div className="readonly-note">当前显示：{theme.effective_theme === "night_dark" ? "夜晚暗黑" : "白天渐变"}</div></section>}
-          {tab === "logs" && <><section><h2>体验日志与诊断包</h2><div className="settings-actions"><button type="button" disabled={busy} onClick={() => void exportDiagnostics()}>导出诊断包</button></div><small>复现问题后请尽量不要清除日志，直接导出诊断包，并记下大致时间、操作步骤、预期结果和实际现象。</small></section><section><h2>本地诊断日志</h2><p>日志只保存在电脑中，按大小自动轮转。当前可查看 {maintenance.data?.log_events ?? 0} 条。</p><div className="log-list">{logItems.map((log) => <div key={log.log_id} className={`log-level--${log.level}`}><time>{new Date(log.created_at).toLocaleString("zh-CN")}</time><strong>{log.level.toUpperCase()} · {log.component} · {log.event_name}</strong><code>{JSON.stringify(log.fields)}</code></div>)}{logItems.length === 0 && <p>当前没有诊断日志。</p>}</div>{logs.hasNextPage && <button type="button" className="load-more-button" disabled={logs.isFetchingNextPage} onClick={() => void logs.fetchNextPage()}>{logs.isFetchingNextPage ? "正在加载" : "加载更多日志"}</button>}<button type="button" className="danger-button" disabled={busy || logItems.length === 0} onClick={() => void clearLogs()}><DeleteOutlined /> 清除日志</button></section><section><h2>重置应用数据</h2><p>重置会清理翻翻的数据库、索引、缓存、设置和日志；独立模型仓库及所有已下载模型永久保留。下次启动前会先移动到时间戳隔离目录，资料源文件始终不动。</p><button type="button" className="danger-button" disabled={busy} onClick={() => void resetApplicationData()}><DeleteOutlined /> 重置并重新启动</button></section></>}
+          {tab === "logs" && <><section><h2>体验日志与诊断包</h2><div className="settings-actions"><button type="button" disabled={busy} onClick={() => void exportDiagnostics()}>导出诊断包</button></div><small>复现问题后请尽量不要清除日志，直接导出诊断包，并记下大致时间、操作步骤、预期结果和实际现象。</small></section><section><h2>本地诊断日志</h2><p>日志只保存在电脑中，按大小自动轮转。当前保留 {maintenance.data?.log_events ?? 0} 条。</p><button type="button" className="danger-button" disabled={busy || (maintenance.data?.log_events ?? 0) === 0} onClick={() => void clearLogs()}><DeleteOutlined /> 清除日志</button></section><section><h2>重置应用数据</h2><p>重置会清理翻翻的数据库、索引、缓存、设置和日志；独立模型仓库及所有已下载模型永久保留。下次启动前会先移动到时间戳隔离目录，资料源文件始终不动。</p><button type="button" className="danger-button" disabled={busy} onClick={() => void resetApplicationData()}><DeleteOutlined /> 重置并重新启动</button></section></>}
         </div>
       </div>
     </section>

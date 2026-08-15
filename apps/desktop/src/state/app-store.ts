@@ -27,7 +27,6 @@ interface SearchPrefs {
 
 interface AppState {
   route: AppRoute;
-  previous_route: AppRoute | null;
   search_query: string;
   search_session: SearchSession | null;
   search_session_query: string;
@@ -48,7 +47,6 @@ interface AppState {
   analysis_tasks: Record<AnalysisTaskKind, AnalysisTaskState>;
   set_analysis_task: (kind: AnalysisTaskKind, patch: Partial<AnalysisTaskState>) => void;
   navigate: (route: AppRoute) => void;
-  go_back: () => void;
   start_search: (query: string) => void;
   set_search_query: (query: string) => void;
   set_search_session: (session: SearchSession | null, query?: string) => void;
@@ -64,7 +62,6 @@ interface AppState {
   reset_ask_state: () => void;
   open_inbox: (status: InboxStatus, todayOnly?: boolean) => void;
   open_collection: (collectionId: string) => void;
-  open_settings: (tab: SettingsTab) => void;
   set_settings_tab: (tab: SettingsTab) => void;
   clear_collection_selection: () => void;
   dismiss_model_prompt: () => void;
@@ -72,7 +69,6 @@ interface AppState {
 
 export const useAppStore = create<AppState>((set) => ({
   route: "home",
-  previous_route: null,
   search_query: "",
   search_session: null,
   search_session_query: "",
@@ -104,13 +100,10 @@ export const useAppStore = create<AppState>((set) => ({
     analysis_tasks: { ...state.analysis_tasks, [kind]: { ...state.analysis_tasks[kind], ...patch } },
   })),
   navigate: (route) => set((state) => route === state.route ? state : (route === "inbox"
-    ? { route, previous_route: state.route, inbox_initial_status: "new", inbox_today_only: false }
+    ? { route, inbox_initial_status: "new", inbox_today_only: false }
     : route === "collections"
-      ? { route, previous_route: state.route, selected_collection_id: null }
-      : { route, previous_route: state.route })),
-  go_back: () => set((state) => state.previous_route
-    ? { route: state.previous_route, previous_route: state.route }
-    : state),
+      ? { route, selected_collection_id: null }
+      : { route })),
   start_search: (search_query) => set({ route: "search", search_query, search_session: null, search_session_query: "" }),
   set_search_query: (search_query) => set({ search_query }),
   set_search_session: (search_session, query) => set(search_session
@@ -143,11 +136,6 @@ export const useAppStore = create<AppState>((set) => ({
     route: "collections",
     selected_collection_id,
   }),
-  open_settings: (settings_tab) => set((state) => ({
-    route: "settings",
-    previous_route: state.route,
-    settings_tab,
-  })),
   set_settings_tab: (settings_tab) => set({ settings_tab }),
   clear_collection_selection: () => set({ selected_collection_id: null }),
   dismiss_model_prompt: () => set({ model_prompt_dismissed: true }),
