@@ -208,7 +208,7 @@ export function CollectionsPage() {
       <header className="page-heading page-heading--inline-note page-heading--compact page-heading--divider">
         <div className="readonly-note"><SafetyCertificateOutlined /> 虚拟集合只做智能分类，不复制或移动任何文件</div>
         <div className="page-heading__actions">
-          <button type="button" className="secondary-gradient-button" disabled={refreshSuggestions.isPending || collectionTask.status === "running"} onClick={() => refreshSuggestions.mutate()}><RobotOutlined /> {refreshSuggestions.isPending || collectionTask.status === "running" ? "正在分析" : "AI分析新建议"}</button>
+          <button type="button" className="secondary-gradient-button" disabled={refreshSuggestions.isPending || collectionTask.status === "running"} onClick={() => refreshSuggestions.mutate()}><RobotOutlined /> {refreshSuggestions.isPending || collectionTask.status === "running" ? "正在分析" : "AI 集合推荐"}</button>
           <button type="button" className={creating ? "text-button" : "primary-button"} onClick={() => { if (creating) closeEditor(); else { setEditingId(null); setCreating(true); } }}>{creating ? <CloseOutlined /> : <PlusOutlined />} {creating ? "取消" : "新建集合"}</button>
         </div>
       </header>
