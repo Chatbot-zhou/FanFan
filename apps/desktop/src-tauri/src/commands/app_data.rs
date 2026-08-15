@@ -3954,6 +3954,10 @@ pub fn maintenance_get(
 static INDEX_STATS_CACHE: OnceLock<Mutex<(Instant, IndexActivityStats)>> = OnceLock::new();
 const INDEX_STATS_CACHE_TTL: Duration = Duration::from_secs(10);
 
+/// Rerank 重排后只把相关性最高的前 N 条证据片段交给生成模型；
+/// 未配置 Rerank 时不截断，保持全部证据进生成的既有行为。
+const RERANK_TOP_EVIDENCE: usize = 3;
+
 fn cached_index_activity_stats(
     catalog: &CatalogService,
 ) -> Result<IndexActivityStats, AppError> {
@@ -5876,6 +5880,7 @@ fn run_retrieval_answer(
         return Ok(extractive);
     }
     let mut reranker_applied = false;
+    let mut claims_before_truncate = 0usize;
     if maintenance.degradation_level == "full"
         && let Some(reranker) = models.active_artifact(ModelRole::Reranker)?
         && reranker.format == ModelFormat::Onnx
@@ -5910,6 +5915,10 @@ fn run_retrieval_answer(
                 && apply_rerank_scores(&mut extractive, &response.scores).is_ok()
             {
                 rerank_runtime_lease.complete();
+                // 重排后只把相关性最高的前 N 条证据片段交给生成模型，
+                // 其余丢弃（生成 prompt 只能引用保留的 S1..SN）。
+                claims_before_truncate = extractive.claims.len();
+                extractive.claims.truncate(RERANK_TOP_EVIDENCE);
                 extractive.retrieval_channels.push("reranker".into());
                 reranker_applied = true;
             }
@@ -5925,6 +5934,8 @@ fn run_retrieval_answer(
         &json!({}),
         &json!({
             "applied": reranker_applied,
+            "claims_before_truncate": claims_before_truncate,
+            "claims_kept": extractive.claims.len(),
             "scores": extractive.claims.iter().take(10).map(|claim| json!({
                 "text": compact_for_prompt(&claim.text, 120),
                 "score": claim.citations.first().map(|citation| citation.retrieval_score),
@@ -8104,6 +8115,63 @@ mod tests {
                 .code,
             "RERANK_OUTPUT_INVALID"
         );
+    }
+
+    #[test]
+    fn rerank_truncates_to_top_evidence_before_generation() {
+        let file_id = |n: u32| Uuid::now_v7();
+        let claim = |file_id, text: &str| AnswerClaim {
+            claim_id: Uuid::now_v7(),
+            text: text.into(),
+            support_status: SupportStatus::Supported,
+            citations: vec![EvidenceRef {
+                evidence_id: Uuid::now_v7(),
+                file_id,
+                revision_id: Uuid::now_v7(),
+                node_id: Uuid::now_v7(),
+                chunk_id: Uuid::now_v7(),
+                image_asset_id: None,
+                quote: text.into(),
+                context_before: None,
+                context_after: None,
+                locator: SourceLocator::default(),
+                retrieval_score: 0.0,
+            }],
+        };
+        let mut result = AnswerResult {
+            session_id: Uuid::now_v7(),
+            message_id: Uuid::now_v7(),
+            answer: String::new(),
+            grounding_status: GroundingStatus::Grounded,
+            insufficient_evidence: false,
+            claims: vec![
+                claim(file_id(1), "第一条"),
+                claim(file_id(2), "第二条"),
+                claim(file_id(3), "第三条"),
+                claim(file_id(4), "第四条"),
+                claim(file_id(5), "第五条"),
+            ],
+            source_files: vec![],
+            used_file_ids: vec![],
+            elapsed_ms: 1,
+            answer_mode: "extractive".into(),
+            retrieval_channels: vec!["fts".into()],
+            index_coverage: 1.0,
+            degradation_reason: None,
+        };
+
+        apply_rerank_scores(&mut result, &[0.1, 0.5, 0.9, 0.3, 0.7]).expect("apply rerank scores");
+        // 重排后按分数降序：0.9/0.7/0.5/0.3/0.1
+        assert_eq!(result.claims[0].text, "第三条");
+        assert_eq!(result.claims[1].text, "第五条");
+        // 只保留相关性最高的前 3 条给生成模型
+        result.claims.truncate(RERANK_TOP_EVIDENCE);
+        assert_eq!(result.claims.len(), RERANK_TOP_EVIDENCE);
+        assert_eq!(result.claims[0].text, "第三条");
+        assert_eq!(result.claims[1].text, "第五条");
+        assert_eq!(result.claims[2].text, "第二条");
+        assert_eq!(result.claims[0].citations[0].retrieval_score, 0.9);
+        assert_eq!(result.claims[2].citations[0].retrieval_score, 0.5);
     }
 
     #[test]
