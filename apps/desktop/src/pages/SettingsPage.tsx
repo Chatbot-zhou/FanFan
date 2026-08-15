@@ -3,7 +3,7 @@ import { isTauri } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
-import { bridge, type ModelRole } from "../bridge";
+import { bridge } from "../bridge";
 import { confirmAction } from "../components/AppConfirm";
 import {
   formatModelDownloadBytes,
@@ -15,17 +15,6 @@ import { useThemePreference } from "../features/theme/ThemeProvider";
 import { errorMessage } from "../utils/app-error";
 
 const bytes = (value: number) => value < 1024 * 1024 ? `${Math.round(value / 1024)} KB` : value < 1024 * 1024 * 1024 ? `${(value / 1024 / 1024).toFixed(1)} MB` : `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`;
-
-const ROLE_NAMES: Record<ModelRole, string> = {
-  generation: "问答基础模型",
-  embedding: "Embedding",
-  vision: "多模态模型",
-  reranker: "Rerank",
-  ocr: "OCR",
-  tts: "语音合成",
-  asr: "语音识别",
-  router: "意图路由",
-};
 
 const CAPABILITY_LABELS = [
   ["generation", "问答"],
@@ -47,7 +36,7 @@ export function SettingsPage() {
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const roots = useQuery({ queryKey: ["settings-roots"], queryFn: () => bridge.root_list() });
-  const models = useQuery({ queryKey: ["settings-models"], queryFn: async () => ({ state: await bridge.model_state_get(), artifacts: await bridge.model_artifact_list(), roleConfigs: await bridge.model_role_config_list() }) });
+  const models = useQuery({ queryKey: ["settings-models"], queryFn: async () => ({ state: await bridge.model_state_get(), artifacts: await bridge.model_artifact_list() }) });
   const modelStore = useQuery({ queryKey: ["model-store-status"], queryFn: () => bridge.model_store_status_get(), enabled: tab === "index" });
   const modelDownloads = useQuery({
     queryKey: ["model-downloads"],
@@ -218,26 +207,7 @@ export function SettingsPage() {
           {tab === "models" && <>
             {visibleDownloads.length > 0 && <section><h2>模型下载</h2><div className="setting-row model-download-overview"><div><strong>{downloadSummary.attention_count > 0 ? `${downloadSummary.attention_count} 项需要处理` : downloadSummary.active_count > 0 ? `${downloadSummary.active_count} 个任务正在进行` : `${downloadSummary.visible_count} 个任务已结束`}</strong><small>{downloadSummary.active_count > 0 ? `${downloadSummary.progress == null ? "正在准备下载" : `总体 ${Math.round(downloadSummary.progress * 100)}%`} · ${formatModelDownloadBytes(downloadSummary.downloaded_bytes)} / ${formatModelDownloadBytes(downloadSummary.total_bytes)}` : "完成和取消记录仅保留到本次应用会话结束"}</small></div><button type="button" onClick={() => navigate("model_setup")}>查看全部任务</button></div></section>}
             <section><h2>当前模型</h2><div className="setting-row"><div className="capability-list">{activeCapabilities === null ? "正在读取" : activeCapabilities.length > 0 ? activeCapabilities.join(" · ") : "尚未启用本地模型"}</div><button type="button" onClick={() => navigate("model_setup")}>管理模型</button></div></section>
-            <section>
-              <h2>已导入组件</h2>
-              <p>每个角色下方显示当前安装的模型；已导入但未使用的模型列在下方，可在「管理模型」中配置。</p>
-              <div className="model-roles">{(() => {
-                const roleConfigs = models.data?.roleConfigs ?? [];
-                const activeIds = new Set(roleConfigs.map((config) => config.active_artifact_id).filter((id): id is string => Boolean(id)));
-                const unused = (models.data?.artifacts ?? []).filter((artifact) => !activeIds.has(artifact.artifact_id));
-                return <>
-                  <div>{roleConfigs.filter((config) => config.role !== "router").map((config) => {
-                    const active = models.data?.artifacts.find((artifact) => artifact.artifact_id === config.active_artifact_id);
-                    return <article key={config.role}><div><strong>{ROLE_NAMES[config.role]}</strong>{active ? <span>{active.model_id}</span> : <span className="model-role-unset">未配置</span>}<small>{config.required_for} · {config.load_policy === "background_index" ? "后台索引" : config.load_policy === "serial_on_demand" ? "串行按需加载" : "按需加载"}</small></div></article>;
-                  })}</div>
-                  {unused.length > 0 && <>
-                    <h3 className="model-unused-heading">已导入但未使用</h3>
-                    <div className="settings-list">{unused.map((artifact) => <div key={artifact.artifact_id}><span><strong>{artifact.model_id}</strong><small>{ROLE_NAMES[artifact.role]} · {artifact.format.toUpperCase()} · {bytes(artifact.size_bytes)}</small></span><em>{artifact.embedding_dimension ? `已自检 · ${artifact.embedding_dimension}维` : artifact.status}</em></div>)}</div>
-                  </>}
-                  {(models.data?.artifacts.length ?? 0) === 0 && <p>还没有导入本地模型。基础搜索不受影响。</p>}
-                </>;
-              })()}</div>
-            </section>
+            <section><h2>已导入组件</h2><div className="settings-list">{models.data?.artifacts.map((artifact) => <div key={artifact.artifact_id}><span><strong>{artifact.model_id}</strong><small>{artifact.role} · {artifact.format.toUpperCase()} · {bytes(artifact.size_bytes)}</small></span><em>{artifact.embedding_dimension ? `已自检 · ${artifact.embedding_dimension}维` : artifact.status}</em></div>)}{models.data?.artifacts.length === 0 && <p>还没有导入本地模型。基础搜索不受影响。</p>}</div></section>
           </>}
           {tab === "index" && <><section><h2>索引状态</h2><div className="metric-strip"><span><strong>{maintenance.data?.indexed_files ?? "—"}</strong>已索引文件</span><span><strong>{maintenance.data?.searchable_chunks ?? "—"}</strong>全文块</span><span><strong>{maintenance.data?.embedded_chunks ?? "—"}</strong>向量块</span><span><strong>{maintenance.data ? bytes(maintenance.data.database_size_bytes) : "—"}</strong>数据库</span></div></section><section><h2>存储分类</h2><p>只允许清理明确标记为缓存的内容；模型断点、索引与源文件不会作为缓存删除。</p><div className="settings-list">{storage.data?.categories.map((category) => <div key={category.key}><span><strong>{category.label}</strong><small>{category.detail}</small></span><em>{bytes(category.size_bytes)}</em>{category.clearable && <button type="button" className="text-button" disabled={busy || category.size_bytes === 0} onClick={() => void clearCache(category.key as "temporary_cache" | "failed_downloads", category.label)}>清理</button>}</div>)}</div></section><section><h2>自动检查站</h2><div className="health-list">{maintenance.data?.checks.map((check) => <div key={check.key} className={`health-${check.status}`}><i /><span><strong>{check.label}</strong><small>{check.detail}</small></span></div>)}</div><div className="settings-actions"><button type="button" disabled={busy} onClick={() => void checkDatabase("quick")}><ReloadOutlined /> {busy ? "检查中" : "快速检查"}</button><button type="button" disabled={busy} onClick={() => void checkDatabase("full")}><ReloadOutlined /> {busy ? "检查中" : "完整检查"}</button><button type="button" className="danger-button" disabled={busy} onClick={() => void rebuild()}><DeleteOutlined /> 重建派生索引</button></div></section></>}
           {tab === "appearance" && <section><h2>显示与动效</h2><p>默认跟随Windows深浅色；你也可以固定使用白天渐变或夜晚暗黑。系统启用减少动态效果后，翻翻会关闭非必要动画。</p><div className="theme-options" role="radiogroup" aria-label="主题"><button type="button" role="radio" aria-checked={theme.preference === "system"} className={theme.preference === "system" ? "selected" : ""} onClick={() => void theme.setPreference("system")}><strong>跟随系统</strong><small>随Windows自动切换</small></button><button type="button" role="radio" aria-checked={theme.preference === "day_gradient"} className={theme.preference === "day_gradient" ? "selected" : ""} onClick={() => void theme.setPreference("day_gradient")}><strong>白天渐变</strong><small>雾蓝 · 浅紫 · 淡粉</small></button><button type="button" role="radio" aria-checked={theme.preference === "night_dark"} className={theme.preference === "night_dark" ? "selected" : ""} onClick={() => void theme.setPreference("night_dark")}><strong>夜晚暗黑</strong><small>黑底 · 白字</small></button></div><div className="readonly-note">当前显示：{theme.effective_theme === "night_dark" ? "夜晚暗黑" : "白天渐变"}</div></section>}
