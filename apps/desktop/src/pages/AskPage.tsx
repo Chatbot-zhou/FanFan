@@ -391,6 +391,9 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
         const snapshot = await bridge.ask_operation_get(result.operation_id);
         if (snapshot.handle.status === "completed") {
           if (!snapshot.result) throw new Error("问答已完成，但结果不完整");
+          // 问答成功即消除红色警告弹窗与重试记录（即使错误来自历史恢复或先前失败）
+          setError(null);
+          setLastFailedQuestion(null);
           setTurns([...turns, { question: trimmed, answer: snapshot.result }]);
           setActiveSessionId(snapshot.result.session_id);
           setPendingQuestion(null);
