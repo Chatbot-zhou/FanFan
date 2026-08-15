@@ -240,7 +240,8 @@ export function ModelManagementPanel() {
                 <div className="role-model-card__heading"><strong>{familyName}</strong></div>
                 {versions.some((item) => item.recommended) && <em className="role-model-card__badge">推荐</em>}
                 <p>{selected.description}</p>
-                {versions.length > 1 && <div className="role-model-card__versions">{versions.map((item) => <button key={item.catalog_id} type="button" className={item.catalog_id === selected.catalog_id ? "selected" : ""} onClick={(event) => { event.stopPropagation(); setSelectedCardId(item.catalog_id); }}>{[sizeOf(item), quantOf(item)].filter(Boolean).join(" · ")}{item.recommended && <em>推荐</em>}</button>)}</div>}
+                {/* 版本按钮高亮严格跟随全局 selectedCardId：同一角色只允许一个量化版本变色，未选中的卡片不显示默认高亮。 */}
+                {versions.length > 1 && <div className="role-model-card__versions">{versions.map((item) => <button key={item.catalog_id} type="button" className={item.catalog_id === selectedCardId ? "selected" : ""} onClick={(event) => { event.stopPropagation(); setSelectedCardId(item.catalog_id); }}>{[sizeOf(item), quantOf(item)].filter(Boolean).join(" · ")}{item.recommended && <em>推荐</em>}</button>)}</div>}
                 <dl><div><dt>下载</dt><dd>{selected.download_size_bytes ? formatBytes(selected.download_size_bytes) : "本地导入"}</dd></div><div><dt>预计内存</dt><dd>{selected.estimated_memory_gb} GB</dd></div><div><dt>预计显存</dt><dd>{selected.estimated_vram_gb ? `${selected.estimated_vram_gb} GB` : "不依赖"}</dd></div><div><dt>CPU速度</dt><dd>{selected.cpu_speed}</dd></div></dl>
                 <ul>{selected.strengths.map((value) => <li key={value}>{value}</li>)}</ul>
                 <small>{selected.limitations.join("；")} · {selected.license_name}</small>
