@@ -424,7 +424,7 @@ impl LocalGenerationRuntime {
         user: &str,
         max_tokens: u32,
     ) -> Result<String, AppError> {
-        self.complete_internal(system, user, max_tokens, None, None)
+        self.complete_internal(system, user, max_tokens, None, None, 0.1)
     }
 
     pub fn complete_cancellable(
@@ -434,7 +434,20 @@ impl LocalGenerationRuntime {
         max_tokens: u32,
         cancelled: &AtomicBool,
     ) -> Result<String, AppError> {
-        self.complete_internal(system, user, max_tokens, Some(cancelled), None)
+        self.complete_internal(system, user, max_tokens, Some(cancelled), None, 0.1)
+    }
+
+    /// 闲聊专用：允许更高的采样温度（0.6B 在 0.1 下只会复读「你好！…」模板）。
+    /// 路由/改写/检索等需要稳定输出的调用保持 0.1 走 complete_cancellable。
+    pub fn complete_chat_cancellable(
+        &mut self,
+        system: &str,
+        user: &str,
+        max_tokens: u32,
+        temperature: f32,
+        cancelled: &AtomicBool,
+    ) -> Result<String, AppError> {
+        self.complete_internal(system, user, max_tokens, Some(cancelled), None, temperature)
     }
 
     pub fn complete_json_cancellable(
@@ -445,7 +458,7 @@ impl LocalGenerationRuntime {
         schema: &serde_json::Value,
         cancelled: &AtomicBool,
     ) -> Result<String, AppError> {
-        self.complete_internal(system, user, max_tokens, Some(cancelled), Some(schema))
+        self.complete_internal(system, user, max_tokens, Some(cancelled), Some(schema), 0.1)
     }
 
     fn complete_internal(
@@ -455,6 +468,7 @@ impl LocalGenerationRuntime {
         max_tokens: u32,
         cancelled: Option<&AtomicBool>,
         json_schema: Option<&serde_json::Value>,
+        temperature: f32,
     ) -> Result<String, AppError> {
         let process = self.process.as_mut().ok_or_else(|| {
             AppError::new("GENERATION_RUNTIME_INACTIVE", "生成模型尚未启动", true)
@@ -481,7 +495,7 @@ impl LocalGenerationRuntime {
         let mut payload = json!({
             "model": "fanfan-local",
             "stream": false,
-            "temperature": 0.1,
+            "temperature": temperature.clamp(0.0, 1.5),
             "max_tokens": max_tokens.clamp(1, 2048),
             "chat_template_kwargs": {"enable_thinking": false},
             "messages": [

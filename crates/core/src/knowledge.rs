@@ -817,6 +817,34 @@ pub fn chat_prompt(request: &AskRequest, history: &[AskMessage]) -> (String, Str
     (system, user)
 }
 
+/// 0.6B 专用的闲聊 prompt。0.6B 指令跟随弱、在裸 system+user 下只会复读
+/// system 里的自我介绍或套「你好！…？」模板复读用户问题（日志实测），但
+/// 示例复读是它的强项。因此：system 只留一句不诱发自我介绍的话；user 给
+/// 5+5 历史后接 4 条「用户：/翻翻：」示例（直接对应实测失败句与寒暄高频
+/// 场景），示例紧邻输出位置，最后以「用户：{q}\n翻翻：」结尾引导续写。
+pub fn chat_prompt_mini(question: &str, history: &[AskMessage]) -> (String, String) {
+    let system = "你是翻翻，一个中文助手。直接回答用户的问题，不要重复用户说的话，不要说「你好！我是翻翻」。"
+        .to_owned();
+    let mut user = String::new();
+    let folded = fold_recent_history(history, 5, 5);
+    if !folded.is_empty() {
+        user.push_str(&format!("对话历史：\n{folded}\n\n"));
+    }
+    user.push_str(
+        "示例：\n\
+         用户：你好\n\
+         翻翻：你好呀，有什么想聊的？\n\
+         用户：你是谁\n\
+         翻翻：我是翻翻，一个中文助手，平时可以帮你查查资料聊聊天。\n\
+         用户：今天天气怎么样\n\
+         翻翻：这我还真不知道，我没有联网看天气的能力，你打开手机天气App看看更准。\n\
+         用户：你别学我说话\n\
+         翻翻：好好好，不学你了。你有别的事想问我吗？\n\n",
+    );
+    user.push_str(&format!("用户：{}\n翻翻：", question.trim()));
+    (system, user)
+}
+
 /// 剥离文本中的 [S\d+] 引用标记（如 "[S1]"），保留正文
 fn strip_citation_markers(text: &str) -> String {
     let marker = Regex::new(r"\[S\d+\]").unwrap();
@@ -1154,6 +1182,38 @@ mod tests {
         let (_, user2) = chat_prompt(&request(), &[]);
         assert!(!user2.contains("对话历史"));
         assert!(user2.starts_with("用户："));
+    }
+
+    #[test]
+    fn chat_prompt_mini_has_examples_and_continuation_tail() {
+        let history = vec![message("user", "你好"), message("assistant", "你好呀")];
+        let (system, user) = chat_prompt_mini("今天天气怎么样", &history);
+        // system 不再有会被 0.6B 转述成自我介绍的长角色设定
+        assert!(!system.contains("本地资料库"));
+        assert!(!system.contains("中文智能助手"));
+        assert!(system.contains("不要重复用户说的话"));
+        // 5+5 历史段保留
+        assert!(user.contains("对话历史："));
+        assert!(user.contains("翻翻：你好呀"));
+        // 4 条示例直接对应实测失败句（你是谁/天气/学我说话）与寒暄
+        assert!(user.contains("用户：你是谁"));
+        assert!(user.contains("用户：今天天气怎么样"));
+        assert!(user.contains("用户：你别学我说话"));
+        assert!(user.contains("用户：你好"));
+        // 示例位于输出位置之前，结尾是「用户：{q}\n翻翻：」续写引导
+        let tail = user
+            .split("翻翻：好好好")
+            .last()
+            .expect("末尾示例存在");
+        assert!(tail.contains("用户：今天天气怎么样\n翻翻："), "输出引导紧邻示例");
+        assert!(!user.contains("你好！我是翻翻"), "示例不含被复读的模板开场白");
+    }
+
+    #[test]
+    fn chat_prompt_mini_empty_history_skips_history_section() {
+        let (_, user) = chat_prompt_mini("你是谁", &[]);
+        assert!(!user.contains("对话历史"));
+        assert!(user.contains("用户：你是谁\n翻翻："));
     }
 
     #[test]
