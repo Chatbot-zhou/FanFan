@@ -36,7 +36,7 @@ function NavigationItem({ item }: { item: (typeof topItems)[number] & { badge?: 
     >
       <span className="sidebar-item__icon">{item.icon}</span>
       <span>{item.label}</span>
-      {item.badge !== undefined && <span className="sidebar-item__badge">{item.badge}</span>}
+      {item.badge !== undefined && <span className="sidebar-item__badge">{item.badge >= 100 ? "99+" : item.badge}</span>}
     </button>
   );
 }

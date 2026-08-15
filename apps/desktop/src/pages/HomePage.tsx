@@ -115,7 +115,7 @@ export function HomePage({ summary, loading }: HomePageProps) {
             else openInbox("new");
           }}>
             <span className="metric-card__icon">{metricIcons[metric.key]}</span>
-            <span><small>{metric.label}</small><strong>{metric.value >= 100 ? "99+" : metric.value}</strong></span>
+            <span><small>{metric.label}</small><strong>{metric.value}</strong></span>
           </button>
         ))}
       </div>
