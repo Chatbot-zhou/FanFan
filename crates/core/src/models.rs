@@ -235,6 +235,14 @@ pub struct ModelStoreStatus {
     pub installed_artifacts: u64,
     pub installed_bytes: u64,
     pub integrity_status: String,
+    /// 已安排迁移的目标目录（重启后执行）；由桌面端配置层填充。
+    pub pending_target_directory: Option<String>,
+    /// 存在待执行的模型仓库迁移时恒为 true；由桌面端配置层填充。
+    pub restart_required: bool,
+    /// 上次迁移/位置解析失败的说明；由桌面端配置层填充。
+    pub last_error: Option<String>,
+    /// 迁移完成前的旧模型仓库；非空表示有待清理的旧仓库。由桌面端配置层填充。
+    pub previous_model_store: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,6 +338,10 @@ impl ModelManager {
                 "ready"
             }
             .into(),
+            pending_target_directory: None,
+            restart_required: false,
+            last_error: None,
+            previous_model_store: None,
         })
     }
 
@@ -1702,6 +1714,35 @@ impl ModelManager {
         atomic_replace_file(&temporary_path, &self.downloads_path).map_err(|error| {
             AppError::new("MODEL_DOWNLOAD_STATE_WRITE_FAILED", error.to_string(), true)
         })
+    }
+
+    /// 只读健康校验：registry.json 存在、可解析且版本未超前。
+    /// 与 open_store 不同，不创建目录、不恢复中断下载、不刷新清单——
+    /// 专供清理前的安全校验使用，避免第二个 ModelManager 实例
+    /// 与在役服务并发改写 downloads.json / registry.json。
+    pub fn registry_readable(model_root: &Path) -> Result<(), AppError> {
+        let registry_path = model_root.join("registry.json");
+        // 与 load_registry 语义一致：缺失视为全新空仓库，可读。
+        if !registry_path.is_file() {
+            return Ok(());
+        }
+        let bytes = fs::read(&registry_path).map_err(|error| {
+            AppError::new(
+                "MODEL_REGISTRY_READ_FAILED",
+                format!("模型注册表不可读：{error}"),
+                true,
+            )
+        })?;
+        let registry = serde_json::from_slice::<ModelRegistryState>(&bytes)
+            .map_err(|error| AppError::new("MODEL_REGISTRY_INVALID", error.to_string(), false))?;
+        if registry.registry_version > REGISTRY_VERSION {
+            return Err(AppError::new(
+                "MODEL_REGISTRY_TOO_NEW",
+                "模型注册表来自更高版本的翻翻",
+                false,
+            ));
+        }
+        Ok(())
     }
 
     fn load_registry(&self) -> Result<ModelRegistryState, AppError> {

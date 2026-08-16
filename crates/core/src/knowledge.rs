@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::router::Intent;
-use crate::{AppError, EvidenceRef, ScopeFilter, SearchSession};
+use crate::{AppError, DocumentType, EvidenceRef, ScopeFilter, SearchSession};
 
 /// 查询意图：从自然语言中提取的结构化检索参数
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -113,6 +113,10 @@ pub struct AskRequest {
     pub retrieval_limit: u32,
     pub max_source_files: u32,
     pub strict_evidence: bool,
+    /// 澄清选择（Step 7）：用户在 NEED_CLARIFICATION 中选中目标文件后，
+    /// 原问题 + 该字段继续问答；锁定 scope、写 USER_SELECTION 记忆。
+    #[serde(default)]
+    pub clarification_selection: Option<Uuid>,
 }
 
 impl AskRequest {
@@ -221,6 +225,107 @@ pub struct AnswerSourceFile {
     pub canonical_path: String,
 }
 
+/// 澄清候选（Step 7）：多个非常接近的目标文件，需要用户明确选择一个。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClarificationOption {
+    pub file_id: Uuid,
+    /// 展示名（文件名）
+    pub display_name: String,
+    pub document_type: Option<DocumentType>,
+    /// Resolver 综合得分（仅展示参考，不是决策依据）
+    pub score: f32,
+    /// 命中的定位信号
+    pub signals: Vec<String>,
+}
+
+/// 回答模式（强类型，9 类）：替代散乱字符串标记，前端据此选择渲染方式。
+///
+/// 序列化为 snake_case；历史数据宽容反序列化（未知/旧标记 → Generated）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnswerMode {
+    /// 普通 RAG 生成（证据核验通过）
+    Generated,
+    /// 闲聊（GENERAL / 路由失败兜底）
+    Chat,
+    /// LOCAL 检索无证据 → 固定拒绝文案，绝不转闲聊
+    RagRefusal,
+    /// 生成内容未通过引用核验的降级展示
+    Unverified,
+    /// NEED_CLARIFICATION：请用户在候选文件中选择目标
+    Clarification,
+    /// DOCUMENT_SUMMARY 整文摘要
+    Summary,
+    /// COMPARE_DOCUMENTS 两侧对比
+    Compare,
+    /// EXTRACT 结构化条目抽取
+    Extract,
+    /// DOCUMENT_FIND：返回定位到的文件
+    Find,
+}
+
+impl AnswerMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AnswerMode::Generated => "generated",
+            AnswerMode::Chat => "chat",
+            AnswerMode::RagRefusal => "rag_refusal",
+            AnswerMode::Unverified => "unverified",
+            AnswerMode::Clarification => "clarification",
+            AnswerMode::Summary => "summary",
+            AnswerMode::Compare => "compare",
+            AnswerMode::Extract => "extract",
+            AnswerMode::Find => "find",
+        }
+    }
+
+    /// 宽容解析：snake_case 变体名；历史字符串兼容（旧内部中间态
+    /// "extractive" → Generated）。未知返回 None。
+    pub fn parse_lenient(input: &str) -> Option<AnswerMode> {
+        let normalized = input.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "generated" | "extractive" => Some(AnswerMode::Generated),
+            "chat" => Some(AnswerMode::Chat),
+            "rag_refusal" => Some(AnswerMode::RagRefusal),
+            "unverified" => Some(AnswerMode::Unverified),
+            "clarification" => Some(AnswerMode::Clarification),
+            "summary" => Some(AnswerMode::Summary),
+            "compare" => Some(AnswerMode::Compare),
+            "extract" => Some(AnswerMode::Extract),
+            "find" => Some(AnswerMode::Find),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for AnswerMode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for AnswerMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(AnswerMode::parse_lenient(&value).unwrap_or(AnswerMode::Generated))
+    }
+}
+
+/// NEED_CLARIFICATION 强类型载荷：随 `AnswerResult`（answer_mode = "clarification"）
+/// 返回给前端，用户选择后带 `clarification_selection` 继续原问题。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ClarificationPayload {
+    /// 用户原始引用（如「我的简历」）；选择后据此写 USER_SELECTION 记忆
+    pub reference: String,
+    pub reason: String,
+    pub options: Vec<ClarificationOption>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AnswerResult {
     pub session_id: Uuid,
@@ -232,13 +337,16 @@ pub struct AnswerResult {
     pub source_files: Vec<AnswerSourceFile>,
     pub used_file_ids: Vec<Uuid>,
     pub elapsed_ms: u64,
-    pub answer_mode: String,
+    pub answer_mode: AnswerMode,
     #[serde(default)]
     pub retrieval_channels: Vec<String>,
     #[serde(default)]
     pub index_coverage: f64,
     #[serde(default)]
     pub degradation_reason: Option<String>,
+    /// NEED_CLARIFICATION 载荷（仅 answer_mode = "clarification" 时非空）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clarification: Option<ClarificationPayload>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -264,6 +372,76 @@ pub struct AskSession {
     pub scope: ScopeFilter,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// 文档画像（document_profiles 表行，migration 8 建表 / 27 扩展）。
+///
+/// 现有列（title/summary/keywords/entities/embedding）由 organizing.rs 的
+/// 集合建议管线写入；`document_type`/`type_confidence`/`section_titles`/
+/// `representative_text_hash` 为 P0 扩展列（migration 27），由后续文档
+/// 分类器写入。Document Resolver 读取它把「目标对象」锁定为 file_id。
+///
+/// 画像只用于**定位**，绝不直接成为 Citation Evidence。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DocumentProfile {
+    pub file_id: Uuid,
+    pub revision_id: Uuid,
+    pub title: String,
+    pub summary: String,
+    pub keywords: Vec<String>,
+    pub entities: Vec<String>,
+    #[serde(default)]
+    pub document_type: Option<DocumentType>,
+    #[serde(default)]
+    pub type_confidence: Option<f32>,
+    #[serde(default)]
+    pub section_titles: Vec<String>,
+    #[serde(default)]
+    pub representative_text_hash: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// 文档画像批量构建（refresh_document_profiles）的统计结果。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProfileRefreshResult {
+    /// 本次构建/更新的画像数
+    pub profiled_files: u64,
+    /// 命中候选但因数据缺失（无 chunk / 无向量）跳过的文件数
+    pub skipped_files: u64,
+}
+
+/// 会话工作上下文（Session Working Context）。
+///
+/// 每个 ask session 保存轻量工作上下文，供 AMBIGUOUS 请求的 Context Resolver
+/// 恢复目标：上一轮定位/引用的文件、文档类型、收藏集与意图。它不是历史
+/// 文本，而是结构化的「用户正在指什么」。
+///
+/// 只允许 Memory/Document Resolver 用它来**定位**文件，绝不允许它成为
+/// Citation Evidence（S# 只能来自原始文件 chunk / image evidence）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AskSessionContext {
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
+    #[serde(default)]
+    pub active_file_id: Option<Uuid>,
+    #[serde(default)]
+    pub active_file_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub active_document_type: Option<DocumentType>,
+    #[serde(default)]
+    pub active_entity_id: Option<Uuid>,
+    #[serde(default)]
+    pub active_collection_id: Option<Uuid>,
+    #[serde(default)]
+    pub last_referenced_file_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub last_intent: Option<String>,
+    /// 最近一次 NEED_CLARIFICATION 的原始引用（如「我的简历」），
+    /// 用户选择后据此写 USER_SELECTION 别名记忆。
+    #[serde(default)]
+    pub pending_clarification_reference: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -425,10 +603,12 @@ pub fn assemble_extractive_answer(
             source_files: Vec::new(),
             used_file_ids: Vec::new(),
             elapsed_ms: started_at.elapsed().as_millis() as u64,
-            answer_mode: "extractive".into(),
+            // 中间态标记（extractive 候选）；调用方按证据门控覆写
+            answer_mode: AnswerMode::Generated,
             retrieval_channels: vec!["filename".into(), "fts".into()],
             index_coverage: 0.0,
             degradation_reason: None,
+            clarification: None,
         };
     }
 
@@ -475,10 +655,12 @@ pub fn assemble_extractive_answer(
         source_files,
         claims,
         elapsed_ms: started_at.elapsed().as_millis() as u64 + session.elapsed_ms,
-        answer_mode: "extractive".into(),
+        // 中间态标记（extractive 候选）；调用方按证据门控覆写
+        answer_mode: AnswerMode::Generated,
         retrieval_channels: vec!["filename".into(), "fts".into()],
         index_coverage: 0.0,
         degradation_reason: None,
+        clarification: None,
     }
 }
 
@@ -631,7 +813,7 @@ pub fn apply_grounded_generation(
     result.claims = claims;
     result.used_file_ids = source_files.iter().map(|source| source.file_id).collect();
     result.source_files = source_files;
-    result.answer_mode = "generated".into();
+    result.answer_mode = AnswerMode::Generated;
     Some(result)
 }
 
@@ -733,63 +915,17 @@ pub fn intent_routing_prompt(question: &str, history: &[AskMessage]) -> (String,
 
 /// 解析路由输出为意图；解析失败或意图非法返回 None
 /// （route_question 兜底默认走 Chat，不再静默落 RAG）。
-/// 兼容两种格式：完整版 prompt 的 JSON（{"intent":"retrieval"|"chat"}）与
-/// 0.6B 迷你版的两字输出（「检索」「闲聊」，允许前后空白/标点/引号噪声）。
 pub fn parse_intent_verdict(raw: &str) -> Option<Intent> {
     let cleaned = strip_code_fence(raw).trim();
-    if let Ok(verdict) = serde_json::from_str::<serde_json::Value>(cleaned) {
-        if let Some(intent) = verdict.get("intent").and_then(|value| value.as_str()) {
-            return match intent {
-                "retrieval" => Some(Intent::Retrieval),
-                "chat" => Some(Intent::Chat),
-                _ => None,
-            };
-        }
-    }
-    // 词级格式：取最后一次出现的候选（recency——模型判的答案通常在末尾）。
-    // 约束行「只输出：检索 或 闲聊」若被复读，「闲聊」靠后 → 偏 Chat 安全方向。
-    let retrieval_pos = cleaned.rfind("检索");
-    let chat_pos = cleaned.rfind("闲聊");
-    match (retrieval_pos, chat_pos) {
-        (Some(retrieval), Some(chat)) if retrieval > chat => Some(Intent::Retrieval),
-        (Some(_), Some(_)) => Some(Intent::Chat),
-        (Some(_), None) => Some(Intent::Retrieval),
-        (None, Some(_)) => Some(Intent::Chat),
-        (None, None) => None,
-    }
-}
-
-/// 0.6B 迷你版意图路由 prompt：两字词级输出（续写强项）+ 词表信号 + 错误样例。
-/// 与完整版 [`intent_routing_prompt`] 并存；route_question 按模型档位选择。
-/// 设计：0.6B 不擅长长 prompt 全局阅读与 JSON 结构化输出，但擅长词级续写与
-/// 示例复读——所以判断标准浓缩为词表引导两句，示例直接给出实测失败句的答案。
-pub fn intent_routing_prompt_mini(question: &str, history: &[AskMessage]) -> (String, String) {
-    let system = "你是意图判断助手。只输出两个字：检索 或 闲聊。不要输出其他任何文字、解释或 markdown 标记。".into();
-    let mut user = String::new();
-    let folded = fold_recent_history(history, 5, 5);
-    if !folded.is_empty() {
-        user.push_str(&format!(
-            "【对话历史】以下是最近 5 条对话的历史记录，不是用户现在说的话：\n{folded}\n\n"
-        ));
-    }
-    user.push_str(&format!(
-        r#"【当前问题】下面这一句才是用户刚刚说的最新一句话，只判断这一句：
-用户说：{question}
-
-判断用户这句话要不要查本地资料库：
-- 想查本地文档、资料、制度、流程、数据、合同、方案 → 检索
-- 其他一切（寒暄、闲聊、知识问答、天气、自我介绍、心情） → 闲聊
-
-例子：
-- 公司的报销流程是什么 → 检索
-- 去年的财务报表数据 → 检索
-- 今天天气怎么样 → 闲聊
-- 你是什么模型 → 闲聊
-
-只输出：检索 或 闲聊。无法确定时输出闲聊。宁可闲聊也绝不误检索。"#,
-        question = question.trim()
-    ));
-    (system, user)
+    serde_json::from_str::<serde_json::Value>(cleaned)
+        .ok()?
+        .get("intent")
+        .and_then(|value| value.as_str())
+        .and_then(|intent| match intent {
+            "retrieval" => Some(Intent::Retrieval),
+            "chat" => Some(Intent::Chat),
+            _ => None,
+        })
 }
 
 /// 构建追问改写 prompt（极简，0.6B 友好）：输入按「history」与「question」
@@ -876,39 +1012,6 @@ pub fn chat_prompt(request: &AskRequest, history: &[AskMessage]) -> (String, Str
     (system, user)
 }
 
-/// 0.6B 专用的闲聊 prompt。0.6B 指令跟随弱、在裸 system+user 下只会复读
-/// system 里的自我介绍或套「你好！…？」模板复读用户问题（日志实测），但
-/// 示例复读是它的强项。因此：system 只留一句不诱发自我介绍的话；user 给
-/// 5+5 历史后接 4 条「用户：/翻翻：」示例（直接对应实测失败句与寒暄高频
-/// 场景），示例紧邻输出位置，最后以「用户：{q}\n翻翻：」结尾引导续写。
-pub fn chat_prompt_mini(question: &str, history: &[AskMessage]) -> (String, String) {
-    // 正面指令优先（手册：说「要做什么」比「不要做什么」有效）：
-    // 只定义「直接回答」，不罗列「不要复读/不要自我介绍」等否定项。
-    let system =
-        "你是翻翻，一个中文助手。用简短、自然、口语化的话直接回答用户的问题，一两句就好。".to_owned();
-    let mut user = String::new();
-    let folded = fold_recent_history(history, 5, 5);
-    if !folded.is_empty() {
-        user.push_str(&format!("【对话历史】\n{folded}\n\n"));
-    }
-    // 示例紧邻输出位置，明确引用（「照下面示例的方式」），长度与语气约束
-    // 都通过示例本身表达——0.6B 复读示例比读指令更可靠。
-    user.push_str(
-        "【示例】照下面示例的方式回答：\n\
-         用户：你好\n\
-         翻翻：你好呀，有什么想聊的？\n\
-         用户：你是谁\n\
-         翻翻：我是翻翻，一个中文助手，平时可以帮你查查资料聊聊天。\n\
-         用户：今天天气怎么样\n\
-         翻翻：这我还真不知道，我没有联网看天气的能力，你打开手机天气App看看更准。\n\
-         用户：你别学我说话\n\
-         翻翻：好好好，不学你了。你有别的事想问我吗？\n\n\
-         【现在】\n",
-    );
-    user.push_str(&format!("用户：{}\n翻翻：", question.trim()));
-    (system, user)
-}
-
 /// 剥离文本中的 [S\d+] 引用标记（如 "[S1]"），保留正文
 fn strip_citation_markers(text: &str) -> String {
     let marker = Regex::new(r"\[S\d+\]").unwrap();
@@ -960,7 +1063,7 @@ pub fn unverified_answer(
     result.claims = Vec::new();
     result.source_files = Vec::new();
     result.used_file_ids = Vec::new();
-    result.answer_mode = "unverified".into();
+    result.answer_mode = AnswerMode::Unverified;
     result.elapsed_ms = elapsed_ms;
     result.degradation_reason = Some("本次生成结果未通过核验，置信度较低".to_owned());
     result
@@ -970,6 +1073,36 @@ pub fn unverified_answer(
 mod tests {
     use super::*;
     use crate::{Availability, SearchChannelState, SearchChannels};
+
+    #[test]
+    fn answer_mode_serializes_as_snake_case_and_tolerates_legacy_values() {
+        // 序列化：9 个变体 → snake_case
+        let serialized = serde_json::to_string(&AnswerMode::Compare).unwrap();
+        assert_eq!(serialized, "\"compare\"");
+        assert_eq!(serde_json::to_string(&AnswerMode::Generated).unwrap(), "\"generated\"");
+        // 历史数据兼容：旧内部标记 "extractive" → Generated
+        let legacy: AnswerMode = serde_json::from_str("\"extractive\"").unwrap();
+        assert_eq!(legacy, AnswerMode::Generated);
+        // 未知值 → Generated（宽容兜底，读旧库不炸）
+        let unknown: AnswerMode = serde_json::from_str("\"whatever\"").unwrap();
+        assert_eq!(unknown, AnswerMode::Generated);
+        // 每个变体的 parse_lenient / as_str 往返
+        for mode in [
+            AnswerMode::Generated,
+            AnswerMode::Chat,
+            AnswerMode::RagRefusal,
+            AnswerMode::Unverified,
+            AnswerMode::Clarification,
+            AnswerMode::Summary,
+            AnswerMode::Compare,
+            AnswerMode::Extract,
+            AnswerMode::Find,
+        ] {
+            assert_eq!(AnswerMode::parse_lenient(mode.as_str()), Some(mode));
+        }
+        assert_eq!(AnswerMode::parse_lenient("FIND"), Some(AnswerMode::Find));
+        assert_eq!(AnswerMode::parse_lenient(""), None);
+    }
 
     fn request() -> AskRequest {
         AskRequest {
@@ -988,6 +1121,7 @@ mod tests {
             retrieval_limit: 12,
             max_source_files: 8,
             strict_evidence: true,
+            clarification_selection: None,
         }
     }
 
@@ -1099,7 +1233,7 @@ mod tests {
         )
         .expect("claims with refusal should resolve to claims");
         assert_eq!(coexistence.claims.len(), 1);
-        assert_eq!(coexistence.answer_mode, "generated");
+        assert_eq!(coexistence.answer_mode, AnswerMode::Generated);
         assert_eq!(grounded_answer_json_schema()["additionalProperties"], false);
     }
 
@@ -1149,48 +1283,6 @@ mod tests {
         assert_eq!(parse_intent_verdict(r#"{"intent":"ambiguous"}"#), None);
         assert_eq!(parse_intent_verdict(r#"{"other":1}"#), None);
         assert_eq!(parse_intent_verdict(""), None);
-        // 0.6B 迷你版的两字输出（含噪声容错）
-        assert_eq!(parse_intent_verdict("闲聊"), Some(Intent::Chat));
-        assert_eq!(parse_intent_verdict("检索"), Some(Intent::Retrieval));
-        assert_eq!(parse_intent_verdict("答案是：闲聊。"), Some(Intent::Chat));
-        assert_eq!(parse_intent_verdict("\"检索\""), Some(Intent::Retrieval));
-        // 约束行被复读（"检索"在前"闲聊"在后）→ 取最后出现的 → 偏 Chat 安全
-        assert_eq!(
-            parse_intent_verdict("只输出：检索 或 闲聊"),
-            Some(Intent::Chat)
-        );
-    }
-
-    #[test]
-    fn intent_routing_prompt_mini_guides_by_vocabulary_and_failure_examples() {
-        let history = vec![message("user", "你好"), message("assistant", "你好！")];
-        let (system, user) = intent_routing_prompt_mini("报销流程是什么", &history);
-        // 词级输出约束
-        assert!(system.contains("只输出两个字"));
-        assert!(user.contains("检索 或 闲聊"));
-        // 词表信号引导
-        assert!(user.contains("文档、资料、制度、流程、数据、合同、方案"));
-        assert!(user.contains("其他一切"));
-        // 实测失败句直接进示例（chat 示例靠后贴近输出位置）
-        assert!(user.contains("今天天气怎么样 → 闲聊"));
-        assert!(user.contains("你是什么模型 → 闲聊"));
-        assert!(user.contains("公司的报销流程是什么 → 检索"));
-        // 5+5 历史段（【对话历史】标记） + 当前问题（【当前问题】标记）+ 兜底句
-        assert!(user.contains("【对话历史】"));
-        assert!(user.contains("不是用户现在说的话"));
-        assert!(user.contains("用户：你好"));
-        assert!(user.contains("翻翻：你好！"));
-        assert!(user.contains("【当前问题】"));
-        assert!(user.contains("用户说：报销流程是什么"));
-        assert!(user.contains("宁可闲聊也绝不误检索"));
-    }
-
-    #[test]
-    fn intent_routing_prompt_mini_empty_history_has_no_history_section() {
-        let (_, user) = intent_routing_prompt_mini("今天天气怎么样", &[]);
-        assert!(!user.contains("【对话历史】"));
-        assert!(user.contains("【当前问题】"));
-        assert!(user.contains("用户说：今天天气怎么样"));
     }
 
     #[test]
@@ -1260,40 +1352,6 @@ mod tests {
         let (_, user2) = chat_prompt(&request(), &[]);
         assert!(!user2.contains("对话历史"));
         assert!(user2.starts_with("【当前问题】"));
-    }
-
-    #[test]
-    fn chat_prompt_mini_has_examples_and_continuation_tail() {
-        let history = vec![message("user", "你好"), message("assistant", "你好呀")];
-        let (system, user) = chat_prompt_mini("今天天气怎么样", &history);
-        // system 不再有会被 0.6B 转述成自我介绍的长角色设定；
-        // 按手册「正面指令优先」：说「直接回答」而非罗列否定项
-        assert!(!system.contains("本地资料库"));
-        assert!(!system.contains("中文智能助手"));
-        assert!(system.contains("直接回答用户的问题"));
-        assert!(!system.contains("不要"));
-        // 5+5 历史段保留
-        assert!(user.contains("【对话历史】"));
-        assert!(user.contains("翻翻：你好呀"));
-        // 4 条示例直接对应实测失败句（你是谁/天气/学我说话）与寒暄
-        assert!(user.contains("用户：你是谁"));
-        assert!(user.contains("用户：今天天气怎么样"));
-        assert!(user.contains("用户：你别学我说话"));
-        assert!(user.contains("用户：你好"));
-        // 示例位于输出位置之前，结尾是「用户：{q}\n翻翻：」续写引导
-        let tail = user
-            .split("翻翻：好好好")
-            .last()
-            .expect("末尾示例存在");
-        assert!(tail.contains("用户：今天天气怎么样\n翻翻："), "输出引导紧邻示例");
-        assert!(!user.contains("你好！我是翻翻"), "示例不含被复读的模板开场白");
-    }
-
-    #[test]
-    fn chat_prompt_mini_empty_history_skips_history_section() {
-        let (_, user) = chat_prompt_mini("你是谁", &[]);
-        assert!(!user.contains("对话历史"));
-        assert!(user.contains("用户：你是谁\n翻翻："));
     }
 
     #[test]
@@ -1549,7 +1607,7 @@ mod tests {
         assert!(degraded.used_file_ids.is_empty());
         assert_eq!(degraded.grounding_status, GroundingStatus::Insufficient);
         assert!(!degraded.insufficient_evidence);
-        assert_eq!(degraded.answer_mode, "unverified");
+        assert_eq!(degraded.answer_mode, AnswerMode::Unverified);
         assert_eq!(degraded.elapsed_ms, 1234);
         assert_eq!(
             degraded.degradation_reason.as_deref(),

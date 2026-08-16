@@ -1016,6 +1016,7 @@ fn strict_ask_request(question: &str, session_id: Option<uuid::Uuid>) -> AskRequ
         retrieval_limit: 10,
         max_source_files: 6,
         strict_evidence: true,
+        clarification_selection: None,
     }
 }
 

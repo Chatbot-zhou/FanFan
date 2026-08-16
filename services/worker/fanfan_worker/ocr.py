@@ -3,10 +3,14 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
 from .protocol import WorkerError
+
+# 瞬时失败（PS 进程异常退出、IO 抖动）的两次重试退避间隔（秒）。
+_WINDOWS_OCR_RETRY_BACKOFF_SECONDS = (0.5, 1.0)
 
 
 def recognize_with_windows(
@@ -26,8 +30,13 @@ def recognize_with_windows(
     if not script_path.is_file():
         return None, WorkerError("OCR_RUNTIME_UNAVAILABLE", "Windows OCR脚本未随Worker安装", False)
     language = "zh-Hans-CN" if any(value.lower().startswith("zh") for value in language_hints) else "en-US"
-    page_limit = min(max_pages or 50, 200)
+    # max_pages 是页数遍历预算（页号未指定时 ps1 只处理前 N 页）；而
+    # page_numbers 是文档内的绝对页码（1-based），上限必须能覆盖请求的最大页号
+    # ——超过 50 页的 PDF 扫描页常在 100+ 页处，按数量预算会误判 OCR_INPUT_INVALID。
+    # ps1 的 -MaxPages 同时用于页号过滤，因此取两者较大者。
+    traversal_limit = min(max_pages or 50, 200)
     selected_pages = sorted(set(page_numbers or []))
+    page_limit = max(traversal_limit, max(selected_pages, default=0))
     if any(page < 1 or page > page_limit for page in selected_pages):
         return None, WorkerError("OCR_INPUT_INVALID", "OCR页码超出本次文档范围", False)
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -61,63 +70,80 @@ def recognize_with_windows(
         if source_kind != "pdf" or render_pages_dir is None:
             return None, WorkerError("OCR_INPUT_INVALID", "Render-only mode requires PDF pages and a cache directory", False)
         command.append("-RenderOnly")
-    try:
-        completed = subprocess.run(
-            command,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            # Budget must stay below the Rust side's document.parse timeout
-            # (worker.rs) so the worker is never killed mid-OCR.
-            timeout=min(270, 30 + page_limit * 8),
-            creationflags=creation_flags,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return None, WorkerError("OCR_TIMEOUT", "OCR处理超过资源预算，已安全停止", True)
-    except OSError as error:
-        return None, WorkerError("OCR_RUNTIME_UNAVAILABLE", str(error), True)
-    if completed.returncode != 0:
-        stderr_text = completed.stderr or ""
-        if "OCR_LANGUAGE_PACK_MISSING" in stderr_text:
-            return None, WorkerError(
-                "OCR_RUNTIME_UNAVAILABLE",
-                "未安装Windows OCR语言包，请在系统设置中添加简体中文语言包后重试",
-                False,
-            )
-        if render_only:
-            return None, WorkerError(
-                "PDF_RENDER_FAILED",
-                "扫描页渲染失败，文件可能损坏或与系统PDF运行时不兼容",
-                False,
-                details={"stage": "pdf_render", "process_exit_code": completed.returncode},
-            )
-        return None, WorkerError(
-            "OCR_RECOGNITION_FAILED",
-            "Windows OCR执行失败",
-            True,
-            details={"stage": "recognition", "process_exit_code": completed.returncode},
-        )
-    after = source_path.stat()
-    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
-        return None, WorkerError("FILE_CHANGED_DURING_PARSE", "OCR期间源文件发生变化，请稍后重试", True)
-    try:
-        result = json.loads(completed.stdout.lstrip("\ufeff").strip())
-    except (json.JSONDecodeError, TypeError) as error:
-        return None, WorkerError("OCR_RESPONSE_INVALID", str(error), False)
-    lines = result.get("lines")
-    if not isinstance(lines, list):
-        return None, WorkerError("OCR_RESPONSE_INVALID", "Windows OCR响应缺少文本行", False)
-    if render_pages_dir is not None:
+    # 瞬时失败（PS 进程异常退出、IO 抖动）重试两次再上报；超时与引擎级
+    # 错误不可重试——超时已耗尽本次预算，重试会把总耗时翻倍并撞上 Rust 侧
+    # document.parse 超时（worker.rs operation_timeout），引擎级错误（语言包
+    # 缺失、渲染不兼容）重试结果相同。
+    def run_once() -> tuple[dict[str, Any] | None, WorkerError | None]:
         try:
-            result["rendered_pages"] = _validated_rendered_pages(
-                result.get("rendered_pages"), render_pages_dir, set(selected_pages)
+            # 超时预算按实际要处理的页数（页号未指定时按遍历上限），
+            # 避免大文档只 OCR 几页却占用全部预算。
+            budget_pages = len(selected_pages) if selected_pages else traversal_limit
+            completed = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                # Budget must stay below the Rust side's document.parse timeout
+                # (worker.rs) so the worker is never killed mid-OCR.
+                timeout=min(270, 30 + budget_pages * 8),
+                creationflags=creation_flags,
+                check=False,
             )
-        except (OSError, ValueError) as error:
+        except subprocess.TimeoutExpired:
+            return None, WorkerError("OCR_TIMEOUT", "OCR处理超过资源预算，已安全停止", True)
+        except OSError as error:
+            return None, WorkerError("OCR_RUNTIME_UNAVAILABLE", str(error), True)
+        if completed.returncode != 0:
+            stderr_text = completed.stderr or ""
+            if "OCR_LANGUAGE_PACK_MISSING" in stderr_text:
+                return None, WorkerError(
+                    "OCR_RUNTIME_UNAVAILABLE",
+                    "未安装Windows OCR语言包，请在系统设置中添加简体中文语言包后重试",
+                    False,
+                )
+            if render_only:
+                return None, WorkerError(
+                    "PDF_RENDER_FAILED",
+                    "扫描页渲染失败，文件可能损坏或与系统PDF运行时不兼容",
+                    False,
+                    details={"stage": "pdf_render", "process_exit_code": completed.returncode},
+                )
+            return None, WorkerError(
+                "OCR_RECOGNITION_FAILED",
+                "Windows OCR执行失败",
+                True,
+                details={"stage": "recognition", "process_exit_code": completed.returncode},
+            )
+        after = source_path.stat()
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            return None, WorkerError("FILE_CHANGED_DURING_PARSE", "OCR期间源文件发生变化，请稍后重试", True)
+        try:
+            result = json.loads(completed.stdout.lstrip("\ufeff").strip())
+        except (json.JSONDecodeError, TypeError) as error:
             return None, WorkerError("OCR_RESPONSE_INVALID", str(error), False)
-    return result, None
+        lines = result.get("lines")
+        if not isinstance(lines, list):
+            return None, WorkerError("OCR_RESPONSE_INVALID", "Windows OCR响应缺少文本行", False)
+        if render_pages_dir is not None:
+            try:
+                result["rendered_pages"] = _validated_rendered_pages(
+                    result.get("rendered_pages"), render_pages_dir, set(selected_pages)
+                )
+            except (OSError, ValueError) as error:
+                return None, WorkerError("OCR_RESPONSE_INVALID", str(error), False)
+        return result, None
+
+    result, error = run_once()
+    if error is not None and error.retryable and error.code != "OCR_TIMEOUT":
+        for backoff in _WINDOWS_OCR_RETRY_BACKOFF_SECONDS:
+            time.sleep(backoff)
+            result, error = run_once()
+            if error is None or not (error.retryable and error.code != "OCR_TIMEOUT"):
+                break
+    return result, error
 
 
 def _validated_rendered_pages(

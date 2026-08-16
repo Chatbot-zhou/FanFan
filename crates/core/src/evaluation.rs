@@ -570,6 +570,446 @@ fn contains_absolute_path(value: &str) -> bool {
     }) || value.starts_with("\\\\")
 }
 
+/// ===== Ask Evaluation Runner（Phase 3）=====
+///
+/// 测试集（JSONL 或 JSON 数组）批量运行问答管线，逐项对比 expected_* 与
+/// actual_*，产出每例 verdict + 全批指标。第一版只保证**数据可采集**，
+/// 不做复杂 NLP 自动评分；error_category 允许人工修改（结果文件可直接编辑）。
+///
+/// 禁止自动学习：Runner 绝不修改 Router Prompt / Resolver 权重 /
+/// Memory / 阈值 / Prototype；运行期间不写任何 Memory（candidate writer
+/// 不启动，clarification_selection 不出现）。
+
+/// 单个评估用例（测试集一行 / 一个元素）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EvaluationCase {
+    pub id: String,
+    pub question: String,
+    #[serde(default)]
+    pub expected_source: Option<String>,
+    #[serde(default)]
+    pub expected_intent: Option<String>,
+    /// 可空：不校验文件命中
+    #[serde(default)]
+    pub expected_file_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub expected_document_type: Option<String>,
+    /// Some(true)：应找到证据；Some(false)：应 NO_EVIDENCE 拒绝；None：不校验
+    #[serde(default)]
+    pub expected_should_find_evidence: Option<bool>,
+}
+
+/// 错误分类（13 类，snake_case；UNKNOWN 兜底）。允许人工修改。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationErrorCategory {
+    RouterError,
+    QueryParseError,
+    ContextError,
+    MemoryError,
+    DocumentResolutionError,
+    DocumentRecallError,
+    ChunkRetrievalError,
+    RerankError,
+    NoEvidenceError,
+    GenerationError,
+    CitationError,
+    ClarificationError,
+    Unknown,
+}
+
+impl EvaluationErrorCategory {
+    /// trace 节点名 → 错误分类（优先于运行级错误码判断）。
+    pub fn from_node(node: &str) -> Option<Self> {
+        Some(match node {
+            "source_routing" => Self::RouterError,
+            "query_parsing" => Self::QueryParseError,
+            "context_resolution" => Self::ContextError,
+            "memory_resolution" => Self::MemoryError,
+            "document_resolution" => Self::DocumentResolutionError,
+            "document_recall" => Self::DocumentRecallError,
+            "retrieval" => Self::ChunkRetrievalError,
+            "reranking" => Self::RerankError,
+            "generation" => Self::GenerationError,
+            "verification" => Self::CitationError,
+            "repair" => Self::CitationError,
+            "clarification_selection" => Self::ClarificationError,
+            _ => return None,
+        })
+    }
+
+    /// 运行级错误码 → 分类（子串匹配，宽匹配已知家族）。
+    pub fn from_error_code(code: &str) -> Self {
+        let upper = code.to_ascii_uppercase();
+        if upper.contains("CLARIFICATION") {
+            Self::ClarificationError
+        } else if upper.contains("GENERATION") || upper.contains("RAG_GENERATION") {
+            Self::GenerationError
+        } else if upper.contains("RERANK") {
+            Self::RerankError
+        } else if upper.contains("EMBEDDING") || upper.contains("RAG_EMBEDDING") {
+            Self::ChunkRetrievalError
+        } else if upper.contains("ROUT") {
+            Self::RouterError
+        } else if upper.contains("PARSE") || upper.contains("PARSER") {
+            Self::QueryParseError
+        } else if upper.contains("RESOLV") || upper.contains("RESOLUTION") {
+            Self::DocumentResolutionError
+        } else if upper.contains("MEMORY") {
+            Self::MemoryError
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
+/// 单条用例的评估结果（JSON 可直接落盘供人工复核/修改分类）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EvaluationRunResult {
+    pub case_id: String,
+    /// 该用例运行时的 operation_id（node_traces 关联键，可对应用例打开 Trace Viewer）
+    #[serde(default)]
+    pub operation_id: String,
+    pub question: String,
+    pub expected_source: Option<String>,
+    pub expected_intent: Option<String>,
+    pub expected_file_ids: Option<Vec<String>>,
+    pub expected_document_type: Option<String>,
+    pub expected_should_find_evidence: Option<bool>,
+    pub actual_source: Option<String>,
+    pub actual_intent: Option<String>,
+    pub actual_file_ids: Vec<String>,
+    pub actual_document_type: Option<String>,
+    pub memory_used: bool,
+    pub clarification_used: bool,
+    pub retrieval_top_files: Vec<String>,
+    pub rerank_top_files: Vec<String>,
+    pub grounding_status: Option<String>,
+    pub answer_mode: Option<String>,
+    /// 检索/回答是否使用了证据（claims 或来源文件非空）
+    pub evidence_found: bool,
+    /// Grounded 且无 Unsupported claim
+    pub answer_grounded: bool,
+    pub claim_count: u64,
+    pub supported_claim_count: u64,
+    pub latency_ms: u64,
+    #[serde(default)]
+    pub error_category: Option<EvaluationErrorCategory>,
+    #[serde(default)]
+    pub error_message: Option<String>,
+    pub pass_fail: bool,
+    #[serde(default)]
+    pub failed_fields: Vec<String>,
+}
+
+/// 逐字段判定结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvaluationVerdict {
+    pub pass_fail: bool,
+    pub failed_fields: Vec<String>,
+}
+
+/// 判定（纯逻辑，无 IO）：expected_* 有值才断言；scope_correct 第一版
+/// 测试集不建模（无可空字段），不参与判定。
+pub fn verdict_for(result: &EvaluationRunResult) -> EvaluationVerdict {
+    let mut failed = Vec::new();
+    if let Some(expected) = result.expected_source.as_deref()
+        && result.actual_source.as_deref() != Some(expected)
+    {
+        failed.push("source_correct".to_owned());
+    }
+    if let Some(expected) = result.expected_intent.as_deref()
+        && result.actual_intent.as_deref() != Some(expected)
+    {
+        failed.push("intent_correct".to_owned());
+    }
+    if let Some(expected) = result.expected_document_type.as_deref()
+        && result.actual_document_type.as_deref() != Some(expected)
+    {
+        failed.push("target_correct".to_owned());
+    }
+    if let Some(expected) = result.expected_file_ids.as_deref() {
+        let hit = expected
+            .iter()
+            .any(|file_id| result.actual_file_ids.iter().any(|actual| actual == file_id));
+        if !hit {
+            failed.push("file_correct".to_owned());
+        }
+    }
+    match result.expected_should_find_evidence {
+        Some(true) => {
+            if !result.evidence_found {
+                failed.push("evidence_found".to_owned());
+            }
+            if !result.answer_grounded {
+                failed.push("answer_grounded".to_owned());
+            }
+        }
+        Some(false) => {
+            if result.evidence_found {
+                failed.push("evidence_found".to_owned());
+            }
+        }
+        None => {}
+    }
+    EvaluationVerdict {
+        pass_fail: failed.is_empty(),
+        failed_fields: failed,
+    }
+}
+
+/// 错误分类（纯逻辑）：节点失败 > 运行错误码 > NO_EVIDENCE > 引用核验。
+pub fn classify_error(
+    failed_nodes: &[&str],
+    run_error_code: Option<&str>,
+    answer_mode: Option<&str>,
+    insufficient_evidence: bool,
+    expected_should_find_evidence: Option<bool>,
+    claims_have_unsupported: bool,
+) -> Option<EvaluationErrorCategory> {
+    if let Some(node) = failed_nodes
+        .iter()
+        .find_map(|node| EvaluationErrorCategory::from_node(node))
+    {
+        return Some(node);
+    }
+    if let Some(code) = run_error_code {
+        return Some(EvaluationErrorCategory::from_error_code(code));
+    }
+    if answer_mode == Some("rag_refusal") || insufficient_evidence {
+        // 预期就是 NO_EVIDENCE 的用例不算错误；未声明预期时按错误上报
+        return (expected_should_find_evidence != Some(false)).then_some(
+            EvaluationErrorCategory::NoEvidenceError,
+        );
+    }
+    if claims_have_unsupported {
+        return Some(EvaluationErrorCategory::CitationError);
+    }
+    None
+}
+
+/// 批量指标（14 项核心 + 耗时分布）。只保证数据可采集，不做通过率硬门槛。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EvaluationRunMetrics {
+    pub total: u64,
+    pub passed: u64,
+    pub source_router_accuracy: f64,
+    pub intent_accuracy: f64,
+    pub document_resolution_top1_accuracy: f64,
+    pub document_resolution_top3_recall: f64,
+    pub memory_hit_accuracy: f64,
+    pub memory_wrong_hit_rate: f64,
+    pub clarification_rate: f64,
+    pub clarification_success_rate: f64,
+    pub retrieval_evidence_recall: f64,
+    pub no_evidence_false_negative_rate: f64,
+    pub grounded_answer_rate: f64,
+    pub citation_pass_rate: f64,
+    pub avg_total_ms: f64,
+    pub p50_total_ms: u64,
+    pub p95_total_ms: u64,
+}
+
+fn fraction(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+/// 聚合指标（纯逻辑）：分母为该指标可判定的用例子集。
+pub fn compute_metrics(results: &[EvaluationRunResult]) -> EvaluationRunMetrics {
+    let total = results.len() as u64;
+    let passed = results.iter().filter(|result| result.pass_fail).count();
+    let source_denominator = results
+        .iter()
+        .filter(|result| result.expected_source.is_some())
+        .count();
+    let intent_denominator = results
+        .iter()
+        .filter(|result| result.expected_intent.is_some())
+        .count();
+    let file_denominator = results
+        .iter()
+        .filter(|result| result.expected_file_ids.is_some())
+        .count();
+    let expect_evidence_denominator = results
+        .iter()
+        .filter(|result| result.expected_should_find_evidence == Some(true))
+        .count();
+    let clarification_denominator = results
+        .iter()
+        .filter(|result| result.clarification_used)
+        .count();
+    let memory_denominator = results
+        .iter()
+        .filter(|result| result.memory_used && result.expected_file_ids.is_some())
+        .count();
+    let claims_denominator = results
+        .iter()
+        .filter(|result| result.claim_count > 0)
+        .count();
+
+    let mut latencies = results
+        .iter()
+        .map(|result| result.latency_ms)
+        .collect::<Vec<_>>();
+    latencies.sort_unstable();
+    let p50 = latencies
+        .get(latencies.len() / 2)
+        .copied()
+        .unwrap_or(0);
+    let p95_index = ((latencies.len() as f64 * 0.95).ceil() as usize)
+        .saturating_sub(1)
+        .min(latencies.len().saturating_sub(1));
+    let p95 = latencies.get(p95_index).copied().unwrap_or(0);
+    let avg_total_ms = if latencies.is_empty() {
+        0.0
+    } else {
+        latencies.iter().sum::<u64>() as f64 / latencies.len() as f64
+    };
+
+    let file_hit = |result: &EvaluationRunResult| -> bool {
+        result.expected_file_ids.as_deref().is_some_and(|expected| {
+            expected
+                .iter()
+                .any(|file_id| result.actual_file_ids.iter().any(|actual| actual == file_id))
+        })
+    };
+    let top_files_hit = |result: &EvaluationRunResult, top: usize| -> bool {
+        result.expected_file_ids.as_deref().is_some_and(|expected| {
+            result
+                .retrieval_top_files
+                .iter()
+                .take(top)
+                .any(|file_id| expected.iter().any(|expected_id| expected_id == file_id))
+        })
+    };
+
+    EvaluationRunMetrics {
+        total,
+        passed: passed as u64,
+        source_router_accuracy: fraction(
+            results
+                .iter()
+                .filter(|result| {
+                    result.expected_source.is_some()
+                        && result.actual_source == result.expected_source
+                })
+                .count(),
+            source_denominator,
+        ),
+        intent_accuracy: fraction(
+            results
+                .iter()
+                .filter(|result| {
+                    result.expected_intent.is_some()
+                        && result.actual_intent == result.expected_intent
+                })
+                .count(),
+            intent_denominator,
+        ),
+        document_resolution_top1_accuracy: fraction(
+            results.iter().filter(|result| top_files_hit(result, 1)).count(),
+            file_denominator,
+        ),
+        document_resolution_top3_recall: fraction(
+            results.iter().filter(|result| top_files_hit(result, 3)).count(),
+            file_denominator,
+        ),
+        memory_hit_accuracy: fraction(
+            results
+                .iter()
+                .filter(|result| result.memory_used && file_hit(result))
+                .count(),
+            memory_denominator,
+        ),
+        memory_wrong_hit_rate: fraction(
+            results
+                .iter()
+                .filter(|result| result.memory_used && !file_hit(result))
+                .count(),
+            memory_denominator,
+        ),
+        clarification_rate: fraction(clarification_denominator, total as usize),
+        clarification_success_rate: fraction(
+            results
+                .iter()
+                .filter(|result| result.clarification_used && file_hit(result))
+                .count(),
+            clarification_denominator,
+        ),
+        retrieval_evidence_recall: fraction(
+            results
+                .iter()
+                .filter(|result| {
+                    result.expected_should_find_evidence == Some(true) && result.evidence_found
+                })
+                .count(),
+            expect_evidence_denominator,
+        ),
+        no_evidence_false_negative_rate: fraction(
+            expect_evidence_denominator
+                - results
+                    .iter()
+                    .filter(|result| {
+                        result.expected_should_find_evidence == Some(true) && result.evidence_found
+                    })
+                    .count(),
+            expect_evidence_denominator,
+        ),
+        grounded_answer_rate: fraction(
+            results.iter().filter(|result| result.answer_grounded).count(),
+            total as usize,
+        ),
+        citation_pass_rate: fraction(
+            results
+                .iter()
+                .filter(|result| {
+                    result.claim_count > 0 && result.supported_claim_count == result.claim_count
+                })
+                .count(),
+            claims_denominator,
+        ),
+        avg_total_ms,
+        p50_total_ms: p50,
+        p95_total_ms: p95,
+    }
+}
+
+/// 解析测试集：JSONL（每行一个用例；# 开头/空行忽略）或整体 JSON 数组。
+/// 首行是 `[` 时按数组解析。出错时带行号定位。
+pub fn parse_evaluation_cases(content: &str) -> Result<Vec<EvaluationCase>, AppError> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    if trimmed.starts_with('[') {
+        let cases: Vec<EvaluationCase> = serde_json::from_str(trimmed)
+            .map_err(|error| AppError::new("EVALUATION_SET_INVALID", error.to_string(), false))?;
+        return Ok(cases);
+    }
+    let mut cases = Vec::new();
+    for (index, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match serde_json::from_str::<EvaluationCase>(line) {
+            Ok(case) => cases.push(case),
+            Err(error) => {
+                return Err(AppError::new(
+                    "EVALUATION_SET_INVALID",
+                    format!("测试集第 {} 行解析失败: {error}", index + 1),
+                    false,
+                ));
+            }
+        }
+    }
+    Ok(cases)
+}
+
 #[derive(Debug, Clone)]
 pub struct EncryptedEvaluationSnapshot {
     pub snapshot_id: Uuid,
@@ -1085,5 +1525,223 @@ mod tests {
             &serde_json::json!({"fields": {"error_code": "PDF_RENDER_FAILED", "file_id": "id"}}),
             None
         ));
+    }
+
+    fn base_result(case_id: &str) -> EvaluationRunResult {
+        EvaluationRunResult {
+            case_id: case_id.into(),
+            operation_id: format!("op-{case_id}"),
+            question: "我的简历里有哪些项目？".into(),
+            expected_source: Some("LOCAL".into()),
+            expected_intent: Some("document_qa".into()),
+            expected_file_ids: Some(vec!["file-1".into()]),
+            expected_document_type: Some("resume".into()),
+            expected_should_find_evidence: Some(true),
+            actual_source: Some("LOCAL".into()),
+            actual_intent: Some("document_qa".into()),
+            actual_file_ids: vec!["file-1".into()],
+            actual_document_type: Some("resume".into()),
+            memory_used: false,
+            clarification_used: false,
+            retrieval_top_files: vec!["file-1".into()],
+            rerank_top_files: vec!["file-1".into()],
+            grounding_status: Some("grounded".into()),
+            answer_mode: Some("generated".into()),
+            evidence_found: true,
+            answer_grounded: true,
+            claim_count: 2,
+            supported_claim_count: 2,
+            latency_ms: 3_000,
+            error_category: None,
+            error_message: None,
+            pass_fail: true,
+            failed_fields: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn evaluation_cases_parse_from_jsonl_and_json_array() {
+        let jsonl = "# 注释行\n\n{\"id\": \"a\", \"question\": \"q1\", \"expected_source\": \"LOCAL\"}\n{\"id\": \"b\", \"question\": \"q2\", \"expected_file_ids\": [\"f1\"]}\n";
+        let cases = parse_evaluation_cases(jsonl).unwrap();
+        assert_eq!(cases.len(), 2);
+        assert_eq!(cases[0].id, "a");
+        assert_eq!(cases[0].expected_source.as_deref(), Some("LOCAL"));
+        assert_eq!(
+            cases[1].expected_file_ids.as_deref(),
+            Some(vec!["f1".to_owned()].as_slice())
+        );
+
+        let array = "[{\"id\": \"c\", \"question\": \"q3\"}]";
+        let cases = parse_evaluation_cases(array).unwrap();
+        assert_eq!(cases.len(), 1);
+        assert_eq!(cases[0].id, "c");
+
+        let bad = "{\"id\": \"broken\"";
+        let error = parse_evaluation_cases(bad).unwrap_err();
+        assert!(error.message.contains("解析失败"), "{}", error.message);
+        assert!(parse_evaluation_cases("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn verdict_flags_expected_field_mismatches() {
+        let mut result = base_result("ok");
+        assert!(verdict_for(&result).pass_fail);
+        assert!(verdict_for(&result).failed_fields.is_empty());
+
+        result.actual_source = Some("GENERAL".into());
+        result.actual_intent = Some("general_chat".into());
+        result.actual_file_ids = vec!["file-2".into()];
+        result.actual_document_type = Some("contract".into());
+        result.evidence_found = false;
+        result.answer_grounded = false;
+        let verdict = verdict_for(&result);
+        assert!(!verdict.pass_fail);
+        assert_eq!(
+            verdict.failed_fields,
+            vec![
+                "source_correct",
+                "intent_correct",
+                "target_correct",
+                "file_correct",
+                "evidence_found",
+                "answer_grounded"
+            ]
+        );
+
+        // expected_should_find_evidence = false：找到证据反而失败
+        let mut result = base_result("neg");
+        result.expected_should_find_evidence = Some(false);
+        result.evidence_found = true;
+        assert!(!verdict_for(&result).pass_fail);
+        // 预期拒绝且确实拒绝 → 通过
+        result.evidence_found = false;
+        result.answer_grounded = false;
+        assert!(verdict_for(&result).pass_fail);
+    }
+
+    #[test]
+    fn error_classification_priority_node_over_code_over_no_evidence() {
+        // 节点失败优先
+        assert_eq!(
+            classify_error(
+                &["generation"],
+                Some("RAG_GENERATION_MODEL_REQUIRED"),
+                Some("generated"),
+                false,
+                Some(true),
+                false,
+            ),
+            Some(EvaluationErrorCategory::GenerationError)
+        );
+        assert_eq!(
+            classify_error(&["source_routing"], None, None, false, None, false),
+            Some(EvaluationErrorCategory::RouterError)
+        );
+        assert_eq!(
+            classify_error(&["document_resolution"], None, None, false, None, false),
+            Some(EvaluationErrorCategory::DocumentResolutionError)
+        );
+        assert_eq!(
+            classify_error(&["unknown_node"], None, None, false, None, false),
+            None
+        );
+        // 运行错误码
+        assert_eq!(
+            classify_error(
+                &[],
+                Some("CLARIFICATION_SELECTION_INVALID"),
+                None,
+                false,
+                None,
+                false,
+            ),
+            Some(EvaluationErrorCategory::ClarificationError)
+        );
+        assert_eq!(
+            classify_error(&[], Some("GENERATION_ACTIVATION_FAILED"), None, false, None, false),
+            Some(EvaluationErrorCategory::GenerationError)
+        );
+        // 未知运行错误码 → Unknown 兜底（第 13 类）
+        assert_eq!(
+            classify_error(&[], Some("OTHER"), None, false, None, false),
+            Some(EvaluationErrorCategory::Unknown)
+        );
+        // NO_EVIDENCE
+        assert_eq!(
+            classify_error(&[], None, Some("rag_refusal"), true, Some(true), false),
+            Some(EvaluationErrorCategory::NoEvidenceError)
+        );
+        assert_eq!(
+            classify_error(&[], None, Some("rag_refusal"), true, Some(false), false),
+            None
+        );
+        assert_eq!(
+            classify_error(&[], None, Some("rag_refusal"), true, None, false),
+            Some(EvaluationErrorCategory::NoEvidenceError)
+        );
+        // 引用核验失败
+        assert_eq!(
+            classify_error(&[], None, Some("generated"), false, None, true),
+            Some(EvaluationErrorCategory::CitationError)
+        );
+        assert_eq!(classify_error(&[], None, Some("generated"), false, None, false), None);
+    }
+
+    #[test]
+    fn metrics_aggregate_denominators_correctly() {
+        let mut good = base_result("good");
+        good.latency_ms = 2_000;
+        let mut wrong_source = base_result("wrong-source");
+        wrong_source.actual_source = Some("GENERAL".into());
+        wrong_source.actual_intent = Some("general_chat".into());
+        wrong_source.pass_fail = false;
+        wrong_source.failed_fields = vec!["source_correct".into(), "intent_correct".into()];
+        wrong_source.latency_ms = 8_000;
+        let mut no_evidence = base_result("no-evidence");
+        no_evidence.expected_should_find_evidence = Some(true);
+        no_evidence.evidence_found = false;
+        no_evidence.answer_grounded = false;
+        no_evidence.grounding_status = Some("insufficient".into());
+        no_evidence.actual_file_ids = Vec::new();
+        no_evidence.retrieval_top_files = Vec::new();
+        no_evidence.rerank_top_files = Vec::new();
+        no_evidence.claim_count = 0;
+        no_evidence.supported_claim_count = 0;
+        no_evidence.latency_ms = 1_000;
+        no_evidence.pass_fail = false;
+        no_evidence.failed_fields = vec!["evidence_found".into(), "answer_grounded".into()];
+        let mut chat = base_result("chat");
+        chat.expected_source = Some("GENERAL".into());
+        chat.actual_source = Some("GENERAL".into());
+        chat.actual_intent = Some("general_chat".into());
+        chat.expected_intent = Some("general_chat".into());
+        chat.expected_file_ids = None;
+        chat.expected_document_type = None;
+        chat.expected_should_find_evidence = None;
+        chat.evidence_found = false;
+        chat.answer_grounded = false;
+        chat.actual_file_ids = Vec::new();
+        chat.claim_count = 0;
+        chat.supported_claim_count = 0;
+        chat.latency_ms = 500;
+
+        let metrics = compute_metrics(&[good, wrong_source, no_evidence, chat]);
+        assert_eq!(metrics.total, 4);
+        assert_eq!(metrics.passed, 2);
+        assert_eq!(metrics.source_router_accuracy, 0.75); // 4 个有 expected_source，3 对
+        assert_eq!(metrics.intent_accuracy, 0.75); // 4 个有 expected_intent，3 对
+        assert_eq!(metrics.document_resolution_top1_accuracy, 2.0 / 3.0);
+        assert_eq!(metrics.document_resolution_top3_recall, 2.0 / 3.0);
+        assert_eq!(metrics.retrieval_evidence_recall, 2.0 / 3.0);
+        assert_eq!(metrics.no_evidence_false_negative_rate, 1.0 / 3.0);
+        assert_eq!(metrics.grounded_answer_rate, 0.5);
+        assert_eq!(metrics.citation_pass_rate, 2.0 / 2.0);
+        assert_eq!(metrics.clarification_rate, 0.0);
+        assert_eq!(metrics.clarification_success_rate, 0.0);
+        assert_eq!(metrics.memory_hit_accuracy, 0.0);
+        assert_eq!(metrics.memory_wrong_hit_rate, 0.0);
+        assert_eq!(metrics.avg_total_ms, (2000 + 8000 + 1000 + 500) as f64 / 4.0);
+        assert_eq!(metrics.p50_total_ms, 2_000); // 500,1000,2000,8000 → 中位 = 2000
+        assert_eq!(metrics.p95_total_ms, 8_000); // ceil(4*0.95)=4 → 最大
     }
 }

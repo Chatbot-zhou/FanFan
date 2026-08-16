@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::knowledge::DocumentProfile;
+use crate::memory::{MemoryAlias, MemoryEntity, MemoryRelation};
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppError {
     pub code: String,
@@ -390,6 +393,90 @@ pub enum SourceKind {
     Image,
 }
 
+/// 文档类型画像（Document Profile 的 document_type 维度）。
+/// 第一版类型全集；文件名只作弱信号，类型判断主要依赖正文语义
+/// （title / summary / section titles / entities / embedding）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentType {
+    Resume,
+    Contract,
+    Invoice,
+    Paper,
+    ProjectDocument,
+    Meeting,
+    LearningMaterial,
+    Certificate,
+    Report,
+    Spreadsheet,
+    Other,
+}
+
+impl DocumentType {
+    /// 全部类型的稳定枚举值（prompt 词表与校验共用）。
+    pub const ALL: [DocumentType; 11] = [
+        DocumentType::Resume,
+        DocumentType::Contract,
+        DocumentType::Invoice,
+        DocumentType::Paper,
+        DocumentType::ProjectDocument,
+        DocumentType::Meeting,
+        DocumentType::LearningMaterial,
+        DocumentType::Certificate,
+        DocumentType::Report,
+        DocumentType::Spreadsheet,
+        DocumentType::Other,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DocumentType::Resume => "resume",
+            DocumentType::Contract => "contract",
+            DocumentType::Invoice => "invoice",
+            DocumentType::Paper => "paper",
+            DocumentType::ProjectDocument => "project_document",
+            DocumentType::Meeting => "meeting",
+            DocumentType::LearningMaterial => "learning_material",
+            DocumentType::Certificate => "certificate",
+            DocumentType::Report => "report",
+            DocumentType::Spreadsheet => "spreadsheet",
+            DocumentType::Other => "other",
+        }
+    }
+
+    /// 中文展示名：文档级召回的类型命中信号用（问题通常用中文指称类型，
+    /// 如「我的简历」「那几份合同」，而 as_str 是英文变体名，无法子串匹配）。
+    pub fn display_name(self) -> &'static str {
+        match self {
+            DocumentType::Resume => "简历",
+            DocumentType::Contract => "合同",
+            DocumentType::Invoice => "发票",
+            DocumentType::Paper => "论文",
+            DocumentType::ProjectDocument => "项目文档",
+            DocumentType::Meeting => "会议纪要",
+            DocumentType::LearningMaterial => "学习资料",
+            DocumentType::Certificate => "证书",
+            DocumentType::Report => "报告",
+            DocumentType::Spreadsheet => "表格",
+            DocumentType::Other => "其他",
+        }
+    }
+
+    /// 宽容解析：去空白/连字符/下划线后按小写匹配变体名。
+    /// 覆盖 LLM 输出的大小写变体（"RESUME"/"Resume"/"project-document" 等）。
+    pub fn parse_lenient(input: &str) -> Option<DocumentType> {
+        let normalized: String = input
+            .chars()
+            .filter(|ch| !ch.is_whitespace() && *ch != '-' && *ch != '_')
+            .collect::<String>()
+            .to_ascii_lowercase();
+        DocumentType::ALL
+            .iter()
+            .copied()
+            .find(|variant| variant.as_str().replace('_', "") == normalized)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EvidenceRef {
     pub evidence_id: Uuid,
@@ -614,6 +701,127 @@ pub struct NodeTracePage {
     pub items: Vec<NodeTraceRecord>,
     pub next_cursor: Option<String>,
     pub total: u64,
+}
+
+/// 一次 Ask 的逐阶段耗时（阶段未出现则为 null）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct AskTraceTiming {
+    pub source_router_ms: Option<u64>,
+    pub query_parser_ms: Option<u64>,
+    pub context_ms: Option<u64>,
+    pub memory_ms: Option<u64>,
+    pub document_resolver_ms: Option<u64>,
+    pub document_recall_ms: Option<u64>,
+    pub embedding_ms: Option<u64>,
+    pub fts_ms: Option<u64>,
+    pub rerank_ms: Option<u64>,
+    pub generation_ms: Option<u64>,
+    pub verification_ms: Option<u64>,
+    pub total_ms: Option<u64>,
+}
+
+/// Trace Viewer 的一次 Ask 追踪视图：按固定阶段顺序分组的节点记录。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AskTrace {
+    pub operation_id: String,
+    pub question: Option<String>,
+    pub answer_mode: Option<String>,
+    pub stages: Vec<AskTraceStage>,
+    pub timing: AskTraceTiming,
+    pub diagnostic_summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AskTraceStage {
+    /// 阶段节点名（source_routing / query_parsing / …），展示顺序见 STAGE_ORDER。
+    pub node: String,
+    /// 该阶段全部记录（按时间正序）
+    pub records: Vec<NodeTraceRecord>,
+}
+
+/// Debug Trace 导出请求（写文件前需 confirmed）。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct AskTraceExportRequest {
+    pub operation_id: String,
+    pub target_path: String,
+    /// 开发选项：保留详细文本（chunk 全文 / 模型 prompt）；默认关闭。
+    pub include_detailed_text: bool,
+    pub confirmed: bool,
+}
+
+/// Debug Trace 导出 JSON 文件内容（已脱敏：路径去全路径、chunk 截断、
+/// 默认不含模型完整 prompt）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AskTraceExport {
+    pub schema_version: u32,
+    pub generated_at: String,
+    pub operation_id: String,
+    pub question: Option<String>,
+    pub answer_mode: Option<String>,
+    pub stages: Vec<AskTraceStage>,
+    pub timing: AskTraceTiming,
+    pub diagnostic_summary: String,
+}
+
+/// Ask Evaluation Runner 请求：读 JSONL/JSON 测试集，批量跑问答，写结果文件。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct AskEvaluationRunRequest {
+    /// 测试集路径（JSONL 或 JSON 数组）
+    pub target_path: String,
+    /// 结果文件路径（JSON，写文件前需 confirmed）
+    pub output_path: String,
+    pub confirmed: bool,
+}
+
+/// 批量运行报告：指标 + 每例结果（结果同时落盘 output_path）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AskEvaluationRunReport {
+    pub schema_version: u32,
+    pub generated_at: String,
+    pub run_id: String,
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub metrics: crate::evaluation::EvaluationRunMetrics,
+    pub results: Vec<crate::evaluation::EvaluationRunResult>,
+}
+
+/// Document Profile Inspector：一次查询返回画像详情 + 文档级向量在场状态。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DocumentProfileInspect {
+    pub file_id: String,
+    pub display_name: String,
+    /// 画像尚未构建（含当前 revision 未嵌入完成）时为 None
+    pub profile: Option<DocumentProfile>,
+    /// 文档级画像向量（分类器/原型比对用）是否已存在
+    pub embedding_present: bool,
+}
+
+/// 画像重建请求：file_ids 为 None 表示全部文件；不重建 Chunk Embedding。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct DocumentProfileRebuildRequest {
+    pub file_ids: Option<Vec<String>>,
+    pub confirmation: String,
+}
+
+/// Memory Inspector 视图（最小实现：三张表 + 可选关键字过滤）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct MemoryInspectorView {
+    pub aliases: Vec<MemoryAlias>,
+    pub relations: Vec<MemoryRelation>,
+    pub entities: Vec<MemoryEntity>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct MemoryRelationStatusRequest {
+    pub relation_id: String,
+    /// confirmed | rejected
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct MemoryClearRequest {
+    pub confirmation: String,
 }
 
 #[cfg(test)]

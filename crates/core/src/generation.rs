@@ -437,19 +437,6 @@ impl LocalGenerationRuntime {
         self.complete_internal(system, user, max_tokens, Some(cancelled), None, 0.1)
     }
 
-    /// 闲聊专用：允许更高的采样温度（0.6B 在 0.1 下只会复读「你好！…」模板）。
-    /// 路由/改写/检索等需要稳定输出的调用保持 0.1 走 complete_cancellable。
-    pub fn complete_chat_cancellable(
-        &mut self,
-        system: &str,
-        user: &str,
-        max_tokens: u32,
-        temperature: f32,
-        cancelled: &AtomicBool,
-    ) -> Result<String, AppError> {
-        self.complete_internal(system, user, max_tokens, Some(cancelled), None, temperature)
-    }
-
     pub fn complete_json_cancellable(
         &mut self,
         system: &str,
@@ -721,7 +708,10 @@ impl LocalGenerationRuntime {
     }
 }
 
-const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+// GPU 冷启动（驱动/CUDA 上下文加载）实测可达 25s+，20s 超时会把可用的
+// GPU 误判为不可用并永久回退 CPU；放宽到 40s，冷启动留出余量。探测在
+// 后台线程运行，超时只影响该线程，不会阻塞窗口。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(40);
 const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 fn probe_runtime_capability(executable: &Path) -> RuntimeCapability {

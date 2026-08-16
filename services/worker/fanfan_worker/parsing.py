@@ -49,6 +49,15 @@ SUPPORTED_OPEN_XML = {"docx", "docm", "xlsx", "xlsm", "pptx", "pptm"}
 IMAGE_FORMATS = {"jpg", "jpeg", "png", "tif", "tiff", "bmp", "webp"}
 LEGACY_OFFICE = {"doc", "xls", "ppt"}
 
+# 单文档 OCR 页数预算：与 ocr.py 的渲染/识别超时预算（270s）匹配，
+# 超出预算的扫描页标记 OCR_REQUIRED 待后续补跑。
+OCR_PAGE_BUDGET = 100
+# rapidocr 逐页识别的时间预算：单页实测 ~6s，100 页需 ~600s，而 Rust 侧
+# document.parse 超时（worker.rs operation_timeout）是 360s——页数预算
+# 拦不住大扫描书。识别循环按此预算提前收尾，剩余页标记 OCR_REQUIRED，
+# 首次索引只识别前若干页，绝不因识别太慢拖垮整份解析。
+OCR_TIME_BUDGET_SECONDS = 200.0
+
 
 def uuid7() -> str:
     timestamp_ms = int(time.time() * 1000) & ((1 << 48) - 1)
@@ -608,7 +617,12 @@ def _recognize_pdf_pages(
         )
     if rendered is not None and primary_error is None:
         lines: list[dict[str, Any]] = []
+        budget_end = primary_started_at + OCR_TIME_BUDGET_SECONDS
         for item in rendered.get("rendered_pages", []):
+            if time.monotonic() >= budget_end:
+                # 识别时间预算用尽：剩余页标记 OCR_REQUIRED 待补跑。
+                # 已识别页照常返回，绝不让整份解析因识别太慢超时失败。
+                break
             page_number = int(item["page_no"])
             page_result, page_error = recognize_image(
                 request.ocr_runtime.payload(Path(str(item["path"])), page_number)
@@ -702,26 +716,40 @@ def _pdf_result(request: ParseRequest, path: Path, started_at: float) -> ParseRe
                 text = ""
                 warnings.append(ParseWarning("PDF_PARSE_FAILED", str(error), locator("pdf", page_no=page_number)))
             if request.ocr_policy == "force" or (request.ocr_policy == "auto" and len(text) < 30):
-                ocr_pages.append(page_number)
+                # 单文档 OCR 预算：纯扫描书（600+ 页）全量 OCR 需几十分钟，
+                # 超出预算的页面标记 OCR_REQUIRED 待后续补跑，首次索引不被拖垮。
+                if request.ocr_policy == "force" or len(ocr_pages) < OCR_PAGE_BUDGET:
+                    ocr_pages.append(page_number)
+                else:
+                    warnings.append(ParseWarning(
+                        "OCR_REQUIRED",
+                        "该页超出本次OCR预算，尚未OCR",
+                        locator("pdf", page_no=page_number),
+                    ))
             if len(text) < 30 and request.ocr_policy == "disabled":
                 warnings.append(ParseWarning("OCR_REQUIRED", "该页可提取文字少于30个字符", locator("pdf", page_no=page_number)))
             nodes.append(DocumentNode(uuid7(), None, page_number, "page", text or None, None, locator("pdf", page_no=page_number)))
-            try:
-                for image in page.images:
-                    image_name = str(getattr(image, "name", "image.bin"))
-                    image_data = bytes(getattr(image, "data", b""))
-                    asset = _cache_image_asset(
-                        request,
-                        image_data,
-                        Path(image_name).suffix,
-                        "pdf_embedded_image",
-                        locator("pdf", page_no=page_number),
-                    )
-                    if asset is not None:
-                        image_assets.append(asset)
-            except Exception as error:
-                # 图片提取尽力而为（如 JBIG2 无解码器抛 RuntimeError），失败只记警告。
-                warnings.append(ParseWarning("PDF_IMAGE_EXTRACT_FAILED", str(error), locator("pdf", page_no=page_number)))
+            # 仅文本页提取内嵌图片：纯扫描页的整页图会由 OCR 渲染路径产出
+            # pdf_scanned_page 资产，这里再解一整份写盘是双份冗余；且 pypdf
+            # 解码大扫描书每页整图实测 ~0.3s/页，600+ 页会拖垮 360s 的解析
+            # 超时预算（实测 616 页扫描书图片提取写盘 ~200s）。
+            if len(text) >= 30:
+                try:
+                    for image in page.images:
+                        image_name = str(getattr(image, "name", "image.bin"))
+                        image_data = bytes(getattr(image, "data", b""))
+                        asset = _cache_image_asset(
+                            request,
+                            image_data,
+                            Path(image_name).suffix,
+                            "pdf_embedded_image",
+                            locator("pdf", page_no=page_number),
+                        )
+                        if asset is not None:
+                            image_assets.append(asset)
+                except Exception as error:
+                    # 图片提取尽力而为（如 JBIG2 无解码器抛 RuntimeError），失败只记警告。
+                    warnings.append(ParseWarning("PDF_IMAGE_EXTRACT_FAILED", str(error), locator("pdf", page_no=page_number)))
         ocr_page_count = 0
         parser_name = "pypdf"
         if ocr_pages:

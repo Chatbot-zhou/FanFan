@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering},
     },
     thread,
@@ -14,32 +14,56 @@ use std::{
 
 use chrono::Utc;
 use fanfan_core::{
-    AddRootRequest, AiRuntimeSnapshot, AnswerClaim, AnswerResult, AppError, AskMessagePage,
-    AskRequest, AskSessionPage, CandidateRoot, CatalogService, ChunkEmbeddingInput,
-    CollectionModelReview, CollectionRecord, CollectionRule, CollectionSuggestion,
-    CollectionSuggestionPage, CollectionSuggestionQuery, CollectionSuggestionRefreshResult,
-    CollectionSuggestionUpdateRequest, CreateCollectionRequest, DegradationLevel, DownloadFile,
-    DownloadedModelMetadata, EmbeddingRequest, ExclusionRule, ExclusionRuleInput, ExportResult,
-    FilePage, FilePreview, FileQuery, FileRecord, ImageUnderstandingResult, ImportCandidate,
-    InboxItem, InboxPage, InboxQuery, InboxUpdateRequest, IncrementalWatchManager,
-    IndexActivityStats, Intent,
-    JobRecord, LocalGenerationRuntime, LogPage, LogQuery, MaintenanceSnapshot, ModelArtifact,
+    AddRootRequest, AiRuntimeSnapshot, AnswerClaim, AnswerMode, AnswerResult, AnswerSourceFile,
+    AppError, AskMessage, EvidenceRef, GroundingStatus, SupportStatus,
+    AskMessagePage, AskRequest, AskSessionContext, AskSessionPage, CandidateRoot, CatalogService,
+    ChunkEmbeddingInput, ClarificationOption, ClarificationPayload, CollectionModelReview,
+    CollectionRecord, CollectionRule, CollectionSuggestion, CollectionSuggestionPage,
+    DocumentCandidate,
+    CollectionSuggestionQuery, CollectionSuggestionRefreshResult, CollectionSuggestionUpdateRequest,
+    CreateCollectionRequest, DegradationLevel, DocumentType, DownloadFile, DownloadedModelMetadata,
+    DocumentProfile, EmbeddingRequest, ExclusionRule, ExclusionRuleInput, ExportResult, FilePage,
+    FilePreview, FileQuery, FileRecord, ImageUnderstandingResult, ImportCandidate, InboxItem,
+    InboxPage, InboxQuery, InboxUpdateRequest, IncrementalWatchManager, IndexActivityStats,
+    JobRecord, LocalGenerationRuntime, LogPage, LogQuery, MaintenanceSnapshot, MemoryHint,
+    MemoryKind, MemorySource, MemoryStatus, MemoryTargetRegistry, MemoryTargetType,
+    MemoryWriteInput, MemoryWriterContext, ModelArtifact,
     ModelCatalogEntry, ModelDownloadFileProgress, ModelDownloadJob, ModelDownloadRemoval,
     ModelEdition, ModelFormat, ModelImportSelection, ModelManager, ModelPreset, ModelRole,
-    ModelRoleConfig, ModelSource, ModelStoreStatus, NodeTracePage, NodeTraceQuery, OcrRuntimeConfig,
-    ParseMetrics, ParseOutcome, ParseRequest, ParseResult, PendingEmbeddingActivation,
+    ModelRoleConfig, ModelSource, ModelStoreStatus, NodeTracePage, NodeTraceQuery,
+    AskTrace, AskTraceExport, AskTraceExportRequest, AskTraceStage, AskTraceTiming,
+    NodeTraceRecord, OcrRuntimeConfig,
+    DocumentProfileInspect, DocumentProfileRebuildRequest, MemoryInspectorView,
+    MemoryRelationStatusRequest, MemoryClearRequest, ProfileRefreshResult,
+    AskEvaluationRunRequest, AskEvaluationRunReport,
+    ParseMetrics, ParseOutcome, ParseRequest, ParseResult, PendingEmbeddingActivation, QueryPlan,
     RagReadiness, RelationGroupPage, RelationGroupQuery, RelationPage, RelationQuery,
-    RelationRefreshResult, RerankRequest,
-    RootRecord, RouteDecision,
-    RuntimeBackendKind, RuntimeCapability, RuntimeInstanceState, RuntimeManager,
-    RuntimeResourceBudget, RuntimeTaskKind,
-    RuntimeTaskRequest, ScopeFilter, SearchMode, SearchRequest, SearchSession, SemanticQuery,
-    SpeechRecognitionRequest, SpeechRecognitionResult, SpeechSynthesisRequest,
-    SpeechSynthesisResult, TriageStatus, WorkerClient, WorkerRole, AskMessage, chat_prompt,
-    chat_prompt_mini, intent_routing_prompt, intent_routing_prompt_mini,
-    is_natural_language_query,
-    parse_intent_verdict, parse_query_intent, parse_rewritten_queries,
-    query_rewrite_prompt, query_understanding_prompt, strip_long_path_prefix,
+    RelationRefreshResult, RerankRequest, ResolverInput, RootRecord, RuntimeBackendKind,
+    RuntimeCapability, RuntimeInstanceState, RuntimeManager, RuntimeResourceBudget,
+    RuntimeTaskKind, RuntimeTaskRequest, ScopeFilter, SearchMode, SearchRequest, SearchSession,
+    SemanticQuery, SourceIntent, SpeechRecognitionRequest, SpeechRecognitionResult,
+    SpeechSynthesisRequest, SpeechSynthesisResult, TriageStatus, WorkerClient, WorkerRole,
+    chat_prompt, is_natural_language_query, match_alias_hints, match_relation_hints,
+    memory_writer_prompt, memory_writer_schema, parse_query_intent, parse_query_plan,
+    parse_rewritten_queries, parse_source_routing, parse_writer_output, prewrite_validate,
+    query_parser_prompt, query_parser_schema, query_rewrite_prompt, query_understanding_prompt,
+    resolve_ambiguous, resolve_documents, resolve_proposal_targets, source_router_prompt,
+    MAX_CANDIDATE_SCOPE,
+    source_routing_schema, strip_long_path_prefix,
+    DocumentOverview, SectionChunk, SectionSummary, StructureEntry,
+    build_document_sections, digests_json, document_overview_prompt, document_summary_prompt,
+    merge_tail_sections, overview_schema, parse_overview, parse_section_summaries,
+    section_summary_schema, MAX_SECTION_CHARS, MAX_SECTIONS,
+    DOCUMENT_RECALL_TOP_N, DOCUMENT_RECALL_VECTOR_CANDIDATES, preselect_document_profiles,
+    rank_document_candidates,
+    COMPARE_FALLBACK_ITEMS, COMPARE_MATERIAL_CHARS, COMPARE_MATERIAL_ITEMS, CompareResults,
+    compare_prompt, compare_schema, parse_compare_results,
+    EXTRACT_MATCH_MIN_LEN, EXTRACT_MAX_ITEMS, extract_prompt, extract_schema,
+    longest_common_substr_len, parse_extract_results,
+};
+use fanfan_core::ask::query_plan::{QueryIntent, QueryOperation, ResolutionStatus};
+use fanfan_core::profile_builder::{
+    TYPE_PROTOTYPE_TEXTS, TypePrototype, classify_document_type,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1057,9 +1081,23 @@ pub fn model_download_list(
 
 #[tauri::command(async)]
 pub fn model_store_status_get(
+    environment: State<'_, EnvironmentServiceState>,
     models: State<'_, ModelServiceState>,
 ) -> Result<ModelStoreStatus, AppError> {
-    models.get()?.store_status()
+    let mut status = models.get()?.store_status()?;
+    let config = crate::read_model_store_location_config(&environment.config_directory)
+        .unwrap_or_default();
+    status.pending_target_directory = config
+        .pending
+        .as_ref()
+        .map(|pending| pending.target_directory.clone());
+    status.restart_required = config.pending.is_some();
+    status.last_error = config.last_error;
+    status.previous_model_store = config.previous_model_store;
+    if config.pending.is_some() {
+        status.migration_state = "migrating".into();
+    }
+    Ok(status)
 }
 
 #[derive(Debug, Deserialize)]
@@ -4288,10 +4326,11 @@ const HOME_SUMMARY_CACHE_TTL: Duration = Duration::from_secs(5);
 const RERANK_TOP_EVIDENCE: usize = 3;
 
 /// 证据门控阈值：rerank（sigmoid 0-1 概率）top-1 低于此值视为候选证据与
-/// 用户原始问题无关，判定为路由误判（闲聊被判检索）→ 转闲聊直接回复，
+/// 用户原始问题无关 → 按 LOCAL 检索失败返回固定文案「当前资料中没有找到
+/// 足够依据」，不再转闲聊（路由语义已明确是资料检索，闲聊会答非所问）。
 /// 杜绝「检索答错把资料库内容当答案」。阈值可依据 trace 中 reranking
 /// 节点记录的每候选 score 实测调优。
-const RERANK_CHAT_FALLBACK_THRESHOLD: f32 = 0.1;
+const RERANK_NO_EVIDENCE_THRESHOLD: f32 = 0.1;
 
 fn cached_index_activity_stats(
     catalog: &CatalogService,
@@ -4534,6 +4573,123 @@ pub async fn storage_migration_schedule(
     })
     .await
     .map_err(|error| AppError::new("STORAGE_MIGRATION_SCHEDULE_FAILED", error.to_string(), true))?
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MigrationCleanupRequest {
+    confirmation: String,
+}
+
+/// 清理迁移完成前的旧应用数据目录（迁移已完成且切换生效后）。
+/// 前置校验：pending 为空、当前数据目录健康（marker 有效）；随后 rename 原子
+/// 隔离再递归删除；途中崩溃由下次启动的 apply_pending_storage_cleanup 兜底。
+#[tauri::command]
+pub async fn storage_migration_cleanup(
+    request: MigrationCleanupRequest,
+    environment: State<'_, EnvironmentServiceState>,
+) -> Result<crate::MigrationCleanupResult, AppError> {
+    if request.confirmation != "CLEANUP_MIGRATED_STORAGE" {
+        return Err(AppError::new(
+            "STORAGE_MIGRATION_CLEANUP_CONFIRMATION_REQUIRED",
+            "清理旧数据需要再次明确确认",
+            false,
+        ));
+    }
+    let config_directory = environment.config_directory.clone();
+    let data_directory = environment.data_directory.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::cleanup_storage_migration(&config_directory, &data_directory)
+    })
+    .await
+    .map_err(|error| {
+        AppError::new(
+            "STORAGE_MIGRATION_CLEANUP_FAILED",
+            error.to_string(),
+            true,
+        )
+    })?
+}
+
+/// 清理迁移完成前的旧模型仓库（迁移已完成且切换生效后）。
+/// 前置校验：pending 为空、当前仓库健康（marker 有效 + registry 可打开）；
+/// 随后 rename 原子隔离再递归删除；途中崩溃由下次启动的
+/// apply_pending_model_store_cleanup 兜底。
+#[tauri::command]
+pub async fn model_store_migration_cleanup(
+    request: MigrationCleanupRequest,
+    environment: State<'_, EnvironmentServiceState>,
+    models: State<'_, ModelServiceState>,
+) -> Result<crate::MigrationCleanupResult, AppError> {
+    if request.confirmation != "CLEANUP_MIGRATED_MODEL_STORE" {
+        return Err(AppError::new(
+            "MODEL_STORE_CLEANUP_CONFIRMATION_REQUIRED",
+            "清理旧模型仓库需要再次明确确认",
+            false,
+        ));
+    }
+    let config_directory = environment.config_directory.clone();
+    let active_store = models.get()?.model_root().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::cleanup_model_store_migration(&config_directory, &active_store)
+    })
+    .await
+    .map_err(|error| {
+        AppError::new(
+            "MODEL_STORE_CLEANUP_FAILED",
+            error.to_string(),
+            true,
+        )
+    })?
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ModelStoreMigrationScheduleRequest {
+    selected_directory: String,
+    confirmation: String,
+}
+
+#[tauri::command]
+pub async fn model_store_migration_schedule(
+    request: ModelStoreMigrationScheduleRequest,
+    environment: State<'_, EnvironmentServiceState>,
+    catalog: State<'_, CatalogServiceState>,
+    models: State<'_, ModelServiceState>,
+) -> Result<ModelStoreStatus, AppError> {
+    if request.confirmation != "MIGRATE_MODEL_STORE" {
+        return Err(AppError::new(
+            "MODEL_STORE_MIGRATION_CONFIRMATION_REQUIRED",
+            "迁移模型仓库需要再次明确确认",
+            false,
+        ));
+    }
+    let config_directory = environment.config_directory.clone();
+    let selected_directory = PathBuf::from(request.selected_directory);
+    let current_store = models.get()?.model_root().to_path_buf();
+    let base_status = models.get()?.store_status()?;
+    let roots = catalog
+        .get()?
+        .list_roots()?
+        .into_iter()
+        .filter(|root| root.enabled)
+        .map(|root| PathBuf::from(root.canonical_path))
+        .collect::<Vec<_>>();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::schedule_model_store_migration(
+            &config_directory,
+            &current_store,
+            &selected_directory,
+            &roots,
+            base_status,
+        )
+    })
+    .await
+    .map_err(|error| {
+        AppError::new(
+            "MODEL_STORE_MIGRATION_SCHEDULE_FAILED",
+            error.to_string(),
+            true,
+        )
+    })?
 }
 
 #[tauri::command(async)]
@@ -4796,7 +4952,7 @@ fn file_size(path: &Path) -> Result<u64, AppError> {
     }
 }
 
-fn directory_size(path: &Path) -> Result<u64, AppError> {
+pub(crate) fn directory_size(path: &Path) -> Result<u64, AppError> {
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -4834,7 +4990,7 @@ fn directory_size(path: &Path) -> Result<u64, AppError> {
     Ok(total)
 }
 
-fn clear_directory_contents(path: &Path) -> Result<u64, AppError> {
+pub(crate) fn clear_directory_contents(path: &Path) -> Result<u64, AppError> {
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -5094,6 +5250,1080 @@ pub fn diagnostic_export(
         size_bytes: bytes.len() as u64,
         sha256,
     })
+}
+
+/// Ask Trace Viewer 阶段展示顺序（固定；未出现的阶段跳过，未知节点追加末尾）。
+const ASK_TRACE_STAGE_ORDER: &[&str] = &[
+    "source_routing",
+    "query_parsing",
+    "context_resolution",
+    "memory_resolution",
+    "document_resolution",
+    "scope_planning",
+    "clarification_selection",
+    "query_rewrite",
+    "document_recall",
+    "retrieval",
+    "reranking",
+    "generation",
+    "verification",
+    "extract",
+    "document_find",
+    "document_compare",
+    "document_summary",
+    "repair",
+    "operation_execution",
+    "memory_candidate_write",
+    "completed",
+];
+
+/// 拉取一次 Ask 的全部节点追踪并组装 Trace Viewer 结构
+///（阶段分组、逐阶段耗时、诊断摘要一行）。任何阶段缺失都不算错——问答
+/// 可能在澄清/拒绝/降级等中途收尾，只展示实际经过的节点。
+fn build_ask_trace(catalog: &CatalogService, operation_id: &str) -> Result<AskTrace, AppError> {
+    let records = catalog.query_node_traces_by_correlation("ask", operation_id)?;
+    if records.is_empty() {
+        return Err(AppError::new(
+            "ASK_TRACE_NOT_FOUND",
+            "找不到该次问答的调试追踪（可能已被清理，或该记录不是 Ask 流程）",
+            false,
+        ));
+    }
+    let stages = group_ask_trace_stages(&records);
+    let timing = aggregate_ask_timing(&stages);
+    let diagnostic_summary = build_diagnostic_summary(&stages);
+    let question = ["source_routing", "query_parsing"]
+        .iter()
+        .find_map(|name| stages.iter().find(|stage| stage.node == *name))
+        .and_then(|stage| stage.records.first())
+        .and_then(|record| record.input_json.get("question"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let answer_mode = stages
+        .iter()
+        .find(|stage| stage.node == "completed")
+        .and_then(|stage| stage.records.last())
+        .and_then(|record| record.output_json.get("answer_mode"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Ok(AskTrace {
+        operation_id: operation_id.to_owned(),
+        question,
+        answer_mode,
+        stages,
+        timing,
+        diagnostic_summary,
+    })
+}
+
+/// 按固定顺序把一次 Ask 的节点追踪分组为阶段；未知节点（未来新增）追加末尾。
+fn group_ask_trace_stages(records: &[NodeTraceRecord]) -> Vec<AskTraceStage> {
+    let mut stages = ASK_TRACE_STAGE_ORDER
+        .iter()
+        .filter_map(|node| {
+            let items = records
+                .iter()
+                .filter(|record| record.node == *node)
+                .cloned()
+                .collect::<Vec<_>>();
+            (!items.is_empty()).then(|| AskTraceStage {
+                node: (*node).to_owned(),
+                records: items,
+            })
+        })
+        .collect::<Vec<_>>();
+    let known = ASK_TRACE_STAGE_ORDER.iter().copied().collect::<HashSet<_>>();
+    let mut extra = records
+        .iter()
+        .map(|record| record.node.as_str())
+        .filter(|node| !known.contains(*node))
+        .collect::<Vec<_>>();
+    extra.sort_unstable();
+    extra.dedup();
+    for node in extra {
+        let items = records
+            .iter()
+            .filter(|record| record.node == node)
+            .cloned()
+            .collect::<Vec<_>>();
+        stages.push(AskTraceStage {
+            node: node.to_owned(),
+            records: items,
+        });
+    }
+    stages
+}
+
+/// 逐阶段耗时聚合：同节点多条记录（如每条 claim 一次 verification）取和；
+/// 阶段未出现保持 null；总耗时取 completed 节点。
+fn aggregate_ask_timing(stages: &[AskTraceStage]) -> AskTraceTiming {
+    let node_sum = |name: &str| -> Option<u64> {
+        let sum = stages
+            .iter()
+            .filter(|stage| stage.node == name)
+            .flat_map(|stage| stage.records.iter())
+            .filter_map(|record| record.elapsed_ms)
+            .sum::<u64>();
+        (sum > 0).then_some(sum)
+    };
+    let mut timing = AskTraceTiming {
+        source_router_ms: node_sum("source_routing"),
+        query_parser_ms: node_sum("query_parsing"),
+        context_ms: node_sum("context_resolution"),
+        memory_ms: node_sum("memory_resolution"),
+        document_resolver_ms: node_sum("document_resolution"),
+        document_recall_ms: node_sum("document_recall"),
+        rerank_ms: node_sum("reranking"),
+        generation_ms: node_sum("generation"),
+        verification_ms: node_sum("verification"),
+        ..Default::default()
+    };
+    // embedding 计时来自 retrieval 节点输出（app 层 encode 计时）；
+    // fts 在 core 的 answer_extractively 内部合并执行、无法再拆，保持 null
+    //（检索总耗时见 retrieval 节点输出 retrieval_elapsed_ms）。
+    if let Some(record) = stages
+        .iter()
+        .find(|stage| stage.node == "retrieval")
+        .and_then(|stage| stage.records.first())
+    {
+        timing.embedding_ms = record.output_json.get("embedding_ms").and_then(Value::as_u64);
+    }
+    timing.total_ms = stages
+        .iter()
+        .find(|stage| stage.node == "completed")
+        .and_then(|stage| stage.records.last())
+        .and_then(|record| record.elapsed_ms);
+    timing
+}
+
+/// 每轮一问的诊断摘要一行（仅 Developer 模式显示）。
+/// 示例：LOCAL DOCUMENT_QA target=resume memory=miss doc=Resolved(0.91)
+///       scope_files=1 retrieval_candidates=12 rerank_top1=0.83 claims=4
+///       4/4 supported total=3421ms
+fn build_diagnostic_summary(stages: &[AskTraceStage]) -> String {
+    let output_of = |node: &str| -> Option<&Value> {
+        stages
+            .iter()
+            .find(|stage| stage.node == node)
+            .and_then(|stage| stage.records.last())
+            .map(|record| &record.output_json)
+    };
+    let mut parts: Vec<String> = Vec::new();
+    // 来源 + 意图（LOCAL DOCUMENT_QA）
+    let source = output_of("source_routing")
+        .and_then(|output| output.get("source"))
+        .and_then(Value::as_str);
+    let intent = output_of("query_parsing")
+        .and_then(|output| output.get("plan"))
+        .and_then(|plan| plan.get("intent"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            stages
+                .iter()
+                .find(|stage| stage.node == "completed")
+                .and_then(|stage| stage.records.last())
+                .and_then(|record| record.output_json.get("answer_mode"))
+                .and_then(Value::as_str)
+        });
+    match (source, intent) {
+        (Some(source), Some(intent)) => parts.push(format!("{source} {intent}")),
+        (Some(source), None) => parts.push(source.to_owned()),
+        (None, Some(intent)) => parts.push(intent.to_owned()),
+        (None, None) => {}
+    }
+    // 目标对象
+    if let Some(target) = output_of("query_parsing")
+        .and_then(|output| output.get("plan"))
+        .and_then(|plan| plan.get("target"))
+    {
+        let reference = target
+            .get("reference")
+            .and_then(Value::as_str)
+            .or_else(|| target.get("document_name").and_then(Value::as_str));
+        if let Some(reference) = reference {
+            parts.push(format!("target={}", compact_for_prompt(reference, 24)));
+        }
+    }
+    // Memory 命中
+    if let Some(ok) = output_of("memory_resolution")
+        .and_then(|output| output.get("memory_resolution_ok"))
+        .and_then(Value::as_bool)
+    {
+        parts.push(if ok {
+            "memory=hit".to_owned()
+        } else {
+            "memory=miss".to_owned()
+        });
+    }
+    // 文档解析结果（status + top 候选分数）
+    if let Some(resolution) = output_of("document_resolution") {
+        let status = resolution
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        let top_score = resolution
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|candidates| candidates.first())
+            .and_then(|candidate| candidate.get("score"))
+            .and_then(Value::as_f64);
+        match top_score {
+            Some(score) => parts.push(format!("doc={status}({score:.2})")),
+            None => parts.push(format!("doc={status}")),
+        }
+    }
+    // 最终 scope 文件数
+    if let Some(files) = output_of("scope_planning")
+        .and_then(|output| output.get("scope_file_ids"))
+        .and_then(Value::as_array)
+    {
+        parts.push(format!("scope_files={}", files.len()));
+    }
+    // 文档级召回候选数
+    if let Some(count) = output_of("document_recall")
+        .and_then(|output| output.get("candidate_count"))
+        .and_then(Value::as_u64)
+    {
+        parts.push(format!("recall_candidates={count}"));
+    }
+    // 初始检索候选（trace 内最多展示 10 条）
+    if let Some(candidates) = output_of("retrieval")
+        .and_then(|output| output.get("candidates"))
+        .and_then(Value::as_array)
+    {
+        parts.push(format!("retrieval_candidates={}", candidates.len()));
+    }
+    // 重排结果
+    if let Some(rerank) = output_of("reranking") {
+        if rerank.get("applied").and_then(Value::as_bool) == Some(true)
+            && let Some(top) = rerank
+                .get("scores")
+                .and_then(Value::as_array)
+                .and_then(|scores| scores.first())
+                .and_then(Value::as_f64)
+        {
+            parts.push(format!("rerank_top1={top:.2}"));
+        } else if let Some(fallback) = rerank.get("fallback").and_then(Value::as_str) {
+            parts.push(format!("rerank={fallback}"));
+        }
+    }
+    // 生成 claim 数 + 核验通过率
+    if let Some(claim_count) = stages
+        .iter()
+        .find(|stage| stage.node == "completed")
+        .and_then(|stage| stage.records.last())
+        .and_then(|record| record.output_json.get("claim_count"))
+        .and_then(Value::as_u64)
+    {
+        parts.push(format!("claims={claim_count}"));
+    }
+    if let Some(records) = stages
+        .iter()
+        .find(|stage| stage.node == "verification")
+        .map(|stage| &stage.records)
+    {
+        let supported = records
+            .iter()
+            .filter(|record| {
+                record
+                    .output_json
+                    .get("supported")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+            })
+            .count();
+        parts.push(format!("{supported}/{} supported", records.len()));
+    }
+    // 总耗时
+    if let Some(total) = stages
+        .iter()
+        .find(|stage| stage.node == "completed")
+        .and_then(|stage| stage.records.last())
+        .and_then(|record| record.elapsed_ms)
+    {
+        parts.push(format!("total={total}ms"));
+    }
+    parts.join(" ")
+}
+
+/// Debug Trace 导出脱敏：全路径 → [路径]文件名、长文本截断（默认）、
+/// 模型完整 prompt 默认隐藏（generation 节点 input）。
+fn sanitize_ask_trace_for_export(stages: &mut [AskTraceStage], include_detailed_text: bool) {
+    for stage in stages {
+        for record in &mut stage.records {
+            let mut input = record.input_json.clone();
+            let mut output = record.output_json.clone();
+            sanitize_trace_value(&mut input, include_detailed_text);
+            sanitize_trace_value(&mut output, include_detailed_text);
+            if !include_detailed_text && stage.node == "generation" {
+                if let Some(Value::String(prompt)) = input.get("prompt") {
+                    let length = prompt.chars().count();
+                    input["prompt"] = json!(format!("[已隐藏] 共 {length} 字符"));
+                }
+            }
+            record.input_json = input;
+            record.output_json = output;
+        }
+    }
+}
+
+/// 递归脱敏单个 trace 值：Windows 绝对路径 / UNC → 只留文件名；长文本截断。
+/// 截断仅默认模式生效（include_detailed_text = true 保留详细文本）。
+fn sanitize_trace_value(value: &mut Value, include_detailed_text: bool) {
+    const EXPORT_TEXT_LIMIT: usize = 2_000;
+    const EXPORT_KEEP_CHARS: usize = 500;
+    match value {
+        Value::String(text) => {
+            *text = sanitize_trace_paths(text);
+            if !include_detailed_text && text.chars().count() > EXPORT_TEXT_LIMIT {
+                let mut kept = text.chars().take(EXPORT_KEEP_CHARS).collect::<String>();
+                kept.push_str("…[已截断]");
+                *text = kept;
+            }
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| sanitize_trace_value(item, include_detailed_text)),
+        Value::Object(map) => map
+            .values_mut()
+            .for_each(|item| sanitize_trace_value(item, include_detailed_text)),
+        _ => {}
+    }
+}
+
+/// 把文本中的 Windows 绝对路径 / UNC 路径替换为「[路径]文件名」。
+/// 启发式扫描：`X:\`（盘符前不带字母数字，避免误伤 JSON 键）或 `\\` 起始，
+/// 到引号 / 空白 / 常见分隔符为止；只保留最后一段作为文件名。
+fn sanitize_trace_paths(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut output = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < text.len() {
+        // 扫描下一个路径起点
+        let mut path_start = None;
+        let mut cursor = index;
+        while cursor < text.len() {
+            let byte = bytes[cursor];
+            let is_drive = byte.is_ascii_alphabetic()
+                && bytes.get(cursor + 1) == Some(&b':')
+                && bytes.get(cursor + 2) == Some(&b'\\')
+                && (cursor == 0 || !bytes[cursor - 1].is_ascii_alphanumeric());
+            let is_unc = byte == b'\\' && bytes.get(cursor + 1) == Some(&b'\\');
+            if is_drive || is_unc {
+                path_start = Some(cursor);
+                break;
+            }
+            cursor += 1;
+        }
+        let Some(start) = path_start else {
+            output.push_str(&text[index..]);
+            break;
+        };
+        // 路径终点：引号 / 空白 / 常见分隔符
+        let mut end = text.len();
+        for (offset, ch) in text[start..].char_indices() {
+            if matches!(ch, '"' | '\'' | ' ' | '\t' | '\n' | '\r' | ',' | '}' | ']' | ')') {
+                end = start + offset;
+                break;
+            }
+        }
+        let path = &text[start..end];
+        let name = path
+            .rsplit('\\')
+            .next()
+            .unwrap_or(path)
+            .trim_end_matches(['/', ':']);
+        output.push_str("[路径]");
+        output.push_str(name);
+        index = end;
+    }
+    output
+}
+
+/// Ask Debug Trace Viewer 数据（Phase 3）：一次 Ask 的全部节点追踪 →
+/// 12+ 阶段分组 + 逐阶段耗时 + 诊断摘要一行。仅用于 Developer / 诊断模式。
+#[tauri::command(async)]
+pub fn ask_trace_get(
+    operation_id: String,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<AskTrace, AppError> {
+    let catalog = catalog.get()?;
+    build_ask_trace(&catalog, &operation_id)
+}
+
+/// Debug Trace 导出（单次问答 → JSON 文件）。
+/// 隐私默认：文件路径脱敏、文本 chunk 截断、不含模型完整 prompt；
+/// include_detailed_text 为开发者选项（默认关闭），仅跳过文本截断并保留
+/// prompt，路径脱敏始终生效。
+#[tauri::command(async)]
+pub fn ask_trace_export(
+    request: AskTraceExportRequest,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<ExportResult, AppError> {
+    if !request.confirmed {
+        return Err(AppError::new(
+            "EXPORT_CONFIRMATION_REQUIRED",
+            "导出调试追踪前需要明确确认",
+            false,
+        ));
+    }
+    let target = PathBuf::from(request.target_path.trim());
+    if !target.is_absolute() || target.extension().and_then(|value| value.to_str()) != Some("json")
+    {
+        return Err(AppError::new(
+            "EXPORT_TARGET_INVALID",
+            "调试追踪必须导出到绝对路径的JSON新文件",
+            false,
+        ));
+    }
+    let catalog = catalog.get()?;
+    let trace = build_ask_trace(&catalog, &request.operation_id)?;
+    let mut stages = trace.stages.clone();
+    sanitize_ask_trace_for_export(&mut stages, request.include_detailed_text);
+    let payload = AskTraceExport {
+        schema_version: 1,
+        generated_at: Utc::now().to_rfc3339(),
+        operation_id: trace.operation_id.clone(),
+        question: trace.question.clone(),
+        answer_mode: trace.answer_mode.clone(),
+        stages,
+        timing: trace.timing.clone(),
+        diagnostic_summary: trace.diagnostic_summary.clone(),
+    };
+    let bytes = serde_json::to_vec_pretty(&payload)
+        .map_err(|error| AppError::new("TRACE_SERIALIZE_FAILED", error.to_string(), false))?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| AppError::new("EXPORT_DIRECTORY_FAILED", error.to_string(), true))?;
+    }
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target)
+        .map_err(|error| {
+            let code = if error.kind() == std::io::ErrorKind::AlreadyExists {
+                "EXPORT_TARGET_EXISTS"
+            } else {
+                "EXPORT_CREATE_FAILED"
+            };
+            AppError::new(code, error.to_string(), true)
+        })?;
+    if let Err(error) = output.write_all(&bytes).and_then(|_| output.flush()) {
+        drop(output);
+        let _ = fs::remove_file(&target);
+        return Err(AppError::new(
+            "EXPORT_WRITE_FAILED",
+            error.to_string(),
+            true,
+        ));
+    }
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    Ok(ExportResult {
+        target_path: target.to_string_lossy().into_owned(),
+        format: "json".to_owned(),
+        row_count: trace
+            .stages
+            .iter()
+            .map(|stage| stage.records.len() as u64)
+            .sum(),
+        size_bytes: bytes.len() as u64,
+        sha256,
+    })
+}
+
+/// Ask Evaluation Runner（Phase 3）：JSONL/JSON 测试集批量运行问答管线。
+///
+/// 隔离性设计：
+/// - 每例独立 operation_id（node_traces 关联键，可对应用例打开 Trace Viewer）
+///   与独立 session_id（本例专用会话，跑完即删——不污染 Ask History /
+///   Session Context；测试「有/无 Memory 与有/无 Session Context」四态时，
+///   Memory 由 Clear Memory 命令控制，Context 天然为空）。
+/// - 不启动 Memory Candidate Writer、不出现 clarification_selection
+///   （禁止自动写 Memory）。
+/// - 结果写 output_path（create_new），每例 verdict 与 error_category
+///   可在 JSON 中人工修改分类后复用。
+#[tauri::command(async)]
+pub async fn ask_evaluation_run(
+    request: AskEvaluationRunRequest,
+    catalog: State<'_, CatalogServiceState>,
+    models: State<'_, ModelServiceState>,
+    sidecars: State<'_, SidecarRegistryState>,
+    generation: State<'_, GenerationServiceState>,
+    runtime_manager: State<'_, RuntimeManagerState>,
+) -> Result<AskEvaluationRunReport, AppError> {
+    if !request.confirmed {
+        return Err(AppError::new(
+            "EVALUATION_CONFIRMATION_REQUIRED",
+            "运行评估测试集前需要明确确认",
+            false,
+        ));
+    }
+    let target = PathBuf::from(request.target_path.trim());
+    if !target.is_file() {
+        return Err(AppError::new(
+            "EVALUATION_SET_NOT_FOUND",
+            "评估测试集文件不存在",
+            false,
+        ));
+    }
+    let output = PathBuf::from(request.output_path.trim());
+    if !output.is_absolute() || output.extension().and_then(|value| value.to_str()) != Some("json") {
+        return Err(AppError::new(
+            "EVALUATION_OUTPUT_INVALID",
+            "评估结果必须写到绝对路径的JSON新文件",
+            false,
+        ));
+    }
+    if output.exists() {
+        return Err(AppError::new(
+            "EVALUATION_OUTPUT_EXISTS",
+            "评估结果文件已存在，请更换输出路径",
+            false,
+        ));
+    }
+    let content = fs::read_to_string(&target)
+        .map_err(|error| AppError::new("EVALUATION_SET_READ_FAILED", error.to_string(), true))?;
+    let cases = fanfan_core::evaluation::parse_evaluation_cases(&content)?;
+    if cases.is_empty() {
+        return Err(AppError::new(
+            "EVALUATION_SET_EMPTY",
+            "评估测试集为空，没有可运行的用例",
+            false,
+        ));
+    }
+    let catalog = catalog.get()?;
+    let models = models.get()?;
+    let worker = sidecars.0.onnx.isolated();
+    let generation = Arc::clone(&generation.0);
+    let runtime_manager = runtime_manager.0.clone();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    tauri::async_runtime::spawn_blocking(move || {
+        // 串行批量运行：本地模型推理不适合并发，逐例独立跑
+        let mut results = Vec::with_capacity(cases.len());
+        for case in &cases {
+            results.push(run_single_evaluation_case(
+                case,
+                &catalog,
+                &models,
+                &worker,
+                &generation,
+                &runtime_manager,
+                &cancelled,
+            ));
+        }
+        for result in &mut results {
+            let verdict = fanfan_core::evaluation::verdict_for(result);
+            result.pass_fail = verdict.pass_fail;
+            result.failed_fields = verdict.failed_fields;
+        }
+        let metrics = fanfan_core::evaluation::compute_metrics(&results);
+        let passed = results.iter().filter(|result| result.pass_fail).count();
+        let report = AskEvaluationRunReport {
+            schema_version: 1,
+            generated_at: Utc::now().to_rfc3339(),
+            run_id: Uuid::now_v7().to_string(),
+            total: results.len(),
+            passed,
+            failed: results.len() - passed,
+            metrics,
+            results,
+        };
+        let bytes = serde_json::to_vec_pretty(&report)
+            .map_err(|error| AppError::new("EVALUATION_SERIALIZE_FAILED", error.to_string(), false))?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output)
+            .map_err(|error| AppError::new("EVALUATION_CREATE_FAILED", error.to_string(), true))?;
+        file.write_all(&bytes)
+            .and_then(|_| file.flush())
+            .map_err(|error| AppError::new("EVALUATION_WRITE_FAILED", error.to_string(), true))?;
+        crate::runtime_log::event(
+            "info",
+            "rag",
+            "ask.evaluation_completed",
+            Some(&report.run_id),
+            &json!({
+                "total": report.total,
+                "passed": report.passed,
+                "failed": report.failed,
+                "output_path": output.to_string_lossy(),
+            }),
+        );
+        Ok(report)
+    })
+    .await
+    .map_err(|error| AppError::new("EVALUATION_RUNTIME_FAILED", error.to_string(), true))?
+}
+
+/// 单例运行：独立操作/会话，跑完即删会话，收集 trace 与 answer 侧字段。
+#[allow(clippy::too_many_arguments)]
+fn run_single_evaluation_case(
+    case: &fanfan_core::evaluation::EvaluationCase,
+    catalog: &CatalogService,
+    models: &ModelManager,
+    worker: &WorkerClient,
+    generation: &Mutex<LocalGenerationRuntime>,
+    runtime_manager: &RuntimeManager,
+    cancelled: &AtomicBool,
+) -> fanfan_core::evaluation::EvaluationRunResult {
+    let operation_id = Uuid::now_v7();
+    let session_id = Uuid::now_v7();
+    let request = AskRequest {
+        question: case.question.clone(),
+        session_id: Some(session_id),
+        scope: ScopeFilter {
+            root_ids: Vec::new(),
+            collection_ids: Vec::new(),
+            file_ids: Vec::new(),
+            extensions: Vec::new(),
+            modified_from: None,
+            modified_to: None,
+            availability: fanfan_core::Availability::Present,
+        },
+        answer_style: fanfan_core::AnswerStyle::Concise,
+        retrieval_limit: 12,
+        max_source_files: 4,
+        strict_evidence: true,
+        clarification_selection: None,
+    };
+    let started = Instant::now();
+    let (answer, run_error) = run_evaluation_ask(
+        &request,
+        catalog,
+        models,
+        worker,
+        generation,
+        runtime_manager,
+        operation_id,
+        cancelled,
+    );
+    let latency_ms = started.elapsed().as_millis() as u64;
+    // 清理本例专用会话（失败路径也可能已写入失败记录；不存在则忽略）
+    let _ = catalog.delete_ask_session(&session_id);
+    let records = catalog
+        .query_node_traces_by_correlation("ask", &operation_id.to_string())
+        .unwrap_or_default();
+    let output_of = |node: &str| {
+        records
+            .iter()
+            .find(|record| record.node == node)
+            .map(|record| &record.output_json)
+    };
+    let failed_nodes = records
+        .iter()
+        .filter(|record| record.status != "ok")
+        .map(|record| record.node.as_str())
+        .collect::<Vec<_>>();
+
+    let actual_source = output_of("source_routing")
+        .and_then(|output| output.get("source"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let actual_intent = output_of("query_parsing")
+        .and_then(|output| output.get("plan"))
+        .and_then(|plan| plan.get("intent"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let actual_document_type = output_of("query_parsing")
+        .and_then(|output| output.get("plan"))
+        .and_then(|plan| plan.get("target"))
+        .and_then(|target| target.get("document_type"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            output_of("context_resolution")
+                .and_then(|output| output.get("resolved_document_type"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    let memory_used = output_of("memory_resolution")
+        .and_then(|output| output.get("memory_resolution_ok"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // 检索候选（retrieval trace 写入时仍是 pre-rerank 顺序，file_id 齐全）
+    let retrieval_top_files = output_of("retrieval")
+        .and_then(|output| output.get("candidates"))
+        .and_then(Value::as_array)
+        .map(|candidates| {
+            candidates
+                .iter()
+                .filter_map(|candidate| candidate.get("file_id"))
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    // rerank 已应用 → 按分数重排（scores 与候选一一对应，同一顺序）；
+    // 未应用 → 与检索顺序一致
+    let rerank_applied = output_of("reranking")
+        .and_then(|output| output.get("applied"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let rerank_top_files = if rerank_applied {
+        let scores = output_of("reranking")
+            .and_then(|output| output.get("scores"))
+            .and_then(Value::as_array);
+        let mut paired = retrieval_top_files
+            .iter()
+            .enumerate()
+            .map(|(index, file_id)| {
+                let score = scores
+                    .and_then(|scores| scores.get(index))
+                    .and_then(|score| score.get("score"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                (file_id.clone(), score)
+            })
+            .collect::<Vec<_>>();
+        paired.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        paired.into_iter().map(|(file_id, _)| file_id).collect()
+    } else {
+        retrieval_top_files.clone()
+    };
+
+    // answer 侧字段 + 错误分类
+    let (actual_file_ids, grounding_status, answer_mode, evidence_found, answer_grounded,
+         claim_count, supported_claim_count, clarification_used, error_message, error_category) =
+        match answer {
+            Some(result) => {
+                let grounding_status =
+                    serde_json::to_string(&result.grounding_status).unwrap_or_default();
+                let grounding_status =
+                    grounding_status.trim_matches('"').to_owned();
+                let supported_count = result
+                    .claims
+                    .iter()
+                    .filter(|claim| claim.support_status == SupportStatus::Supported)
+                    .count();
+                let claims_have_unsupported = supported_count < result.claims.len();
+                let category = fanfan_core::evaluation::classify_error(
+                    &failed_nodes,
+                    None,
+                    Some(result.answer_mode.as_str()),
+                    result.insufficient_evidence,
+                    case.expected_should_find_evidence,
+                    claims_have_unsupported,
+                );
+                (
+                    result
+                        .used_file_ids
+                        .iter()
+                        .map(|file_id| file_id.to_string())
+                        .collect::<Vec<_>>(),
+                    Some(grounding_status),
+                    Some(result.answer_mode.as_str().to_owned()),
+                    !result.claims.is_empty() || !result.used_file_ids.is_empty(),
+                    result.grounding_status == GroundingStatus::Grounded && !claims_have_unsupported,
+                    result.claims.len() as u64,
+                    supported_count as u64,
+                    result.clarification.is_some()
+                        || result.answer_mode == AnswerMode::Clarification,
+                    None,
+                    category,
+                )
+            }
+            None => {
+                let category = fanfan_core::evaluation::classify_error(
+                    &failed_nodes,
+                    run_error.as_ref().map(|error| error.code.as_str()),
+                    None,
+                    false,
+                    case.expected_should_find_evidence,
+                    false,
+                );
+                (
+                    Vec::new(),
+                    None,
+                    None,
+                    false,
+                    false,
+                    0,
+                    0,
+                    false,
+                    run_error.map(|error| error.message),
+                    category,
+                )
+            }
+        };
+
+    fanfan_core::evaluation::EvaluationRunResult {
+        case_id: case.id.clone(),
+        operation_id: operation_id.to_string(),
+        question: case.question.clone(),
+        expected_source: case.expected_source.clone(),
+        expected_intent: case.expected_intent.clone(),
+        expected_file_ids: case.expected_file_ids.clone(),
+        expected_document_type: case.expected_document_type.clone(),
+        expected_should_find_evidence: case.expected_should_find_evidence,
+        actual_source,
+        actual_intent,
+        actual_file_ids,
+        actual_document_type,
+        memory_used,
+        clarification_used,
+        retrieval_top_files,
+        rerank_top_files,
+        grounding_status,
+        answer_mode,
+        evidence_found,
+        answer_grounded,
+        claim_count,
+        supported_claim_count,
+        latency_ms,
+        error_category,
+        error_message,
+        pass_fail: false,
+        failed_fields: Vec::new(),
+    }
+}
+
+/// 批量运行的单例执行器：与 ask_start 同口径的运行时租约 + compute_answer，
+/// 不启动 Memory Candidate Writer，不写前台活动守卫。
+fn run_evaluation_ask(
+    request: &AskRequest,
+    catalog: &CatalogService,
+    models: &ModelManager,
+    worker: &WorkerClient,
+    generation: &Mutex<LocalGenerationRuntime>,
+    runtime_manager: &RuntimeManager,
+    operation_id: Uuid,
+    cancelled: &AtomicBool,
+) -> (Option<AnswerResult>, Option<AppError>) {
+    let generation_artifact_id = models
+        .active_artifact(ModelRole::Generation)
+        .ok()
+        .flatten()
+        .map(|artifact| artifact.artifact_id.to_string());
+    let mut runtime_request =
+        RuntimeTaskRequest::interactive(RuntimeTaskKind::Ask, RuntimeBackendKind::LlamaCpp);
+    runtime_request.cpu_threads = interactive_inference_threads();
+    runtime_request.timeout = Duration::from_secs(45);
+    runtime_request.model_id = generation_artifact_id;
+    runtime_request.idempotency_key = Some(format!("ask-eval:{operation_id}"));
+    let runtime_lease = match runtime_manager.acquire(runtime_request) {
+        Ok(lease) => lease,
+        Err(error) => return (None, Some(error)),
+    };
+    let phase = |_name: &str, _progress: f64| {};
+    let verified_claim = |_claim: &AnswerClaim| {};
+    match compute_answer(
+        request,
+        catalog,
+        models,
+        worker,
+        generation,
+        runtime_manager,
+        operation_id,
+        cancelled,
+        (&phase, &verified_claim),
+    ) {
+        Ok(answer) => {
+            runtime_lease.complete();
+            (Some(answer), None)
+        }
+        Err(error) => {
+            if error.code != "OPERATION_CANCELLED" {
+                let _ = catalog.record_ask_failure(request, &error);
+            }
+            runtime_lease.fail(&error.code);
+            (None, Some(error))
+        }
+    }
+}
+
+/// Document Profile Inspector（Phase 3）：单个文件的画像详情 + 向量在场状态。
+#[tauri::command(async)]
+pub fn document_profile_inspect(
+    file_id: String,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<DocumentProfileInspect, AppError> {
+    let file_id = Uuid::parse_str(&file_id)
+        .map_err(|_| AppError::new("FILE_ID_INVALID", "文件标识无效", false))?;
+    let catalog = catalog.get()?;
+    let profile = catalog.get_document_profile(file_id)?;
+    let embedding_present = catalog.profile_vector(&file_id)?.is_some();
+    let display_name = profile
+        .as_ref()
+        .map(|profile| profile.title.clone())
+        .unwrap_or_else(|| file_id.to_string());
+    Ok(DocumentProfileInspect {
+        file_id: file_id.to_string(),
+        display_name,
+        profile,
+        embedding_present,
+    })
+}
+
+/// 画像重建（单文件或全部）。不强制重新生成 Chunk Embedding——只有当前
+/// revision 的 chunk 已全量嵌入的文件会被重建，其余如实计入 skipped。
+#[tauri::command(async)]
+pub fn document_profile_rebuild(
+    request: DocumentProfileRebuildRequest,
+    catalog: State<'_, CatalogServiceState>,
+    models: State<'_, ModelServiceState>,
+) -> Result<ProfileRefreshResult, AppError> {
+    fanfan_core::validate_rebuild_confirmation(&request.confirmation)?;
+    let catalog = catalog.get()?;
+    let artifact = models
+        .get()?
+        .active_artifact(ModelRole::Embedding)?
+        .ok_or_else(|| {
+            AppError::new(
+                "RAG_EMBEDDING_MODEL_REQUIRED",
+                "重建画像需要先配置并通过自检的中文 Embedding 模型",
+                false,
+            )
+        })?;
+    let file_ids = request
+        .file_ids
+        .map(|ids| {
+            ids.iter()
+                .map(|id| {
+                    Uuid::parse_str(id)
+                        .map_err(|_| AppError::new("FILE_ID_INVALID", "文件标识无效", false))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
+    catalog.rebuild_document_profiles(&artifact.artifact_id.to_string(), file_ids.as_deref())
+}
+
+/// Memory Inspector（Phase 3，最小实现）：三张记忆表 + 可选关键字过滤
+///（alias / entity 名 / predicate / file_id / entity_id）。
+#[tauri::command(async)]
+pub fn memory_inspector_query(
+    search: Option<String>,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<MemoryInspectorView, AppError> {
+    let catalog = catalog.get()?;
+    let aliases = catalog.list_memory_aliases(500)?;
+    let relations = catalog.list_memory_relations(None, 2000)?;
+    let entities = catalog.list_memory_entities(2000)?;
+    let Some(keyword) = search
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(MemoryInspectorView {
+            aliases,
+            relations,
+            entities,
+        });
+    };
+    let matches_text = |text: &str| text.to_lowercase().contains(&keyword);
+    let matches_uuid = |id: Uuid| id.to_string().contains(&keyword);
+    Ok(MemoryInspectorView {
+        aliases: aliases
+            .into_iter()
+            .filter(|alias| matches_text(&alias.alias) || matches_uuid(alias.target_id))
+            .collect(),
+        relations: relations
+            .into_iter()
+            .filter(|relation| {
+                matches_text(&relation.predicate)
+                    || matches_uuid(relation.subject_id)
+                    || matches_uuid(relation.object_id)
+            })
+            .collect(),
+        entities: entities
+            .into_iter()
+            .filter(|entity| {
+                matches_text(&entity.canonical_name)
+                    || matches_text(&entity.entity_type)
+                    || matches_uuid(entity.entity_id)
+            })
+            .collect(),
+    })
+}
+
+/// Memory 关系 confirm / reject（只改 status，不动数据）。
+#[tauri::command(async)]
+pub fn memory_relation_set_status(
+    request: MemoryRelationStatusRequest,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<bool, AppError> {
+    let relation_id = Uuid::parse_str(&request.relation_id)
+        .map_err(|_| AppError::new("RELATION_ID_INVALID", "关系标识无效", false))?;
+    let status = match request.status.as_str() {
+        "confirmed" => MemoryStatus::Confirmed,
+        "rejected" => MemoryStatus::Rejected,
+        _ => {
+            return Err(AppError::new(
+                "MEMORY_STATUS_INVALID",
+                "只允许 confirmed 或 rejected",
+                false,
+            ))
+        }
+    };
+    catalog
+        .get()?
+        .update_memory_relation_status(relation_id, status)
+}
+
+#[tauri::command(async)]
+pub fn memory_alias_delete(
+    alias_id: String,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<bool, AppError> {
+    let alias_id = Uuid::parse_str(&alias_id)
+        .map_err(|_| AppError::new("ALIAS_ID_INVALID", "别名标识无效", false))?;
+    catalog.get()?.delete_memory_alias(alias_id)
+}
+
+#[tauri::command(async)]
+pub fn memory_entity_delete(
+    entity_id: String,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<bool, AppError> {
+    let entity_id = Uuid::parse_str(&entity_id)
+        .map_err(|_| AppError::new("ENTITY_ID_INVALID", "实体标识无效", false))?;
+    catalog.get()?.delete_memory_entity(entity_id)
+}
+
+#[tauri::command(async)]
+pub fn memory_relation_delete(
+    relation_id: String,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<bool, AppError> {
+    let relation_id = Uuid::parse_str(&relation_id)
+        .map_err(|_| AppError::new("RELATION_ID_INVALID", "关系标识无效", false))?;
+    catalog.get()?.delete_memory_relation(relation_id)
+}
+
+/// 清空全部记忆（aliases / relations / entities 三表；二次确认短语校验）。
+/// 不动文件 / 索引 / Embedding / Ask 历史。
+#[tauri::command(async)]
+pub fn memory_clear(
+    request: MemoryClearRequest,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<u64, AppError> {
+    if request.confirmation != "CLEAR_MEMORY" {
+        return Err(AppError::new(
+            "MEMORY_CLEAR_CONFIRMATION_REQUIRED",
+            "清空记忆需要明确确认",
+            false,
+        ));
+    }
+    catalog.get()?.clear_memory()
+}
+
+/// 清空当前会话的 Ask Session Context（测试有/无 Memory × 有/无 Context 四态）。
+#[tauri::command(async)]
+pub fn ask_session_context_clear(
+    session_id: String,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<bool, AppError> {
+    let session_id = Uuid::parse_str(&session_id)
+        .map_err(|_| AppError::new("SESSION_ID_INVALID", "会话标识无效", false))?;
+    catalog
+        .get()?
+        .clear_ask_session_context(session_id)
+        .map(|_| true)
 }
 
 #[derive(Debug, Deserialize)]
@@ -5660,6 +6890,28 @@ pub fn ask_start(
                         "elapsed_ms": operation_started.elapsed().as_millis() as u64,
                     }),
                 );
+                // 异步 Memory Candidate Writer（Step 6）：问答结束后在后台尝试
+                // 提取用户明确表达的关系/别名候选。全程失败静默，绝不影响已
+                // 完成的回答；STRICT：只写 model_inference + candidate。
+                {
+                    let catalog = Arc::clone(&catalog);
+                    let models = Arc::clone(&models);
+                    let generation = Arc::clone(&generation);
+                    let question = request.question.clone();
+                    let session_id = request.session_id;
+                    let answer = answer.clone();
+                    std::thread::spawn(move || {
+                        run_memory_candidate_writer(
+                            &catalog,
+                            &models,
+                            &generation,
+                            &question,
+                            session_id,
+                            &answer,
+                            operation_id,
+                        );
+                    });
+                }
                 runtime_lease.complete();
             }
             Err(error) => {
@@ -5721,6 +6973,29 @@ fn trace_node(
     );
 }
 
+/// operation_execution 精简节点：记录「本轮问答实际走了哪条管线」
+/// （chat 侧的入口分支；检索侧在 finish_retrieval_with_plan 内记录）。
+fn trace_operation_execution(
+    catalog: &CatalogService,
+    correlation_id: &str,
+    session_id: Option<&str>,
+    reason: &str,
+    pipeline: &str,
+) {
+    trace_node(
+        catalog,
+        "ask",
+        "operation_execution",
+        correlation_id,
+        session_id,
+        None,
+        &json!({ "reason": reason }),
+        &json!({ "pipeline": pipeline }),
+        "ok",
+        None,
+    );
+}
+
 /// 追踪字段容量控制：单个字符串字段截 8KB；序列化后仍超 8KB 则整体降级为截断预览。
 fn truncate_for_trace(value: &Value) -> Value {
     const NODE_TRACE_LIMIT: usize = 8000;
@@ -5752,6 +7027,184 @@ fn truncate_for_trace(value: &Value) -> Value {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// 问答结束后的异步 Memory Candidate Writer（Step 5/6）。
+///
+/// 铁律：
+/// - **禁止所有问答自动写 Memory**——只有用户明确表达/确认/起别名等事件，
+///   由模型从本轮问答中判定（`should_write`），普通问答不产生任何记忆；
+/// - STRICT：所有写入强制 `source = model_inference` + `status = candidate`，
+///   **绝不自动确认**（确认只能来自用户显式操作，见澄清选择/确认链路）；
+/// - 写入前对每个目标再次执行存储层合法性检查（文件在场 + 授权根）；
+/// - 任何失败只记日志，绝不影响问答主链路、绝不上抛。
+fn run_memory_candidate_writer(
+    catalog: &Arc<CatalogService>,
+    models: &Arc<ModelManager>,
+    generation: &Arc<Mutex<LocalGenerationRuntime>>,
+    question: &str,
+    session_id: Option<Uuid>,
+    answer: &AnswerResult,
+    operation_id: Uuid,
+) {
+    let outcome = (|| -> Result<u64, AppError> {
+        let Some(artifact) = models.active_artifact(ModelRole::Generation)? else {
+            return Ok(0);
+        };
+        // 1. 注册表：本轮涉及的文件（id + 真名）+ 已知实体。
+        //    无明确涉及文件时不写——目标无法确定性验证。
+        let entities = catalog.list_memory_entities(2000)?;
+        let used_ids: HashSet<Uuid> = answer
+            .used_file_ids
+            .iter()
+            .chain(answer.source_files.iter().map(|source| &source.file_id))
+            .copied()
+            .collect();
+        let profiles = catalog.list_document_profiles(None, 2000)?;
+        let involved: Vec<(Uuid, String)> = profiles
+            .into_iter()
+            .map(|(profile, name)| (profile.file_id, name))
+            .filter(|(file_id, _)| used_ids.contains(file_id))
+            .collect();
+        // 收藏集也是合法目标（别名可指向收藏集，见 resolve_name 实体→文件→收藏集）
+        let collections = catalog
+            .list_collections()?
+            .into_iter()
+            .map(|collection| (collection.collection_id, collection.name))
+            .collect::<Vec<_>>();
+        let registry = MemoryTargetRegistry {
+            files: involved
+                .iter()
+                .map(|(file_id, name)| (*file_id, name.as_str()))
+                .collect(),
+            entities,
+            collections: collections
+                .iter()
+                .map(|(collection_id, name)| (*collection_id, name.as_str()))
+                .collect(),
+        };
+        if registry.files.is_empty() {
+            return Ok(0);
+        }
+        // 2. Writer 判定（结构化 JSON；解析失败按「不写」处理）
+        let history = session_id
+            .map(|session_id| catalog.load_ask_history(&session_id, 20))
+            .transpose()?
+            .unwrap_or_default();
+        let active_files = registry
+            .files
+            .iter()
+            .map(|(_, name)| (*name).to_owned())
+            .collect::<Vec<_>>();
+        let known_entities = registry
+            .entities
+            .iter()
+            .map(|entity| entity.canonical_name.clone())
+            .collect::<Vec<_>>();
+        let known_collections = collections
+            .iter()
+            .map(|(_, name)| name.clone())
+            .collect::<Vec<_>>();
+        let context = MemoryWriterContext {
+            question,
+            answer: &answer.answer,
+            history: &history,
+            active_files: &active_files,
+            known_entities: &known_entities,
+            known_collections: &known_collections,
+        };
+        let (system, user) = memory_writer_prompt(&context);
+        let raw = complete_json_with_model(
+            generation,
+            &artifact,
+            &system,
+            &user,
+            200,
+            &memory_writer_schema(),
+            &AtomicBool::new(false),
+        )?;
+        let Some(output) = parse_writer_output(&raw) else {
+            return Ok(0);
+        };
+        // 3. 确定性预写验证 → 名字解析 → 写入（先过合法性复核）
+        let validated = prewrite_validate(output);
+        let validated_count = validated.len();
+        let writes = resolve_proposal_targets(validated, &registry);
+        let mut written = 0_u64;
+        let mut rejected = 0_u64;
+        for write in &writes {
+            let target_valid = memory_target_legality_valid(catalog, write)?;
+            if !target_valid {
+                rejected += 1;
+                continue;
+            }
+            match write.kind {
+                MemoryKind::Relation => {
+                    catalog.upsert_memory_relation(write)?;
+                }
+                MemoryKind::Alias => {
+                    catalog.upsert_memory_alias(write)?;
+                }
+            }
+            written += 1;
+        }
+        trace_node(
+            catalog,
+            "ask",
+            "memory_candidate_write",
+            &operation_id.to_string(),
+            session_id.map(|id| id.to_string()).as_deref(),
+            None,
+            &json!({
+                "question": question,
+                "involved_files": active_files,
+            }),
+            &json!({
+                "writer_raw": raw,
+                "validated_proposal_count": validated_count,
+                "write_attempt_count": writes.len(),
+                "written": written,
+                "rejected_by_legality": rejected,
+            }),
+            "ok",
+            None,
+        );
+        Ok(written)
+    })();
+    match outcome {
+        Ok(written) if written > 0 => crate::runtime_log::event(
+            "info",
+            "rag",
+            "memory.candidates_written",
+            Some(&operation_id.to_string()),
+            &json!({ "operation_id": operation_id, "written": written }),
+        ),
+        Ok(_) => {}
+        Err(error) => crate::runtime_log::event(
+            "warning",
+            "rag",
+            "memory.writer_failed",
+            Some(&operation_id.to_string()),
+            &json!({ "operation_id": operation_id, "error_code": error.code }),
+        ),
+    }
+}
+
+/// Memory 写入前合法性复核（确定性门）：文件目标必须在场且位于授权根，
+/// 收藏集必须存在；实体恒有效。绝不放行悬空/越权目标。
+fn memory_target_legality_valid(
+    catalog: &CatalogService,
+    write: &MemoryWriteInput,
+) -> Result<bool, AppError> {
+    let valid_target = |target_type: MemoryTargetType, target_id: Uuid| -> Result<bool, AppError> {
+        match target_type {
+            MemoryTargetType::File => catalog.memory_file_target_valid(target_id),
+            MemoryTargetType::Collection => catalog.memory_collection_target_valid(target_id),
+            MemoryTargetType::Entity => Ok(true),
+        }
+    };
+    Ok(valid_target(write.subject_type, write.subject_id)?
+        && valid_target(write.object_type, write.object_id)?)
+}
+
 fn compute_answer(
     request: &AskRequest,
     catalog: &CatalogService,
@@ -5767,7 +7220,7 @@ fn compute_answer(
     if cancelled.load(Ordering::Acquire) {
         return Err(AppError::new("OPERATION_CANCELLED", "问答已取消", false));
     }
-    phase("intent_routing", 0.05);
+    phase("source_routing", 0.05);
     let generation_artifact = models.active_artifact(ModelRole::Generation)?;
     let maintenance = catalog.maintenance_snapshot()?;
     let generation_artifact = generation_artifact.ok_or_else(|| {
@@ -5777,44 +7230,87 @@ fn compute_answer(
             false,
         )
     })?;
-    // 路由前加载一次会话历史（最多 20 条，覆盖路由/闲聊/检索生成的 5+5 需要），
-    // 三个环节共用同一份；当前轮次问答在 record_ask_exchange 之后才落库，不含本轮。
+    // 路由前加载一次会话历史（最多 20 条，覆盖路由/解析/闲聊/检索生成的 5+5 需要），
+    // 各环节共用同一份；当前轮次问答在 record_ask_exchange 之后才落库，不含本轮。
     let history = request
         .session_id
         .map(|session_id| catalog.load_ask_history(&session_id, 20))
         .transpose()?
         .unwrap_or_default();
-    let routing_started = Instant::now();
-    let (routing, routing_raw) = route_question(
-        request,
-        &history,
-        generation,
-        &generation_artifact,
-        cancelled,
-    )?;
+    // 会话工作上下文（Context/Document Resolver 的输入；读取失败按空处理，
+    // Memory 层出错不得阻断问答）。
+    let session_context: AskSessionContext = request
+        .session_id
+        .map(|session_id| catalog.get_ask_session_context(session_id))
+        .transpose()?
+        .flatten()
+        .unwrap_or_default();
     let session_id = request.session_id.map(|id| id.to_string());
+    let session_id_ref = session_id.as_deref();
+
+    // Step 7：用户在 NEED_CLARIFICATION 中选定了目标文件 → 跳过路由，
+    // 写 USER_SELECTION 记忆并锁定 scope 继续原问题。
+    if let Some(selection) = request.clarification_selection {
+        return run_clarified_answer(
+            request,
+            catalog,
+            models,
+            worker,
+            runtime_manager,
+            generation,
+            &generation_artifact,
+            maintenance,
+            &history,
+            &session_context,
+            selection,
+            operation_id,
+            cancelled,
+            progress,
+        );
+    }
+
+    // 1. Source Router（LOCAL / GENERAL / AMBIGUOUS）
+    let routing_started = Instant::now();
+    let (routing, routing_raw) = {
+        let (system, user) = source_router_prompt(request.question.trim(), &history);
+        let raw = complete_json_with_model(
+            generation,
+            &generation_artifact,
+            &system,
+            &user,
+            48,
+            &source_routing_schema(),
+            cancelled,
+        )?;
+        (parse_source_routing(&raw), Some(raw))
+    };
     trace_node(
         &catalog,
         "ask",
-        "routing",
+        "source_routing",
         &operation_id.to_string(),
-        session_id.as_deref(),
+        session_id_ref,
         None,
         &json!({ "question": request.question }),
         &json!({
-            "router": "llm",
-            "intent": format!("{:?}", routing.intent),
-            "top_category": format!("{:?}", routing.top_category),
-            "top_score": routing.top_score,
-            "margin": routing.margin,
-            "router_active": routing.top_score > 0.0,
-            "arbitration_raw": routing_raw,
+            "source": routing.map(|value| value.source.as_str()).unwrap_or("parse_failed"),
+            "confidence": routing.map(|value| value.confidence).unwrap_or(0.0),
+            "routing_ok": routing.is_some(),
+            "routing_raw": routing_raw,
         }),
         "ok",
         Some(routing_started.elapsed().as_millis() as u64),
     );
-    match routing.intent {
-        Intent::Chat => run_chat_answer(
+    let Some(routing) = routing else {
+        // 路由解析失败 → 保守闲聊（与旧行为一致：路由失败默认 chat，不猜检索）
+        trace_operation_execution(
+            catalog,
+            &operation_id.to_string(),
+            session_id_ref,
+            "routing_parse_failed",
+            "chat",
+        );
+        return run_chat_answer(
             request,
             catalog,
             generation,
@@ -5824,73 +7320,1826 @@ fn compute_answer(
             operation_id,
             cancelled,
             phase,
-        ),
-        _ => {
-            // Embedding 只被检索分支需要：闲聊在缺 Embedding 时正常工作。
-            let embedding = models.active_artifact(ModelRole::Embedding)?;
-            run_retrieval_answer(
+        );
+    };
+    if routing.source == SourceIntent::General {
+        trace_operation_execution(
+            catalog,
+            &operation_id.to_string(),
+            session_id_ref,
+            "general",
+            "chat",
+        );
+        return run_chat_answer(
+            request,
+            catalog,
+            generation,
+            &generation_artifact,
+            &maintenance,
+            &history,
+            operation_id,
+            cancelled,
+            phase,
+        );
+    }
+
+    // 2. AMBIGUOUS → Context Resolver（结合会话上下文恢复目标；恢复失败兜底闲聊）
+    let mut context_scope: Vec<uuid::Uuid> = Vec::new();
+    if routing.source == SourceIntent::Ambiguous {
+        let context_started = Instant::now();
+        let context_resolution = resolve_ambiguous(&session_context);
+        trace_node(
+            &catalog,
+            "ask",
+            "context_resolution",
+            &operation_id.to_string(),
+            session_id_ref,
+            None,
+            &json!({ "question": request.question, "session_has_active_file": session_context.active_file_id.is_some() }),
+            &json!({
+                "status": context_resolution.status.as_str(),
+                "source": context_resolution.source.as_str(),
+                "intent": context_resolution.intent.as_str(),
+                "resolved_file_ids": context_resolution.resolved_file_ids,
+                "resolved_document_type": context_resolution.resolved_document_type.map(|value| value.as_str()),
+                "signal": context_resolution.signal,
+                "confidence": context_resolution.confidence,
+                "fallback_reason": context_resolution.fallback_reason,
+            }),
+            "ok",
+            Some(context_started.elapsed().as_millis() as u64),
+        );
+        if !context_resolution.is_resolved() {
+            // P0 安全兜底：不猜文件、不假装 LOCAL，走闲聊（会如实说明没看懂指代）
+            trace_operation_execution(
+                catalog,
+                &operation_id.to_string(),
+                session_id_ref,
+                "ambiguous_unresolved",
+                "chat",
+            );
+            return run_chat_answer(
                 request,
                 catalog,
-                models,
-                worker,
-                runtime_manager,
                 generation,
-                generation_artifact,
-                embedding,
-                maintenance,
+                &generation_artifact,
+                &maintenance,
                 &history,
                 operation_id,
                 cancelled,
-                (phase, verified_claim),
-            )
+                phase,
+            );
+        }
+        context_scope = context_resolution.resolved_file_ids.clone();
+        // 只有文档类型可恢复时：把类型并入 target，交给 Document Resolver 按类型找
+        if context_scope.is_empty()
+            && let Some(document_type) = context_resolution.resolved_document_type
+        {
+            let Some(mut plan) = parse_ask_plan(
+                request, catalog, generation, &generation_artifact, &history, operation_id,
+                session_id_ref, cancelled, phase,
+            )?
+            else {
+                // 解析失败：按类型宽检索（不锁文件，退化为全库）
+                return run_retrieval_answer(
+                    request, catalog, models, worker, runtime_manager, generation,
+                    generation_artifact, embedding_for_retrieval(&models)?, maintenance, &history,
+                    operation_id, cancelled, (phase, verified_claim), None, false, false,
+                );
+            };
+            plan.source = SourceIntent::Local;
+            plan.requires_document_resolution = true;
+            plan.target.document_type = plan.target.document_type.or(Some(document_type));
+            return finish_retrieval_with_plan(
+                request, catalog, models, worker, runtime_manager, generation, generation_artifact,
+                embedding_for_retrieval(&models)?, maintenance, &history, &session_context,
+                plan, context_scope, operation_id, cancelled, (phase, verified_claim),
+            );
         }
     }
+
+    // 3. Query Parser（LOCAL 或已恢复的 AMBIGUOUS 都要先结构化）
+    let plan = parse_ask_plan(
+        request, catalog, generation, &generation_artifact, &history, operation_id,
+        session_id_ref, cancelled, phase,
+    )?;
+    let Some(mut plan) = plan else {
+        // 解析失败回退：原问题在（可能的）上下文 scope 内检索，不劣化现状
+        let mut scoped = request.clone();
+        if !context_scope.is_empty() {
+            scoped.scope.file_ids = context_scope.clone();
+        }
+        return run_retrieval_answer(
+            &scoped, catalog, models, worker, runtime_manager, generation, generation_artifact,
+            embedding_for_retrieval(&models)?, maintenance, &history, operation_id, cancelled,
+            (phase, verified_claim), None, false, false,
+        );
+    };
+    if routing.source == SourceIntent::Ambiguous && !context_scope.is_empty() {
+        plan.source = SourceIntent::Local;
+        // 会话上下文已锁定文件：目标对象即上下文恢复出的文件，跳过 Document Resolver
+        plan.requires_document_resolution = false;
+        plan.target.document_type = plan.target.document_type.or(session_context.active_document_type);
+    }
+    finish_retrieval_with_plan(
+        request, catalog, models, worker, runtime_manager, generation, generation_artifact,
+        embedding_for_retrieval(&models)?, maintenance, &history, &session_context, plan,
+        context_scope, operation_id, cancelled, (phase, verified_claim),
+    )
 }
 
-/// 意图路由：LLM 直路由。生成模型按 5+5 对话历史判断走检索还是闲聊
-/// （≤32 token 的 JSON 补全，模型在 ask 租约阶段已加载）。
-/// 解析失败或调用失败默认 Chat——闲聊答错无副作用，检索答错会把资料库内容
-/// 当答案胡说（0.6B 仲裁失败的教训）。返回路由 LLM 原始输出供节点追踪复盘。
-/// 回复内容一律由模型生成，不做任何关键词/白名单规则分流。
-fn route_question(
+/// 澄清选择继续（Step 7）：用户在 NEED_CLARIFICATION 中选定目标文件后，
+/// 带原问题重跑——先过合法性检查（与 Document Resolver 同口径），
+/// 写 USER_SELECTION 别名记忆（用户明确选中 = 高信任信号），锁定 scope，
+/// 再重新解析 content_query 完成检索。
+#[allow(clippy::too_many_arguments)]
+fn run_clarified_answer(
     request: &AskRequest,
-    history: &[AskMessage],
+    catalog: &CatalogService,
+    models: &ModelManager,
+    worker: &WorkerClient,
+    runtime_manager: &RuntimeManager,
     generation: &Mutex<LocalGenerationRuntime>,
     generation_artifact: &ModelArtifact,
+    maintenance: MaintenanceSnapshot,
+    history: &[AskMessage],
+    session_context: &AskSessionContext,
+    selection: Uuid,
+    operation_id: Uuid,
     cancelled: &AtomicBool,
-) -> Result<(RouteDecision, Option<String>), AppError> {
-    let fallback_chat = RouteDecision {
-        intent: Intent::Chat,
-        top_category: Intent::Chat,
-        top_score: 0.0,
-        margin: 0.0,
-    };
-    // 档位自适应：0.6B 用词级两字输出的迷你版 prompt（词级续写是它的强项，
-    // JSON 输出与长 prompt 分类是它误判的放大器）；更强模型用完整定义版。
-    let (system, user) = if generation_artifact
-        .model_id
-        .to_lowercase()
-        .contains("0.6b")
+    progress: AskProgressCallbacks<'_>,
+) -> Result<AnswerResult, AppError> {
+    let (phase, verified_claim) = progress;
+    if !catalog.memory_file_target_valid(selection)? {
+        return Err(AppError::new(
+            "CLARIFICATION_SELECTION_INVALID",
+            "所选文件已不可用（已删除/离线/越权），请重新提问",
+            false,
+        ));
+    }
+    // USER_SELECTION 记忆：待澄清引用（如「我的简历」）→ 别名指向所选文件。
+    // 用户明确选中 = 用户选择来源（rank 4），但严格不自动确认其他推断；
+    // 引用不适合做别名（过长/问句）则不写。
+    if let Some(reference) = session_context
+        .pending_clarification_reference
+        .as_deref()
+        .filter(|reference| is_alias_writable_reference(reference))
+        && let Some(alias) = fanfan_core::normalize_alias(reference)
     {
-        intent_routing_prompt_mini(request.question.trim(), history)
+        let _ = catalog.upsert_memory_alias(&MemoryWriteInput {
+            kind: MemoryKind::Alias,
+            subject_type: MemoryTargetType::File,
+            subject_id: selection,
+            predicate: "alias".to_owned(),
+            object_type: MemoryTargetType::File,
+            object_id: selection,
+            alias: Some(alias),
+            confidence: 0.95,
+            source_type: MemorySource::UserSelection,
+            source_id: Some(format!("clarification:{operation_id}")),
+            status: MemoryStatus::Confirmed,
+        });
+    }
+    // 会话上下文锁定所选文件，清除待澄清引用（选择即已消费）
+    let mut updated_context = session_context.clone();
+    updated_context.active_file_id = Some(selection);
+    updated_context.active_file_ids = vec![selection];
+    updated_context.pending_clarification_reference = None;
+    updated_context.last_referenced_file_ids = vec![selection];
+    updated_context.updated_at = Some(Utc::now());
+    if let Some(session_id) = request.session_id {
+        let _ = catalog.update_ask_session_context(session_id, &updated_context);
+    }
+    trace_node(
+        catalog,
+        "ask",
+        "clarification_selection",
+        &operation_id.to_string(),
+        request.session_id.map(|id| id.to_string()).as_deref(),
+        None,
+        &json!({
+            "question": request.question,
+            "selection": selection,
+            "pending_reference": session_context.pending_clarification_reference,
+        }),
+        &json!({
+            "selection_valid": true,
+            "memory_written": true,
+            "locked_scope": vec![selection],
+        }),
+        "ok",
+        None,
+    );
+    // 重新解析 content_query（目标已锁定，跳过 Document Resolver 与路由）
+    let parsed = parse_ask_plan(
+        request,
+        catalog,
+        generation,
+        generation_artifact,
+        history,
+        operation_id,
+        request.session_id.map(|id| id.to_string()).as_deref(),
+        cancelled,
+        phase,
+    )?;
+    let mut plan = parsed.unwrap_or_default();
+    plan.source = SourceIntent::Local;
+    plan.requires_document_resolution = false;
+    finish_retrieval_with_plan(
+        request,
+        catalog,
+        models,
+        worker,
+        runtime_manager,
+        generation,
+        generation_artifact.clone(),
+        embedding_for_retrieval(models)?,
+        maintenance,
+        history,
+        &updated_context,
+        plan,
+        vec![selection],
+        operation_id,
+        cancelled,
+        (phase, verified_claim),
+    )
+}
+
+/// 待澄清引用是否适合写成别名（Step 7）：短名词短语、不是问句。
+/// 长句/问句整段写别名只会污染记忆（如「我资料里有没有提到法律项目」）。
+fn is_alias_writable_reference(reference: &str) -> bool {
+    let trimmed = reference.trim();
+    let length = trimmed.chars().count();
+    (2..=20).contains(&length)
+        && !trimmed.ends_with('？')
+        && !trimmed.ends_with('?')
+        && !trimmed.ends_with('吗')
+        && !trimmed.ends_with('呢')
+        && !trimmed.contains("什么")
+        && !trimmed.contains("怎么")
+        && !trimmed.contains("哪些")
+        && !trimmed.contains("有没有")
+}
+
+/// Step 7 澄清触发条件：Memory 未能消歧 + 存在多个非常接近的候选 + 有可选候选。
+/// 注意 MultipleCandidates 的 resolved_file_ids 是 top-2/3（非空），scope 非空
+/// 不代表已经「锁定」，仍须回问用户——不能让分支条件与 resolver 输出相悖。
+fn should_ask_clarification(
+    memory_resolution_ok: bool,
+    resolution_status: Option<ResolutionStatus>,
+    has_candidates: bool,
+) -> bool {
+    !memory_resolution_ok
+        && resolution_status == Some(ResolutionStatus::MultipleCandidates)
+        && has_candidates
+}
+
+/// Embedding 只被检索分支需要：闲聊在缺 Embedding 时正常工作。
+fn embedding_for_retrieval(models: &ModelManager) -> Result<Option<ModelArtifact>, AppError> {
+    models.active_artifact(ModelRole::Embedding)
+}
+
+/// Query Parser 步骤：结构化 LOCAL（或已恢复）请求。返回 None 表示解析失败
+/// （调用方按原问题回退检索，不中断问答）。
+#[allow(clippy::too_many_arguments)]
+fn parse_ask_plan(
+    request: &AskRequest,
+    catalog: &CatalogService,
+    generation: &Mutex<LocalGenerationRuntime>,
+    generation_artifact: &ModelArtifact,
+    history: &[AskMessage],
+    operation_id: Uuid,
+    session_id_ref: Option<&str>,
+    cancelled: &AtomicBool,
+    phase: &dyn Fn(&str, f64),
+) -> Result<Option<QueryPlan>, AppError> {
+    phase("query_parsing", 0.12);
+    let (system, user) = query_parser_prompt(request.question.trim(), history);
+    let raw = complete_json_with_model(
+        generation,
+        generation_artifact,
+        &system,
+        &user,
+        160,
+        &query_parser_schema(),
+        cancelled,
+    )?;
+    let plan = parse_query_plan(&raw);
+    trace_node(
+        catalog,
+        "ask",
+        "query_parsing",
+        &operation_id.to_string(),
+        session_id_ref,
+        None,
+        &json!({ "question": request.question }),
+        &json!({
+            "parsed": plan.is_some(),
+            "plan": plan,
+            "parsing_raw": raw,
+        }),
+        "ok",
+        None,
+    );
+    Ok(plan)
+}
+
+/// Memory Resolver 数据装载（Step 6）：可信来源别名 + 已确认关系 → 命中提示。
+/// 任何存储读取失败都静默降级为空（Memory 层出错不得阻断问答）。
+fn load_memory_hints(catalog: &CatalogService, question: &str) -> (Vec<MemoryHint>, Vec<MemoryHint>) {
+    let aliases = catalog.list_memory_aliases(500).unwrap_or_default();
+    let entities = catalog.list_memory_entities(2000).unwrap_or_default();
+    let relations = catalog
+        .list_memory_relations(Some(MemoryStatus::Confirmed), 2000)
+        .unwrap_or_default();
+    // 只有「可信来源」的别名参与定位（user_explicit / user_confirmed /
+    // user_selection / repeated_usage）；推断类别名是候选，等用户确认，绝不参与。
+    let trusted_aliases = aliases
+        .into_iter()
+        .filter(|alias| alias.source_type.allows_confirmed())
+        .collect::<Vec<_>>();
+    let alias_hints = match_alias_hints(question, &trusted_aliases);
+    let relation_hints = match_relation_hints(question, &entities, &relations);
+    (alias_hints, relation_hints)
+}
+
+/// DOCUMENT_FIND（spec 十一.1）：只运行 Document Resolver 的结果，不跑普通
+/// chunk RAG。定位到文件 → 返回文件卡片式回答（answer_mode = find，无 claims
+/// ——「找到文件」本身是目标，不需要证据句）；未定位到任何候选 → LOCAL +
+/// NO_EVIDENCE 固定拒绝文案，绝不转闲聊。
+#[allow(clippy::too_many_arguments)]
+fn run_document_find_answer(
+    request: &AskRequest,
+    catalog: &CatalogService,
+    resolved_scope: &[Uuid],
+    resolution_candidates: &[DocumentCandidate],
+    resolution_file_names: &HashMap<Uuid, String>,
+    operation_id: Uuid,
+    cancelled: &AtomicBool,
+    progress: AskProgressCallbacks<'_>,
+) -> Result<AnswerResult, AppError> {
+    let (phase, _verified_claim) = progress;
+    let _ = cancelled;
+    let correlation_id = operation_id.to_string();
+    let session_id = request.session_id.map(|id| id.to_string());
+    let session_id_ref = session_id.as_deref();
+    let started = Instant::now();
+    let mut file_names = resolution_file_names.clone();
+    if file_names.is_empty() {
+        let profiles = catalog.list_document_profiles(None, 2000)?;
+        for (profile, name) in profiles {
+            file_names.entry(profile.file_id).or_insert(name);
+        }
+    }
+    let file_id = resolved_scope
+        .first()
+        .copied()
+        .or_else(|| resolution_candidates.first().map(|candidate| candidate.file_id));
+    let Some(file_id) = file_id else {
+        let message =
+            "没有在资料中找到你说的文件。可以换一种说法（文件名、类型或内容关键词），或确认资料已完成索引。"
+                .to_owned();
+        return finish_summary_refusal(request, catalog, operation_id, &message, started, phase);
+    };
+    let name = file_names
+        .get(&file_id)
+        .cloned()
+        .unwrap_or_else(|| "未命名文件".to_owned());
+    let canonical_path = catalog
+        .file_preview(&file_id, 1)
+        .map(|preview| preview.file.canonical_path.clone())
+        .unwrap_or_default();
+    let result = AnswerResult {
+        session_id: request.session_id.unwrap_or_else(Uuid::now_v7),
+        message_id: Uuid::now_v7(),
+        answer: format!("找到了：{name}（{canonical_path}）"),
+        grounding_status: GroundingStatus::Grounded,
+        insufficient_evidence: false,
+        claims: Vec::new(),
+        source_files: vec![AnswerSourceFile {
+            file_id,
+            display_name: name.clone(),
+            canonical_path: canonical_path.clone(),
+        }],
+        used_file_ids: vec![file_id],
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        answer_mode: AnswerMode::Find,
+        retrieval_channels: vec!["document_find".into()],
+        index_coverage: 0.0,
+        degradation_reason: None,
+        clarification: None,
+    };
+    trace_node(
+        catalog,
+        "ask",
+        "document_find",
+        &correlation_id,
+        session_id_ref,
+        None,
+        &json!({ "reference": request.question }),
+        &json!({
+            "file_id": file_id.to_string(),
+            "name": name,
+            "canonical_path": canonical_path,
+        }),
+        "ok",
+        Some(result.elapsed_ms),
+    );
+    trace_node(
+        catalog,
+        "ask",
+        "completed",
+        &correlation_id,
+        session_id_ref,
+        None,
+        &json!({}),
+        &json!({
+            "answer_mode": result.answer_mode,
+            "answer": result.answer,
+            "claim_count": 0,
+            "grounding_status": format!("{:?}", result.grounding_status),
+            "insufficient_evidence": false,
+            "degradation_reason": result.degradation_reason,
+        }),
+        "ok",
+        Some(result.elapsed_ms),
+    );
+    catalog.record_ask_exchange(request, &result)?;
+    phase("completed", 1.0);
+    Ok(result)
+}
+
+/// QueryPlan → 检索的最后一步：Document Resolver 锁定文件白名单 → 写入
+/// scope.file_ids → 用 content_query 检索。
+#[allow(clippy::too_many_arguments)]
+fn finish_retrieval_with_plan(
+    request: &AskRequest,
+    catalog: &CatalogService,
+    models: &ModelManager,
+    worker: &WorkerClient,
+    runtime_manager: &RuntimeManager,
+    generation: &Mutex<LocalGenerationRuntime>,
+    generation_artifact: ModelArtifact,
+    embedding: Option<ModelArtifact>,
+    maintenance: MaintenanceSnapshot,
+    history: &[AskMessage],
+    session_context: &AskSessionContext,
+    plan: QueryPlan,
+    context_scope: Vec<uuid::Uuid>,
+    operation_id: Uuid,
+    cancelled: &AtomicBool,
+    progress: AskProgressCallbacks<'_>,
+) -> Result<AnswerResult, AppError> {
+    // 4. Document Resolver（目标对象 → file_id 白名单）
+    let mut resolved_scope = context_scope;
+    let mut document_resolution: Option<Value> = None;
+    // Step 7：解析状态与候选提升到外部，供 NEED_CLARIFICATION 分支使用
+    let mut resolution_status: Option<ResolutionStatus> = None;
+    let mut resolution_candidates: Vec<DocumentCandidate> = Vec::new();
+    let mut resolution_file_names: HashMap<Uuid, String> = HashMap::new();
+    if plan.requires_document_resolution && resolved_scope.is_empty() {
+        let resolution_started = Instant::now();
+        let profiles_with_names =
+            catalog.list_document_profiles(plan.target.document_type, 2000)?;
+        let mut file_names = HashMap::with_capacity(profiles_with_names.len());
+        let profiles = profiles_with_names
+            .into_iter()
+            .map(|(profile, name)| {
+                file_names.insert(profile.file_id, name);
+                profile
+            })
+            .collect::<Vec<DocumentProfile>>();
+        let input = ResolverInput::new(&plan, session_context, profiles, file_names);
+        let resolution = resolve_documents(&input);
+        resolved_scope = resolution.resolved_file_ids.clone();
+        resolution_status = Some(resolution.status);
+        resolution_candidates = resolution.candidates.clone();
+        resolution_file_names = input.file_names.clone();
+        trace_node(
+            catalog,
+            "ask",
+            "document_resolution",
+            &operation_id.to_string(),
+            request.session_id.map(|id| id.to_string()).as_deref(),
+            None,
+            &json!({
+                "target": {
+                    "reference": plan.target.reference,
+                    "document_type": plan.target.document_type.map(|value| value.as_str()),
+                    "document_name": plan.target.document_name,
+                    "owner": plan.target.owner,
+                    "entity_name": plan.target.entity_name,
+                },
+                "candidate_count": resolution.candidates.len(),
+            }),
+            &json!({
+                "candidates": resolution.candidates,
+                "resolved_file_ids": resolution.resolved_file_ids,
+                "confidence": resolution.confidence,
+                "status": resolution.status.as_str(),
+                "fallback_reason": resolution.fallback_reason,
+            }),
+            "ok",
+            Some(resolution_started.elapsed().as_millis() as u64),
+        );
+        document_resolution = Some(json!({
+            "status": resolution.status.as_str(),
+            "resolved_file_ids": resolution.resolved_file_ids,
+            "candidate_count": resolution.candidates.len(),
+        }));
+    }
+
+    // 4.5 Memory Resolver（别名/关系 → 定位提示）。
+    // 设计约束（Step 4/6）：Memory 只帮助理解和定位，绝不作为事实证据；
+    // 解析出的 file_id 必须逐个通过存储层合法性检查（存在 + present + 授权根，
+    // 与 Document Resolver 同口径）；只有 confirmed 关系与「可信来源」别名参与
+    // 定位；命中并验证通过后**以 Memory 定位优先**（用户明确起的别名/已确认关系
+    // 是比 Resolver 启发式更强的定位信号，满足「禁止把简历当全库关键词搜索」）。
+    let memory_started = Instant::now();
+    let (alias_hints, relation_hints) = load_memory_hints(catalog, request.question.trim());
+    let mut memory_scope: Vec<Uuid> = Vec::new();
+    let mut memory_resolution_ok = false;
+    {
+        for hint in alias_hints.iter().chain(relation_hints.iter()) {
+            match hint.target_type {
+                MemoryTargetType::File => {
+                    if catalog
+                        .memory_file_target_valid(hint.target_id)
+                        .unwrap_or(false)
+                    {
+                        memory_scope.push(hint.target_id);
+                    }
+                }
+                MemoryTargetType::Collection => {
+                    if catalog
+                        .memory_collection_target_valid(hint.target_id)
+                        .unwrap_or(false)
+                        && let Ok(files) = catalog.collection_files(&hint.target_id)
+                    {
+                        // 收藏集成员逐个复验：绝不放行越权/离线文件
+                        for file in files {
+                            if catalog
+                                .memory_file_target_valid(file.file_id)
+                                .unwrap_or(false)
+                            {
+                                memory_scope.push(file.file_id);
+                            }
+                        }
+                    }
+                }
+                MemoryTargetType::Entity => {}
+            }
+        }
+        memory_scope.sort_unstable();
+        memory_scope.dedup();
+        if !memory_scope.is_empty() {
+            resolved_scope = memory_scope.clone();
+            memory_resolution_ok = true;
+        }
+    }
+    // 被实际采纳进 scope 的别名 → 提升使用次数（repeated_usage 升级依据；
+    // 失败静默，不阻断主链路）
+    if memory_resolution_ok {
+        for hint in &alias_hints {
+            if resolved_scope.contains(&hint.target_id)
+                && let Ok(aliases) = catalog.find_memory_aliases(&hint.matched_text)
+            {
+                for alias in aliases
+                    .into_iter()
+                    .filter(|alias| alias.target_id == hint.target_id)
+                {
+                    let _ = catalog.bump_memory_alias(alias.alias_id);
+                }
+            }
+        }
+    }
+    trace_node(
+        catalog,
+        "ask",
+        "memory_resolution",
+        &operation_id.to_string(),
+        request.session_id.map(|id| id.to_string()).as_deref(),
+        None,
+        &json!({
+            "question": request.question,
+            "requires_document_resolution": plan.requires_document_resolution,
+        }),
+        &json!({
+            "alias_hint_count": alias_hints.len(),
+            "relation_hint_count": relation_hints.len(),
+            "alias_hints": alias_hints,
+            "relation_hints": relation_hints,
+            "valid_memory_scope": memory_scope,
+            "memory_resolution_ok": memory_resolution_ok,
+            "resolved_scope_after_memory": resolved_scope,
+        }),
+        "ok",
+        Some(memory_started.elapsed().as_millis() as u64),
+    );
+
+    // 4.5.4 Step 12：operation_execution —— 记录实际执行的管线分支
+    // （前端流程展示与排障依据；任何分支都从本节点出发）。
+    let execution_pipeline = if plan.intent == QueryIntent::CompareDocuments {
+        "document_compare"
+    } else if plan.intent == QueryIntent::DocumentFind {
+        "document_find"
+    } else if plan.requires_full_document {
+        "document_summary"
     } else {
-        intent_routing_prompt(request.question.trim(), history)
+        "chunk_rag"
     };
-    let raw = match complete_with_model(generation, generation_artifact, &system, &user, 32, cancelled)
-    {
-        Ok(raw) => raw,
-        Err(_) => return Ok((fallback_chat, None)),
+    trace_node(
+        catalog,
+        "ask",
+        "operation_execution",
+        &operation_id.to_string(),
+        request.session_id.map(|id| id.to_string()).as_deref(),
+        None,
+        &json!({
+            "intent": plan.intent.as_str(),
+            "operation": plan.operation.as_str(),
+            "requires_document_resolution": plan.requires_document_resolution,
+            "requires_full_document": plan.requires_full_document,
+        }),
+        &json!({
+            "pipeline": execution_pipeline,
+            "resolved_file_count": resolved_scope.len(),
+            "candidate_count": resolution_candidates.len(),
+        }),
+        "ok",
+        None,
+    );
+
+    // 4.5.5 Step 10：COMPARE_DOCUMENTS 走两侧对比管线（spec 十一.6）。
+    // 放在 Clarification 之前：比较请求的目标是「两份文档」，primary 出现
+    // 多候选时不问「哪一份」——两侧取最有把握的候选，比较意图优先。
+    if plan.intent == QueryIntent::CompareDocuments {
+        return run_compare_answer(
+            request,
+            catalog,
+            models,
+            worker,
+            runtime_manager,
+            generation,
+            generation_artifact,
+            embedding,
+            maintenance,
+            history,
+            session_context,
+            plan,
+            resolved_scope,
+            &resolution_candidates,
+            &resolution_file_names,
+            operation_id,
+            cancelled,
+            progress,
+        );
+    }
+
+    // 4.6 Step 7：存在多个非常接近的候选且 Memory 未能消歧 → 返回强类型
+    // NEED_CLARIFICATION，由用户明确选择目标文件后继续；不再静默保留
+    // top-2/3 宽检索（用户明确指代时猜错比让用户选一次更伤）。
+    // 注意：MultipleCandidates 的 resolved_file_ids 是 top-2/3（非空），
+    // 触发条件只看「状态 + 有可选候选」，不能要求 scope 为空。
+    if should_ask_clarification(memory_resolution_ok, resolution_status, !resolution_candidates.is_empty()) {
+        let clarification_started = Instant::now();
+        let reference = plan
+            .target
+            .reference
+            .clone()
+            .or_else(|| plan.target.document_name.clone())
+            .unwrap_or_else(|| compact_for_prompt(request.question.trim(), 40));
+        let options = resolution_candidates
+            .iter()
+            .take(MAX_CANDIDATE_SCOPE)
+            .map(|candidate| ClarificationOption {
+                file_id: candidate.file_id,
+                display_name: resolution_file_names
+                    .get(&candidate.file_id)
+                    .cloned()
+                    .unwrap_or_else(|| "未命名文件".to_owned()),
+                document_type: None,
+                score: candidate.score,
+                signals: candidate.signals.clone(),
+            })
+            .collect::<Vec<_>>();
+        // 保存待澄清引用：用户选择后据此写 USER_SELECTION 别名记忆
+        if let Some(session_id) = request.session_id {
+            let mut pending_context = session_context.clone();
+            pending_context.pending_clarification_reference = Some(reference.clone());
+            pending_context.updated_at = Some(Utc::now());
+            let _ = catalog.update_ask_session_context(session_id, &pending_context);
+        }
+        let payload = ClarificationPayload {
+            reference: reference.clone(),
+            reason: "本地存在多份非常接近的候选文件，请选择你指的是哪一份。".to_owned(),
+            options,
+        };
+        let result = AnswerResult {
+            session_id: request.session_id.unwrap_or_else(Uuid::now_v7),
+            message_id: Uuid::now_v7(),
+            answer: format!("请选择你指的是哪一份：\n{}", payload.reason),
+            grounding_status: fanfan_core::GroundingStatus::Insufficient,
+            insufficient_evidence: false,
+            claims: Vec::new(),
+            source_files: Vec::new(),
+            used_file_ids: Vec::new(),
+            elapsed_ms: clarification_started.elapsed().as_millis() as u64,
+            answer_mode: AnswerMode::Clarification,
+            retrieval_channels: Vec::new(),
+            index_coverage: 0.0,
+            degradation_reason: None,
+            clarification: Some(payload),
+        };
+        trace_node(
+            catalog,
+            "ask",
+            "clarification",
+            &operation_id.to_string(),
+            request.session_id.map(|id| id.to_string()).as_deref(),
+            None,
+            &json!({
+                "reference": reference,
+                "candidate_count": resolution_candidates.len(),
+            }),
+            &json!({
+                "answer_mode": result.answer_mode,
+                "options": result.clarification,
+                "question": request.question,
+            }),
+            "ok",
+            Some(clarification_started.elapsed().as_millis() as u64),
+        );
+        catalog.record_ask_exchange(request, &result)?;
+        progress.0("clarification", 1.0);
+        return Ok(result);
+    }
+
+    // 4.5.6 Step 12：DOCUMENT_FIND（spec 十一.1）只返回定位结果，不跑 chunk RAG。
+    // 放在 Clarification 之后：多候选且未消歧时先让用户选定目标文件。
+    if plan.intent == QueryIntent::DocumentFind {
+        return run_document_find_answer(
+            request,
+            catalog,
+            &resolved_scope,
+            &resolution_candidates,
+            &resolution_file_names,
+            operation_id,
+            cancelled,
+            progress,
+        );
+    }
+
+    // 5. 保存会话工作上下文（定位结果供下一轮 AMBIGUOUS 恢复；失败不阻断回答）
+    let mut updated_context = session_context.clone();
+    if !resolved_scope.is_empty() {
+        updated_context.active_file_id = Some(resolved_scope[0]);
+        updated_context.active_file_ids = resolved_scope.clone();
+        updated_context.last_referenced_file_ids = resolved_scope.clone();
+    }
+    if let Some(document_type) = plan.target.document_type {
+        updated_context.active_document_type = Some(document_type);
+    }
+    updated_context.last_intent = Some(plan.intent.as_str().to_owned());
+    updated_context.updated_at = Some(Utc::now());
+    if let Some(session_id) = request.session_id {
+        let _ = catalog.update_ask_session_context(session_id, &updated_context);
+    }
+
+    // 6. 组装检索请求：scope.file_ids 白名单 + content_query 检索词
+    let mut scoped = request.clone();
+    if !resolved_scope.is_empty() {
+        scoped.scope.file_ids = resolved_scope.clone();
+    }
+    if let Some(content_query) = plan.content_query.clone() {
+        scoped.question = content_query;
+    }
+    trace_node(
+        catalog,
+        "ask",
+        "scope_planning",
+        &operation_id.to_string(),
+        request.session_id.map(|id| id.to_string()).as_deref(),
+        None,
+        &json!({
+            "intent": plan.intent.as_str(),
+            "operation": plan.operation.as_str(),
+            "requires_document_resolution": plan.requires_document_resolution,
+            "requires_full_document": plan.requires_full_document,
+            "content_query": plan.content_query,
+        }),
+        &json!({
+            "scope_file_ids": scoped.scope.file_ids,
+            "retrieval_question": scoped.question,
+            "document_resolution": document_resolution,
+        }),
+        "ok",
+        None,
+    );
+    // Step 8：DOCUMENT_SUMMARY 走整文分层摘要管线（spec 十一.3：禁止只拿
+    // top-3 chunk 生成）。目标文件已由 Document/Memory Resolver 与澄清锁定，
+    // 不再经过普通 chunk 检索。
+    if plan.requires_full_document {
+        return run_document_summary_answer(
+            request,
+            catalog,
+            models,
+            generation,
+            generation_artifact,
+            operation_id,
+            cancelled,
+            progress,
+            resolved_scope,
+            &resolution_candidates,
+            plan.target.document_type,
+        );
+    }
+    run_retrieval_answer(
+        &scoped,
+        catalog,
+        models,
+        worker,
+        runtime_manager,
+        generation,
+        generation_artifact,
+        embedding,
+        maintenance,
+        history,
+        operation_id,
+        cancelled,
+        progress,
+        // Step 11：EXTRACT operation 随主检索管线走，尾段重组为结构化列表
+        Some(plan.operation),
+        // 改写跳过仅用于 DOCUMENT_SUMMARY（已分流）；此处恒为 false
+        false,
+        // 文档级召回只服务全库资料请求（scope 由 recall 填充）；单文档
+        // QA/SUMMARY 的目标已由 Resolver 锁定，不在此列。
+        plan.intent == QueryIntent::LibraryQa || plan.intent == QueryIntent::MultiDocumentQa,
+    )
+}
+
+/// 文档级召回（Step 9，spec 十一.5 / 十二）：全库画像 metadata 信号粗筛 →
+/// 粗筛集批量取向量精排 → 融合排序取前 `DOCUMENT_RECALL_TOP_N`。
+///
+/// 只在 scope 为空的全库资料请求时调用；任何失败（画像读取 / 向量缺失 /
+/// 数据源未就绪）都在内部吞掉并如实 trace，返回空集让调用方回落到 wider
+/// chunk retrieval——召回是增益层，绝不中断问答。trace 节点 `document_recall`
+/// 记录问题、候选分数与信号（前端可展示「按哪些依据找到这些文档」）。
+fn run_document_recall(
+    catalog: &CatalogService,
+    question: &str,
+    question_vector: Option<&[f32]>,
+    correlation_id: &str,
+    session_id_ref: Option<&str>,
+) -> Vec<Uuid> {
+    let started = Instant::now();
+    let mut trace_status = "ok";
+    let mut reason = "recalled";
+    let mut recalled: Vec<Uuid> = Vec::new();
+    let mut recall_signals: Vec<serde_json::Value> = Vec::new();
+    let outcome: Result<(), AppError> = (|| {
+        let profiles = catalog.list_document_profiles(None, 10_000)?;
+        if profiles.is_empty() {
+            trace_status = "empty";
+            reason = "no_profiles";
+            return Ok(());
+        }
+        // 第 1 级：metadata 粗筛（分数降序、截断到向量候选上限），
+        // 只对这批取向量——避免对全库逐文件查一次库。
+        let preselected = preselect_document_profiles(question, &profiles);
+        if preselected.is_empty() {
+            trace_status = "empty";
+            reason = "no_metadata_match";
+            return Ok(());
+        }
+        let vector_ids: Vec<Uuid> =
+            preselected.iter().map(|(_, file_id, _)| *file_id).collect();
+        let vectors = catalog.profile_vectors(&vector_ids)?;
+        // 第 2 级：向量精排 + 融合。
+        let ranked = rank_document_candidates(question, question_vector, &profiles, &vectors);
+        recalled = ranked.iter().map(|candidate| candidate.file_id).collect();
+        recall_signals = ranked
+            .iter()
+            .map(|candidate| {
+                json!({
+                    "file_id": candidate.file_id.to_string(),
+                    "score": candidate.score,
+                    "signals": candidate.signals,
+                })
+            })
+            .collect();
+        if recalled.is_empty() {
+            trace_status = "empty";
+            reason = "below_min_score";
+        }
+        Ok(())
+    })();
+    if let Err(error) = outcome {
+        trace_node(
+            catalog,
+            "ask",
+            "document_recall",
+            correlation_id,
+            session_id_ref,
+            None,
+            &json!({ "question": question, "has_vector": question_vector.is_some() }),
+            &json!({
+                "status": "failed",
+                "error_code": error.code,
+                "candidate_count": 0,
+            }),
+            "error",
+            Some(started.elapsed().as_millis() as u64),
+        );
+        return Vec::new();
+    }
+    trace_node(
+        catalog,
+        "ask",
+        "document_recall",
+        correlation_id,
+        session_id_ref,
+        None,
+        &json!({
+            "question": question,
+            "has_vector": question_vector.is_some(),
+            "preselect_cap": DOCUMENT_RECALL_VECTOR_CANDIDATES,
+        }),
+        &json!({
+            "status": trace_status,
+            "reason": reason,
+            "candidate_count": recalled.len(),
+            "candidates": recall_signals,
+            "top_n_cap": DOCUMENT_RECALL_TOP_N,
+        }),
+        trace_status,
+        Some(started.elapsed().as_millis() as u64),
+    );
+    recalled
+}
+
+/// 单次摘要批次的最大正文字符数（生成模型上下文 4096 token，中文 1 字符
+/// ≈ 1~2 token，3500 字符给 prompt 留出输出与结构余量）。
+const SUMMARY_BATCH_CHARS: usize = 3_500;
+/// 单节进入 prompt 的正文上限（超长节截断，不截证据引用）。
+const SUMMARY_SECTION_CAP_CHARS: usize = 1_200;
+/// 摘要失败时的确定性回退：展示节内前 220 字，绝不因模型失败而整体失败
+/// （开发约束 7：所有模型失败不得导致应用崩溃）。
+const SUMMARY_FALLBACK_CHARS: usize = 220;
+
+/// DOCUMENT_SUMMARY：整文分层摘要（spec 十一.3 / 二十 CASE 7）。
+///
+/// 管线：读取整份文档结构（document_nodes 分页）+ 当前修订全部 chunk →
+/// 章节分组（heading 边界 + 超长拆分）→ 分批逐节摘要（每批一个
+/// complete_json_with_model 调用，JSON Schema 约束）→ 总览聚合 →
+/// 逐节 claims（引用真实 chunk 原文，通过 validate_answer_evidence 全量校验）。
+///
+/// 失败语义：模型任一批次失败都回退到确定性节内摘录（`SUMMARY_FALLBACK_CHARS`
+/// 前 220 字），只有目标文件完全无法解析/无正文时才按 LOCAL + NO_EVIDENCE
+/// 返回固定拒绝文案；绝不转闲聊。
+#[allow(clippy::too_many_arguments)]
+fn run_document_summary_answer(
+    request: &AskRequest,
+    catalog: &CatalogService,
+    _models: &ModelManager,
+    generation: &Mutex<LocalGenerationRuntime>,
+    generation_artifact: ModelArtifact,
+    operation_id: Uuid,
+    cancelled: &AtomicBool,
+    progress: AskProgressCallbacks<'_>,
+    resolved_scope: Vec<Uuid>,
+    resolution_candidates: &[DocumentCandidate],
+    document_type_hint: Option<DocumentType>,
+) -> Result<AnswerResult, AppError> {
+    let (phase, verified_claim) = progress;
+    let correlation_id = operation_id.to_string();
+    let session_id = request.session_id.map(|id| id.to_string());
+    let session_id_ref = session_id.as_deref();
+    let started_at = Instant::now();
+
+    // 目标文件：多候选时按 Resolver 综合得分取最高者（摘要按单文档执行）
+    let mut target_file = resolved_scope.first().copied();
+    if resolved_scope.len() > 1 {
+        target_file = resolution_candidates
+            .iter()
+            .find(|candidate| resolved_scope.contains(&candidate.file_id))
+            .map(|candidate| candidate.file_id)
+            .or(target_file);
+    }
+    let Some(target_file) = target_file else {
+        // LOCAL + NO_EVIDENCE：目标未锁定 → 固定文案拒绝（spec 十三），不转闲聊
+        return finish_summary_refusal(
+            request,
+            catalog,
+            operation_id,
+            "无法确定要概括哪份资料。你可以说得更具体一些，例如文件的名称或类型。",
+            started_at,
+            phase,
+        );
     };
-    let decision = match parse_intent_verdict(&raw) {
-        Some(intent) => RouteDecision {
-            intent,
-            top_category: intent,
-            top_score: 0.0,
-            margin: 0.0,
+    let file = catalog.file_preview(&target_file, 1)?.file;
+    let file_name = file.display_name.clone();
+    let file_path = file.canonical_path.clone();
+
+    phase("understanding", 0.08);
+    // 1. 整份文档结构：document_nodes 分页读取（200/批，上限 4000 节点防失控）
+    let nodes_total = catalog.file_document_node_count(&target_file)?;
+    let mut nodes = Vec::new();
+    let mut offset = 0usize;
+    let mut summary_truncated = false;
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(AppError::new("OPERATION_CANCELLED", "问答已取消", false));
+        }
+        let preview = catalog.file_preview_page(&target_file, offset, 200, None)?;
+        if preview.revision_id.is_none() {
+            break;
+        }
+        let batch_len = preview.nodes.len();
+        nodes.extend(preview.nodes);
+        offset = match preview.next_offset {
+            Some(next) => next as usize,
+            None => break,
+        };
+        if batch_len == 0 || nodes.len() > 4_000 {
+            // 截断是明确行为而非隐藏降级：trace 里如实记录总数/用量/截断标记
+            summary_truncated = nodes.len() > 4_000;
+            break;
+        }
+    }
+    let nodes_used = nodes.len();
+    let node_heading_paths = nodes
+        .into_iter()
+        .map(|node| (node.node_id, node.heading_path))
+        .collect::<HashMap<_, _>>();
+
+    // 2. 当前修订全部 chunk（摘要证据：真实 chunk 原文）
+    let section_chunks = catalog
+        .file_chunks(&target_file)?
+        .into_iter()
+        .map(|chunk| SectionChunk {
+            chunk_id: chunk.chunk_id,
+            node_id: chunk.node_id,
+            revision_id: chunk.revision_id,
+            ordinal: chunk.ordinal,
+            text: chunk.text,
+            locator: chunk.locator,
+        })
+        .collect::<Vec<_>>();
+    if section_chunks.is_empty() {
+        return finish_summary_refusal(
+            request,
+            catalog,
+            operation_id,
+            "这份资料还没有可概括的正文内容（可能仍在解析，或为纯图片/扫描件）。",
+            started_at,
+            phase,
+        );
+    }
+
+    // 3. 章节分组（heading 边界 + 超长拆分 + 尾部合并）
+    let mut sections = build_document_sections(
+        &section_chunks,
+        &node_heading_paths,
+        MAX_SECTION_CHARS,
+    );
+    merge_tail_sections(&mut sections, MAX_SECTIONS);
+    let type_hint = document_type_hint.map(|value| value.as_str());
+
+    // 4. 分批逐节摘要；模型失败/解析失败 → 确定性节内摘录回退
+    let mut digests = Vec::<SectionSummary>::with_capacity(sections.len());
+    let mut batch_fallbacks = 0_usize;
+    let mut index = 0usize;
+    while index < sections.len() {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(AppError::new("OPERATION_CANCELLED", "问答已取消", false));
+        }
+        let mut batch = Vec::new();
+        let mut batch_chars = 0usize;
+        while index < sections.len() && (batch.is_empty() || batch_chars < SUMMARY_BATCH_CHARS) {
+            let section = &sections[index];
+            let compacted = compact_for_prompt(&section.text(), SUMMARY_SECTION_CAP_CHARS);
+            if !batch.is_empty() && batch_chars.saturating_add(compacted.len()) > SUMMARY_BATCH_CHARS {
+                break;
+            }
+            batch_chars = batch_chars.saturating_add(compacted.len());
+            batch.push((index, section, compacted));
+            index += 1;
+        }
+        phase("generating", 0.62);
+        let batch_started = Instant::now();
+        let payload = batch
+            .iter()
+            .map(|(_, section, compacted)| json!({
+                "title": section.title,
+                "content": compacted,
+            }))
+            .collect::<Value>();
+        let (system, user) = document_summary_prompt(&file_name, type_hint, &payload.to_string());
+        let parsed = match complete_json_with_model(
+            generation,
+            &generation_artifact,
+            &system,
+            &user,
+            640,
+            &section_summary_schema(),
+            cancelled,
+        ) {
+            Ok(raw) => parse_section_summaries(&raw),
+            Err(_) => Vec::new(),
+        };
+        let mut by_title = HashMap::<String, SectionSummary>::new();
+        for digest in parsed {
+            by_title.insert(digest.title.trim().to_ascii_lowercase(), digest);
+        }
+        let mut batch_digests = Vec::with_capacity(batch.len());
+        let mut batch_failed = false;
+        for (_, section, _) in &batch {
+            let key = section.title.trim().to_ascii_lowercase();
+            let base_key = key.trim_end_matches(|ch: char| ch.is_ascii_digit())
+                .trim_end_matches("（续")
+                .trim();
+            let digest = by_title
+                .remove(&key)
+                .or_else(|| by_title.remove(base_key))
+                .unwrap_or_else(|| {
+                    batch_failed = true;
+                    SectionSummary {
+                        title: section.title.clone(),
+                        summary: compact_for_prompt(&section.text(), SUMMARY_FALLBACK_CHARS),
+                        key_points: Vec::new(),
+                    }
+                });
+            batch_digests.push(digest);
+        }
+        if batch_failed {
+            batch_fallbacks += 1;
+        }
+        trace_node(
+            catalog,
+            "ask",
+            "document_summary",
+            &correlation_id,
+            session_id_ref,
+            Some(&(batch.len()).to_string()),
+            &json!({
+                "file_id": target_file.to_string(),
+                "file_name": file_name,
+                "section_count": batch.len(),
+                "section_titles": batch.iter().map(|(_, section, _)| &section.title).collect::<Vec<_>>(),
+            }),
+            &json!({
+                "fallback_sections": batch_fallbacks,
+                "digests": batch_digests,
+                "summary_truncated": summary_truncated,
+                "nodes_total": nodes_total,
+                "nodes_used": nodes_used,
+            }),
+            "ok",
+            Some(batch_started.elapsed().as_millis() as u64),
+        );
+        digests.extend(batch_digests);
+    }
+
+    // 5. 总览聚合（最后一层）：各节摘要 → 文档总览
+    let overview_started = Instant::now();
+    let overview = {
+        let payload = digests_json(&digests);
+        let (system, user) = document_overview_prompt(&file_name, type_hint, &payload.to_string());
+        match complete_json_with_model(
+            generation,
+            &generation_artifact,
+            &system,
+            &user,
+            512,
+            &overview_schema(),
+            cancelled,
+        )
+        .ok()
+        .and_then(|raw| parse_overview(&raw))
+        {
+            Some(overview) => overview,
+            None => {
+                batch_fallbacks += 1;
+                DocumentOverview {
+                    overview: String::new(),
+                    overall_summary: digests
+                        .iter()
+                        .map(|digest| digest.summary.as_str())
+                        .collect::<Vec<_>>()
+                        .join("；"),
+                    structure: digests
+                        .iter()
+                        .map(|digest| StructureEntry {
+                            title: digest.title.clone(),
+                            key_points: digest.key_points.clone(),
+                        })
+                        .collect(),
+                }
+            }
+        }
+    };
+    trace_node(
+        catalog,
+        "ask",
+        "document_summary",
+        &correlation_id,
+        session_id_ref,
+        Some("overview".into()),
+        &json!({ "file_id": target_file.to_string(), "digest_count": digests.len() }),
+        &json!({ "overview": overview, "fallback": batch_fallbacks }),
+        "ok",
+        Some(overview_started.elapsed().as_millis() as u64),
+    );
+
+    // 6. 组装 AnswerResult：逐节 claim + 真实 chunk 引用（quote = 原文全文）
+    let mut claims = Vec::with_capacity(digests.len());
+    for (section, digest) in sections.iter().zip(digests.iter()) {
+        let mut text = format!("【{}】{}", digest.title, digest.summary);
+        if !digest.key_points.is_empty() {
+            text.push_str(&format!("\n要点：{}", digest.key_points.join("；")));
+        }
+        let citations = section
+            .chunks
+            .iter()
+            .take(3)
+            .map(|chunk| EvidenceRef {
+                evidence_id: Uuid::now_v7(),
+                file_id: target_file,
+                revision_id: chunk.revision_id,
+                node_id: chunk.node_id,
+                chunk_id: chunk.chunk_id,
+                image_asset_id: None,
+                quote: chunk.text.clone(),
+                context_before: None,
+                context_after: None,
+                locator: chunk.locator.clone(),
+                retrieval_score: 0.0,
+            })
+            .collect::<Vec<_>>();
+        claims.push(AnswerClaim {
+            claim_id: Uuid::now_v7(),
+            text,
+            support_status: SupportStatus::Supported,
+            citations,
+        });
+    }
+
+    let mut answer_parts = Vec::new();
+    if !overview.overview.is_empty() {
+        answer_parts.push(overview.overview.clone());
+    }
+    if !overview.overall_summary.is_empty() {
+        answer_parts.push(overview.overall_summary.clone());
+    }
+    answer_parts.push("## 文档结构".to_owned());
+    for digest in &digests {
+        answer_parts.push(format!("### {}\n{}", digest.title, digest.summary));
+        for point in &digest.key_points {
+            answer_parts.push(format!("- {point}"));
+        }
+    }
+    let result = AnswerResult {
+        session_id: request.session_id.unwrap_or_else(Uuid::now_v7),
+        message_id: Uuid::now_v7(),
+        answer: answer_parts.join("\n\n"),
+        grounding_status: if claims.is_empty() {
+            GroundingStatus::Insufficient
+        } else {
+            GroundingStatus::Grounded
         },
-        None => fallback_chat,
+        insufficient_evidence: claims.is_empty(),
+        claims,
+        source_files: vec![AnswerSourceFile {
+            file_id: target_file,
+            display_name: file_name.clone(),
+            canonical_path: file_path,
+        }],
+        used_file_ids: vec![target_file],
+        elapsed_ms: started_at.elapsed().as_millis() as u64,
+        answer_mode: AnswerMode::Summary,
+        retrieval_channels: vec!["document_structure".into()],
+        index_coverage: 0.0,
+        degradation_reason: (batch_fallbacks > 0)
+            .then(|| format!("有{batch_fallbacks}个摘要批次回退为确定性节内摘录（模型输出未通过解析）")),
+        clarification: None,
     };
-    Ok((decision, Some(raw)))
+    for claim in &result.claims {
+        verified_claim(claim);
+    }
+    catalog.validate_answer_evidence(&result)?;
+    trace_node(
+        catalog,
+        "ask",
+        "completed",
+        &correlation_id,
+        session_id_ref,
+        None,
+        &json!({}),
+        &json!({
+            "answer_mode": result.answer_mode,
+            "answer": result.answer,
+            "claim_count": result.claims.len(),
+            "grounding_status": format!("{:?}", result.grounding_status),
+            "insufficient_evidence": result.insufficient_evidence,
+            "degradation_reason": result.degradation_reason,
+            "elapsed_ms": result.elapsed_ms,
+        }),
+        "ok",
+        Some(result.elapsed_ms),
+    );
+    catalog.record_ask_exchange(request, &result)?;
+    phase("completed", 1.0);
+    Ok(result)
+}
+
+/// 摘要目标的确定性拒绝（LOCAL + NO_EVIDENCE / 无正文）：固定文案返回，
+/// 落库 + trace + 结束相位，不转闲聊。
+fn finish_summary_refusal(
+    request: &AskRequest,
+    catalog: &CatalogService,
+    operation_id: Uuid,
+    message: &str,
+    started_at: Instant,
+    phase: &dyn Fn(&str, f64),
+) -> Result<AnswerResult, AppError> {
+    let result = AnswerResult {
+        session_id: request.session_id.unwrap_or_else(Uuid::now_v7),
+        message_id: Uuid::now_v7(),
+        answer: message.to_owned(),
+        grounding_status: GroundingStatus::Insufficient,
+        insufficient_evidence: true,
+        claims: Vec::new(),
+        source_files: Vec::new(),
+        used_file_ids: Vec::new(),
+        elapsed_ms: started_at.elapsed().as_millis() as u64,
+        answer_mode: AnswerMode::RagRefusal,
+        retrieval_channels: Vec::new(),
+        index_coverage: 0.0,
+        degradation_reason: None,
+        clarification: None,
+    };
+    let session_id = request.session_id.map(|id| id.to_string());
+    trace_node(
+        catalog,
+        "ask",
+        "completed",
+        &operation_id.to_string(),
+        session_id.as_deref(),
+        None,
+        &json!({}),
+        &json!({
+            "answer_mode": result.answer_mode,
+            "answer": result.answer,
+            "claim_count": 0,
+            "insufficient_evidence": true,
+            "degradation_reason": "summary_target_unresolved_or_empty",
+        }),
+        "ok",
+        Some(result.elapsed_ms),
+    );
+    catalog.record_ask_exchange(request, &result)?;
+    phase("completed", 1.0);
+    Ok(result)
+}
+
+/// COMPARE_DOCUMENTS：两篇文档对比（spec 十一.6 / 二十 CASE 8）。
+///
+/// 管线：两侧目标确定（primary 走 Resolver 结果；secondary_target 独立
+/// 解析，失败时用 primary 候选集的次高文件——「比较两个版本」时 Resolver
+/// 的多候选常恰为两侧）→ 两侧分别 chunk 取证（scope 单文件）→ 比较生成
+/// （JSON Schema 约束输出）→ 逐比较点 claims（每点引用两侧真实 chunk
+/// 原文，通过 validate_answer_evidence 精确引用校验）。
+///
+/// 失败语义：比较生成失败/解析失败 → 确定性回退（两侧检索到的原文材料
+/// 并排呈现，无模型文本）；两侧目标不足或重合 → 退化为普通检索回答
+/// （多文档 QA 语义），trace 如实记录；绝不转闲聊（spec 十三）。
+#[allow(clippy::too_many_arguments)]
+fn run_compare_answer(
+    request: &AskRequest,
+    catalog: &CatalogService,
+    models: &ModelManager,
+    worker: &WorkerClient,
+    runtime_manager: &RuntimeManager,
+    generation: &Mutex<LocalGenerationRuntime>,
+    generation_artifact: ModelArtifact,
+    embedding: Option<ModelArtifact>,
+    maintenance: MaintenanceSnapshot,
+    history: &[AskMessage],
+    session_context: &AskSessionContext,
+    plan: QueryPlan,
+    resolved_scope: Vec<Uuid>,
+    resolution_candidates: &[DocumentCandidate],
+    resolution_file_names: &HashMap<Uuid, String>,
+    operation_id: Uuid,
+    cancelled: &AtomicBool,
+    progress: AskProgressCallbacks<'_>,
+) -> Result<AnswerResult, AppError> {
+    let (phase, verified_claim) = progress;
+    let correlation_id = operation_id.to_string();
+    let session_id = request.session_id.map(|id| id.to_string());
+    let session_id_ref = session_id.as_deref();
+    let started_at = Instant::now();
+    let compare_started = Instant::now();
+
+    // 1. 确定两侧文件。
+    let mut file_names = resolution_file_names.clone();
+    if file_names.is_empty() {
+        let profiles_with_names = catalog.list_document_profiles(None, 2000)?;
+        for (profile, name) in profiles_with_names {
+            file_names.entry(profile.file_id).or_insert(name);
+        }
+    }
+    let mut side_candidates = resolved_scope.clone();
+    side_candidates.extend(resolution_candidates.iter().map(|candidate| candidate.file_id));
+    side_candidates.dedup();
+    // 多候选（>2 侧）时 COMPARE 不清澄直接取 top-2：trace 如实标记自动选择（Phase 2 欠项）
+    let compare_auto_selected = side_candidates.len() > 2;
+    let primary_file = side_candidates.first().copied();
+    let mut secondary_file = side_candidates.get(1).copied();
+    // secondary_target 独立解析（若 parser 拆出了第二个目标）
+    if let Some(secondary) = plan.secondary_target.as_ref() {
+        let mut secondary_plan = plan.clone();
+        secondary_plan.target = secondary.clone();
+        let profiles = catalog.list_document_profiles(None, 2000)?;
+        let input = ResolverInput::new(
+            &secondary_plan,
+            session_context,
+            profiles.iter().map(|(profile, _)| profile.clone()).collect(),
+            file_names.clone(),
+        );
+        let resolution = resolve_documents(&input);
+        secondary_file = resolution
+            .resolved_file_ids
+            .first()
+            .copied()
+            .or_else(|| resolution.candidates.first().map(|candidate| candidate.file_id))
+            .or(secondary_file);
+    }
+    if primary_file == secondary_file {
+        secondary_file = None;
+    }
+    let (Some(side_a), Some(side_b)) = (primary_file, secondary_file) else {
+        // 不假装比较（trace 如实记录 fallback）。
+        let mut scoped = request.clone();
+        if !side_candidates.is_empty() {
+            scoped.scope.file_ids = side_candidates.clone();
+        }
+        trace_node(
+            catalog,
+            "ask",
+            "document_compare",
+            &correlation_id,
+            session_id_ref,
+            None,
+            &json!({
+                "intent": "compare_documents",
+                "primary_file": side_candidates.first().map(|id| id.to_string()),
+                "secondary_target": plan.secondary_target.as_ref().map(|target| target.reference.clone()),
+            }),
+            &json!({ "status": "fallback_insufficient_targets", "fallback": "multi_document_qa" }),
+            "ok",
+            Some(compare_started.elapsed().as_millis() as u64),
+        );
+        return run_retrieval_answer(
+            &scoped,
+            catalog,
+            models,
+            worker,
+            runtime_manager,
+            generation,
+            generation_artifact,
+            embedding,
+            maintenance,
+            history,
+            operation_id,
+            cancelled,
+            progress,
+            None,
+            false,
+            false,
+        );
+    };
+
+    // 2. 编码对比问题向量（两侧检索共用同一向量）。
+    let embedding = embedding.ok_or_else(|| {
+        AppError::new(
+            "RAG_EMBEDDING_MODEL_REQUIRED",
+            "问资料需要先配置并通过自检的中文 Embedding 模型",
+            false,
+        )
+    })?;
+    let artifact_id = embedding.artifact_id.to_string();
+    let question_text = plan
+        .content_query
+        .clone()
+        .unwrap_or_else(|| request.question.trim().to_owned());
+    let tokenizer_path = PathBuf::from(&embedding.local_path)
+        .parent()
+        .map(|parent| parent.join("tokenizer.json"))
+        .filter(|path| path.is_file())
+        .ok_or_else(|| {
+            AppError::new(
+                "EMBEDDING_TOKENIZER_MISSING",
+                "Embedding tokenizer 不存在，完整 RAG 已停止",
+                true,
+            )
+        })?;
+    let mut embedding_runtime_request = RuntimeTaskRequest::interactive(
+        RuntimeTaskKind::Embedding,
+        RuntimeBackendKind::OnnxRuntime,
+    );
+    embedding_runtime_request.cpu_threads = 2;
+    embedding_runtime_request.timeout = Duration::from_secs(10);
+    embedding_runtime_request.model_id = Some(artifact_id.clone());
+    let embedding_runtime_lease = runtime_manager.acquire(embedding_runtime_request)?;
+    let response = worker.encode_embeddings(&EmbeddingRequest {
+        model_path: embedding.local_path.clone(),
+        tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
+        texts: vec![format!(
+            "{}{}",
+            embedding.query_prefix.as_deref().unwrap_or(""),
+            question_text
+        )],
+        max_length: embedding.max_length.unwrap_or(512),
+        threads: 2,
+    })?;
+    embedding_runtime_lease.complete();
+    if response.vectors.is_empty() {
+        return Err(AppError::new(
+            "EMBEDDING_EMPTY",
+            "Embedding 运行时没有返回查询向量",
+            true,
+        ));
+    }
+
+    // 3. 两侧分别取证：scope = 单侧文件，各跑一次 extractive 检索。
+    phase("hybrid_retrieval", 0.3);
+    let mut side_materials: Vec<(Uuid, String, Vec<String>, Vec<EvidenceRef>)> = Vec::new();
+    for file_id in [side_a, side_b] {
+        let mut sub_request = request.clone();
+        sub_request.question = question_text.clone();
+        sub_request.scope.file_ids = vec![file_id];
+        sub_request.retrieval_limit = sub_request.retrieval_limit.min(COMPARE_MATERIAL_ITEMS as u32);
+        sub_request.max_source_files = sub_request.max_source_files.min(1);
+        let result = catalog.answer_extractively(
+            &sub_request,
+            Some(SemanticQuery { model_artifact_id: &artifact_id, vector: &response.vectors[0] }),
+        )?;
+        let name = file_names
+            .get(&file_id)
+            .cloned()
+            .unwrap_or_else(|| "未命名文件".to_owned());
+        let mut quotes = Vec::<String>::new();
+        let mut evidence = Vec::<EvidenceRef>::new();
+        for claim in result.claims.into_iter().take(COMPARE_MATERIAL_ITEMS) {
+            for citation in claim.citations {
+                if quotes.len() >= COMPARE_MATERIAL_ITEMS {
+                    break;
+                }
+                quotes.push(compact_for_prompt(&citation.quote, COMPARE_MATERIAL_CHARS));
+                evidence.push(citation);
+            }
+        }
+        side_materials.push((file_id, name, quotes, evidence));
+    }
+    let (_, a_name, a_quotes, a_evidence) = &side_materials[0];
+    let (_, b_name, b_quotes, b_evidence) = &side_materials[1];
+    if a_quotes.is_empty() || b_quotes.is_empty() {
+        // 任一侧无取证材料 → LOCAL + NO_EVIDENCE 语义：固定文案拒绝，
+        // 不转闲聊（spec 十三）。
+        let message = format!(
+            "没能在两侧都找到可比较的内容（{} 命中 {} 条，{} 命中 {} 条）。可以换一种说法，或确认资料已完成索引。",
+            a_name, a_quotes.len(), b_name, b_quotes.len()
+        );
+        return finish_summary_refusal(request, catalog, operation_id, &message, started_at, phase);
+    }
+
+    // 4. 比较生成（JSON Schema 约束）；失败 → 确定性回退。
+    phase("generating", 0.6);
+    let compare_generate_started = Instant::now();
+    let mut fallback = false;
+    let results = {
+        let (system, user) = compare_prompt(a_name, a_quotes, b_name, b_quotes, &question_text);
+        match complete_json_with_model(
+            generation,
+            &generation_artifact,
+            &system,
+            &user,
+            800,
+            &compare_schema(),
+            cancelled,
+        )
+        .ok()
+        .and_then(|raw| parse_compare_results(&raw))
+        {
+            Some(results) => results,
+            None => {
+                fallback = true;
+                CompareResults {
+                    similarities: Vec::new(),
+                    differences: Vec::new(),
+                    conclusion: String::new(),
+                }
+            }
+        }
+    };
+
+    // 5. 组装 claims 与答案。claims 的引用证据永远来自两侧检索到的真实
+    // chunk 原文（quote = 原文全文，通过 validate_answer_evidence 精确校验）；
+    // 模型输出的左右摘引（left/right_evidence）只作展示。
+    let mut claims = Vec::<AnswerClaim>::new();
+    let mut answer_parts = Vec::<String>::new();
+    if !results.conclusion.is_empty() {
+        answer_parts.push(format!("**结论**：{}", results.conclusion));
+    }
+    for point in &results.similarities {
+        let mut citations = Vec::with_capacity(2);
+        if let Some(evidence) = a_evidence.first() {
+            citations.push(evidence.clone());
+        }
+        if let Some(evidence) = b_evidence.first() {
+            citations.push(evidence.clone());
+        }
+        claims.push(AnswerClaim {
+            claim_id: Uuid::now_v7(),
+            text: format!("相同点：{}", point.point),
+            support_status: if citations.len() == 2 {
+                SupportStatus::Supported
+            } else {
+                SupportStatus::Partial
+            },
+            citations,
+        });
+    }
+    for difference in &results.differences {
+        let mut citations = Vec::with_capacity(2);
+        if let Some(evidence) = a_evidence.first() {
+            citations.push(evidence.clone());
+        }
+        if let Some(evidence) = b_evidence.first() {
+            citations.push(evidence.clone());
+        }
+        let mut text = format!("差异：{}", difference.point);
+        if !difference.left_evidence.is_empty() {
+            text.push_str(&format!("\n左（{}）：{}", a_name, difference.left_evidence));
+        }
+        if !difference.right_evidence.is_empty() {
+            text.push_str(&format!("\n右（{}）：{}", b_name, difference.right_evidence));
+        }
+        claims.push(AnswerClaim {
+            claim_id: Uuid::now_v7(),
+            text,
+            support_status: if citations.len() == 2 {
+                SupportStatus::Supported
+            } else {
+                SupportStatus::Partial
+            },
+            citations,
+        });
+    }
+    // 总览 claim：结论引用两侧首条证据。
+    if !results.conclusion.is_empty() {
+        let mut citations = Vec::with_capacity(2);
+        if let Some(evidence) = a_evidence.first() {
+            citations.push(evidence.clone());
+        }
+        if let Some(evidence) = b_evidence.first() {
+            citations.push(evidence.clone());
+        }
+        claims.push(AnswerClaim {
+            claim_id: Uuid::now_v7(),
+            text: format!("结论：{}", results.conclusion),
+            support_status: if citations.len() == 2 {
+                SupportStatus::Supported
+            } else {
+                SupportStatus::Partial
+            },
+            citations,
+        });
+    }
+
+    let used_file_ids = vec![side_a, side_b];
+    let mut source_files = Vec::new();
+    for file_id in used_file_ids.clone() {
+        let name = file_names
+            .get(&file_id)
+            .cloned()
+            .unwrap_or_else(|| "未命名文件".to_owned());
+        let canonical_path = catalog
+            .file_preview(&file_id, 1)
+            .map(|preview| preview.file.canonical_path.clone())
+            .unwrap_or_default();
+        source_files.push(AnswerSourceFile { file_id, display_name: name, canonical_path });
+    }
+
+    // 确定性回退：比较生成失败 → 两侧检索到的原文材料并排呈现。
+    if fallback {
+        claims.clear();
+        answer_parts.clear();
+        answer_parts.push("未能生成对比结论，以下为两侧检索到的原文依据：".to_owned());
+        for (index, (_, name, quotes, evidence)) in side_materials.iter().enumerate() {
+            answer_parts.push(format!("### 侧 {}：{}", index + 1, name));
+            for (quote_index, quote) in quotes.iter().take(COMPARE_FALLBACK_ITEMS).enumerate() {
+                answer_parts.push(format!("{}. {}", quote_index + 1, quote));
+            }
+            for evidence in evidence.iter().take(COMPARE_FALLBACK_ITEMS) {
+                claims.push(AnswerClaim {
+                    claim_id: Uuid::now_v7(),
+                    text: format!("【{}】{}", name, compact_for_prompt(&evidence.quote, 260)),
+                    support_status: SupportStatus::Supported,
+                    citations: vec![evidence.clone()],
+                });
+            }
+        }
+    }
+    if !results.similarities.is_empty() {
+        answer_parts.push("## 相同点".to_owned());
+        for point in &results.similarities {
+            answer_parts.push(format!("- {}", point.point));
+        }
+    }
+    if !results.differences.is_empty() {
+        answer_parts.push("## 差异点".to_owned());
+        for difference in &results.differences {
+            answer_parts.push(format!("- {}", difference.point));
+        }
+    }
+
+    let result = AnswerResult {
+        session_id: request.session_id.unwrap_or_else(Uuid::now_v7),
+        message_id: Uuid::now_v7(),
+        answer: answer_parts.join("\n\n"),
+        grounding_status: if claims.is_empty() {
+            GroundingStatus::Insufficient
+        } else {
+            GroundingStatus::Grounded
+        },
+        insufficient_evidence: claims.is_empty(),
+        claims,
+        source_files,
+        used_file_ids,
+        elapsed_ms: started_at.elapsed().as_millis() as u64,
+        answer_mode: AnswerMode::Compare,
+        retrieval_channels: vec!["document_compare".into()],
+        index_coverage: 0.0,
+        degradation_reason: fallback
+            .then(|| "对比生成未通过解析，回退为两侧原文材料并排呈现".to_owned()),
+        clarification: None,
+    };
+    for claim in &result.claims {
+        verified_claim(claim);
+    }
+    catalog.validate_answer_evidence(&result)?;
+    trace_node(
+        catalog,
+        "ask",
+        "document_compare",
+        &correlation_id,
+        session_id_ref,
+        None,
+        &json!({
+            "question": question_text,
+            "side_a": { "file_id": side_a.to_string(), "name": a_name },
+            "side_b": { "file_id": side_b.to_string(), "name": b_name },
+            "quotes_side_a": a_quotes.len(),
+            "quotes_side_b": b_quotes.len(),
+            "secondary_target": plan.secondary_target.as_ref().map(|target| target.reference.clone()),
+            "compare_auto_selected": compare_auto_selected,
+        }),
+        &json!({
+            "similarities": results.similarities,
+            "differences": results.differences,
+            "conclusion": results.conclusion,
+            "fallback": fallback,
+            "claim_count": result.claims.len(),
+        }),
+        "ok",
+        Some(compare_generate_started.elapsed().as_millis() as u64),
+    );
+    trace_node(
+        catalog,
+        "ask",
+        "completed",
+        &correlation_id,
+        session_id_ref,
+        None,
+        &json!({}),
+        &json!({
+            "answer_mode": result.answer_mode,
+            "answer": result.answer,
+            "claim_count": result.claims.len(),
+            "grounding_status": format!("{:?}", result.grounding_status),
+            "insufficient_evidence": result.insufficient_evidence,
+            "degradation_reason": result.degradation_reason,
+            "elapsed_ms": result.elapsed_ms,
+        }),
+        "ok",
+        Some(result.elapsed_ms),
+    );
+    catalog.record_ask_exchange(request, &result)?;
+    phase("completed", 1.0);
+    Ok(result)
 }
 
 /// 闲聊分支：跳过检索/索引 gate，直接用生成模型对话（带会话历史）。
@@ -5913,39 +9162,16 @@ fn run_chat_answer(
         ));
     }
     phase("chat_generating", 0.7);
-    // 档位自适应：0.6B 用示例复读版 prompt + 更高采样温度（0.1 下只会复读
-    // system 自我介绍或套「你好！…？」模板复读问题，日志实测）；强模型
-    // 维持完整 prompt + 0.1 不变。
-    let is_mini = generation_artifact
-        .model_id
-        .to_lowercase()
-        .contains("0.6b");
-    let (system, user) = if is_mini {
-        chat_prompt_mini(request.question.trim(), history)
-    } else {
-        chat_prompt(request, history)
-    };
+    let (system, user) = chat_prompt(request, history);
     let started_at = Instant::now();
-    let answer = if is_mini {
-        complete_chat_with_model(
-            generation,
-            generation_artifact,
-            &system,
-            &user,
-            512,
-            0.6,
-            cancelled,
-        )?
-    } else {
-        complete_with_model(
-            generation,
-            generation_artifact,
-            &system,
-            &user,
-            512,
-            cancelled,
-        )?
-    };
+    let answer = complete_with_model(
+        generation,
+        generation_artifact,
+        &system,
+        &user,
+        512,
+        cancelled,
+    )?;
     let result = AnswerResult {
         session_id: request.session_id.unwrap_or_else(Uuid::now_v7),
         message_id: Uuid::now_v7(),
@@ -5956,10 +9182,11 @@ fn run_chat_answer(
         source_files: Vec::new(),
         used_file_ids: Vec::new(),
         elapsed_ms: started_at.elapsed().as_millis() as u64,
-        answer_mode: "chat".into(),
+        answer_mode: AnswerMode::Chat,
         retrieval_channels: Vec::new(),
         index_coverage: 0.0,
         degradation_reason: None,
+        clarification: None,
     };
     let session_id = request.session_id.map(|id| id.to_string());
     trace_node(
@@ -6002,6 +9229,9 @@ fn run_retrieval_answer(
     operation_id: Uuid,
     cancelled: &AtomicBool,
     progress: AskProgressCallbacks<'_>,
+    operation: Option<QueryOperation>,
+    skip_query_rewrite: bool,
+    document_recall: bool,
 ) -> Result<AnswerResult, AppError> {
     let (phase, verified_claim) = progress;
     let correlation_id = operation_id.to_string();
@@ -6036,10 +9266,14 @@ fn run_retrieval_answer(
             true,
         ));
     }
-    // 改写：无条件尝试（空泛/一题多问/指代上文都交给模型决定，行式输出
-    // 每行一个问题；已明确单一的问题模型会原样复读）。解析失败/为空 →
-    // 回退用户原始问题，不中断检索（0.6B 改写质量波动时保证不劣于现状）。
-    let rewritten_queries = {
+    // 改写：只在 content_query 上做（目标对象已在 Query Parser 阶段与检索词
+    // 分离，改写不再接触 target）；空泛/一题多问交给模型决定，行式输出每行
+    // 一个问题；已明确单一的问题模型会原样复读。解析失败/为空 → 回退当前
+    // 检索词，不中断检索。DOCUMENT_SUMMARY（requires_full_document）跳过
+    // 改写——整文摘要不需要检索词改写。
+    let rewritten_queries = if skip_query_rewrite {
+        Vec::new()
+    } else {
         let (system, user) = query_rewrite_prompt(request.question.trim(), history);
         let rewritten = complete_with_model(
             generation,
@@ -6052,7 +9286,7 @@ fn run_retrieval_answer(
         let parsed = parse_rewritten_queries(&rewritten);
         // 防复读校验：0.6B 改写时会把历史里最后一条助手回复整句复读成改写
         // 结果（历史标记若未生效）。与历史任一助手消息相同的输出视为改写
-        // 失败 → 回退用户原始问题，避免拿聊天回复去检索。
+        // 失败 → 回退当前检索词，避免拿聊天回复去检索。
         let echoes_history = parsed.iter().any(|query| {
             history
                 .iter()
@@ -6077,10 +9311,19 @@ fn run_retrieval_answer(
         || retrieval_questions
             .first()
             .is_some_and(|question| question != request.question.trim());
+    // 改写只在 content_query 上做；跳过（DOCUMENT_SUMMARY）或改写失败
+    // （空结果/复读历史）时回退当前检索词，节点如实记录原因。
+    let rewrite_outcome = if skip_query_rewrite {
+        "skipped"
+    } else if rewritten_marked {
+        "applied"
+    } else {
+        "fallback_original"
+    };
     trace_node(
         catalog,
         "ask",
-        "understanding",
+        "query_rewrite",
         &correlation_id,
         session_id_ref,
         None,
@@ -6088,6 +9331,8 @@ fn run_retrieval_answer(
         &json!({
             "rewritten_queries": &retrieval_questions,
             "rewritten": rewritten_marked,
+            "skip_query_rewrite": skip_query_rewrite,
+            "outcome": rewrite_outcome,
         }),
         "ok",
         None,
@@ -6125,6 +9370,7 @@ fn run_retrieval_answer(
             )
         })
         .collect::<Vec<_>>();
+    let embedding_started = Instant::now();
     let mut embedding_runtime_request = RuntimeTaskRequest::interactive(
         RuntimeTaskKind::Embedding,
         RuntimeBackendKind::OnnxRuntime,
@@ -6141,6 +9387,7 @@ fn run_retrieval_answer(
         threads: 2,
     })?;
     embedding_runtime_lease.complete();
+    let embedding_ms = embedding_started.elapsed().as_millis() as u64;
     if response.vectors.len() != retrieval_questions.len() {
         return Err(AppError::new(
             "EMBEDDING_EMPTY",
@@ -6149,9 +9396,27 @@ fn run_retrieval_answer(
         ));
     }
     let artifact_id = embedding.artifact_id.to_string();
+    // 文档级召回（Step 9，spec 十一.5 / 十二）：scope 为空的全库资料请求
+    // （LibraryQa / MultiDocumentQa）先定位相关文档候选集，再把 chunk 检索
+    // 约束在候选文档内部——不要让所有 chunk 永远直接参与竞争。召回失败/
+    // 无结果 → 保留 wider chunk retrieval 兜底，绝不中断（增益层，任何
+    // 失败都在 run_document_recall 内部吞掉并如实 trace）。
+    let mut scoped = request.clone();
+    if document_recall && scoped.scope.file_ids.is_empty() {
+        let recalled = run_document_recall(
+            catalog,
+            &retrieval_questions[0],
+            Some(&response.vectors[0]),
+            &correlation_id,
+            session_id_ref,
+        );
+        if !recalled.is_empty() {
+            scoped.scope.file_ids = recalled;
+        }
+    }
     let mut sub_results = Vec::with_capacity(retrieval_questions.len());
     for (question, vector) in retrieval_questions.iter().zip(response.vectors.iter()) {
-        let mut sub_request = request.clone();
+        let mut sub_request = scoped.clone();
         sub_request.question = question.clone();
         sub_request.retrieval_limit = sub_request.retrieval_limit.min(10);
         sub_request.max_source_files = sub_request.max_source_files.min(6);
@@ -6163,6 +9428,9 @@ fn run_retrieval_answer(
             }),
         )?);
     }
+    // 检索计时：FTS + 语义 + RRF 在 answer_extractively 内部合并执行，
+    // 该总耗时已覆盖 fts/semantic/rrf/mmr（core 内不可再拆，如实记录）。
+    let retrieval_elapsed_ms = sub_results.iter().map(|result| result.elapsed_ms).sum::<u64>();
     let mut extractive = merge_extractive_results(sub_results);
     extractive.index_coverage = index_coverage;
     extractive.retrieval_channels = vec![
@@ -6183,6 +9451,8 @@ fn run_retrieval_answer(
         &json!({
             "channels": extractive.retrieval_channels,
             "insufficient_evidence": extractive.insufficient_evidence,
+            "embedding_ms": embedding_ms,
+            "retrieval_elapsed_ms": retrieval_elapsed_ms,
             "candidates": extractive.claims.iter().take(10).map(|claim| json!({
                 "file_id": claim.citations.first().map(|citation| citation.file_id.to_string()),
                 "quote": compact_for_prompt(&claim.text, 500),
@@ -6193,7 +9463,7 @@ fn run_retrieval_answer(
         None,
     );
     if extractive.insufficient_evidence {
-        extractive.answer_mode = "rag_refusal".into();
+        extractive.answer_mode = AnswerMode::RagRefusal;
         trace_node(
             catalog,
             "ask",
@@ -6258,15 +9528,15 @@ fn run_retrieval_answer(
             {
                 rerank_runtime_lease.complete();
                 // 证据门控：rerank 后 top-1 分数过低 → 候选证据与用户原始
-                // 问题无关，大概率路由误判（闲聊被判检索）→ 转闲聊直接回复，
-                // 杜绝「检索答错把资料库内容当答案」。阈值据 trace 实测调优。
+                // 问题无关，按 LOCAL 检索失败处理（返回固定文案，不转闲聊，
+                // 不拿弱相关片段当答案）。阈值据 trace 实测调优。
                 let top_score = extractive
                     .claims
                     .first()
                     .and_then(|claim| claim.citations.first())
                     .map(|citation| citation.retrieval_score)
                     .unwrap_or(0.0);
-                if top_score < RERANK_CHAT_FALLBACK_THRESHOLD {
+                if top_score < RERANK_NO_EVIDENCE_THRESHOLD {
                     trace_node(
                         catalog,
                         "ask",
@@ -6283,24 +9553,51 @@ fn run_retrieval_answer(
                                 .collect::<Vec<_>>(),
                         }),
                         &json!({
-                            "fallback": "rerank_chat",
+                            "fallback": "rerank_no_evidence",
                             "top_score": top_score,
-                            "threshold": RERANK_CHAT_FALLBACK_THRESHOLD,
+                            "threshold": RERANK_NO_EVIDENCE_THRESHOLD,
                         }),
                         "ok",
                         None,
                     );
-                    return run_chat_answer(
-                        request,
-                        catalog,
-                        generation,
-                        &generation_artifact,
-                        &maintenance,
-                        history,
-                        operation_id,
-                        cancelled,
-                        phase,
+                    // LOCAL 检索失败：清空证据与来源，按固定文案返回
+                    //（与检索阶段无证据的 rag_refusal 一致，前端据此
+                    // 引导用户补充资料或换种说法）。
+                    extractive.claims.clear();
+                    extractive.source_files.clear();
+                    extractive.used_file_ids.clear();
+                    extractive.insufficient_evidence = true;
+                    extractive.grounding_status = fanfan_core::GroundingStatus::Insufficient;
+                    // 与检索阶段无证据的固定文案一致（assemble_extractive_answer）
+                    extractive.answer =
+                        "当前资料中未找到足够依据。你可以换一种说法、扩大检索范围，或等待相关资料完成索引。"
+                            .to_owned();
+                    extractive.answer_mode = AnswerMode::RagRefusal;
+                    extractive.degradation_reason = Some(
+                        "候选证据与问题相关性过低（rerank top-1 低于阈值），已拒绝生成".to_owned(),
                     );
+                    trace_node(
+                        catalog,
+                        "ask",
+                        "completed",
+                        &correlation_id,
+                        session_id_ref,
+                        None,
+                        &json!({}),
+                        &json!({
+                            "answer_mode": "rag_refusal",
+                            "answer": extractive.answer,
+                            "claim_count": 0,
+                            "grounding_status": format!("{:?}", extractive.grounding_status),
+                            "insufficient_evidence": true,
+                            "degradation_reason": extractive.degradation_reason,
+                        }),
+                        "ok",
+                        Some(extractive.elapsed_ms),
+                    );
+                    catalog.record_ask_exchange(request, &extractive)?;
+                    phase("completed", 1.0);
+                    return Ok(extractive);
                 }
                 // 重排后只把相关性最高的前 N 条证据片段交给生成模型，
                 // 其余丢弃（生成 prompt 只能引用保留的 S1..SN）。
@@ -6640,13 +9937,35 @@ fn run_retrieval_answer(
     grounded.used_file_ids = verified_file_ids.into_iter().collect();
     if rejected_claims > 0 {
         grounded.grounding_status = fanfan_core::GroundingStatus::Partial;
-        grounded.answer_mode = "generated".into();
+        grounded.answer_mode = AnswerMode::Generated;
         grounded.degradation_reason = Some(format!(
             "有{rejected_claims}个候选事实句未通过原文支持性校验，已自动隐藏"
         ));
     }
     grounded.index_coverage = index_coverage;
     grounded.retrieval_channels = extractive.retrieval_channels;
+    // Step 11：EXTRACT operation（spec 十六 CASE 1）→ 把已验证的 grounded
+    // 回答重组为「条目 + 每项证据」结构化列表。重组失败/空条目 → 原样保留
+    // 已验证回答（绝不 crash、不劣化）。重组后的 claims 逐条 verified_claim
+    // 并重新过 validate_answer_evidence（引用证据都是已验证的真实 chunk）。
+    if operation == Some(QueryOperation::Extract)
+        && !grounded.claims.is_empty()
+        && restructure_as_extract(
+            catalog,
+            generation,
+            &generation_artifact,
+            request,
+            &mut grounded,
+            &correlation_id,
+            session_id_ref,
+            cancelled,
+        )?
+    {
+        for claim in &grounded.claims {
+            verified_claim(claim);
+        }
+        catalog.validate_answer_evidence(&grounded)?;
+    }
     trace_node(
         catalog,
         "ask",
@@ -6671,6 +9990,164 @@ fn run_retrieval_answer(
     catalog.record_ask_exchange(request, &grounded)?;
     phase("completed", 1.0);
     Ok(grounded)
+}
+
+/// Step 11：EXTRACT operation（spec 十六 CASE 1「我的简历里面有哪些项目」）。
+///
+/// 把已验证的 grounded 回答重组为「条目 + 每项证据」结构化列表：
+/// 模型只产出条目清单（`extract_schema` JSON 约束），每条目的引用证据由
+/// 确定性最长公共子串对齐到已验证的真实 chunk 原文（≥ EXTRACT_MATCH_MIN_LEN
+/// 字符才算命中）；未命中任何证据的条目回退到重排分最高的证据。抽取生成
+/// 失败或空条目 → 返回 false，调用方原样保留已验证回答（绝不 crash、不
+/// 劣化既有结果）。模型输出的 evidence 摘引只作展示，不作为引用证据。
+///
+/// 返回 true 表示已完成重组（调用方负责逐条 verified_claim 与
+/// validate_answer_evidence）。
+fn restructure_as_extract(
+    catalog: &CatalogService,
+    generation: &Mutex<LocalGenerationRuntime>,
+    generation_artifact: &ModelArtifact,
+    request: &AskRequest,
+    grounded: &mut AnswerResult,
+    correlation_id: &str,
+    session_id_ref: Option<&str>,
+    cancelled: &AtomicBool,
+) -> Result<bool, AppError> {
+    let started = Instant::now();
+    let materials = grounded
+        .claims
+        .iter()
+        .enumerate()
+        .map(|(index, claim)| {
+            let quotes = claim
+                .citations
+                .iter()
+                .map(|citation| compact_for_prompt(&citation.quote, 220))
+                .collect::<Vec<_>>()
+                .join("；");
+            format!(
+                "[M{}] {}（证据：{}）",
+                index + 1,
+                compact_for_prompt(&claim.text, 200),
+                quotes
+            )
+        })
+        .collect::<Vec<_>>();
+    let (system, user) = extract_prompt(request.question.trim(), &materials);
+    let raw = complete_json_with_model(
+        generation,
+        generation_artifact,
+        &system,
+        &user,
+        400,
+        &extract_schema(),
+        cancelled,
+    )?;
+    let Some(results) = parse_extract_results(&raw) else {
+        trace_node(
+            catalog,
+            "ask",
+            "extract",
+            correlation_id,
+            session_id_ref,
+            None,
+            &json!({ "question": request.question, "material_count": materials.len() }),
+            &json!({ "status": "empty_or_unparseable", "fallback": "keep_grounded_answer" }),
+            "ok",
+            Some(started.elapsed().as_millis() as u64),
+        );
+        return Ok(false);
+    };
+    // 每条目 → 确定性证据对齐（最长公共子串；不信任模型自报编号）。
+    let mut new_claims = Vec::with_capacity(results.items.len());
+    let mut matched_count = 0_usize;
+    for item in results.items.iter().take(EXTRACT_MAX_ITEMS) {
+        let mut best: Option<(usize, EvidenceRef)> = None;
+        for claim in &grounded.claims {
+            for citation in &claim.citations {
+                let overlap = longest_common_substr_len(&item.item, &citation.quote);
+                if overlap >= EXTRACT_MATCH_MIN_LEN
+                    && best
+                        .as_ref()
+                        .is_none_or(|(current, _)| overlap > *current)
+                {
+                    best = Some((overlap, citation.clone()));
+                }
+            }
+        }
+        let citations = match best {
+            Some((_, citation)) => {
+                matched_count = matched_count.saturating_add(1);
+                vec![citation]
+            }
+            // 回退：重排分最高的证据（保持每项都有真实出处）
+            None => grounded
+                .claims
+                .iter()
+                .flat_map(|claim| claim.citations.iter())
+                .max_by(|left, right| left.retrieval_score.total_cmp(&right.retrieval_score))
+                .cloned()
+                .into_iter()
+                .collect(),
+        };
+        let mut text = item.item.clone();
+        if !item.evidence.is_empty() {
+            text.push_str(&format!("\n证据：{}", item.evidence));
+        }
+        new_claims.push(AnswerClaim {
+            claim_id: Uuid::now_v7(),
+            text,
+            support_status: if citations.is_empty() {
+                SupportStatus::Partial
+            } else {
+                SupportStatus::Supported
+            },
+            citations,
+        });
+    }
+    if new_claims.is_empty() {
+        trace_node(
+            catalog,
+            "ask",
+            "extract",
+            correlation_id,
+            session_id_ref,
+            None,
+            &json!({ "question": request.question, "material_count": materials.len() }),
+            &json!({ "status": "no_items", "fallback": "keep_grounded_answer" }),
+            "ok",
+            Some(started.elapsed().as_millis() as u64),
+        );
+        return Ok(false);
+    }
+    grounded.claims = new_claims;
+    grounded.answer = grounded
+        .claims
+        .iter()
+        .enumerate()
+        .map(|(index, claim)| format!("{}. {}", index + 1, claim.text))
+        .collect::<Vec<_>>()
+        .join("\n");
+    grounded.answer_mode = AnswerMode::Extract;
+    grounded.retrieval_channels.push("structured_extract".into());
+    trace_node(
+        catalog,
+        "ask",
+        "extract",
+        correlation_id,
+        session_id_ref,
+        None,
+        &json!({ "question": request.question, "material_count": materials.len() }),
+        &json!({
+            "status": "ok",
+            "item_count": grounded.claims.len(),
+            "matched_evidence": matched_count,
+            "fallback_evidence_used": grounded.claims.len().saturating_sub(matched_count),
+        }),
+        "ok",
+        Some(started.elapsed().as_millis() as u64),
+    );
+    Ok(true)
 }
 
 /// 合并多个子查询的检索结果（一题多问改写拆分后的分别检索）：
@@ -6750,31 +10227,6 @@ fn complete_with_model(
         runtime.activate(&artifact.local_path, 4096, threads)?;
     }
     runtime.complete_cancellable(system_prompt, prompt, max_tokens, cancelled)
-}
-
-/// 闲聊专用：允许更高的采样温度（0.6B 在 0.1 下只会复读模板开场白）。
-/// 路由/改写/检索等稳定输出场景继续走 complete_with_model（0.1）。
-fn complete_chat_with_model(
-    generation: &Mutex<LocalGenerationRuntime>,
-    artifact: &ModelArtifact,
-    system_prompt: &str,
-    prompt: &str,
-    max_tokens: u32,
-    temperature: f32,
-    cancelled: &AtomicBool,
-) -> Result<String, AppError> {
-    let mut runtime = generation.lock().map_err(|_| {
-        AppError::new(
-            "GENERATION_RUNTIME_LOCK_FAILED",
-            "生成运行时状态已损坏",
-            true,
-        )
-    })?;
-    let threads = interactive_inference_threads();
-    if runtime.active_model_path() != Some(artifact.local_path.as_str()) || !runtime.is_active() {
-        runtime.activate(&artifact.local_path, 4096, threads)?;
-    }
-    runtime.complete_chat_cancellable(system_prompt, prompt, max_tokens, temperature, cancelled)
 }
 
 fn complete_json_with_model(
@@ -7980,7 +11432,310 @@ pub(crate) fn spawn_embed_pending(app: AppHandle, catalog: Arc<CatalogService>) 
                 break;
             }
         }
+        // 嵌入收敛后：后台构建文档画像（画像要求当前 revision 全量嵌入完成，
+        // 所以放在嵌入循环结束后）。与嵌入共用线程，避免新增调度点；前台
+        // 活动期间让出，等待下一次 spawn_embed_pending 再继续。
+        loop {
+            if worker.foreground_activity.load(Ordering::Acquire) > 0 {
+                break;
+            }
+            if !run_profile_build_cycle(&app, &catalog, &worker) {
+                break;
+            }
+            thread::yield_now();
+        }
     });
+}
+
+/// 画像构建每批最大文件数（与集合建议一致的上限）。
+const PROFILE_BUILD_BATCH: u32 = 200;
+
+/// 分类扫描每批最大画像数（与画像构建同量级）。
+const CLASSIFY_BATCH: u32 = 200;
+
+/// 文档画像构建循环（Step 1 + Step 2）：每次调用处理一批（≤[`PROFILE_BUILD_BATCH`]）
+/// 「已解析 + 全量嵌入」的文件，画像就绪后立即对仍未分类的画像做类型判定。
+///
+/// 返回 true 表示本批已满（画像或分类可能还有更多，继续下一批）；
+/// 返回 false 表示无事可做或出错（本轮结束，下次 spawn 再试）。
+///
+/// 构建/分类失败只记日志：画像与类型只影响 Document Resolver 的定位精度，
+/// 绝不影响浏览 / FTS / 语义检索 / 基础 RAG。
+fn run_profile_build_cycle(
+    app: &AppHandle,
+    catalog: &CatalogService,
+    worker: &WorkerServiceState,
+) -> bool {
+    let models_state = app.state::<ModelServiceState>();
+    let models = match models_state.get() {
+        Ok(models) => models,
+        Err(error) => {
+            crate::runtime_log::event(
+                "warning",
+                "profile",
+                "profile.cycle_failed",
+                None,
+                &json!({"error_code": error.code}),
+            );
+            return false;
+        }
+    };
+    let artifact = match models.active_artifact(ModelRole::Embedding) {
+        Ok(Some(artifact)) => artifact,
+        Ok(None) => return false, // 未启用 Embedding 模型，无法计算画像向量
+        Err(error) => {
+            crate::runtime_log::event(
+                "warning",
+                "profile",
+                "profile.cycle_failed",
+                None,
+                &json!({"error_code": error.code}),
+            );
+            return false;
+        }
+    };
+    let artifact_id = artifact.artifact_id.to_string();
+    if worker.foreground_activity.load(Ordering::Acquire) > 0 {
+        return false;
+    }
+    let cycle_id = Uuid::now_v7().to_string();
+    let cycle_started = Instant::now();
+    match catalog.refresh_document_profiles(&artifact_id, PROFILE_BUILD_BATCH) {
+        Ok(result) => {
+            if result.profiled_files > 0 || result.skipped_files > 0 {
+                crate::runtime_log::event(
+                    "info",
+                    "profile",
+                    "profile.cycle_completed",
+                    Some(&cycle_id),
+                    &json!({
+                        "profiled_files": result.profiled_files,
+                        "skipped_files": result.skipped_files,
+                        "elapsed_ms": cycle_started.elapsed().as_millis() as u64,
+                    }),
+                );
+            }
+            // 画像就绪后立即尝试分类（Step 2）：纯计算 + 少量回写，失败只记日志
+            let attempted = run_classification_pass(app, catalog, worker, &artifact);
+            // 画像批次打满或分类还有待处理画像 → 继续下一轮
+            result.profiled_files >= u64::from(PROFILE_BUILD_BATCH)
+                || attempted >= u64::from(CLASSIFY_BATCH)
+        }
+        Err(error) => {
+            crate::runtime_log::event(
+                "warning",
+                "profile",
+                "profile.cycle_failed",
+                Some(&cycle_id),
+                &json!({
+                    "error_code": error.code,
+                    "elapsed_ms": cycle_started.elapsed().as_millis() as u64,
+                }),
+            );
+            false
+        }
+    }
+}
+
+/// 分类原型向量缓存（进程级，按 Embedding 模型 artifact_id 缓存）。
+/// 原型 = TYPE_PROTOTYPE_TEXTS 逐类型取句向量均值并 L2 归一化；
+/// 模型不变则只计算一次，全进程复用（模型切换时自然重算）。
+static PROTOTYPE_VECTORS: OnceLock<Mutex<HashMap<String, Vec<(DocumentType, Vec<f32>)>>>> =
+    OnceLock::new();
+
+fn prototype_cache(
+) -> MutexGuard<'static, HashMap<String, Vec<(DocumentType, Vec<f32>)>>> {
+    PROTOTYPE_VECTORS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 取当前 Embedding 模型的分类原型向量：缓存命中直接返回，否则用 onnx
+/// 对 TYPE_PROTOTYPE_TEXTS 编码一次、按类型聚合。失败返回 Err——分类是
+/// best-effort，调用方记日志后跳过本轮即可。
+fn prototype_vectors_for(
+    worker: &WorkerClient,
+    runtime_manager: &RuntimeManager,
+    artifact: &ModelArtifact,
+) -> Result<Vec<(DocumentType, Vec<f32>)>, AppError> {
+    let key = artifact.artifact_id.to_string();
+    if let Some(cached) = prototype_cache().get(&key) {
+        return Ok(cached.clone());
+    }
+    let texts = TYPE_PROTOTYPE_TEXTS
+        .iter()
+        .flat_map(|(_, prototype_texts)| prototype_texts.iter().copied())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let tokenizer_path = PathBuf::from(&artifact.local_path)
+        .parent()
+        .map(|parent| parent.join("tokenizer.json"))
+        .ok_or_else(|| {
+            AppError::new("EMBEDDING_TOKENIZER_MISSING", "Embedding 模型目录无效", false)
+        })?;
+    if !tokenizer_path.is_file() {
+        return Err(AppError::new(
+            "EMBEDDING_TOKENIZER_MISSING",
+            "Embedding tokenizer 不存在，文档类型分类已跳过",
+            false,
+        ));
+    }
+    let mut runtime_request = RuntimeTaskRequest::interactive(
+        RuntimeTaskKind::Embedding,
+        RuntimeBackendKind::OnnxRuntime,
+    );
+    runtime_request.cpu_threads = 2;
+    runtime_request.timeout = Duration::from_secs(30);
+    runtime_request.model_id = Some(key.clone());
+    let runtime_lease = runtime_manager.acquire(runtime_request)?;
+    let response = worker.encode_embeddings(&EmbeddingRequest {
+        model_path: artifact.local_path.clone(),
+        tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
+        texts,
+        max_length: artifact.max_length.unwrap_or(512),
+        threads: 2,
+    })?;
+    runtime_lease.complete();
+    if response.dimension == 0
+        || response.vectors.len() != TYPE_PROTOTYPE_TEXTS.iter().map(|(_, texts)| texts.len()).sum::<usize>()
+    {
+        return Err(AppError::new(
+            "EMBEDDING_EMPTY",
+            "Embedding 运行时没有返回全量原型向量",
+            false,
+        ));
+    }
+    let mut prototypes = Vec::with_capacity(TYPE_PROTOTYPE_TEXTS.len());
+    let mut offset = 0;
+    for (document_type, prototype_texts) in TYPE_PROTOTYPE_TEXTS {
+        let count = prototype_texts.len();
+        let vectors = response.vectors[offset..offset + count].to_vec();
+        offset += count;
+        let mut mean = vec![0.0_f32; response.dimension as usize];
+        for vector in &vectors {
+            for (target, value) in mean.iter_mut().zip(vector) {
+                *target += value;
+            }
+        }
+        let norm = mean.iter().map(|value| value * value).sum::<f32>().sqrt();
+        if !norm.is_finite() || norm <= f32::EPSILON {
+            continue; // 该类型原型退化（无法归一化）：跳过，不参与比对
+        }
+        mean.iter_mut().for_each(|value| *value /= norm);
+        prototypes.push((*document_type, mean));
+    }
+    prototype_cache().insert(key, prototypes.clone());
+    Ok(prototypes)
+}
+
+/// 文档类型分类扫描（Step 2）：把「画像就绪但 document_type 仍为 NULL」的
+/// 画像按 规则 + Embedding 原型 判定并回写。返回本轮尝试的画像数；调用方
+/// 用它决定是否继续下一轮。
+///
+/// 无信号（分类函数返回 None）的画像保持 NULL：这是「其他/未定」的显式
+/// 表示，绝不猜类型；下次有内容变化（新 revision 触发重建）时自然重判。
+/// 分类失败只记日志：类型只影响 Document Resolver 的信号权重与类型化检索，
+/// 绝不阻塞索引或问答主链。
+fn run_classification_pass(
+    app: &AppHandle,
+    catalog: &CatalogService,
+    worker: &WorkerServiceState,
+    artifact: &ModelArtifact,
+) -> u64 {
+    let pending = match catalog.list_profiles_needing_classification(CLASSIFY_BATCH) {
+        Ok(pending) => pending,
+        Err(error) => {
+            crate::runtime_log::event(
+                "warning",
+                "profile",
+                "profile.classify_failed",
+                None,
+                &json!({"error_code": error.code, "phase": "list"}),
+            );
+            return 0;
+        }
+    };
+    if pending.is_empty() {
+        return 0; // 无待分类画像：不动原型缓存，不打扰 Embedding 运行时
+    }
+    let runtime_manager = app.state::<RuntimeManagerState>();
+    let prototypes = match prototype_vectors_for(&worker.client, &runtime_manager.0, artifact) {
+        Ok(prototypes) => prototypes,
+        Err(error) => {
+            crate::runtime_log::event(
+                "warning",
+                "profile",
+                "profile.classify_failed",
+                None,
+                &json!({"error_code": error.code, "phase": "prototype"}),
+            );
+            return 0;
+        }
+    };
+    if prototypes.is_empty() {
+        return 0; // 原型全部退化：本轮无向量可比较，下轮重试
+    }
+    let started = Instant::now();
+    let mut classified = 0_u64;
+    let mut failed = 0_u64;
+    for (profile, file_name) in pending {
+        // 画像向量读取失败按「无向量」处理：退化为纯规则路径，不阻塞该画像
+        let vector = catalog
+            .profile_vector(&profile.file_id)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let prototype_refs = prototypes
+            .iter()
+            .map(|(document_type, vector)| TypePrototype {
+                document_type: *document_type,
+                vector,
+            })
+            .collect::<Vec<_>>();
+        let decision = classify_document_type(
+            &profile.title,
+            &file_name,
+            &profile.section_titles,
+            &profile.summary,
+            &vector,
+            &prototype_refs,
+        );
+        let Some((document_type, confidence)) = decision else {
+            continue; // 无信号：保持 NULL，等新内容触发重新判定
+        };
+        let mut updated = profile.clone();
+        updated.document_type = Some(document_type);
+        updated.type_confidence = Some(confidence);
+        updated.updated_at = Utc::now();
+        match catalog.update_document_profile_classifier(&updated) {
+            Ok(true) => classified += 1,
+            Ok(false) => failed += 1, // 画像被并发删除/重建：下轮由待分类列表补齐
+            Err(error) => {
+                failed += 1;
+                crate::runtime_log::event(
+                    "warning",
+                    "profile",
+                    "profile.classify_failed",
+                    None,
+                    &json!({"error_code": error.code, "phase": "write"}),
+                );
+            }
+        }
+    }
+    let attempted = classified + failed;
+    crate::runtime_log::event(
+        "info",
+        "profile",
+        "profile.classify_completed",
+        None,
+        &json!({
+            "attempted": attempted,
+            "classified": classified,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        }),
+    );
+    attempted
 }
 
 fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &WorkerServiceState) {
@@ -8605,10 +12360,11 @@ mod tests {
             ],
             used_file_ids: vec![first_file, second_file],
             elapsed_ms: 1,
-            answer_mode: "extractive".into(),
+            answer_mode: AnswerMode::Generated,
             retrieval_channels: vec!["fts".into()],
             index_coverage: 1.0,
             degradation_reason: None,
+            clarification: None,
         };
 
         apply_rerank_scores(&mut result, &[0.1, 0.9]).expect("apply valid rerank scores");
@@ -8626,7 +12382,7 @@ mod tests {
 
     #[test]
     fn rerank_truncates_to_top_evidence_before_generation() {
-        let file_id = |n: u32| Uuid::now_v7();
+        let file_id = |_n: u32| Uuid::now_v7();
         let claim = |file_id, text: &str| AnswerClaim {
             claim_id: Uuid::now_v7(),
             text: text.into(),
@@ -8661,10 +12417,11 @@ mod tests {
             source_files: vec![],
             used_file_ids: vec![],
             elapsed_ms: 1,
-            answer_mode: "extractive".into(),
+            answer_mode: AnswerMode::Generated,
             retrieval_channels: vec!["fts".into()],
             index_coverage: 1.0,
             degradation_reason: None,
+            clarification: None,
         };
 
         apply_rerank_scores(&mut result, &[0.1, 0.5, 0.9, 0.3, 0.7]).expect("apply rerank scores");
@@ -8718,15 +12475,56 @@ mod tests {
             }],
             used_file_ids: vec![file_id],
             elapsed_ms: 10,
-            answer_mode: "generated".into(),
+            answer_mode: AnswerMode::Generated,
             retrieval_channels: vec!["fts".into()],
             index_coverage: 1.0,
             degradation_reason: None,
+            clarification: None,
         };
 
         let markdown = render_answer_export(&answer, "md").expect("render export");
         assert!(markdown.contains("项目说明.md"));
         assert!(markdown.contains("采用混合召回"));
         assert!(!markdown.contains("敏感目录"));
+    }
+
+    #[test]
+    fn clarification_reference_alias_writability_gate() {
+        // 场景 F：用户澄清选择后，「待澄清引用」只有适合做别名的短名词短语
+        // 才写入 USER_SELECTION 记忆；问句/长句整段写入会污染记忆。
+        assert!(is_alias_writable_reference("我的简历"));
+        assert!(is_alias_writable_reference("第二份合同"));
+        assert!(is_alias_writable_reference("LangGraph 项目"));
+        // 问句 / 疑问词 / 过长引用：不写
+        assert!(!is_alias_writable_reference("我的简历里有什么？"));
+        assert!(!is_alias_writable_reference("有没有 LangGraph"));
+        assert!(!is_alias_writable_reference("第二份合同里面有没有身份证号"));
+        assert!(!is_alias_writable_reference("我"));
+        assert!(!is_alias_writable_reference(&"很".repeat(21)));
+    }
+
+    #[test]
+    fn should_ask_clarification_dispatch_gate() {
+        // 修复验证（Step 14）：MultipleCandidates 的 resolved_file_ids 是
+        // top-2/3（非空），旧条件 `resolved_scope.is_empty()` 与 resolver 输出
+        // 相悖，导致 NEED_CLARIFICATION 分支永远不触发。触发条件只看
+        // 「状态 + 有可选候选」，与 scope 是否非空无关。
+        // 注意：fanfan_core 根不 glob 导出本类型（与 organizing::ResolutionStatus
+        // 撞名），沿用文件顶部 ask::query_plan 的导入。
+
+        // 核心场景：Memory 未消歧 + MultipleCandidates + 有候选 → 必须回问
+        // （触发条件与 scope 是否非空无关——MultipleCandidates 的
+        // resolved_file_ids 是 top-2/3，scope 非空不代表锁定）
+        assert!(should_ask_clarification(false, Some(ResolutionStatus::MultipleCandidates), true));
+        // Memory 已消歧 → 不问（Memory 定位优先，锁定目标）
+        assert!(!should_ask_clarification(true, Some(ResolutionStatus::MultipleCandidates), true));
+        // 唯一候选 / 未解析 → 不问
+        // 唯一候选（Resolved）→ 不问
+        assert!(!should_ask_clarification(false, Some(ResolutionStatus::Resolved), true));
+        assert!(!should_ask_clarification(false, Some(ResolutionStatus::Unresolved), true));
+        // 未运行 Resolver（scope 已被上下文/记忆锁定）→ 不问
+        assert!(!should_ask_clarification(false, None, true));
+        // 无候选（理论防御）→ 不问
+        assert!(!should_ask_clarification(false, Some(ResolutionStatus::MultipleCandidates), false));
     }
 }

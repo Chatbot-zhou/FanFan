@@ -18,29 +18,42 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    AnswerResult, AnswerSourceFile, AppError, AppLogRecord, AskMessage, AskMessagePage, AskRequest,
-    AskSessionPage, AskSessionSummary, AuthorizationSource, BUILT_IN_EXCLUSION_RULES,
+    AnswerResult, AnswerSourceFile, AppError, AppLogRecord, AskMessage, AskMessagePage,
+    AskRequest, AskSessionContext, AskSessionPage, AskSessionSummary, AuthorizationSource,
+    BUILT_IN_EXCLUSION_RULES,
     CandidateRoot, CandidateRootStatus, CandidateRootType, ChunkEmbeddingInput, CollectionKind,
+    DocumentType,
     CollectionModelReview, CollectionRecord, CollectionRule, CollectionSuggestedMember,
     CollectionSuggestion, CollectionSuggestionPage, CollectionSuggestionQuery,
     CollectionSuggestionRefreshResult, CollectionSuggestionUpdateRequest, CreateCollectionRequest,
-    DegradationLevel, DegradationState, DiscoveredFile, DocumentNode, EvaluationIntegritySnapshot,
+    DegradationLevel, DegradationState, DiscoveredFile, DocumentNode, DocumentProfile,
+    EvaluationIntegritySnapshot,
     ExclusionRule, ExclusionRuleClass, ExclusionRuleInput, ExclusionRuleType, FilePage,
     FileProcessingDisposition, FileQuery, FileRecord, FileRelation, FileSystemEvent,
     HealthCheckItem, ImageAsset, ImageUnderstandingResult, InboxEventType, InboxItem, InboxPage,
     InboxQuery, InboxUpdateRequest, IndexActivityStats, IndexRebuildResult, JobRecord, JobStatus,
     LogPage, LogQuery, MaintenanceSnapshot, NodeTracePage, NodeTraceQuery, NodeTraceRecord,
     ParseOutcome, ParseResult, ParseStatus, PendingEmbeddingChunk, PendingImageUnderstanding,
-    ProcessingCoverageSnapshot, RankedHit, RelationGroupMemberRecord, RelationGroupPage,
-    RelationGroupQuery, RelationGroupRecord, RelationGroupRole, RelationGroupType,
-    RelationPage, RelationQuery, RelationRefreshResult, RelationType, ResolutionStatus,
-    RootKind, RootRecord, RootSource, RootStatus, ScanOutcome, ScopeFilter, SearchMode,
-    SemanticQuery, SourceLocator, TriageStatus, VolumeType, WatchMode, chunks_from_nodes,
+    ProcessingCoverageSnapshot, ProfileRefreshResult, RankedHit, RelationGroupMemberRecord,
+    RelationGroupPage, RelationGroupQuery, RelationGroupRecord, RelationGroupRole,
+    RelationGroupType, RelationPage, RelationQuery, RelationRefreshResult, RelationType,
+    ResolutionStatus, RootKind, RootRecord, RootSource, RootStatus, ScanOutcome, ScopeFilter,
+    SearchMode, SemanticQuery, SourceLocator, TriageStatus, VolumeType, WatchMode, chunks_from_nodes,
     cluster_relation_edges, fts_query, normalized_version_key,
 };
+use crate::memory::{
+    MemoryAlias, MemoryEntity, MemoryRelation, MemorySource, MemoryStatus, MemoryTargetType,
+    MemoryWriteInput, normalize_alias,
+};
+#[cfg(test)]
+use crate::memory::MemoryKind;
 use crate::organizing::{RelationEdge, SeedProfile, seed_expand_semantic_groups};
+use crate::profile_builder::{
+    build_representative_text, extract_section_titles, pick_head_mid_tail,
+    representative_text_hash,
+};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 25;
+pub const CURRENT_SCHEMA_VERSION: u32 = 29;
 
 type VectorSourceRow = (u64, String, String, String, Vec<f32>);
 type SemanticCandidate = (Uuid, String, f32);
@@ -894,6 +907,95 @@ const MIGRATIONS: &[Migration] = &[
              WHERE parse_status = 'encrypted'
                AND processing_disposition = 'parseable_content';
         "#,
+    },
+    Migration {
+        version: 26,
+        name: "ask_session_context",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS ask_session_context (
+                session_id TEXT PRIMARY KEY,
+                active_file_id TEXT,
+                active_file_ids_json TEXT NOT NULL DEFAULT '[]',
+                active_document_type TEXT,
+                active_entity_id TEXT,
+                active_collection_id TEXT,
+                last_referenced_file_ids_json TEXT NOT NULL DEFAULT '[]',
+                last_intent TEXT,
+                updated_at TEXT NOT NULL
+            );
+        "#,
+    },
+    Migration {
+        version: 27,
+        name: "document_profiles_classifier_columns",
+        sql: r#"
+            ALTER TABLE document_profiles ADD COLUMN document_type TEXT;
+            ALTER TABLE document_profiles ADD COLUMN type_confidence REAL;
+            ALTER TABLE document_profiles ADD COLUMN section_titles_json TEXT NOT NULL DEFAULT '[]';
+            ALTER TABLE document_profiles ADD COLUMN representative_text_hash TEXT;
+            CREATE INDEX IF NOT EXISTS idx_document_profiles_type
+                ON document_profiles(document_type) WHERE document_type IS NOT NULL;
+        "#,
+    },
+    Migration {
+        version: 28,
+        name: "memory_layer",
+        sql: r#"
+            CREATE TABLE IF NOT EXISTS memory_entities (
+                entity_id TEXT PRIMARY KEY,
+                entity_type TEXT NOT NULL,
+                canonical_name TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (entity_type, canonical_name)
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_relations (
+                relation_id TEXT PRIMARY KEY,
+                subject_type TEXT NOT NULL,
+                subject_id TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                object_type TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.0,
+                status TEXT NOT NULL DEFAULT 'candidate',
+                source_type TEXT NOT NULL,
+                source_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (subject_type, subject_id, predicate, object_type, object_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_relations_subject
+                ON memory_relations(subject_type, subject_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_relations_object
+                ON memory_relations(object_type, object_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_relations_status
+                ON memory_relations(status);
+
+            CREATE TABLE IF NOT EXISTS memory_aliases (
+                alias_id TEXT PRIMARY KEY,
+                alias TEXT NOT NULL,
+                target_type TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.0,
+                source_type TEXT NOT NULL,
+                source_id TEXT,
+                hit_count INTEGER NOT NULL DEFAULT 0,
+                last_used_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (alias, target_type, target_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_aliases_alias
+                ON memory_aliases(alias);
+        "#,
+    },
+    Migration {
+        version: 29,
+        name: "ask_session_clarification",
+        sql: "ALTER TABLE ask_session_context \
+              ADD COLUMN pending_clarification_reference TEXT",
     },
 ];
 
@@ -5254,13 +5356,16 @@ impl CatalogStore {
                         JOIN roots r ON r.root_id = frm.root_id
                         WHERE frm.file_id = f.file_id AND r.enabled = 1
                       )
+                      -- 配额 6（原为 3）：早期 Windows OCR 引擎不可用时的失败
+                      -- 尝试不应耗尽新引擎（PP-OCRv5）的回归机会——引擎就绪前
+                      -- 的尝试不计数，给足轮次；超过 6 次的损坏文件仍会停止重试。
                       AND (
                         SELECT COUNT(*)
                         FROM processing_attempts pa
                         WHERE pa.file_id = f.file_id
                           AND pa.operation = 'parse'
                           AND pa.status = 'ocr_pending'
-                      ) < 3
+                      ) < 6
                     ORDER BY f.last_seen_at, f.file_id
                     LIMIT ?1
                 )
@@ -7063,6 +7168,1135 @@ impl CatalogStore {
             .map_err(|error| storage_error("ASK_HISTORY_WRITE_FAILED", error, true))
     }
 
+    /// 读取会话工作上下文；无记录返回 None（正常路径：新会话）。
+    /// Memory 层出错不得阻断问答——读取失败按无上下文处理。
+    pub fn get_ask_session_context(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<AskSessionContext>, AppError> {
+        let connection = self.connect()?;
+        let row = connection
+            .query_row(
+                "SELECT active_file_id, active_file_ids_json, active_document_type, \
+                        active_entity_id, active_collection_id, last_referenced_file_ids_json, \
+                        last_intent, updated_at, pending_clarification_reference \
+                 FROM ask_session_context WHERE session_id = ?1",
+                params![session_id.to_string()],
+                |row| {
+                    let active_file_ids_json: String = row.get(1)?;
+                    let last_referenced_json: String = row.get(5)?;
+                    Ok(AskSessionContext {
+                        session_id: Some(session_id),
+                        active_file_id: row
+                            .get::<_, Option<String>>(0)?
+                            .as_deref()
+                            .and_then(|value| Uuid::parse_str(value).ok()),
+                        active_file_ids: serde_json::from_str(&active_file_ids_json)
+                            .unwrap_or_default(),
+                        active_document_type: row
+                            .get::<_, Option<String>>(2)?
+                            .as_deref()
+                            .and_then(DocumentType::parse_lenient),
+                        active_entity_id: row
+                            .get::<_, Option<String>>(3)?
+                            .as_deref()
+                            .and_then(|value| Uuid::parse_str(value).ok()),
+                        active_collection_id: row
+                            .get::<_, Option<String>>(4)?
+                            .as_deref()
+                            .and_then(|value| Uuid::parse_str(value).ok()),
+                        last_referenced_file_ids: serde_json::from_str(&last_referenced_json)
+                            .unwrap_or_default(),
+                        last_intent: row.get(6)?,
+                        updated_at: row
+                            .get::<_, Option<String>>(7)?
+                            .as_deref()
+                            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                            .map(|value| value.with_timezone(&Utc)),
+                        pending_clarification_reference: row.get(8)?,
+                    })
+                },
+            );
+        match row {
+            Ok(context) => Ok(Some(context)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(storage_error("ASK_CONTEXT_READ_FAILED", error, true)),
+        }
+    }
+
+    /// 更新会话工作上下文（upsert）。不存在的会话也允许写入（Ask 会在
+    /// 落库 exchange 时补建会话行，context 与之解耦）。
+    pub fn update_ask_session_context(
+        &self,
+        session_id: Uuid,
+        context: &AskSessionContext,
+    ) -> Result<(), AppError> {
+        let connection = self.connect()?;
+        let active_file_ids_json = serde_json::to_string(&context.active_file_ids)
+            .map_err(|error| AppError::new("ASK_CONTEXT_INVALID", error.to_string(), false))?;
+        let last_referenced_json = serde_json::to_string(&context.last_referenced_file_ids)
+            .map_err(|error| AppError::new("ASK_CONTEXT_INVALID", error.to_string(), false))?;
+        let now = context.updated_at.unwrap_or_else(Utc::now);
+        connection
+            .execute(
+                "INSERT INTO ask_session_context \
+                    (session_id, active_file_id, active_file_ids_json, active_document_type, \
+                     active_entity_id, active_collection_id, last_referenced_file_ids_json, \
+                     last_intent, pending_clarification_reference, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                 ON CONFLICT(session_id) DO UPDATE SET \
+                    active_file_id = excluded.active_file_id, \
+                    active_file_ids_json = excluded.active_file_ids_json, \
+                    active_document_type = excluded.active_document_type, \
+                    active_entity_id = excluded.active_entity_id, \
+                    active_collection_id = excluded.active_collection_id, \
+                    last_referenced_file_ids_json = excluded.last_referenced_file_ids_json, \
+                    last_intent = excluded.last_intent, \
+                    pending_clarification_reference = excluded.pending_clarification_reference, \
+                    updated_at = excluded.updated_at",
+                params![
+                    session_id.to_string(),
+                    context.active_file_id.map(|value| value.to_string()),
+                    active_file_ids_json,
+                    context.active_document_type.map(|value| value.as_str()),
+                    context.active_entity_id.map(|value| value.to_string()),
+                    context.active_collection_id.map(|value| value.to_string()),
+                    last_referenced_json,
+                    context.last_intent,
+                    context.pending_clarification_reference,
+                    now.to_rfc3339(),
+                ],
+            )
+            .map_err(|error| storage_error("ASK_CONTEXT_WRITE_FAILED", error, true))?;
+        Ok(())
+    }
+
+    /// 清空会话工作上下文（新会话开始 / 会话删除时调用）。
+    pub fn clear_ask_session_context(&self, session_id: Uuid) -> Result<(), AppError> {
+        let connection = self.connect()?;
+        connection
+            .execute(
+                "DELETE FROM ask_session_context WHERE session_id = ?1",
+                params![session_id.to_string()],
+            )
+            .map_err(|error| storage_error("ASK_CONTEXT_WRITE_FAILED", error, true))?;
+        Ok(())
+    }
+
+    // ---- Document Profile（document_profiles 扩展列读写）----
+
+    /// 读取文档画像；无画像返回 None。
+    /// DocumentProfile 生产链：为「已解析 + 当前 revision 全量嵌入完成」的
+    /// 文件构建/重建文档画像。
+    ///
+    /// 画像内容（纯确定性逻辑，无 LLM）：
+    /// - title = files.display_name；
+    /// - section_titles = 从 document_nodes.heading_path_json 提取的叶子标题；
+    /// - summary = 首个代表性 chunk 的压缩文本；
+    /// - 代表性文本 = title + section_titles + head/mid/tail chunk，取其
+    ///   sha256 作为 representative_text_hash；
+    /// - 文档级向量 = 文件前 3 个 chunk 嵌入的均值（与集合建议口径一致）。
+    ///
+    /// 生命周期：画像绑定构建时的 revision_id；stale 画像（revision 不匹配）
+    /// 在 list_document_profiles 检索侧被过滤，绝不用于定位新 revision。
+    /// 单文件构建失败只跳过该文件（skipped_files+1），不影响其他文件；
+    /// 构建链错误只降级 Document Resolver 的定位能力。
+    pub fn refresh_document_profiles(
+        &self,
+        model_artifact_id: &str,
+        max_files: u32,
+    ) -> Result<ProfileRefreshResult, AppError> {
+        if max_files == 0 || max_files > 2000 {
+            return Err(AppError::new(
+                "PROFILE_REFRESH_INVALID",
+                "画像构建需要有效的 Embedding 模型，且单批文件数必须在 1 到 2000 之间",
+                false,
+            ));
+        }
+        const PROFILE_ALGORITHM_VERSION: &str = "profile_base_v1";
+        let connection = self.connect()?;
+        // 候选：parse 完成 + availability=present + 画像缺失/过期（revision 或
+        // Embedding 模型变化、无章节标题、无代表性文本哈希）+ 当前 revision
+        // 的 chunk 已**全量**嵌入（部分嵌入不建画像，等待嵌入收敛后再构建）。
+        // 与 refresh_collection_suggestions 共用「画像缺失或过期」语义，但
+        // 不依赖 algorithm_version（集合聚类的算法标签与本链无关）。
+        let targets_sql = format!(
+            "WITH targets AS MATERIALIZED (
+                SELECT f.file_id, f.current_revision_id, f.display_name
+                FROM files f
+                LEFT JOIN document_profiles p ON p.file_id = f.file_id
+                WHERE f.current_revision_id IS NOT NULL
+                  AND f.parse_status = 'parsed'
+                  AND f.availability = 'present'
+                  AND {AUTHORIZED_FILE_SQL}
+                  AND EXISTS (SELECT 1 FROM chunk_embeddings ce
+                              WHERE ce.file_id = f.file_id AND ce.revision_id = f.current_revision_id
+                                AND ce.model_artifact_id = ?1)
+                  AND NOT EXISTS (
+                        SELECT 1 FROM chunks c2
+                        WHERE c2.file_id = f.file_id AND c2.revision_id = f.current_revision_id
+                          AND NOT EXISTS (
+                                SELECT 1 FROM chunk_embeddings ce2
+                                WHERE ce2.chunk_id = c2.chunk_id AND ce2.model_artifact_id = ?1))
+                  AND (p.file_id IS NULL OR p.revision_id <> f.current_revision_id
+                       OR p.embedding_model_id <> ?1 OR p.section_titles_json = '[]'
+                       OR p.representative_text_hash IS NULL)
+                ORDER BY f.last_seen_at DESC LIMIT ?2
+            ) SELECT t.file_id, t.current_revision_id, t.display_name FROM targets t"
+        );
+        let targets = {
+            let mut statement = connection
+                .prepare(&targets_sql)
+                .map_err(|error| storage_error("PROFILE_REFRESH_QUERY_FAILED", error, true))?;
+            statement
+                .query_map(
+                    params![model_artifact_id, i64::from(max_files)],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .map_err(|error| storage_error("PROFILE_REFRESH_QUERY_FAILED", error, true))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| storage_error("PROFILE_REFRESH_QUERY_FAILED", error, true))?
+        };
+        // 代表性 chunk：头（rn=1）/ 中（rn=ceil(total/2)）/ 尾（rn=total），
+        // 一条窗口查询取回，不整表读入。
+        const REPRESENTATIVE_CHUNKS_SQL: &str =
+            "SELECT text FROM (SELECT c.text, ROW_NUMBER() OVER (ORDER BY c.ordinal) AS rn, \
+             COUNT(*) OVER () AS total FROM chunks c WHERE c.file_id = ?1 AND c.revision_id = ?2) \
+             WHERE rn = 1 OR rn = total OR rn = (total + 1) / 2";
+        // 章节标题：全部节点的 heading_path_json（确定性提取在 profile_builder）。
+        const SECTION_TITLES_SQL: &str =
+            "SELECT heading_path_json FROM document_nodes dn WHERE dn.revision_id = ?1 ORDER BY dn.ordinal";
+        let mut vector_cache = HashMap::<Uuid, Vec<f32>>::new();
+        let mut records: Vec<(String, String, String, String, String, u32, Vec<u8>, String, String, String)> = Vec::new();
+        let mut skipped_files: u64 = 0;
+        for (file_id, revision_id, title) in targets {
+            let file_id = match Uuid::parse_str(&file_id) {
+                Ok(value) => value,
+                Err(_) => {
+                    skipped_files += 1;
+                    continue;
+                }
+            };
+            let chunks = {
+                let mut statement = connection
+                    .prepare(REPRESENTATIVE_CHUNKS_SQL)
+                    .map_err(|error| storage_error("PROFILE_REFRESH_QUERY_FAILED", error, true))?;
+                let rows = statement
+                    .query_map(
+                        params![file_id.to_string(), revision_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(|error| storage_error("PROFILE_REFRESH_QUERY_FAILED", error, true))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| storage_error("PROFILE_REFRESH_QUERY_FAILED", error, true))?;
+                rows
+            };
+            let (head, mid, tail) = pick_head_mid_tail(&chunks);
+            let section_titles = {
+                let mut statement = connection
+                    .prepare(SECTION_TITLES_SQL)
+                    .map_err(|error| storage_error("PROFILE_REFRESH_QUERY_FAILED", error, true))?;
+                let rows = statement
+                    .query_map(params![revision_id], |row| row.get::<_, String>(0))
+                    .map_err(|error| storage_error("PROFILE_REFRESH_QUERY_FAILED", error, true))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| storage_error("PROFILE_REFRESH_QUERY_FAILED", error, true))?;
+                extract_section_titles(rows.iter().enumerate().map(|(index, json)| {
+                    (index as u64, json.as_str())
+                }))
+            };
+            // 文档级向量缺失 → 跳过（本次不建画像，等嵌入收敛后下轮重建）。
+            let Some(vector) = file_vector_for(
+                &connection,
+                Some(model_artifact_id),
+                file_id,
+                &mut vector_cache,
+            )? else {
+                skipped_files += 1;
+                continue;
+            };
+            let representative = build_representative_text(&title, &section_titles, &head, &mid, &tail);
+            let summary = compact_profile_text(&head, 260);
+            let keywords = profile_keywords(&title);
+            records.push((
+                file_id.to_string(),
+                revision_id,
+                title,
+                summary,
+                serde_json::to_string(&keywords).unwrap_or_else(|_| "[]".into()),
+                vector.len() as u32,
+                encode_vector(&vector),
+                semantic_bucket(&vector),
+                serde_json::to_string(&section_titles).unwrap_or_else(|_| "[]".into()),
+                representative_text_hash(&representative),
+            ));
+        }
+        drop(connection);
+        let mut profiled_files = 0_u64;
+        for batch in records.chunks(100) {
+            let _permit = self.acquire_write(WritePriority::Background);
+            let mut connection = self.connect()?;
+            let transaction = connection.transaction().map_err(|error| {
+                storage_error("PROFILE_REFRESH_WRITE_FAILED", error, true)
+            })?;
+            for (file_id, revision_id, title, summary, keywords, dimension, vector, bucket, section_titles, hash) in
+                batch
+            {
+                let now = Utc::now().to_rfc3339();
+                // 只更新基础列 + 章节/哈希列；document_type/type_confidence 归
+                // 分类器所有（Step 2），本链绝不覆写。但 revision 变化时分类器
+                // 结果属于旧内容，必须清空等待重新分类（旧类型绝不带到新版本）。
+                transaction
+                    .execute(
+                        "INSERT INTO document_profiles (file_id, revision_id, title, summary, keywords_json, entities_json, embedding_model_id, dimension, vector_blob, candidate_bucket, algorithm_version, section_titles_json, representative_text_hash, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, '[]', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13) ON CONFLICT(file_id) DO UPDATE SET revision_id = excluded.revision_id, title = excluded.title, summary = excluded.summary, keywords_json = excluded.keywords_json, entities_json = excluded.entities_json, embedding_model_id = excluded.embedding_model_id, dimension = excluded.dimension, vector_blob = excluded.vector_blob, candidate_bucket = excluded.candidate_bucket, algorithm_version = excluded.algorithm_version, section_titles_json = excluded.section_titles_json, representative_text_hash = excluded.representative_text_hash, document_type = CASE WHEN document_profiles.revision_id <> excluded.revision_id THEN NULL ELSE document_profiles.document_type END, type_confidence = CASE WHEN document_profiles.revision_id <> excluded.revision_id THEN NULL ELSE document_profiles.type_confidence END, updated_at = excluded.updated_at",
+                        params![
+                            file_id,
+                            revision_id,
+                            title,
+                            summary,
+                            keywords,
+                            model_artifact_id,
+                            dimension,
+                            vector,
+                            bucket,
+                            PROFILE_ALGORITHM_VERSION,
+                            section_titles,
+                            hash,
+                            now,
+                        ],
+                    )
+                    .map_err(|error| storage_error("PROFILE_REFRESH_WRITE_FAILED", error, true))?;
+                profiled_files = profiled_files.saturating_add(1);
+            }
+            transaction.commit().map_err(|error| {
+                storage_error("PROFILE_REFRESH_WRITE_FAILED", error, true)
+            })?;
+        }
+        Ok(ProfileRefreshResult {
+            profiled_files,
+            skipped_files,
+        })
+    }
+
+    /// 强制重建文档画像（单文件或全部）。**不重新生成 Chunk Embedding**——
+    /// 画像构建仍要求当前 revision 的 chunk 已全量嵌入（部分嵌入的文件跳过）。
+    ///
+    /// 实现：先删除目标画像行（沿用 revision 变更语义：document_type /
+    /// type_confidence 一并清空，旧分类结果绝不带到重建结果），再走常规
+    /// refresh 路径重建；全部模式按批循环直到没有缺失画像（不可建文件
+    /// 永远不入选 targets，不会死循环）。
+    pub fn rebuild_document_profiles(
+        &self,
+        model_artifact_id: &str,
+        file_ids: Option<&[Uuid]>,
+    ) -> Result<ProfileRefreshResult, AppError> {
+        let _permit = self.acquire_write(WritePriority::Background);
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| storage_error("PROFILE_REBUILD_WRITE_FAILED", error, true))?;
+        match file_ids {
+            Some(ids) => {
+                for file_id in ids {
+                    transaction
+                        .execute(
+                            "DELETE FROM document_profiles WHERE file_id = ?1",
+                            params![file_id.to_string()],
+                        )
+                        .map_err(|error| {
+                            storage_error("PROFILE_REBUILD_WRITE_FAILED", error, true)
+                        })?;
+                }
+            }
+            None => {
+                transaction
+                    .execute("DELETE FROM document_profiles", [])
+                    .map_err(|error| storage_error("PROFILE_REBUILD_WRITE_FAILED", error, true))?;
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| storage_error("PROFILE_REBUILD_WRITE_FAILED", error, true))?;
+        drop(connection);
+        let mut profiled_files = 0_u64;
+        let mut skipped_files = 0_u64;
+        let mut batch = self.refresh_document_profiles(model_artifact_id, 2000)?;
+        profiled_files = profiled_files.saturating_add(batch.profiled_files);
+        skipped_files = skipped_files.saturating_add(batch.skipped_files);
+        if file_ids.is_none() {
+            while batch.profiled_files > 0 {
+                batch = self.refresh_document_profiles(model_artifact_id, 2000)?;
+                profiled_files = profiled_files.saturating_add(batch.profiled_files);
+                skipped_files = skipped_files.saturating_add(batch.skipped_files);
+            }
+        }
+        Ok(ProfileRefreshResult {
+            profiled_files,
+            skipped_files,
+        })
+    }
+
+    pub fn get_document_profile(&self, file_id: Uuid) -> Result<Option<DocumentProfile>, AppError> {
+        let connection = self.connect()?;
+        let row = connection
+            .query_row(
+                "SELECT p.file_id, p.revision_id, p.title, p.summary, p.keywords_json, \
+                        p.entities_json, p.document_type, p.type_confidence, \
+                        p.section_titles_json, p.representative_text_hash, p.updated_at \
+                 FROM document_profiles p WHERE p.file_id = ?1",
+                params![file_id.to_string()],
+                map_profile_row,
+            );
+        match row {
+            Ok((raw, _)) => Ok(Some(parse_profile_row(raw)?)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(storage_error("DOCUMENT_PROFILE_READ_FAILED", error, true)),
+        }
+    }
+
+    /// 写入画像的分类器扩展列（document_type/type_confidence/section_titles/
+    /// representative_text_hash）。只更新扩展列，不动 organizing.rs 拥有的
+    /// 其余列；画像行尚不存在时返回 Ok(false)（分类器在画像就绪后运行）。
+    pub fn update_document_profile_classifier(
+        &self,
+        profile: &DocumentProfile,
+    ) -> Result<bool, AppError> {
+        let connection = self.connect()?;
+        let section_titles_json = serde_json::to_string(&profile.section_titles)
+            .map_err(|error| AppError::new("DOCUMENT_PROFILE_INVALID", error.to_string(), false))?;
+        let changed = connection
+            .execute(
+                "UPDATE document_profiles SET \
+                    document_type = ?2, \
+                    type_confidence = ?3, \
+                    section_titles_json = ?4, \
+                    representative_text_hash = ?5, \
+                    updated_at = ?6 \
+                 WHERE file_id = ?1",
+                params![
+                    profile.file_id.to_string(),
+                    profile.document_type.map(|value| value.as_str()),
+                    profile.type_confidence.map(f64::from),
+                    section_titles_json,
+                    profile.representative_text_hash,
+                    profile.updated_at.to_rfc3339(),
+                ],
+            )
+            .map_err(|error| storage_error("DOCUMENT_PROFILE_WRITE_FAILED", error, true))?;
+        Ok(changed > 0)
+    }
+
+    /// 列出文档画像（可按文档类型过滤），返回 (画像, 文件名)。
+    /// 供 Document Resolver 定位目标文件；limit 保护画像库过大。
+    ///
+    /// 生命周期失效（Step 1）：只返回 `revision_id = f.current_revision_id`
+    /// 的**当前**画像——stale 画像（文件更新后尚未重建）绝不参与定位，
+    /// 避免把「旧版本的简历」解析成用户现在指的「简历」。
+    /// 当前修订的 document_nodes 总数（SUMMARY 节点上限截断的 trace 用；
+    /// 计数当前修订，文件不存在/未解析 → 0）。
+    pub fn file_document_node_count(&self, file_id: &Uuid) -> Result<u64, AppError> {
+        let connection = self.connect()?;
+        let count: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM document_nodes n \
+                 JOIN files f ON f.file_id = ?1 AND n.revision_id = f.current_revision_id",
+                params![file_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| storage_error("DOCUMENT_NODE_COUNT_FAILED", error, true))?;
+        Ok(count)
+    }
+
+    pub fn list_document_profiles(
+        &self,
+        document_type: Option<DocumentType>,
+        limit: u32,
+    ) -> Result<Vec<(DocumentProfile, String)>, AppError> {
+        let connection = self.connect()?;
+        let type_clause = if document_type.is_some() {
+            "AND p.document_type = ?2"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT p.file_id, p.revision_id, p.title, p.summary, p.keywords_json, \
+                    p.entities_json, p.document_type, p.type_confidence, \
+                    p.section_titles_json, p.representative_text_hash, p.updated_at, f.name \
+             FROM document_profiles p JOIN files f ON f.file_id = p.file_id \
+             WHERE f.availability = 'present' AND p.revision_id = f.current_revision_id {type_clause} \
+             ORDER BY p.updated_at DESC LIMIT ?1"
+        );
+        let mut statement = connection
+            .prepare(&sql)
+            .map_err(|error| storage_error("DOCUMENT_PROFILE_LIST_FAILED", error, true))?;
+        let mut rows = if let Some(document_type) = document_type {
+            statement
+                .query_map(params![limit as i64, document_type.as_str()], map_profile_row)
+                .map_err(|error| storage_error("DOCUMENT_PROFILE_LIST_FAILED", error, true))?
+        } else {
+            statement
+                .query_map(params![limit as i64], map_profile_row)
+                .map_err(|error| storage_error("DOCUMENT_PROFILE_LIST_FAILED", error, true))?
+        };
+        let mut profiles = Vec::new();
+        for row in rows.by_ref() {
+            let (raw, name) = row
+                .map_err(|error| storage_error("DOCUMENT_PROFILE_LIST_FAILED", error, true))?;
+            // 单行损坏跳过（定位是 best-effort，不因一行坏画像拖垮整次解析）
+            if let Ok(profile) = parse_profile_row(raw) {
+                profiles.push((profile, name.unwrap_or_default()));
+            }
+        }
+        drop(rows);
+        Ok(profiles)
+    }
+
+    /// 列出待分类画像：`document_type IS NULL` 且当前（revision 匹配、文件在场）。
+    /// 分类器（Step 2）在画像就绪后扫描这些行；revision 变更时画像的
+    /// document_type 已被重建链清空，因此这里的行即「新内容尚未分类」。
+    /// 按 updated_at DESC：最后更新的画像优先（用户最可能马上问到）。
+    pub fn list_profiles_needing_classification(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<(DocumentProfile, String)>, AppError> {
+        let connection = self.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT p.file_id, p.revision_id, p.title, p.summary, p.keywords_json, \
+                        p.entities_json, p.document_type, p.type_confidence, \
+                        p.section_titles_json, p.representative_text_hash, p.updated_at, f.name \
+                 FROM document_profiles p JOIN files f ON f.file_id = p.file_id \
+                 WHERE f.availability = 'present' AND p.revision_id = f.current_revision_id \
+                   AND p.document_type IS NULL \
+                 ORDER BY p.updated_at DESC LIMIT ?1",
+            )
+            .map_err(|error| storage_error("DOCUMENT_PROFILE_LIST_FAILED", error, true))?;
+        let mut rows = statement
+            .query_map(params![limit as i64], map_profile_row)
+            .map_err(|error| storage_error("DOCUMENT_PROFILE_LIST_FAILED", error, true))?;
+        let mut profiles = Vec::new();
+        for row in rows.by_ref() {
+            let (raw, name) = row
+                .map_err(|error| storage_error("DOCUMENT_PROFILE_LIST_FAILED", error, true))?;
+            // 单行损坏跳过（分类是 best-effort，不因一行坏画像拖垮整批）
+            if let Ok(profile) = parse_profile_row(raw) {
+                profiles.push((profile, name.unwrap_or_default()));
+            }
+        }
+        drop(rows);
+        Ok(profiles)
+    }
+
+    /// 读取画像已存的文档级向量（分类器与原型向量比对用）。
+    /// 画像存在但向量缺失/损坏时返回 None——分类退化为纯规则路径，不阻塞。
+    pub fn profile_vector(&self, file_id: &Uuid) -> Result<Option<Vec<f32>>, AppError> {
+        let connection = self.connect()?;
+        let row = connection
+            .query_row(
+                "SELECT vector_blob, dimension FROM document_profiles WHERE file_id = ?1",
+                params![file_id.to_string()],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, u32>(1)?)),
+            );
+        match row {
+            Ok((blob, dimension)) => {
+                Ok(decode_vector(&blob, dimension).ok().filter(|vector| !vector.is_empty()))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(storage_error("DOCUMENT_PROFILE_READ_FAILED", error, true)),
+        }
+    }
+
+    /// 批量读取画像向量（文档级召回：metadata 预筛后只取候选集的向量，
+    /// 避免对全库逐文件查一次库）。缺失/损坏的向量静默跳过——召回是
+    /// 增益层，不因单条坏向量拖垮整批。
+    pub fn profile_vectors(
+        &self,
+        file_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<f32>>, AppError> {
+        let mut vectors = std::collections::HashMap::new();
+        if file_ids.is_empty() {
+            return Ok(vectors);
+        }
+        let placeholders = std::iter::repeat("?")
+            .take(file_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let connection = self.connect()?;
+        let sql = format!(
+            "SELECT file_id, vector_blob, dimension FROM document_profiles \
+             WHERE file_id IN ({placeholders})"
+        );
+        let mut statement = connection
+            .prepare(&sql)
+            .map_err(|error| storage_error("DOCUMENT_PROFILE_VECTORS_FAILED", error, true))?;
+        let params: Vec<String> = file_ids.iter().map(|id| id.to_string()).collect();
+        let mut rows = statement
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, u32>(2)?))
+            })
+            .map_err(|error| storage_error("DOCUMENT_PROFILE_VECTORS_FAILED", error, true))?;
+        for row in rows.by_ref() {
+            match row {
+                Ok((file_id, blob, dimension)) => {
+                    if let Ok(id) = uuid::Uuid::parse_str(&file_id)
+                        && let Ok(vector) = decode_vector(&blob, dimension)
+                        && !vector.is_empty()
+                    {
+                        vectors.insert(id, vector);
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        drop(rows);
+        Ok(vectors)
+    }
+
+    // ============================== Memory 数据层（Step 3） ==============================
+    //
+    // Memory 不是第二份知识库：只存「用户 ↔ 实体 ↔ 文件」的关系、别名和稳定
+    // 信息，帮助理解和定位。不复制 Chunk 正文，绝不能作为最终事实证据。
+    // 合并规则：同一三元组/别名重复写入时，低信任来源不能覆盖高信任来源
+    // （rank 见 MemorySource）；推断类来源只允许 candidate。
+
+    /// 插入或取回实体（按 (entity_type, canonical_name) 去重）。
+    pub fn upsert_memory_entity(
+        &self,
+        entity_type: &str,
+        canonical_name: &str,
+        metadata_json: &serde_json::Value,
+    ) -> Result<Uuid, AppError> {
+        let connection = self.connect()?;
+        let now = Utc::now().to_rfc3339();
+        connection
+            .execute(
+                "INSERT INTO memory_entities (entity_id, entity_type, canonical_name, metadata_json, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5) ON CONFLICT(entity_type, canonical_name) DO NOTHING",
+                params![Uuid::now_v7().to_string(), entity_type, canonical_name, metadata_json.to_string(), now],
+            )
+            .map_err(|error| storage_error("MEMORY_ENTITY_WRITE_FAILED", error, true))?;
+        let entity_id: String = connection
+            .query_row(
+                "SELECT entity_id FROM memory_entities WHERE entity_type = ?1 AND canonical_name = ?2",
+                params![entity_type, canonical_name],
+                |row| row.get(0),
+            )
+            .map_err(|error| storage_error("MEMORY_ENTITY_READ_FAILED", error, true))?;
+        Uuid::parse_str(&entity_id).map_err(|error| {
+            AppError::new("MEMORY_ENTITY_INVALID", error.to_string(), false)
+        })
+    }
+
+    pub fn memory_entity_by_id(&self, entity_id: Uuid) -> Result<Option<MemoryEntity>, AppError> {
+        let connection = self.connect()?;
+        let row = connection
+            .query_row(
+                "SELECT entity_id, entity_type, canonical_name, metadata_json, created_at, updated_at FROM memory_entities WHERE entity_id = ?1",
+                params![entity_id.to_string()],
+                map_memory_entity_row,
+            );
+        match row {
+            Ok(entity) => Ok(Some(entity)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(storage_error("MEMORY_ENTITY_READ_FAILED", error, true)),
+        }
+    }
+
+    pub fn memory_entity_by_name(
+        &self,
+        entity_type: &str,
+        canonical_name: &str,
+    ) -> Result<Option<MemoryEntity>, AppError> {
+        let connection = self.connect()?;
+        let row = connection
+            .query_row(
+                "SELECT entity_id, entity_type, canonical_name, metadata_json, created_at, updated_at FROM memory_entities WHERE entity_type = ?1 AND canonical_name = ?2",
+                params![entity_type, canonical_name],
+                map_memory_entity_row,
+            );
+        match row {
+            Ok(entity) => Ok(Some(entity)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(storage_error("MEMORY_ENTITY_READ_FAILED", error, true)),
+        }
+    }
+
+    pub fn list_memory_entities(&self, limit: u32) -> Result<Vec<MemoryEntity>, AppError> {
+        let connection = self.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT entity_id, entity_type, canonical_name, metadata_json, created_at, updated_at FROM memory_entities ORDER BY updated_at DESC LIMIT ?1",
+            )
+            .map_err(|error| storage_error("MEMORY_ENTITY_READ_FAILED", error, true))?;
+        let rows = statement
+            .query_map(params![limit as i64], map_memory_entity_row)
+            .map_err(|error| storage_error("MEMORY_ENTITY_READ_FAILED", error, true))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| storage_error("MEMORY_ENTITY_READ_FAILED", error, true))?;
+        drop(statement);
+        Ok(rows)
+    }
+
+    /// 修改实体（名称/类型变更时迁移同实体关系？不：名称变更会破坏别名/关系
+    /// 的语义绑定，因此只允许修改元数据与规范化展示名，关系仍按 entity_id 指向）。
+    pub fn update_memory_entity(
+        &self,
+        entity_id: Uuid,
+        canonical_name: &str,
+        metadata_json: &serde_json::Value,
+    ) -> Result<bool, AppError> {
+        let connection = self.connect()?;
+        let changed = connection
+            .execute(
+                "UPDATE memory_entities SET canonical_name = ?2, metadata_json = ?3, updated_at = ?4 WHERE entity_id = ?1",
+                params![entity_id.to_string(), canonical_name, metadata_json.to_string(), Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| storage_error("MEMORY_ENTITY_WRITE_FAILED", error, true))?;
+        Ok(changed > 0)
+    }
+
+    /// 删除实体，并级联清理引用它的关系（subject/object）与别名（target）。
+    pub fn delete_memory_entity(&self, entity_id: Uuid) -> Result<bool, AppError> {
+        let connection = self.connect()?;
+        let _permit = self.acquire_write(WritePriority::Background);
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(|error| storage_error("MEMORY_ENTITY_DELETE_FAILED", error, true))?;
+        transaction
+            .execute(
+                "DELETE FROM memory_relations WHERE (subject_type = 'entity' AND subject_id = ?1) OR (object_type = 'entity' AND object_id = ?1)",
+                params![entity_id.to_string()],
+            )
+            .map_err(|error| storage_error("MEMORY_ENTITY_DELETE_FAILED", error, true))?;
+        transaction
+            .execute(
+                "DELETE FROM memory_aliases WHERE target_type = 'entity' AND target_id = ?1",
+                params![entity_id.to_string()],
+            )
+            .map_err(|error| storage_error("MEMORY_ENTITY_DELETE_FAILED", error, true))?;
+        let changed = transaction
+            .execute(
+                "DELETE FROM memory_entities WHERE entity_id = ?1",
+                params![entity_id.to_string()],
+            )
+            .map_err(|error| storage_error("MEMORY_ENTITY_DELETE_FAILED", error, true))?;
+        transaction
+            .commit()
+            .map_err(|error| storage_error("MEMORY_ENTITY_DELETE_FAILED", error, true))?;
+        Ok(changed > 0)
+    }
+
+    /// 写入（或按来源等级合并）一条关系。
+    ///
+    /// 合并规则（确定性）：
+    /// - 新三元组 → 插入，status 按输入（推断类来源强制降为 candidate）；
+    /// - 已存在：输入来源等级 >= 现有等级 → 覆盖 status/confidence/source；
+    ///   等级更低 → 原样保留（低信任不能覆盖高信任事实，也不能复活 stale/rejected）。
+    pub fn upsert_memory_relation(&self, input: &MemoryWriteInput) -> Result<Uuid, AppError> {
+        let connection = self.connect()?;
+        let now = Utc::now().to_rfc3339();
+        let existing: Option<(String, MemorySource, MemoryStatus)> = connection
+            .query_row(
+                "SELECT relation_id, source_type, status FROM memory_relations WHERE subject_type = ?1 AND subject_id = ?2 AND predicate = ?3 AND object_type = ?4 AND object_id = ?5",
+                params![
+                    input.subject_type.as_storage(),
+                    input.subject_id.to_string(),
+                    input.predicate,
+                    input.object_type.as_storage(),
+                    input.object_id.to_string(),
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        MemorySource::parse_storage(&row.get::<_, String>(1)?),
+                        MemoryStatus::parse_storage(&row.get::<_, String>(2)?),
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| storage_error("MEMORY_RELATION_READ_FAILED", error, true))?;
+        let existing_rank = existing
+            .as_ref()
+            .map(|(_, source, _)| source.rank())
+            .unwrap_or(0);
+        let status = if input.status == MemoryStatus::Confirmed && !input.source_type.allows_confirmed() {
+            MemoryStatus::Candidate
+        } else {
+            input.status
+        };
+        if let Some((relation_id, _, _)) = existing {
+            if input.source_type.rank() >= existing_rank {
+                connection
+                    .execute(
+                        "UPDATE memory_relations SET confidence = ?2, status = ?3, source_type = ?4, source_id = ?5, updated_at = ?6 WHERE relation_id = ?1",
+                        params![
+                            relation_id,
+                            f64::from(input.confidence.clamp(0.0, 1.0)),
+                            status.as_storage(),
+                            input.source_type.as_storage(),
+                            input.source_id,
+                            now,
+                        ],
+                    )
+                    .map_err(|error| storage_error("MEMORY_RELATION_WRITE_FAILED", error, true))?;
+            }
+            return Uuid::parse_str(&relation_id)
+                .map_err(|error| AppError::new("MEMORY_RELATION_INVALID", error.to_string(), false));
+        }
+        let relation_id = Uuid::now_v7();
+        connection
+            .execute(
+                "INSERT INTO memory_relations (relation_id, subject_type, subject_id, predicate, object_type, object_id, confidence, status, source_type, source_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+                params![
+                    relation_id.to_string(),
+                    input.subject_type.as_storage(),
+                    input.subject_id.to_string(),
+                    input.predicate,
+                    input.object_type.as_storage(),
+                    input.object_id.to_string(),
+                    f64::from(input.confidence.clamp(0.0, 1.0)),
+                    status.as_storage(),
+                    input.source_type.as_storage(),
+                    input.source_id,
+                    now,
+                ],
+            )
+            .map_err(|error| storage_error("MEMORY_RELATION_WRITE_FAILED", error, true))?;
+        Ok(relation_id)
+    }
+
+    pub fn memory_relation_by_id(
+        &self,
+        relation_id: Uuid,
+    ) -> Result<Option<MemoryRelation>, AppError> {
+        let connection = self.connect()?;
+        let row = connection
+            .query_row(
+                "SELECT relation_id, subject_type, subject_id, predicate, object_type, object_id, confidence, status, source_type, source_id, created_at, updated_at FROM memory_relations WHERE relation_id = ?1",
+                params![relation_id.to_string()],
+                map_memory_relation_row,
+            );
+        match row {
+            Ok(relation) => Ok(Some(relation)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(storage_error("MEMORY_RELATION_READ_FAILED", error, true)),
+        }
+    }
+
+    /// 更新关系状态（确认候选 / 拒绝 / 标记失效），返回是否真的变了。
+    pub fn update_memory_relation_status(
+        &self,
+        relation_id: Uuid,
+        status: MemoryStatus,
+    ) -> Result<bool, AppError> {
+        let connection = self.connect()?;
+        let changed = connection
+            .execute(
+                "UPDATE memory_relations SET status = ?2, updated_at = ?3 WHERE relation_id = ?1",
+                params![relation_id.to_string(), status.as_storage(), Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| storage_error("MEMORY_RELATION_WRITE_FAILED", error, true))?;
+        Ok(changed > 0)
+    }
+
+    /// 按主体列出关系（可过滤状态）；limit 保护关系库过大。
+    pub fn list_memory_relations_by_subject(
+        &self,
+        subject_type: MemoryTargetType,
+        subject_id: Uuid,
+        status: Option<MemoryStatus>,
+        limit: u32,
+    ) -> Result<Vec<MemoryRelation>, AppError> {
+        self.list_memory_relations(
+            "subject_type = ?1 AND subject_id = ?2",
+            vec![
+                SqlValue::Text(subject_type.as_storage().to_owned()),
+                SqlValue::Text(subject_id.to_string()),
+            ],
+            status,
+            limit,
+        )
+    }
+
+    /// 按客体列出关系（反向查找：「这个文件关联了谁」）。
+    pub fn list_memory_relations_by_object(
+        &self,
+        object_type: MemoryTargetType,
+        object_id: Uuid,
+        status: Option<MemoryStatus>,
+        limit: u32,
+    ) -> Result<Vec<MemoryRelation>, AppError> {
+        self.list_memory_relations(
+            "object_type = ?1 AND object_id = ?2",
+            vec![
+                SqlValue::Text(object_type.as_storage().to_owned()),
+                SqlValue::Text(object_id.to_string()),
+            ],
+            status,
+            limit,
+        )
+    }
+
+    /// 列出全部候选关系（Memory Writer 确定性与校验用）。
+    pub fn list_memory_relation_candidates(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<MemoryRelation>, AppError> {
+        self.list_memory_relations("status = 'candidate'", Vec::new(), None, limit)
+    }
+
+    pub fn list_memory_relations(
+        &self,
+        where_conditions: &str,
+        mut params: Vec<SqlValue>,
+        status: Option<MemoryStatus>,
+        limit: u32,
+    ) -> Result<Vec<MemoryRelation>, AppError> {
+        let connection = self.connect()?;
+        let status_clause = if status.is_some() { " AND status = ?3" } else { "" };
+        if let Some(status) = status {
+            params.push(SqlValue::Text(status.as_storage().to_owned()));
+        }
+        let sql = format!(
+            "SELECT relation_id, subject_type, subject_id, predicate, object_type, object_id, confidence, status, source_type, source_id, created_at, updated_at FROM memory_relations WHERE {where_conditions}{status_clause} ORDER BY updated_at DESC LIMIT ?{}",
+            params.len() + 1
+        );
+        params.push(SqlValue::Integer(limit as i64));
+        let mut statement = connection
+            .prepare(&sql)
+            .map_err(|error| storage_error("MEMORY_RELATION_READ_FAILED", error, true))?;
+        let rows = statement
+            .query_map(params_from_iter(params), map_memory_relation_row)
+            .map_err(|error| storage_error("MEMORY_RELATION_READ_FAILED", error, true))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| storage_error("MEMORY_RELATION_READ_FAILED", error, true))?;
+        drop(statement);
+        Ok(rows)
+    }
+
+    /// 删除关系。
+    pub fn delete_memory_relation(&self, relation_id: Uuid) -> Result<bool, AppError> {
+        let connection = self.connect()?;
+        let changed = connection
+            .execute(
+                "DELETE FROM memory_relations WHERE relation_id = ?1",
+                params![relation_id.to_string()],
+            )
+            .map_err(|error| storage_error("MEMORY_RELATION_DELETE_FAILED", error, true))?;
+        Ok(changed > 0)
+    }
+
+    /// 写入（或按来源等级合并）一条别名。别名必须规范化后非空。
+    pub fn upsert_memory_alias(&self, input: &MemoryWriteInput) -> Result<Uuid, AppError> {
+        let alias = input.alias.as_deref().and_then(normalize_alias).ok_or_else(|| {
+            AppError::new("MEMORY_ALIAS_INVALID", "别名不能为空", false)
+        })?;
+        let connection = self.connect()?;
+        let now = Utc::now().to_rfc3339();
+        let existing: Option<(String, MemorySource)> = connection
+            .query_row(
+                "SELECT alias_id, source_type FROM memory_aliases WHERE alias = ?1 AND target_type = ?2 AND target_id = ?3",
+                params![alias, input.subject_type.as_storage(), input.subject_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        MemorySource::parse_storage(&row.get::<_, String>(1)?),
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| storage_error("MEMORY_ALIAS_READ_FAILED", error, true))?;
+        if let Some((alias_id, existing_source)) = existing {
+            if input.source_type.rank() >= existing_source.rank() {
+                connection
+                    .execute(
+                        "UPDATE memory_aliases SET confidence = ?2, source_type = ?3, source_id = ?4, updated_at = ?5 WHERE alias_id = ?1",
+                        params![
+                            alias_id,
+                            f64::from(input.confidence.clamp(0.0, 1.0)),
+                            input.source_type.as_storage(),
+                            input.source_id,
+                            now,
+                        ],
+                    )
+                    .map_err(|error| storage_error("MEMORY_ALIAS_WRITE_FAILED", error, true))?;
+            }
+            return Uuid::parse_str(&alias_id)
+                .map_err(|error| AppError::new("MEMORY_ALIAS_INVALID", error.to_string(), false));
+        }
+        let alias_id = Uuid::now_v7();
+        connection
+            .execute(
+                "INSERT INTO memory_aliases (alias_id, alias, target_type, target_id, confidence, source_type, source_id, hit_count, last_used_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, ?8, ?8)",
+                params![
+                    alias_id.to_string(),
+                    alias,
+                    input.subject_type.as_storage(),
+                    input.subject_id.to_string(),
+                    f64::from(input.confidence.clamp(0.0, 1.0)),
+                    input.source_type.as_storage(),
+                    input.source_id,
+                    now,
+                ],
+            )
+            .map_err(|error| storage_error("MEMORY_ALIAS_WRITE_FAILED", error, true))?;
+        Ok(alias_id)
+    }
+
+    /// 别名精确匹配（规范化后等值）。按置信度、使用次数排序返回全部候选，
+    /// 由调用方（Memory Resolver）决定是否足够明确。
+    pub fn find_memory_aliases(&self, alias: &str) -> Result<Vec<MemoryAlias>, AppError> {
+        let Some(alias) = normalize_alias(alias) else {
+            return Ok(Vec::new());
+        };
+        let connection = self.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT alias_id, alias, target_type, target_id, confidence, source_type, source_id, hit_count, last_used_at, created_at, updated_at FROM memory_aliases WHERE alias = ?1 ORDER BY confidence DESC, hit_count DESC, updated_at DESC LIMIT 20",
+            )
+            .map_err(|error| storage_error("MEMORY_ALIAS_READ_FAILED", error, true))?;
+        let rows = statement
+            .query_map(params![alias], map_memory_alias_row)
+            .map_err(|error| storage_error("MEMORY_ALIAS_READ_FAILED", error, true))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| storage_error("MEMORY_ALIAS_READ_FAILED", error, true))?;
+        drop(statement);
+        Ok(rows)
+    }
+
+    pub fn memory_alias_by_id(&self, alias_id: Uuid) -> Result<Option<MemoryAlias>, AppError> {
+        let connection = self.connect()?;
+        let row = connection
+            .query_row(
+                "SELECT alias_id, alias, target_type, target_id, confidence, source_type, source_id, hit_count, last_used_at, created_at, updated_at FROM memory_aliases WHERE alias_id = ?1",
+                params![alias_id.to_string()],
+                map_memory_alias_row,
+            );
+        match row {
+            Ok(alias) => Ok(Some(alias)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(storage_error("MEMORY_ALIAS_READ_FAILED", error, true)),
+        }
+    }
+
+    /// 别名被解析命中：hit_count + 1 并刷新 last_used_at（repeated_usage 升级依据）。
+    pub fn bump_memory_alias(&self, alias_id: Uuid) -> Result<bool, AppError> {
+        let connection = self.connect()?;
+        let changed = connection
+            .execute(
+                "UPDATE memory_aliases SET hit_count = hit_count + 1, last_used_at = ?2 WHERE alias_id = ?1",
+                params![alias_id.to_string(), Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| storage_error("MEMORY_ALIAS_WRITE_FAILED", error, true))?;
+        Ok(changed > 0)
+    }
+
+    pub fn list_memory_aliases(&self, limit: u32) -> Result<Vec<MemoryAlias>, AppError> {
+        let connection = self.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT alias_id, alias, target_type, target_id, confidence, source_type, source_id, hit_count, last_used_at, created_at, updated_at FROM memory_aliases ORDER BY updated_at DESC LIMIT ?1",
+            )
+            .map_err(|error| storage_error("MEMORY_ALIAS_READ_FAILED", error, true))?;
+        let rows = statement
+            .query_map(params![limit as i64], map_memory_alias_row)
+            .map_err(|error| storage_error("MEMORY_ALIAS_READ_FAILED", error, true))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| storage_error("MEMORY_ALIAS_READ_FAILED", error, true))?;
+        drop(statement);
+        Ok(rows)
+    }
+
+    /// 删除别名。
+    pub fn delete_memory_alias(&self, alias_id: Uuid) -> Result<bool, AppError> {
+        let connection = self.connect()?;
+        let changed = connection
+            .execute(
+                "DELETE FROM memory_aliases WHERE alias_id = ?1",
+                params![alias_id.to_string()],
+            )
+            .map_err(|error| storage_error("MEMORY_ALIAS_DELETE_FAILED", error, true))?;
+        Ok(changed > 0)
+    }
+
+    /// 清空全部记忆（aliases / relations / entities 三表）。
+    /// Phase 3 调试用：只影响 Memory 层，不动文件 / 索引 / Embedding / 会话。
+    pub fn clear_memory(&self) -> Result<u64, AppError> {
+        let _permit = self.acquire_write(WritePriority::Background);
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| storage_error("MEMORY_CLEAR_FAILED", error, true))?;
+        let mut deleted = 0_u64;
+        for table in ["memory_aliases", "memory_relations", "memory_entities"] {
+            deleted = deleted.saturating_add(
+                transaction
+                    .execute(&format!("DELETE FROM {table}"), [])
+                    .map_err(|error| storage_error("MEMORY_CLEAR_FAILED", error, true))?
+                    as u64,
+            );
+        }
+        transaction
+            .commit()
+            .map_err(|error| storage_error("MEMORY_CLEAR_FAILED", error, true))?;
+        Ok(deleted)
+    }
+
+    /// 文件被删除/失效（Step 16）：引用该文件的关系 → stale（不删除——
+    /// 用户以后可能重新添加同名文件并手动确认，stale 允许复活）；
+    /// 指向该文件的别名 → 删除（别名失去目标的解析只会造成误导）。
+    pub fn invalidate_memory_for_file(&self, file_id: Uuid) -> Result<u64, AppError> {
+        let connection = self.connect()?;
+        let stale = connection
+            .execute(
+                "UPDATE memory_relations SET status = 'stale', updated_at = ?2 WHERE (subject_type = 'file' AND subject_id = ?1) OR (object_type = 'file' AND object_id = ?1)",
+                params![file_id.to_string(), Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| storage_error("MEMORY_RELATION_WRITE_FAILED", error, true))?;
+        let deleted = connection
+            .execute(
+                "DELETE FROM memory_aliases WHERE target_type = 'file' AND target_id = ?1",
+                params![file_id.to_string()],
+            )
+            .map_err(|error| storage_error("MEMORY_ALIAS_DELETE_FAILED", error, true))?;
+        Ok(stale as u64 + deleted as u64)
+    }
+
+    /// Memory Resolver 合法性检查（Step 4）：目标文件必须真实存在、当前在场
+    /// 且位于授权根——与 Document Resolver 同口径。别名/关系解析出的 file_id
+    /// 绝不绕过这道检查：指向已删除/离线/越权文件的别名直接失效，不注入 scope。
+    pub fn memory_file_target_valid(&self, file_id: Uuid) -> Result<bool, AppError> {
+        let connection = self.connect()?;
+        let valid: bool = connection
+            .query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM files f WHERE f.file_id = ?1 AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL})"
+                ),
+                params![file_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| storage_error("MEMORY_TARGET_CHECK_FAILED", error, true))?;
+        Ok(valid)
+    }
+
+    /// Memory Resolver 合法性检查：收藏集必须真实存在。
+    pub fn memory_collection_target_valid(&self, collection_id: Uuid) -> Result<bool, AppError> {
+        let connection = self.connect()?;
+        let valid: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM collections c WHERE c.collection_id = ?1)",
+                params![collection_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| storage_error("MEMORY_TARGET_CHECK_FAILED", error, true))?;
+        Ok(valid)
+    }
+
     pub fn validate_answer_evidence(&self, answer: &AnswerResult) -> Result<(), AppError> {
         let connection = self.connect()?;
         for citation in answer.claims.iter().flat_map(|claim| &claim.citations) {
@@ -7194,6 +8428,69 @@ impl CatalogStore {
             ));
         }
         Ok(PathBuf::from(file.canonical_path))
+    }
+
+    /// DOCUMENT_SUMMARY 用：按文档顺序读取当前修订的全部 chunk
+    /// （含 chunk_id/node_id/text/locator，供分层摘要与逐节证据引用）。
+    /// 只返回授权 + present + 当前修订的 chunk；文件无当前修订时返回空。
+    pub fn file_chunks(&self, file_id: &Uuid) -> Result<Vec<crate::ContentChunk>, AppError> {
+        let connection = self.connect()?;
+        let file = authorized_file_by_id(&connection, file_id)?;
+        let Some(revision_id) = file.current_revision_id else {
+            return Ok(Vec::new());
+        };
+        let mut statement = connection
+            .prepare(
+                "SELECT chunk_id, revision_id, node_id, ordinal, text, normalized_text, \
+                        token_count, content_hash, language, locator_json, \
+                        embedding_model_id, embedding_status \
+                 FROM chunks WHERE file_id = ?1 AND revision_id = ?2 ORDER BY ordinal",
+            )
+            .map_err(|error| storage_error("FILE_CHUNKS_QUERY_FAILED", error, true))?;
+        let rows = statement
+            .query_map(
+                params![file_id.to_string(), revision_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, u64>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, String>(11)?,
+                    ))
+                },
+            )
+            .map_err(|error| storage_error("FILE_CHUNKS_QUERY_FAILED", error, true))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| storage_error("FILE_CHUNKS_QUERY_FAILED", error, true))?;
+        let mut chunks = Vec::with_capacity(rows.len());
+        for (chunk_id, revision_id, node_id, ordinal, text, normalized_text, token_count, content_hash, language, locator_json, embedding_model_id, embedding_status) in rows {
+            let Ok(locator) = serde_json::from_str::<SourceLocator>(&locator_json) else {
+                continue;
+            };
+            chunks.push(crate::ContentChunk {
+                chunk_id: parse_uuid_value(&chunk_id)?,
+                revision_id: parse_uuid_value(&revision_id)?,
+                node_id: parse_uuid_value(&node_id)?,
+                ordinal: ordinal as u64,
+                text,
+                normalized_text,
+                token_count,
+                content_hash,
+                language,
+                locator,
+                embedding_model_id,
+                embedding_status,
+            });
+        }
+        Ok(chunks)
     }
 
     pub fn authorized_image_asset_path(
@@ -7766,6 +9063,65 @@ impl CatalogStore {
             next_cursor: (consumed < total).then(|| consumed.to_string()),
             total,
         })
+    }
+
+    /// 拉取一次操作（如单次 Ask）的全部节点追踪，按时间正序（流水顺序）。
+    /// 单次 Ask 的节点数有限，不做分页；供 Trace Viewer 与 Debug Trace 导出使用。
+    pub fn query_node_traces_by_correlation(
+        &self,
+        flow: &str,
+        correlation_id: &str,
+    ) -> Result<Vec<NodeTraceRecord>, AppError> {
+        let connection = self.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT trace_id, flow, node, correlation_id, session_id, entity_id, input_json, output_json, status, elapsed_ms, created_at FROM node_traces WHERE flow = ?1 AND correlation_id = ?2 ORDER BY created_at ASC, trace_id ASC",
+            )
+            .map_err(|error| storage_error("NODE_TRACE_QUERY_FAILED", error, true))?;
+        let rows = statement
+            .query_map(params![flow, correlation_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, String>(10)?,
+                ))
+            })
+            .map_err(|error| storage_error("NODE_TRACE_QUERY_FAILED", error, true))?
+            .map(|row| {
+                let (trace_id, flow, node, correlation_id, session_id, entity_id, input_json, output_json, status, elapsed_ms, created_at) =
+                    row.map_err(|error| storage_error("NODE_TRACE_QUERY_FAILED", error, true))?;
+                Ok(NodeTraceRecord {
+                    trace_id,
+                    flow,
+                    node,
+                    correlation_id,
+                    session_id,
+                    entity_id,
+                    input_json: serde_json::from_str(&input_json).map_err(|error| {
+                        AppError::new("NODE_TRACE_DATA_INVALID", error.to_string(), false)
+                    })?,
+                    output_json: serde_json::from_str(&output_json).map_err(|error| {
+                        AppError::new("NODE_TRACE_DATA_INVALID", error.to_string(), false)
+                    })?,
+                    status,
+                    elapsed_ms: elapsed_ms.map(|value| value as u64),
+                    created_at: DateTime::parse_from_rfc3339(&created_at)
+                        .map_err(|error| {
+                            AppError::new("NODE_TRACE_DATA_INVALID", error.to_string(), false)
+                        })?
+                        .with_timezone(&Utc),
+                })
+            })
+            .collect::<Result<Vec<_>, AppError>>()?;
+        Ok(rows)
     }
 
     pub fn clear_node_traces(&self) -> Result<u64, AppError> {
@@ -9987,6 +11343,135 @@ fn parse_uuid_column(value: &str, index: usize) -> rusqlite::Result<Uuid> {
     })
 }
 
+/// document_profiles 查询行的原始列元组（不解析，供调用方宽松解析）。
+type ProfileRow = (
+    String,              // file_id
+    String,              // revision_id
+    String,              // title
+    String,              // summary
+    String,              // keywords_json
+    String,              // entities_json
+    Option<String>,      // document_type
+    Option<f64>,         // type_confidence
+    String,              // section_titles_json
+    Option<String>,      // representative_text_hash
+    String,              // updated_at
+);
+
+/// 行映射：原始列元组（rusqlite 闭包里只做类型转换，语义解析放外面）。
+fn map_memory_entity_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntity> {
+    let metadata_json: String = row.get(3)?;
+    Ok(MemoryEntity {
+        entity_id: parse_uuid_value(&row.get::<_, String>(0)?)
+            .map_err(storage_row_value)?,
+        entity_type: row.get(1)?,
+        canonical_name: row.get(2)?,
+        metadata_json: serde_json::from_str(&metadata_json)
+            .unwrap_or(serde_json::Value::Object(Default::default())),
+        created_at: parse_datetime_value(&row.get::<_, String>(4)?).map_err(storage_row_value)?,
+        updated_at: parse_datetime_value(&row.get::<_, String>(5)?).map_err(storage_row_value)?,
+    })
+}
+
+fn map_memory_relation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRelation> {
+    Ok(MemoryRelation {
+        relation_id: parse_uuid_value(&row.get::<_, String>(0)?).map_err(storage_row_value)?,
+        subject_type: MemoryTargetType::parse_storage(&row.get::<_, String>(1)?),
+        subject_id: parse_uuid_value(&row.get::<_, String>(2)?).map_err(storage_row_value)?,
+        predicate: row.get(3)?,
+        object_type: MemoryTargetType::parse_storage(&row.get::<_, String>(4)?),
+        object_id: parse_uuid_value(&row.get::<_, String>(5)?).map_err(storage_row_value)?,
+        confidence: row.get::<_, f64>(6)? as f32,
+        status: MemoryStatus::parse_storage(&row.get::<_, String>(7)?),
+        source_type: MemorySource::parse_storage(&row.get::<_, String>(8)?),
+        source_id: row.get(9)?,
+        created_at: parse_datetime_value(&row.get::<_, String>(10)?).map_err(storage_row_value)?,
+        updated_at: parse_datetime_value(&row.get::<_, String>(11)?).map_err(storage_row_value)?,
+    })
+}
+
+fn map_memory_alias_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryAlias> {
+    let last_used_at: Option<String> = row.get(8)?;
+    Ok(MemoryAlias {
+        alias_id: parse_uuid_value(&row.get::<_, String>(0)?).map_err(storage_row_value)?,
+        alias: row.get(1)?,
+        target_type: MemoryTargetType::parse_storage(&row.get::<_, String>(2)?),
+        target_id: parse_uuid_value(&row.get::<_, String>(3)?).map_err(storage_row_value)?,
+        confidence: row.get::<_, f64>(4)? as f32,
+        source_type: MemorySource::parse_storage(&row.get::<_, String>(5)?),
+        source_id: row.get(6)?,
+        hit_count: row.get::<_, i64>(7)? as u32,
+        last_used_at: last_used_at
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc)),
+        created_at: parse_datetime_value(&row.get::<_, String>(9)?).map_err(storage_row_value)?,
+        updated_at: parse_datetime_value(&row.get::<_, String>(10)?).map_err(storage_row_value)?,
+    })
+}
+
+fn storage_row_value(error: AppError) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error.message)),
+    )
+}
+
+fn map_profile_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(ProfileRow, Option<String>)> {
+    Ok((
+        (
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+            row.get(8)?,
+            row.get(9)?,
+            row.get(10)?,
+        ),
+        row.get(11).ok(),
+    ))
+}
+
+/// 语义解析：原始列元组 → DocumentProfile。
+fn parse_profile_row(raw: ProfileRow) -> Result<DocumentProfile, AppError> {
+    let (
+        file_id,
+        revision_id,
+        title,
+        summary,
+        keywords_json,
+        entities_json,
+        document_type,
+        type_confidence,
+        section_titles_json,
+        representative_text_hash,
+        updated_at,
+    ) = raw;
+    let invalid = |error: serde_json::Error| {
+        AppError::new("DOCUMENT_PROFILE_INVALID", error.to_string(), false)
+    };
+    Ok(DocumentProfile {
+        file_id: parse_uuid_value(&file_id)?,
+        revision_id: parse_uuid_value(&revision_id)?,
+        title,
+        summary,
+        keywords: serde_json::from_str(&keywords_json).map_err(invalid)?,
+        entities: serde_json::from_str(&entities_json).map_err(invalid)?,
+        document_type: document_type
+            .as_deref()
+            .and_then(DocumentType::parse_lenient),
+        type_confidence: type_confidence.map(|value| value as f32),
+        section_titles: serde_json::from_str(&section_titles_json).map_err(invalid)?,
+        representative_text_hash,
+        updated_at: parse_datetime_value(&updated_at)?,
+    })
+}
+
 fn parse_uuid_value(value: &str) -> Result<Uuid, AppError> {
     Uuid::parse_str(value)
         .map_err(|error| AppError::new("SCHEMA_UUID_V7_REQUIRED", error.to_string(), false))
@@ -11023,6 +12508,11 @@ mod tests {
                 (22, "node_traces".to_owned()),
                 (23, "chunk_neighbor_context_index".to_owned()),
                 (24, "relation_groups".to_owned()),
+                (25, "encrypted_disposition_consistency".to_owned()),
+                (26, "ask_session_context".to_owned()),
+                (27, "document_profiles_classifier_columns".to_owned()),
+                (28, "memory_layer".to_owned()),
+                (29, "ask_session_clarification".to_owned()),
             ]
         );
         let rules = store.list_exclusion_rules().expect("list exclusion rules");
@@ -11071,6 +12561,1193 @@ mod tests {
         assert_eq!(
             store.migration_history().expect("history").len(),
             CURRENT_SCHEMA_VERSION as usize
+        );
+    }
+
+    #[test]
+    fn ask_session_context_persists_round_trip_and_clears() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+        let session_id = uuid::Uuid::now_v7();
+        let file_a = uuid::Uuid::now_v7();
+        let file_b = uuid::Uuid::now_v7();
+
+        // 无记录 → None
+        assert!(store
+            .get_ask_session_context(session_id)
+            .expect("read context")
+            .is_none());
+
+        let now = chrono::Utc::now();
+        let context = crate::AskSessionContext {
+            session_id: Some(session_id),
+            active_file_id: Some(file_a),
+            active_file_ids: vec![file_a, file_b],
+            active_document_type: Some(crate::DocumentType::Resume),
+            active_entity_id: Some(file_b),
+            active_collection_id: None,
+            last_referenced_file_ids: vec![file_b],
+            last_intent: Some("document_qa".to_owned()),
+            pending_clarification_reference: Some("第一份".to_owned()),
+            updated_at: Some(now),
+        };
+        store
+            .update_ask_session_context(session_id, &context)
+            .expect("write context");
+
+        let loaded = store
+            .get_ask_session_context(session_id)
+            .expect("read context")
+            .expect("context exists");
+        assert_eq!(loaded.active_file_id, Some(file_a));
+        assert_eq!(loaded.active_file_ids, vec![file_a, file_b]);
+        assert_eq!(loaded.active_document_type, Some(crate::DocumentType::Resume));
+        assert_eq!(loaded.active_entity_id, Some(file_b));
+        assert_eq!(loaded.last_referenced_file_ids, vec![file_b]);
+        assert_eq!(loaded.last_intent.as_deref(), Some("document_qa"));
+        assert_eq!(
+            loaded.pending_clarification_reference.as_deref(),
+            Some("第一份")
+        );
+        assert!(loaded.updated_at.is_some());
+
+        // upsert：第二次写入覆盖而非新增
+        let mut second = context.clone();
+        second.active_file_id = Some(file_b);
+        second.last_intent = Some("document_summary".to_owned());
+        store
+            .update_ask_session_context(session_id, &second)
+            .expect("update context");
+        let reloaded = store
+            .get_ask_session_context(session_id)
+            .expect("read context")
+            .expect("context exists");
+        assert_eq!(reloaded.active_file_id, Some(file_b));
+        assert_eq!(reloaded.last_intent.as_deref(), Some("document_summary"));
+
+        // clear 后回到无记录
+        store
+            .clear_ask_session_context(session_id)
+            .expect("clear context");
+        assert!(store
+            .get_ask_session_context(session_id)
+            .expect("read context")
+            .is_none());
+    }
+
+    #[test]
+    fn document_profile_classifier_columns_round_trip() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+        let file_id = Uuid::now_v7();
+        let revision_id = Uuid::now_v7();
+        let now = Utc::now().to_rfc3339();
+
+        // 直接落一行画像（模拟 organizing.rs 写入基础列，migration 27 后扩展列为默认值）
+        {
+            let connection = store.connect().expect("connect");
+            connection
+                .execute(
+                    "INSERT INTO files (file_id, canonical_path, path_key, name, extension, size_bytes, modified_at, discovered_at, availability) \
+                     VALUES (?1, ?1 || ':path', ?1 || ':path', 'resume.pdf', 'pdf', 1024, ?2, ?2, 'present')",
+                    params![file_id.to_string(), now],
+                )
+                .expect("insert file");
+            connection
+                .execute(
+                    "INSERT INTO file_revisions (revision_id, file_id, size_bytes, fs_modified_at, metadata_fingerprint, created_at) \
+                     VALUES (?1, ?2, 1024, ?3, 'fp', ?3)",
+                    params![revision_id.to_string(), file_id.to_string(), now],
+                )
+                .expect("insert revision");
+            connection
+                .execute(
+                    "INSERT INTO document_profiles (file_id, revision_id, title, summary, keywords_json, entities_json, embedding_model_id, dimension, vector_blob, candidate_bucket, algorithm_version, created_at, updated_at) \
+                     VALUES (?1, ?2, '我的简历', '软件工程师简历', '[]', '[]', 'emb', 0, X'', 'bucket', 'v1', ?3, ?3)",
+                    params![file_id.to_string(), revision_id.to_string(), now],
+                )
+                .expect("insert profile");
+        }
+
+        // 扩展列初始为默认值
+        let initial = store
+            .get_document_profile(file_id)
+            .expect("read profile")
+            .expect("profile exists");
+        assert_eq!(initial.title, "我的简历");
+        assert_eq!(initial.document_type, None);
+        assert_eq!(initial.section_titles, Vec::<String>::new());
+
+        // 分类器写入扩展列后回读
+        let updated = DocumentProfile {
+            document_type: Some(DocumentType::Resume),
+            type_confidence: Some(0.97),
+            section_titles: vec!["项目经历".to_owned(), "教育背景".to_owned()],
+            representative_text_hash: Some("sha256:abc123".to_owned()),
+            ..initial
+        };
+        assert!(store
+            .update_document_profile_classifier(&updated)
+            .expect("update classifier columns"));
+
+        let loaded = store
+            .get_document_profile(file_id)
+            .expect("read profile")
+            .expect("profile exists");
+        assert_eq!(loaded.document_type, Some(DocumentType::Resume));
+        assert_eq!(loaded.type_confidence, Some(0.97));
+        assert_eq!(
+            loaded.section_titles,
+            vec!["项目经历".to_owned(), "教育背景".to_owned()]
+        );
+        assert_eq!(
+            loaded.representative_text_hash.as_deref(),
+            Some("sha256:abc123")
+        );
+
+        // 不存在画像行的更新是不带副作用的 no-op
+        let missing = DocumentProfile {
+            file_id: Uuid::now_v7(),
+            ..updated.clone()
+        };
+        assert!(!store
+            .update_document_profile_classifier(&missing)
+            .expect("update missing profile is no-op"));
+        assert!(store
+            .get_document_profile(missing.file_id)
+            .expect("read missing profile")
+            .is_none());
+    }
+
+    /// 画像构建测试用种子：parsed 文件 + 多个带章节路径的节点 + 若干 chunk
+    /// （chunk 数与嵌入数可分别控制，用于验证「全量嵌入」门槛）。
+    fn seed_profile_file(
+        connection: &Connection,
+        root_id: &Uuid,
+        name: &str,
+        revision_id: Uuid,
+        heading_paths: &[&str],
+        chunk_texts: &[&str],
+        embedded_count: usize,
+        model_artifact_id: &str,
+    ) -> (Uuid, Uuid) {
+        let file_id = Uuid::now_v7();
+        let now = Utc::now().to_rfc3339();
+        let path = format!("C:\\Users\\Test\\Documents\\{name}");
+        let path_key = path.to_ascii_lowercase();
+        connection
+            .execute(
+                "INSERT INTO files (file_id, canonical_path, path_key, name, extension, size_bytes, modified_at, discovered_at, availability, volume_id, display_name, mime_type, current_revision_id, parse_status, first_seen_at, last_seen_at) VALUES (?1, ?2, ?3, ?4, 'pdf', 1024, ?5, ?5, 'present', 'vol-test', ?4, 'application/pdf', ?6, 'parsed', ?5, ?5)",
+                params![file_id.to_string(), path, path_key, name, now, revision_id.to_string()],
+            )
+            .expect("insert file");
+        connection
+            .execute(
+                "INSERT INTO file_revisions (revision_id, file_id, size_bytes, fs_modified_at, metadata_fingerprint, created_at, parse_status) VALUES (?1, ?2, 1024, ?3, ?4, ?3, 'parsed')",
+                params![revision_id.to_string(), file_id.to_string(), now, format!("{name}:{revision_id}")],
+            )
+            .expect("insert revision");
+        connection
+            .execute(
+                "INSERT INTO file_root_memberships (file_id, root_id, relative_path, is_primary) VALUES (?1, ?2, ?3, 1)",
+                params![file_id.to_string(), root_id.to_string(), name],
+            )
+            .expect("insert membership");
+        // 节点数 = max(标题路径数, chunk 数)：保证每个 chunk 都有对应节点
+        let node_count = heading_paths.len().max(chunk_texts.len());
+        for ordinal in 0..node_count {
+            let node_id = Uuid::now_v7();
+            connection
+                .execute(
+                    "INSERT INTO document_nodes (node_id, revision_id, ordinal, node_type, locator_json, heading_path_json, text) VALUES (?1, ?2, ?3, 'text', ?4, ?5, ?6)",
+                    params![
+                        node_id.to_string(),
+                        revision_id.to_string(),
+                        ordinal as u64,
+                        serde_json::json!({"page_no": 1}).to_string(),
+                        heading_paths.get(ordinal).copied().unwrap_or("[]"),
+                        chunk_texts.get(ordinal).copied().unwrap_or(""),
+                    ],
+                )
+                .expect("insert node");
+        }
+        for (ordinal, text) in chunk_texts.iter().enumerate() {
+            let chunk_id = Uuid::now_v7();
+            connection
+                .execute(
+                    "INSERT INTO chunks (chunk_id, file_id, revision_id, node_id, ordinal, text, normalized_text, token_count, content_hash, language, locator_json) VALUES (?1, ?2, ?3, (SELECT node_id FROM document_nodes WHERE revision_id = ?3 AND ordinal = ?4 LIMIT 1), ?4, ?5, ?5, 4, ?1, 'zh', '{}')",
+                    params![chunk_id.to_string(), file_id.to_string(), revision_id.to_string(), ordinal as u64, text],
+                )
+                .expect("insert chunk");
+            if ordinal < embedded_count {
+                let vector = [0.1 + ordinal as f32 * 0.05, 0.2, 0.3, 0.4, 0.5, 0.6];
+                connection
+                    .execute(
+                        "INSERT INTO chunk_embeddings (chunk_id, model_artifact_id, file_id, revision_id, dimension, vector_blob, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            chunk_id.to_string(),
+                            model_artifact_id,
+                            file_id.to_string(),
+                            revision_id.to_string(),
+                            vector.len() as u32,
+                            encode_vector(&vector),
+                            now,
+                        ],
+                    )
+                    .expect("insert embedding");
+            }
+        }
+        (file_id, revision_id)
+    }
+
+    #[test]
+    fn document_profile_builder_builds_profile_from_parsed_embedded_file() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+        let root = store
+            .upsert_root(&test_root_registration())
+            .expect("insert root");
+        let (file_id, revision_id) = {
+            let connection = store.connect().expect("connect");
+            seed_profile_file(
+                &connection,
+                &root.root_id,
+                "大模型开发工程师-周晨.pdf",
+                Uuid::now_v7(),
+                &[r#"[]"#, r#"["教育背景"]"#, r#"["项目经历","LangGraph 多智能体"]"#, r#"["项目经历"]"#],
+                &["软件工程师简历概览", "北京大学 计算机专业", "LangGraph 多智能体项目介绍", "项目经历总结"],
+                4,
+                "embedding-test",
+            )
+        };
+
+        let result = store
+            .refresh_document_profiles("embedding-test", 200)
+            .expect("refresh profiles");
+        assert_eq!(result.profiled_files, 1);
+        assert_eq!(result.skipped_files, 0);
+
+        let profile = store
+            .get_document_profile(file_id)
+            .expect("read profile")
+            .expect("profile exists");
+        assert_eq!(profile.revision_id, revision_id);
+        assert_eq!(profile.title, "大模型开发工程师-周晨.pdf");
+        // section_titles：叶子标题、文档顺序、去重
+        assert_eq!(
+            profile.section_titles,
+            vec!["教育背景", "LangGraph 多智能体", "项目经历"]
+        );
+        // summary = 首个 chunk 压缩文本
+        assert_eq!(profile.summary, "软件工程师简历概览");
+        // 代表性文本哈希非空且稳定（代表内容含 title + sections + head/mid/tail）
+        let hash = profile.representative_text_hash.expect("hash present");
+        assert!(hash.starts_with("0x") || hash.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert!(!profile.keywords.is_empty());
+        // 扩展列初始为空（分类器 Step 2 写入）
+        assert_eq!(profile.document_type, None);
+    }
+
+    #[test]
+    fn document_profile_builder_skips_files_without_or_partial_embeddings() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+        let root = store
+            .upsert_root(&test_root_registration())
+            .expect("insert root");
+        let (no_embed_file, partial_file) = {
+            let connection = store.connect().expect("connect");
+            // 无任何嵌入 → 不进入候选（门槛：至少存在一条当前模型嵌入）
+            let no_embed = seed_profile_file(
+                &connection,
+                &root.root_id,
+                "无嵌入.pdf",
+                Uuid::now_v7(),
+                &[r#"["教育背景"]"#],
+                &["只有文本没有向量"],
+                0,
+                "embedding-test",
+            );
+            // 部分嵌入（2/3 chunk 有向量）→ 不进入候选（门槛：全量嵌入完成）
+            let partial = seed_profile_file(
+                &connection,
+                &root.root_id,
+                "部分嵌入.pdf",
+                Uuid::now_v7(),
+                &[r#"["项目经历"]"#],
+                &["第一段", "第二段", "第三段"],
+                2,
+                "embedding-test",
+            );
+            (no_embed, partial)
+        };
+
+        let result = store
+            .refresh_document_profiles("embedding-test", 200)
+            .expect("refresh profiles");
+        // 两个文件都被门槛排除：不建画像、不计数为失败（静默等待嵌入收敛）
+        assert_eq!(result.profiled_files, 0);
+        assert!(store
+            .get_document_profile(no_embed_file.0)
+            .expect("read profile")
+            .is_none());
+        assert!(store
+            .get_document_profile(partial_file.0)
+            .expect("read profile")
+            .is_none());
+    }
+
+    #[test]
+    fn document_profile_lifecycle_tracks_revision_and_invalidates_stale() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+        let root = store
+            .upsert_root(&test_root_registration())
+            .expect("insert root");
+        let file_id = {
+            let connection = store.connect().expect("connect");
+            let (file_id, _) = seed_profile_file(
+                &connection,
+                &root.root_id,
+                "我的简历.pdf",
+                Uuid::now_v7(),
+                &[r#"["项目经历"]"#],
+                &["第一版简历内容"],
+                1,
+                "embedding-test",
+            );
+            file_id
+        };
+        store
+            .refresh_document_profiles("embedding-test", 200)
+            .expect("build v1 profile");
+        let listed = store
+            .list_document_profiles(None, 200)
+            .expect("list profiles");
+        assert_eq!(listed.len(), 1);
+
+        // 文件更新：只新增 file_revisions 行 + 节点/chunk/嵌入（真实索引流程中
+        // 文件行不重复插入），files.current_revision_id 切换到新 revision。
+        let new_revision = {
+            let connection = store.connect().expect("connect");
+            let new_revision = Uuid::now_v7();
+            let now = Utc::now().to_rfc3339();
+            connection
+                .execute(
+                    "INSERT INTO file_revisions (revision_id, file_id, size_bytes, fs_modified_at, metadata_fingerprint, created_at, parse_status) VALUES (?1, ?2, 1024, ?3, ?4, ?3, 'parsed')",
+                    params![
+                        new_revision.to_string(),
+                        file_id.to_string(),
+                        now,
+                        format!("我的简历.pdf:v2")
+                    ],
+                )
+                .expect("insert new revision");
+            for (ordinal, (heading, text)) in
+                [(r#"["项目经历"]"#, "第二版简历内容"), (r#"["技能"]"#, "LangGraph 技能描述")]
+                    .iter()
+                    .enumerate()
+            {
+                let node_id = Uuid::now_v7();
+                connection
+                    .execute(
+                        "INSERT INTO document_nodes (node_id, revision_id, ordinal, node_type, locator_json, heading_path_json, text) VALUES (?1, ?2, ?3, 'text', '{}', ?4, ?5)",
+                        params![node_id.to_string(), new_revision.to_string(), ordinal as u64, heading, text],
+                    )
+                    .expect("insert new-revision node");
+                let chunk_id = Uuid::now_v7();
+                connection
+                    .execute(
+                        "INSERT INTO chunks (chunk_id, file_id, revision_id, node_id, ordinal, text, normalized_text, token_count, content_hash, language, locator_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 4, ?1, 'zh', '{}')",
+                        params![
+                            chunk_id.to_string(),
+                            file_id.to_string(),
+                            new_revision.to_string(),
+                            node_id.to_string(),
+                            ordinal as u64,
+                            text
+                        ],
+                    )
+                    .expect("insert new-revision chunk");
+                let vector = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+                connection
+                    .execute(
+                        "INSERT INTO chunk_embeddings (chunk_id, model_artifact_id, file_id, revision_id, dimension, vector_blob, created_at) VALUES (?1, 'embedding-test', ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            chunk_id.to_string(),
+                            file_id.to_string(),
+                            new_revision.to_string(),
+                            vector.len() as u32,
+                            encode_vector(&vector),
+                            now
+                        ],
+                    )
+                    .expect("insert new-revision embedding");
+            }
+            connection
+                .execute(
+                    "UPDATE files SET current_revision_id = ?1 WHERE file_id = ?2",
+                    params![new_revision.to_string(), file_id.to_string()],
+                )
+                .expect("switch current revision");
+            new_revision
+        };
+
+        // 画像仍是旧 revision：list_document_profiles 必须过滤掉（stale 不参与定位）
+        let listed = store
+            .list_document_profiles(None, 200)
+            .expect("list stale-filtered profiles");
+        assert!(
+            listed.is_empty(),
+            "旧 revision 的画像不得出现在定位候选里"
+        );
+
+        // 生产链重建 → 画像绑定新 revision 且内容更新
+        let result = store
+            .refresh_document_profiles("embedding-test", 200)
+            .expect("rebuild profile");
+        assert_eq!(result.profiled_files, 1);
+        let profile = store
+            .get_document_profile(file_id)
+            .expect("read profile")
+            .expect("profile exists");
+        assert_eq!(profile.revision_id, new_revision);
+        assert_eq!(profile.section_titles, vec!["项目经历", "技能"]);
+        let listed = store
+            .list_document_profiles(None, 200)
+            .expect("list profiles after rebuild");
+        assert_eq!(listed.len(), 1);
+    }
+
+    #[test]
+    fn document_profile_builder_preserves_classifier_columns() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+        let root = store
+            .upsert_root(&test_root_registration())
+            .expect("insert root");
+        let file_id = {
+            let connection = store.connect().expect("connect");
+            let (file_id, _) = seed_profile_file(
+                &connection,
+                &root.root_id,
+                "我的简历.pdf",
+                Uuid::now_v7(),
+                &[r#"["项目经历"]"#],
+                &["第一版简历内容"],
+                1,
+                "embedding-test",
+            );
+            file_id
+        };
+        store
+            .refresh_document_profiles("embedding-test", 200)
+            .expect("build profile");
+        // 分类器写入 document_type（Step 2 的生产调用；这里模拟写入）
+        let mut classified = store
+            .get_document_profile(file_id)
+            .expect("read profile")
+            .expect("profile exists");
+        classified.document_type = Some(DocumentType::Resume);
+        classified.type_confidence = Some(0.96);
+        store
+            .update_document_profile_classifier(&classified)
+            .expect("classify");
+
+        // 再次构建画像：基础列更新，分类器列必须原样保留（生产链不覆写）
+        store
+            .refresh_document_profiles("embedding-test", 200)
+            .expect("rebuild profile");
+        let profile = store
+            .get_document_profile(file_id)
+            .expect("read profile")
+            .expect("profile exists");
+        assert_eq!(profile.document_type, Some(DocumentType::Resume));
+        assert_eq!(profile.type_confidence, Some(0.96));
+    }
+
+    #[test]
+    fn revision_change_resets_classifier_columns_and_pending_list_serves_classifier() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+        let root = store
+            .upsert_root(&test_root_registration())
+            .expect("insert root");
+        let file_id = {
+            let connection = store.connect().expect("connect");
+            let (file_id, _) = seed_profile_file(
+                &connection,
+                &root.root_id,
+                "我的简历.pdf",
+                Uuid::now_v7(),
+                &[r#"["项目经历"]"#],
+                &["第一版简历内容"],
+                1,
+                "embedding-test",
+            );
+            file_id
+        };
+        store
+            .refresh_document_profiles("embedding-test", 200)
+            .expect("build v1 profile");
+
+        // 分类器写入类型 + 置信度
+        let mut classified = store
+            .get_document_profile(file_id)
+            .expect("read profile")
+            .expect("profile exists");
+        classified.document_type = Some(DocumentType::Resume);
+        classified.type_confidence = Some(0.96);
+        store
+            .update_document_profile_classifier(&classified)
+            .expect("classify");
+        // 已分类的画像不再出现在待分类列表里
+        assert_eq!(
+            store
+                .list_profiles_needing_classification(200)
+                .expect("pending list")
+                .len(),
+            0
+        );
+        // profile_vector 能读回画像已存的文档级向量（分类器与原型比对用）；
+        // 存的是均值归一化后的向量（与 semantic_cluster_v3 口径一致）：
+        // 方向与 [0.1..0.6] 相同、模长 ≈ 1
+        let vector = store
+            .profile_vector(&file_id)
+            .expect("read profile vector")
+            .expect("vector exists");
+        let magnitude = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+        assert!((magnitude - 1.0).abs() < 1e-5, "profile vector must be normalized");
+        for (actual, expected) in vector.iter().zip([0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6]) {
+            let scale = *actual / expected;
+            assert!(
+                (scale - vector[0] / 0.1).abs() < 1e-5,
+                "profile vector must be collinear with chunk mean"
+            );
+        }
+
+        // 文件更新（新 revision 只加 revision 行 + 内容，files.current_revision_id 切换）
+        let new_revision = {
+            let connection = store.connect().expect("connect");
+            let new_revision = Uuid::now_v7();
+            let now = Utc::now().to_rfc3339();
+            connection
+                .execute(
+                    "INSERT INTO file_revisions (revision_id, file_id, size_bytes, fs_modified_at, metadata_fingerprint, created_at, parse_status) VALUES (?1, ?2, 1024, ?3, ?4, ?3, 'parsed')",
+                    params![
+                        new_revision.to_string(),
+                        file_id.to_string(),
+                        now,
+                        format!("我的简历.pdf:v2")
+                    ],
+                )
+                .expect("insert new revision");
+            let node_id = Uuid::now_v7();
+            connection
+                .execute(
+                    "INSERT INTO document_nodes (node_id, revision_id, ordinal, node_type, locator_json, heading_path_json, text) VALUES (?1, ?2, ?3, 'text', '{}', ?4, ?5)",
+                    params![node_id.to_string(), new_revision.to_string(), 0_u64, r#"["项目经历"]"#, "第二版简历内容"],
+                )
+                .expect("insert new-revision node");
+            let chunk_id = Uuid::now_v7();
+            connection
+                .execute(
+                    "INSERT INTO chunks (chunk_id, file_id, revision_id, node_id, ordinal, text, normalized_text, token_count, content_hash, language, locator_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 4, ?1, 'zh', '{}')",
+                    params![
+                        chunk_id.to_string(),
+                        file_id.to_string(),
+                        new_revision.to_string(),
+                        node_id.to_string(),
+                        0_u64,
+                        "第二版简历内容"
+                    ],
+                )
+                .expect("insert new-revision chunk");
+            let vector = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+            connection
+                .execute(
+                    "INSERT INTO chunk_embeddings (chunk_id, model_artifact_id, file_id, revision_id, dimension, vector_blob, created_at) VALUES (?1, 'embedding-test', ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        chunk_id.to_string(),
+                        file_id.to_string(),
+                        new_revision.to_string(),
+                        vector.len() as u32,
+                        encode_vector(&vector),
+                        now
+                    ],
+                )
+                .expect("insert new-revision embedding");
+            connection
+                .execute(
+                    "UPDATE files SET current_revision_id = ?1 WHERE file_id = ?2",
+                    params![new_revision.to_string(), file_id.to_string()],
+                )
+                .expect("switch current revision");
+            new_revision
+        };
+
+        // 重建画像：revision 变化 → 分类器列必须清空（旧类型绝不带到新版本），
+        // 且待分类列表重新包含该画像（等分类器重判）。
+        store
+            .refresh_document_profiles("embedding-test", 200)
+            .expect("rebuild profile");
+        let profile = store
+            .get_document_profile(file_id)
+            .expect("read profile")
+            .expect("profile exists");
+        assert_eq!(profile.revision_id, new_revision);
+        assert_eq!(profile.document_type, None);
+        assert_eq!(profile.type_confidence, None);
+        let pending = store
+            .list_profiles_needing_classification(200)
+            .expect("pending list after rebuild");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0.file_id, file_id);
+        assert_eq!(pending[0].1, "我的简历.pdf");
+        // 新版本向量可读回，分类器可立即用
+        assert!(store.profile_vector(&file_id).expect("vector").is_some());
+    }
+
+    #[test]
+    fn profile_vectors_batch_returns_only_requested_profiles() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+        let root = store
+            .upsert_root(&test_root_registration())
+            .expect("insert root");
+        let file_a = {
+            let connection = store.connect().expect("connect");
+            let (file_a, _) = seed_profile_file(
+                &connection,
+                &root.root_id,
+                "述职报告.docx",
+                Uuid::now_v7(),
+                &[r#"["项目经历"]"#],
+                &["第一份述职内容"],
+                2,
+                "embedding-test",
+            );
+            file_a
+        };
+        let file_b = {
+            let connection = store.connect().expect("connect");
+            let (file_b, _) = seed_profile_file(
+                &connection,
+                &root.root_id,
+                "会议纪要.md",
+                Uuid::now_v7(),
+                &[r#"["议程"]"#],
+                &["会议议程内容"],
+                2,
+                "embedding-test",
+            );
+            file_b
+        };
+        store
+            .refresh_document_profiles("embedding-test", 200)
+            .expect("build profiles");
+
+        // 只请求 A：返回单条
+        let vectors = store.profile_vectors(&[file_a]).expect("batch vectors");
+        assert_eq!(vectors.len(), 1);
+        assert!(vectors.contains_key(&file_a));
+        // 请求 A+B：全部返回，且向量为归一化文档向量
+        let vectors = store.profile_vectors(&[file_a, file_b]).expect("batch vectors");
+        assert_eq!(vectors.len(), 2);
+        for vector in vectors.values() {
+            let magnitude = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+            assert!(
+                (magnitude - 1.0).abs() < 1e-5,
+                "profile vectors must be normalized"
+            );
+        }
+        // 空输入：空 map，不报错
+        assert!(store.profile_vectors(&[]).expect("empty batch").is_empty());
+        // 不存在的 id：静默跳过
+        let missing = store
+            .profile_vectors(&[Uuid::now_v7()])
+            .expect("missing batch");
+        assert!(missing.is_empty());
+    }
+
+    #[allow(dead_code)]
+    fn test_memory_write_input(
+        kind: MemoryKind,
+        subject_type: MemoryTargetType,
+        subject_id: Uuid,
+        object_type: MemoryTargetType,
+        object_id: Uuid,
+        alias: Option<&str>,
+        confidence: f32,
+        source_type: MemorySource,
+        status: MemoryStatus,
+    ) -> MemoryWriteInput {
+        MemoryWriteInput {
+            kind,
+            subject_type,
+            subject_id,
+            predicate: "is_about".to_owned(),
+            object_type,
+            object_id,
+            alias: alias.map(str::to_owned),
+            confidence,
+            source_type,
+            source_id: Some("session-test".to_owned()),
+            status,
+        }
+    }
+
+    #[test]
+    fn memory_entities_dedup_by_type_and_name() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+        let metadata = serde_json::json!({"title": "周晨"});
+        let first = store
+            .upsert_memory_entity("person", "周晨", &metadata)
+            .expect("insert entity");
+        let second = store
+            .upsert_memory_entity("person", "周晨", &metadata)
+            .expect("insert same entity");
+        assert_eq!(first, second, "同名实体必须去重");
+        let entities = store.list_memory_entities(10).expect("list entities");
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].entity_id, first);
+        assert_eq!(entities[0].entity_type, "person");
+        assert_eq!(entities[0].canonical_name, "周晨");
+        assert_eq!(store.memory_entity_by_name("person", "周晨").expect("by name").unwrap().entity_id, first);
+        assert!(store.memory_entity_by_id(first).expect("by id").is_some());
+        assert!(store.memory_entity_by_id(Uuid::now_v7()).expect("missing").is_none());
+    }
+
+    #[test]
+    fn memory_relation_merge_honors_source_rank_and_rejection() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+        let file = Uuid::now_v7();
+        let entity = Uuid::now_v7();
+
+        // 推断类来源写入 → 即使请求 confirmed 也降为 candidate（严禁 PDF→张三）
+        let inference = test_memory_write_input(
+            MemoryKind::Relation,
+            MemoryTargetType::Entity,
+            entity,
+            MemoryTargetType::File,
+            file,
+            None,
+            0.4,
+            MemorySource::DocumentInference,
+            MemoryStatus::Confirmed,
+        );
+        let first = store.upsert_memory_relation(&inference).expect("insert");
+        let stored = store
+            .memory_relation_by_id(first)
+            .expect("read relation")
+            .expect("exists");
+        assert_eq!(stored.status, MemoryStatus::Candidate);
+        assert_eq!(stored.source_type, MemorySource::DocumentInference);
+
+        // 更高等级来源覆盖：document_inference(2) → repeated_usage(3)
+        let repeated = MemoryWriteInput {
+            source_type: MemorySource::RepeatedUsage,
+            confidence: 0.8,
+            status: MemoryStatus::Confirmed,
+            ..inference.clone()
+        };
+        let _ = store.upsert_memory_relation(&repeated).expect("upgrade");
+        let stored = store
+            .memory_relation_by_id(first)
+            .expect("read relation")
+            .expect("exists");
+        assert_eq!(stored.status, MemoryStatus::Confirmed);
+        assert_eq!(stored.source_type, MemorySource::RepeatedUsage);
+        assert_eq!(stored.confidence, 0.8);
+
+        // 低等级来源不能覆盖高等级事实
+        let weaker = MemoryWriteInput {
+            source_type: MemorySource::ModelInference,
+            confidence: 0.9,
+            status: MemoryStatus::Candidate,
+            ..inference
+        };
+        let _ = store.upsert_memory_relation(&weaker).expect("weaker write");
+        let stored = store
+            .memory_relation_by_id(first)
+            .expect("read relation")
+            .expect("exists");
+        assert_eq!(stored.status, MemoryStatus::Confirmed, "低等级不能降级高等级事实");
+        assert_eq!(stored.source_type, MemorySource::RepeatedUsage);
+        assert_eq!(stored.confidence, 0.8, "低等级不能覆盖置信度");
+
+        // 拒绝后：低等级来源不能复活，更高等级来源可以
+        let other_file = Uuid::now_v7();
+        let rejected = test_memory_write_input(
+            MemoryKind::Relation,
+            MemoryTargetType::Entity,
+            entity,
+            MemoryTargetType::File,
+            other_file,
+            None,
+            0.6,
+            MemorySource::UserExplicit,
+            MemoryStatus::Confirmed,
+        );
+        let rejected_id = store.upsert_memory_relation(&rejected).expect("insert");
+        store
+            .update_memory_relation_status(rejected_id, MemoryStatus::Rejected)
+            .expect("reject");
+        let weak_revive = MemoryWriteInput {
+            source_type: MemorySource::ModelInference,
+            status: MemoryStatus::Candidate,
+            ..rejected
+        };
+        let _ = store.upsert_memory_relation(&weak_revive).expect("weak revive write");
+        assert_eq!(
+            store.memory_relation_by_id(rejected_id).expect("read").expect("exists").status,
+            MemoryStatus::Rejected,
+            "被拒绝的关系不能被低等级来源复活"
+        );
+        let strong_revive = MemoryWriteInput {
+            source_type: MemorySource::UserExplicit,
+            status: MemoryStatus::Confirmed,
+            confidence: 1.0,
+            ..weak_revive
+        };
+        let _ = store.upsert_memory_relation(&strong_revive).expect("strong revive write");
+        assert_eq!(
+            store.memory_relation_by_id(rejected_id).expect("read").expect("exists").status,
+            MemoryStatus::Confirmed,
+            "用户明确表达可以复活被拒绝的关系"
+        );
+    }
+
+    #[test]
+    fn memory_relation_lists_filter_by_subject_object_and_status() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+        let file = Uuid::now_v7();
+        let entity_a = Uuid::now_v7();
+        let entity_b = Uuid::now_v7();
+        let relation = test_memory_write_input(
+            MemoryKind::Relation,
+            MemoryTargetType::Entity,
+            entity_a,
+            MemoryTargetType::File,
+            file,
+            None,
+            0.5,
+            MemorySource::UserExplicit,
+            MemoryStatus::Confirmed,
+        );
+        let _ = store.upsert_memory_relation(&relation).expect("insert a");
+        let candidate = MemoryWriteInput {
+            status: MemoryStatus::Candidate,
+            source_type: MemorySource::DocumentInference,
+            subject_id: entity_b,
+            predicate: "mentions".to_owned(),
+            ..relation.clone()
+        };
+        let _ = store.upsert_memory_relation(&candidate).expect("insert b");
+
+        // 按主体 + 状态过滤
+        let confirmed = store
+            .list_memory_relations_by_subject(
+                MemoryTargetType::Entity,
+                entity_a,
+                Some(MemoryStatus::Confirmed),
+                10,
+            )
+            .expect("by subject confirmed");
+        assert_eq!(confirmed.len(), 1);
+        assert_eq!(confirmed[0].object_id, file);
+        let all = store
+            .list_memory_relations_by_subject(MemoryTargetType::Entity, entity_a, None, 10)
+            .expect("by subject all");
+        assert_eq!(all.len(), 1, "entity_a 只有一条");
+        let by_object = store
+            .list_memory_relations_by_object(MemoryTargetType::File, file, None, 10)
+            .expect("by object");
+        assert_eq!(by_object.len(), 2, "两个实体都指向该文件");
+        // 候选列表（writer 确定性校验用）
+        let candidates = store
+            .list_memory_relation_candidates(10)
+            .expect("candidates");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].subject_id, entity_b);
+    }
+
+    #[test]
+    fn memory_alias_upsert_bump_find_and_retarget() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+        let file_a = Uuid::now_v7();
+        let file_b = Uuid::now_v7();
+        let input = test_memory_write_input(
+            MemoryKind::Alias,
+            MemoryTargetType::File,
+            file_a,
+            MemoryTargetType::File,
+            Uuid::now_v7(),
+            Some("我的简历"),
+            1.0,
+            MemorySource::UserExplicit,
+            MemoryStatus::Confirmed,
+        );
+        let alias_id = store.upsert_memory_alias(&input).expect("insert alias");
+
+        // 大小写/空白差异仍能命中（规范化匹配）
+        let hits = store.find_memory_aliases("  我的  简历 ").expect("find alias");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].alias_id, alias_id);
+        assert_eq!(hits[0].target_id, file_a);
+        assert_eq!(hits[0].alias, "我的简历");
+        // 空别名不产生命中
+        assert!(store.find_memory_aliases("   ").expect("blank").is_empty());
+
+        // 命中计数 + 使用时间
+        store.bump_memory_alias(alias_id).expect("bump");
+        let hits = store.find_memory_aliases("我的简历").expect("find again");
+        assert_eq!(hits[0].hit_count, 1);
+        assert!(hits[0].last_used_at.is_some());
+
+        // 同一别名重新指向新目标 → 新行；原目标保留
+        let retarget = MemoryWriteInput {
+            subject_id: file_b,
+            ..input
+        };
+        let _ = store.upsert_memory_alias(&retarget).expect("retarget");
+        let hits = store.find_memory_aliases("我的简历").expect("find both");
+        assert_eq!(hits.len(), 2, "同一别名指向两个目标都应保留，由解析层裁决");
+
+        // 空别名拒绝写入
+        let invalid = MemoryWriteInput {
+            alias: Some("   ".to_owned()),
+            ..retarget
+        };
+        let error = store.upsert_memory_alias(&invalid).expect_err("blank alias rejected");
+        assert_eq!(error.code, "MEMORY_ALIAS_INVALID");
+
+        // 删除
+        assert!(store.delete_memory_alias(alias_id).expect("delete"));
+        assert_eq!(store.list_memory_aliases(10).expect("list").len(), 1);
+    }
+
+    #[test]
+    fn memory_entity_delete_cascades_relations_and_aliases() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+        let entity_id = store
+            .upsert_memory_entity("project", "法律项目", &serde_json::json!({}))
+            .expect("insert entity");
+        let file = Uuid::now_v7();
+        let relation = test_memory_write_input(
+            MemoryKind::Relation,
+            MemoryTargetType::Entity,
+            entity_id,
+            MemoryTargetType::File,
+            file,
+            None,
+            0.9,
+            MemorySource::UserExplicit,
+            MemoryStatus::Confirmed,
+        );
+        let relation_id = store.upsert_memory_relation(&relation).expect("insert relation");
+        let alias = test_memory_write_input(
+            MemoryKind::Alias,
+            MemoryTargetType::Entity,
+            entity_id,
+            MemoryTargetType::Entity,
+            entity_id,
+            Some("法律项目"),
+            0.9,
+            MemorySource::UserExplicit,
+            MemoryStatus::Confirmed,
+        );
+        let alias_id = store.upsert_memory_alias(&alias).expect("insert alias");
+
+        assert!(store.delete_memory_entity(entity_id).expect("delete entity"));
+        assert!(store.memory_entity_by_id(entity_id).expect("entity gone").is_none());
+        assert!(store.memory_relation_by_id(relation_id).expect("relation gone").is_none());
+        assert!(store.memory_alias_by_id(alias_id).expect("alias gone").is_none());
+        // 其他文件的关系不受影响
+        assert!(store
+            .list_memory_relations_by_object(MemoryTargetType::File, file, None, 10)
+            .expect("by object")
+            .is_empty());
+    }
+
+    #[test]
+    fn invalidate_memory_for_file_stales_relations_and_drops_aliases() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+        let file = Uuid::now_v7();
+        let entity = Uuid::now_v7();
+        let relation = test_memory_write_input(
+            MemoryKind::Relation,
+            MemoryTargetType::File,
+            file,
+            MemoryTargetType::Entity,
+            entity,
+            None,
+            0.9,
+            MemorySource::UserExplicit,
+            MemoryStatus::Confirmed,
+        );
+        let relation_id = store.upsert_memory_relation(&relation).expect("insert relation");
+        let alias = test_memory_write_input(
+            MemoryKind::Alias,
+            MemoryTargetType::File,
+            file,
+            MemoryTargetType::File,
+            file,
+            Some("我的简历"),
+            0.9,
+            MemorySource::UserExplicit,
+            MemoryStatus::Confirmed,
+        );
+        store.upsert_memory_alias(&alias).expect("insert alias");
+
+        let affected = store.invalidate_memory_for_file(file).expect("invalidate");
+        assert_eq!(affected, 2);
+        let stale = store.memory_relation_by_id(relation_id).expect("read").expect("exists");
+        assert_eq!(stale.status, MemoryStatus::Stale, "文件失效后关系标记 stale，不删除");
+        assert!(store
+            .find_memory_aliases("我的简历")
+            .expect("aliases")
+            .is_empty(), "指向失效文件的别名删除");
+    }
+
+    #[test]
+    fn memory_target_validation_rejects_missing_offline_and_unauthorized_files() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+        let root = store
+            .upsert_root(&test_root_registration())
+            .expect("insert root");
+        let (file_id, _) = {
+            let connection = store.connect().expect("connect");
+            seed_profile_file(
+                &connection,
+                &root.root_id,
+                "我的简历.pdf",
+                Uuid::now_v7(),
+                &[r#"["项目经历"]"#],
+                &["简历内容"],
+                1,
+                "embedding-test",
+            )
+        };
+
+        // 在场 + 授权根内 → 合法
+        assert!(store.memory_file_target_valid(file_id).expect("valid file"));
+        // 不存在的文件 → 不合法
+        assert!(!store
+            .memory_file_target_valid(Uuid::now_v7())
+            .expect("missing file"));
+        // 文件删除（availability 离开 present）→ 不合法：别名不得把失效文件注入 scope
+        store
+            .connect()
+            .expect("connect")
+            .execute(
+                "UPDATE files SET availability = 'gone' WHERE file_id = ?1",
+                params![file_id.to_string()],
+            )
+            .expect("remove file");
+        assert!(!store.memory_file_target_valid(file_id).expect("offline file"));
+        // 收藏集：不存在的 → 不合法
+        assert!(!store
+            .memory_collection_target_valid(Uuid::now_v7())
+            .expect("missing collection"));
+    }
+
+    #[test]
+    fn memory_target_rejects_file_outside_authorized_roots() {
+        // 边界 (2)：别名指向「在场但不在任何已启用授权根」的文件 → 不采用，
+        // 绝不把越权文件注入 scope。
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+        let now = Utc::now().to_rfc3339();
+        let rogue_file = Uuid::now_v7();
+        // 注册一个根再禁用：文件在场但所属根未启用 → 不授权
+        let mut rogue_registration = test_root_registration();
+        rogue_registration.canonical_path = "C:\\Users\\Test\\Other".to_owned();
+        rogue_registration.path_key = "c:\\users\\test\\other".to_owned();
+        let rogue_root = store
+            .upsert_root(&rogue_registration)
+            .expect("insert rogue root");
+        store.disable_root(&rogue_root.root_id).expect("disable root");
+        {
+            let connection = store.connect().expect("connect");
+            connection
+                .execute(
+                    "INSERT INTO files (file_id, canonical_path, path_key, name, extension, size_bytes, modified_at, discovered_at, availability, volume_id, display_name, mime_type, parse_status, first_seen_at, last_seen_at) VALUES (?1, ?2, ?2, '未授权.pdf', 'pdf', 1024, ?3, ?3, 'present', 'vol-rogue', '未授权.pdf', 'application/pdf', 'parsed', ?3, ?3)",
+                    params![rogue_file.to_string(), "C:\\Users\\Test\\Other\\未授权.pdf".to_owned(), now],
+                )
+                .expect("insert rogue file");
+            // membership 指向已禁用的根：不在任何授权根内
+            connection
+                .execute(
+                    "INSERT INTO file_root_memberships (file_id, root_id, relative_path, is_primary) VALUES (?1, ?2, '未授权.pdf', 1)",
+                    params![rogue_file.to_string(), rogue_root.root_id.to_string()],
+                )
+                .expect("insert membership to disabled root");
+        }
+        assert!(
+            !store.memory_file_target_valid(rogue_file).expect("rogue file"),
+            "在场但在未授权根的 memory 目标一律无效"
+        );
+    }
+
+    #[test]
+    fn file_document_node_count_tracks_current_revision_only() {
+        // 边界 (5) 的数据层：SUMMARY 截断的 nodes_total 必须以当前修订为准，
+        // 旧修订节点不计入；文件不存在 → 0。
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+        let root = store
+            .upsert_root(&test_root_registration())
+            .expect("insert root");
+        let revision_id = Uuid::now_v7();
+        let file_id = {
+            let connection = store.connect().expect("connect");
+            let (file_id, _) = seed_profile_file(
+                &connection,
+                &root.root_id,
+                "长文档.pdf",
+                revision_id,
+                &[r#"["一"]"#, r#"["二"]"#, r#"["三"]"#],
+                &["一", "二", "三"],
+                0,
+                "embedding-test",
+            );
+            file_id
+        };
+        {
+            // 旧修订的孤立节点（文件行从不指向它）不得被计数
+            let connection = store.connect().expect("connect");
+            let stale_revision = Uuid::now_v7();
+            connection
+                .execute(
+                    "INSERT INTO file_revisions (revision_id, file_id, size_bytes, fs_modified_at, metadata_fingerprint, created_at, parse_status) VALUES (?1, ?2, 1024, ?3, ?4, ?3, 'parsed')",
+                    params![stale_revision.to_string(), file_id.to_string(), Utc::now().to_rfc3339(), "stale".to_owned()],
+                )
+                .expect("insert stale revision");
+            let stale_node = Uuid::now_v7();
+            connection
+                .execute(
+                    "INSERT INTO document_nodes (node_id, revision_id, ordinal, node_type, locator_json, heading_path_json, text) VALUES (?1, ?2, 0, 'text', '{}', '[]', '旧版本')",
+                    params![stale_node.to_string(), stale_revision.to_string()],
+                )
+                .expect("insert stale-revision node");
+        }
+        assert_eq!(
+            store.file_document_node_count(&file_id).expect("count"),
+            3,
+            "只统计当前修订的 document_nodes"
+        );
+        assert_eq!(
+            store.file_document_node_count(&Uuid::now_v7()).expect("missing file"),
+            0,
+            "文件不存在 → 0（不报错）"
         );
     }
 
@@ -11277,6 +13954,75 @@ mod tests {
         // 明文存储：不被 sanitize 脱敏
         assert_eq!(node_page.items[0].input_json["question"], serde_json::json!("问题2"));
         assert_eq!(node_page.items[0].elapsed_ms, Some(20));
+    }
+
+    #[test]
+    fn node_traces_are_queryable_by_correlation_in_flow_order() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+
+        for (index, node) in ["source_routing", "query_parsing", "retrieval", "completed"]
+            .iter()
+            .enumerate()
+        {
+            store
+                .record_node_trace(
+                    "ask",
+                    node,
+                    "corr-ask-1",
+                    Some("session-1"),
+                    None,
+                    &serde_json::json!({ "question": "我的简历里有没有 LangGraph" }),
+                    &serde_json::json!({ "step": index }),
+                    "ok",
+                    Some(index as u64 * 10),
+                )
+                .expect("record ask trace");
+        }
+        // 另一 correlation 与另一 flow 不应混入
+        store
+            .record_node_trace(
+                "ask",
+                "source_routing",
+                "corr-ask-2",
+                None,
+                None,
+                &serde_json::json!({ "question": "别的" }),
+                &serde_json::json!({ "step": 99 }),
+                "ok",
+                None,
+            )
+            .expect("record other correlation");
+        store
+            .record_node_trace(
+                "search",
+                "retrieval",
+                "corr-ask-1",
+                None,
+                None,
+                &serde_json::json!({ "query": "搜索" }),
+                &serde_json::json!({ "count": 1 }),
+                "ok",
+                None,
+            )
+            .expect("record other flow");
+
+        let records = store
+            .query_node_traces_by_correlation("ask", "corr-ask-1")
+            .expect("query by correlation");
+        assert_eq!(records.len(), 4);
+        // 时间正序 = 流水顺序
+        assert_eq!(records[0].node, "source_routing");
+        assert_eq!(records[1].node, "query_parsing");
+        assert_eq!(records[2].node, "retrieval");
+        assert_eq!(records[3].node, "completed");
+        assert_eq!(records[2].elapsed_ms, Some(20));
+        assert!(records.iter().all(|record| record.flow == "ask"));
+
+        let empty = store
+            .query_node_traces_by_correlation("ask", "corr-missing")
+            .expect("empty query");
+        assert!(empty.is_empty());
     }
 
     #[test]
@@ -12071,6 +14817,7 @@ mod tests {
             retrieval_limit: 12,
             max_source_files: 8,
             strict_evidence: true,
+            clarification_selection: None,
         };
         let image_answer = store
             .answer_extractively(&ask, None)
@@ -12232,6 +14979,7 @@ mod tests {
                     retrieval_limit: 12,
                     max_source_files: 8,
                     strict_evidence: true,
+                    clarification_selection: None,
                 },
                 None,
             )

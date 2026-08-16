@@ -15,6 +15,7 @@ use crate::{
     FileRecord, FileRelation, FileSystemEvent, ImageUnderstandingResult, InboxPage, InboxQuery,
     InboxUpdateRequest, IndexActivityStats, IndexRebuildResult, JobRecord, JobStatus,
     LogEventInput, LogPage, LogQuery, MaintenanceSnapshot, NodeTracePage, NodeTraceQuery,
+    NodeTraceRecord,
     ParseResult, PendingEmbeddingChunk, PendingImageUnderstanding, ProcessingCoverageSnapshot,
     RelationGroupPage, RelationGroupQuery, RelationPage, RelationQuery, RelationRefreshResult,
     RootRegistration, ScanControl, ScanPolicy,
@@ -729,6 +730,204 @@ impl CatalogService {
             .refresh_collection_suggestions(model_artifact_id, max_files)
     }
 
+    /// DocumentProfile 生产链（Step 1）：为「已解析 + 全量嵌入完成」的文件
+    /// 构建/重建文档画像。后台批次调用，单文件失败只跳过。
+    pub fn refresh_document_profiles(
+        &self,
+        model_artifact_id: &str,
+        max_files: u32,
+    ) -> Result<crate::ProfileRefreshResult, AppError> {
+        self.store
+            .refresh_document_profiles(model_artifact_id, max_files)
+    }
+
+    /// 强制重建画像（单文件或全部，不重建 Chunk Embedding）。
+    pub fn rebuild_document_profiles(
+        &self,
+        model_artifact_id: &str,
+        file_ids: Option<&[Uuid]>,
+    ) -> Result<crate::ProfileRefreshResult, AppError> {
+        self.store
+            .rebuild_document_profiles(model_artifact_id, file_ids)
+    }
+
+    pub fn get_document_profile(
+        &self,
+        file_id: Uuid,
+    ) -> Result<Option<crate::DocumentProfile>, AppError> {
+        self.store.get_document_profile(file_id)
+    }
+
+    /// 列出待分类画像（document_type IS NULL 且当前版本在场），供分类器扫描。
+    pub fn list_profiles_needing_classification(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<(crate::DocumentProfile, String)>, AppError> {
+        self.store.list_profiles_needing_classification(limit)
+    }
+
+    /// 读取画像已存的文档级向量（分类器与原型向量比对用）。
+    pub fn profile_vector(&self, file_id: &Uuid) -> Result<Option<Vec<f32>>, AppError> {
+        self.store.profile_vector(file_id)
+    }
+
+    /// 回写画像的分类器扩展列（document_type/type_confidence 等）。
+    pub fn update_document_profile_classifier(
+        &self,
+        profile: &crate::DocumentProfile,
+    ) -> Result<bool, AppError> {
+        self.store.update_document_profile_classifier(profile)
+    }
+
+    // ------------------------------ Memory 数据层（Step 3） ------------------------------
+
+    pub fn upsert_memory_entity(
+        &self,
+        entity_type: &str,
+        canonical_name: &str,
+        metadata_json: &serde_json::Value,
+    ) -> Result<Uuid, AppError> {
+        self.store
+            .upsert_memory_entity(entity_type, canonical_name, metadata_json)
+    }
+
+    pub fn memory_entity_by_id(&self, entity_id: Uuid) -> Result<Option<crate::MemoryEntity>, AppError> {
+        self.store.memory_entity_by_id(entity_id)
+    }
+
+    pub fn memory_entity_by_name(
+        &self,
+        entity_type: &str,
+        canonical_name: &str,
+    ) -> Result<Option<crate::MemoryEntity>, AppError> {
+        self.store.memory_entity_by_name(entity_type, canonical_name)
+    }
+
+    pub fn list_memory_entities(&self, limit: u32) -> Result<Vec<crate::MemoryEntity>, AppError> {
+        self.store.list_memory_entities(limit)
+    }
+
+    pub fn update_memory_entity(
+        &self,
+        entity_id: Uuid,
+        canonical_name: &str,
+        metadata_json: &serde_json::Value,
+    ) -> Result<bool, AppError> {
+        self.store
+            .update_memory_entity(entity_id, canonical_name, metadata_json)
+    }
+
+    pub fn delete_memory_entity(&self, entity_id: Uuid) -> Result<bool, AppError> {
+        self.store.delete_memory_entity(entity_id)
+    }
+
+    pub fn upsert_memory_relation(
+        &self,
+        input: &crate::MemoryWriteInput,
+    ) -> Result<Uuid, AppError> {
+        self.store.upsert_memory_relation(input)
+    }
+
+    pub fn memory_relation_by_id(
+        &self,
+        relation_id: Uuid,
+    ) -> Result<Option<crate::MemoryRelation>, AppError> {
+        self.store.memory_relation_by_id(relation_id)
+    }
+
+    pub fn update_memory_relation_status(
+        &self,
+        relation_id: Uuid,
+        status: crate::MemoryStatus,
+    ) -> Result<bool, AppError> {
+        self.store.update_memory_relation_status(relation_id, status)
+    }
+
+    pub fn list_memory_relations_by_subject(
+        &self,
+        subject_type: crate::MemoryTargetType,
+        subject_id: Uuid,
+        status: Option<crate::MemoryStatus>,
+        limit: u32,
+    ) -> Result<Vec<crate::MemoryRelation>, AppError> {
+        self.store
+            .list_memory_relations_by_subject(subject_type, subject_id, status, limit)
+    }
+
+    pub fn list_memory_relations_by_object(
+        &self,
+        object_type: crate::MemoryTargetType,
+        object_id: Uuid,
+        status: Option<crate::MemoryStatus>,
+        limit: u32,
+    ) -> Result<Vec<crate::MemoryRelation>, AppError> {
+        self.store
+            .list_memory_relations_by_object(object_type, object_id, status, limit)
+    }
+
+    pub fn list_memory_relation_candidates(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<crate::MemoryRelation>, AppError> {
+        self.store.list_memory_relation_candidates(limit)
+    }
+
+    /// 列出全部关系（可按状态过滤；Memory Resolver 定位用）。
+    pub fn list_memory_relations(
+        &self,
+        status: Option<crate::MemoryStatus>,
+        limit: u32,
+    ) -> Result<Vec<crate::MemoryRelation>, AppError> {
+        self.store.list_memory_relations("1 = 1", Vec::new(), status, limit)
+    }
+
+    pub fn delete_memory_relation(&self, relation_id: Uuid) -> Result<bool, AppError> {
+        self.store.delete_memory_relation(relation_id)
+    }
+
+    pub fn upsert_memory_alias(&self, input: &crate::MemoryWriteInput) -> Result<Uuid, AppError> {
+        self.store.upsert_memory_alias(input)
+    }
+
+    pub fn find_memory_aliases(&self, alias: &str) -> Result<Vec<crate::MemoryAlias>, AppError> {
+        self.store.find_memory_aliases(alias)
+    }
+
+    pub fn memory_alias_by_id(&self, alias_id: Uuid) -> Result<Option<crate::MemoryAlias>, AppError> {
+        self.store.memory_alias_by_id(alias_id)
+    }
+
+    pub fn bump_memory_alias(&self, alias_id: Uuid) -> Result<bool, AppError> {
+        self.store.bump_memory_alias(alias_id)
+    }
+
+    pub fn list_memory_aliases(&self, limit: u32) -> Result<Vec<crate::MemoryAlias>, AppError> {
+        self.store.list_memory_aliases(limit)
+    }
+
+    pub fn delete_memory_alias(&self, alias_id: Uuid) -> Result<bool, AppError> {
+        self.store.delete_memory_alias(alias_id)
+    }
+
+    /// 清空全部记忆（aliases / relations / entities）。
+    pub fn clear_memory(&self) -> Result<u64, AppError> {
+        self.store.clear_memory()
+    }
+
+    pub fn invalidate_memory_for_file(&self, file_id: Uuid) -> Result<u64, AppError> {
+        self.store.invalidate_memory_for_file(file_id)
+    }
+
+    /// Memory Resolver 合法性检查（Step 4）：文件必须存在、在场且位于授权根。
+    pub fn memory_file_target_valid(&self, file_id: Uuid) -> Result<bool, AppError> {
+        self.store.memory_file_target_valid(file_id)
+    }
+
+    /// Memory Resolver 合法性检查：收藏集必须真实存在。
+    pub fn memory_collection_target_valid(&self, collection_id: Uuid) -> Result<bool, AppError> {
+        self.store.memory_collection_target_valid(collection_id)
+    }
+
     pub fn query_collection_suggestions(
         &self,
         request: &crate::CollectionSuggestionQuery,
@@ -1005,6 +1204,47 @@ impl CatalogService {
         self.store.record_ask_failure(request, error)
     }
 
+    pub fn get_ask_session_context(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<crate::AskSessionContext>, AppError> {
+        self.store.get_ask_session_context(session_id)
+    }
+
+    pub fn update_ask_session_context(
+        &self,
+        session_id: Uuid,
+        context: &crate::AskSessionContext,
+    ) -> Result<(), AppError> {
+        self.store.update_ask_session_context(session_id, context)
+    }
+
+    pub fn clear_ask_session_context(&self, session_id: Uuid) -> Result<(), AppError> {
+        self.store.clear_ask_session_context(session_id)
+    }
+
+    /// 列出文档画像（Document Resolver 候选数据源），返回 (画像, 文件名)。
+    pub fn list_document_profiles(
+        &self,
+        document_type: Option<crate::DocumentType>,
+        limit: u32,
+    ) -> Result<Vec<(crate::DocumentProfile, String)>, AppError> {
+        self.store.list_document_profiles(document_type, limit)
+    }
+
+    /// 当前修订的 document_nodes 总数（SUMMARY 截断追踪用；未解析 → 0）。
+    pub fn file_document_node_count(&self, file_id: &Uuid) -> Result<u64, AppError> {
+        self.store.file_document_node_count(file_id)
+    }
+
+    /// 批量读取画像向量（文档级召回精排用，key = file_id）。
+    pub fn profile_vectors(
+        &self,
+        file_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<f32>>, AppError> {
+        self.store.profile_vectors(file_ids)
+    }
+
     pub fn answer_result(&self, message_id: &Uuid) -> Result<AnswerResult, AppError> {
         self.store.answer_result(message_id)
     }
@@ -1086,6 +1326,15 @@ impl CatalogService {
         self.store.query_node_traces(request)
     }
 
+    pub fn query_node_traces_by_correlation(
+        &self,
+        flow: &str,
+        correlation_id: &str,
+    ) -> Result<Vec<NodeTraceRecord>, AppError> {
+        self.store
+            .query_node_traces_by_correlation(flow, correlation_id)
+    }
+
     pub fn clear_node_traces(&self) -> Result<u64, AppError> {
         self.store.clear_node_traces()
     }
@@ -1142,6 +1391,11 @@ impl CatalogService {
     ) -> Result<FilePreview, AppError> {
         self.store
             .file_preview_page(file_id, offset, node_limit, anchor_node_id)
+    }
+
+    /// DOCUMENT_SUMMARY 用：按文档顺序读取当前修订的全部 chunk。
+    pub fn file_chunks(&self, file_id: &Uuid) -> Result<Vec<crate::ContentChunk>, AppError> {
+        self.store.file_chunks(file_id)
     }
 
     pub fn authorized_file_path(&self, file_id: &Uuid) -> Result<PathBuf, AppError> {

@@ -5,7 +5,7 @@ use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, atomic::AtomicBool},
+    sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}},
     thread,
     time::{Duration, Instant},
 };
@@ -212,27 +212,7 @@ pub fn run() {
                     thread::sleep(Duration::from_millis(750));
                 }
             });
-            let packaged_runtime_root = app.path().resource_dir()?.join("runtime");
-            let development_runtime_root =
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../.artifacts/runtime");
-            let managed_runtime_root = data_dir.join("runtime");
-            let gpu_candidates = [
-                managed_runtime_root.join("llama-cuda/llama-server.exe"),
-                managed_runtime_root.join("llama-vulkan/llama-server.exe"),
-                packaged_runtime_root.join("llama-cuda/llama-server.exe"),
-                packaged_runtime_root.join("llama-vulkan/llama-server.exe"),
-                development_runtime_root.join("llama-cuda/llama-server.exe"),
-                development_runtime_root.join("llama-vulkan/llama-server.exe"),
-            ];
-            let cpu_candidates = [
-                managed_runtime_root.join("llama/llama-server.exe"),
-                packaged_runtime_root.join("llama/llama-server.exe"),
-                development_runtime_root.join("llama/llama-server.exe"),
-            ];
-            let cpu_executable = cpu_candidates
-                .into_iter()
-                .find(|path| path.is_file())
-                .unwrap_or_else(|| development_runtime_root.join("llama/llama-server.exe"));
+            let (gpu_candidates, cpu_executable) = generation_runtime_candidates(app, &data_dir);
             // Start with the CPU runtime immediately so setup never blocks on
             // device probing; the GPU probe runs in the background and swaps
             // the runtime in once it completes (cold GPU bring-up can take
@@ -266,6 +246,7 @@ pub fn run() {
                 initialize_background_services(
                     startup_app,
                     data_dir,
+                    config_dir.clone(),
                     durable_model_store,
                     legacy_model_roots,
                     catalog,
@@ -283,6 +264,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            inference_runtime_refresh,
             commands::startup::startup_get_state,
             commands::welcome::welcome_get_state,
             commands::welcome::welcome_complete,
@@ -365,12 +347,27 @@ pub fn run() {
             app_data::storage_usage_get,
             app_data::storage_location_get,
             app_data::storage_migration_schedule,
+            app_data::model_store_migration_schedule,
+            app_data::storage_migration_cleanup,
+            app_data::model_store_migration_cleanup,
             app_data::cache_clear,
             app_data::app_data_reset_schedule,
             app_data::maintenance_log_query,
             app_data::maintenance_logs_clear,
             app_data::node_trace_query,
             app_data::node_trace_clear,
+            app_data::ask_trace_get,
+            app_data::ask_trace_export,
+            app_data::ask_evaluation_run,
+            app_data::document_profile_inspect,
+            app_data::document_profile_rebuild,
+            app_data::memory_inspector_query,
+            app_data::memory_relation_set_status,
+            app_data::memory_alias_delete,
+            app_data::memory_entity_delete,
+            app_data::memory_relation_delete,
+            app_data::memory_clear,
+            app_data::ask_session_context_clear,
             app_data::diagnostic_event_append,
             app_data::diagnostic_export,
             app_data::index_rebuild,
@@ -388,11 +385,17 @@ pub fn run() {
 
 const STORAGE_LOCATION_FILE: &str = "storage-location.json";
 const MANAGED_STORAGE_MARKER: &str = ".fanfan-managed-data-v1";
+const MODEL_STORE_LOCATION_FILE: &str = "model-store-location.json";
+const MODEL_STORE_TARGET_DIRECTORY_NAME: &str = "FanFanModelStore";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct StorageLocationConfig {
     active_data_directory: Option<String>,
     pending: Option<PendingStorageMigration>,
+    /// 迁移完成前的旧数据目录（可清理目标）；迁移完成时由 pending 转移而来。
+    previous_data_directory: Option<String>,
+    /// 已隔离等待删除的旧数据目录（清理中断时的崩溃兜底）。
+    cleanup_quarantine: Option<String>,
     last_error: Option<String>,
     updated_at: Option<String>,
 }
@@ -410,6 +413,27 @@ pub(crate) struct StorageLocationStatus {
     pending_target_directory: Option<String>,
     restart_required: bool,
     last_error: Option<String>,
+    /// 迁移完成前的旧数据目录；非空表示有待清理的旧数据。
+    previous_data_directory: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ModelStoreLocationConfig {
+    active_model_store: Option<String>,
+    pending: Option<PendingModelStoreMigration>,
+    /// 迁移完成前的旧模型仓库（可清理目标）；迁移完成时由 pending 转移而来。
+    previous_model_store: Option<String>,
+    /// 已隔离等待删除的旧模型仓库（清理中断时的崩溃兜底）。
+    cleanup_quarantine_store: Option<String>,
+    last_error: Option<String>,
+    updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingModelStoreMigration {
+    source_directory: String,
+    target_directory: String,
+    requested_at: String,
 }
 
 pub(crate) fn storage_location_status(
@@ -425,6 +449,7 @@ pub(crate) fn storage_location_status(
             .map(|pending| pending.target_directory.clone()),
         restart_required: config.pending.is_some(),
         last_error: config.last_error,
+        previous_data_directory: config.previous_data_directory,
     }
 }
 
@@ -499,6 +524,19 @@ pub(crate) fn schedule_storage_migration(
         ));
     }
     let mut config = read_storage_location_config(config_dir).unwrap_or_default();
+    // 上一次迁移的旧数据还没清理：再迁移会覆盖 previous 引用，旧目录变成无法
+    // 清理的孤儿——拒绝，要求先清理（前端按钮同时禁用，此处是双保险）。
+    if config
+        .previous_data_directory
+        .as_deref()
+        .is_some_and(|path| Path::new(path).is_dir())
+    {
+        return Err(fanfan_core::AppError::new(
+            "STORAGE_MIGRATION_PREVIOUS_PENDING_CLEANUP",
+            "上一次迁移的旧数据尚未清理，请先清理旧数据后再安排新的迁移",
+            false,
+        ));
+    }
     config.active_data_directory = Some(current_data_dir.to_string_lossy().into_owned());
     config.pending = Some(PendingStorageMigration {
         source_directory: current_data_dir.to_string_lossy().into_owned(),
@@ -518,6 +556,7 @@ pub(crate) fn schedule_storage_migration(
 }
 
 fn resolve_application_data_directory(config_dir: &Path, default_data_dir: &Path) -> PathBuf {
+    apply_pending_storage_cleanup(config_dir);
     let mut config = read_storage_location_config(config_dir).unwrap_or_default();
     let active = config
         .active_data_directory
@@ -533,10 +572,19 @@ fn resolve_application_data_directory(config_dir: &Path, default_data_dir: &Path
     let result = copy_tree_verified(&source, &target);
     match result {
         Ok(()) => {
+            // 迁移完成：旧目录由 pending 转入 previous，供后续手动清理释放磁盘。
+            config.previous_data_directory = Some(pending.source_directory);
             config.active_data_directory = Some(target.to_string_lossy().into_owned());
             config.pending = None;
             config.last_error = None;
             config.updated_at = Some(Utc::now().to_rfc3339());
+            runtime_log::event(
+                "info",
+                "storage",
+                "storage.migration_completed",
+                None,
+                &serde_json::json!({ "target_directory": target }),
+            );
             if write_storage_location_config(config_dir, &config).is_ok() {
                 target
             } else {
@@ -552,6 +600,219 @@ fn resolve_application_data_directory(config_dir: &Path, default_data_dir: &Path
             source
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct MigrationCleanupResult {
+    pub(crate) removed_entries: u64,
+    pub(crate) freed_bytes: u64,
+}
+
+/// 为待删除的旧目录生成同盘隔离路径（rename 原子隔离，防半删）。
+fn cleanup_quarantine_path(previous: &Path) -> PathBuf {
+    let parent = previous.parent().unwrap_or_else(|| Path::new("."));
+    let name = previous
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "data".into());
+    let mut counter = 0_usize;
+    loop {
+        let candidate = parent.join(if counter == 0 {
+            format!(
+                "{name}.fanfan-cleanup-{}",
+                Utc::now().format("%Y%m%d-%H%M%S")
+            )
+        } else {
+            format!(
+                "{name}.fanfan-cleanup-{}-{counter}",
+                Utc::now().format("%Y%m%d-%H%M%S")
+            )
+        });
+        if !candidate.exists() {
+            return candidate;
+        }
+        counter += 1;
+    }
+}
+
+fn storage_marker_valid(data_directory: &Path) -> bool {
+    data_directory
+        .join(MANAGED_STORAGE_MARKER)
+        .is_file()
+        && fs::read_to_string(data_directory.join(MANAGED_STORAGE_MARKER))
+            .is_ok_and(|content| content.trim() == "FANFAN_MANAGED_DATA_V1")
+}
+
+fn model_store_marker_valid(store: &Path) -> bool {
+    store.join(MODEL_STORE_READY_MARKER).is_file()
+        && fs::read_to_string(store.join(MODEL_STORE_READY_MARKER))
+            .is_ok_and(|content| content.trim() == "FANFAN_MODEL_STORE_V1")
+}
+
+/// 清理迁移完成前的旧数据目录（仅「迁移已完成且切换生效」后允许）。
+/// 三重保障：pending 必须为空；active 目录健康校验（迁移时已全量哈希对拍，
+/// 此处确认切换后的目录仍完好）；rename 原子隔离后再递归删除，途中崩溃
+/// 由下次启动的 apply_pending_storage_cleanup 兜底。
+pub(crate) fn cleanup_storage_migration(
+    config_dir: &Path,
+    active_data_dir: &Path,
+) -> Result<MigrationCleanupResult, fanfan_core::AppError> {
+    let mut config = read_storage_location_config(config_dir).unwrap_or_default();
+    if config.pending.is_some() {
+        return Err(fanfan_core::AppError::new(
+            "STORAGE_MIGRATION_CLEANUP_PENDING",
+            "存储迁移尚未完成，暂不能清理旧数据",
+            true,
+        ));
+    }
+    let Some(previous_text) = config.previous_data_directory.clone() else {
+        return Err(fanfan_core::AppError::new(
+            "STORAGE_MIGRATION_CLEANUP_NOTHING",
+            "没有待清理的旧数据",
+            false,
+        ));
+    };
+    let previous = PathBuf::from(&previous_text);
+    if !previous.is_absolute() || !previous.is_dir() {
+        // 旧目录已不存在（可能被手动删除）：没有可清理的对象，清掉引用即可，
+        // 避免界面残留"待清理"提示且阻塞后续新迁移。
+        config.previous_data_directory = None;
+        config.cleanup_quarantine = None;
+        config.updated_at = Some(Utc::now().to_rfc3339());
+        let _ = write_storage_location_config(config_dir, &config);
+        return Ok(MigrationCleanupResult {
+            removed_entries: 0,
+            freed_bytes: 0,
+        });
+    }
+    // 先 canonicalize：Windows junction/symlink 会绕过纯文本路径比较，
+    // canonicalize 会把 reparse point 解析到真实目标后再比对。
+    let previous_canonical = fs::canonicalize(&previous).unwrap_or_else(|_| previous.clone());
+    let active_canonical =
+        fs::canonicalize(active_data_dir).unwrap_or_else(|_| active_data_dir.to_path_buf());
+    if previous_canonical == active_canonical
+        || path_contains(&previous_canonical, &active_canonical)
+        || path_contains(&active_canonical, &previous_canonical)
+    {
+        return Err(fanfan_core::AppError::new(
+            "STORAGE_MIGRATION_CLEANUP_VERIFICATION_FAILED",
+            "旧数据目录与当前数据目录存在重叠，已停止清理",
+            true,
+        ));
+    }
+    if !active_data_dir.is_dir() || !storage_marker_valid(active_data_dir) {
+        return Err(fanfan_core::AppError::new(
+            "STORAGE_MIGRATION_CLEANUP_VERIFICATION_FAILED",
+            "当前数据目录校验未通过，已停止清理旧数据",
+            true,
+        ));
+    }
+    // rename 原子隔离：此后即使进程崩溃，旧数据也只是改名未删，启动兜底会删完。
+    let quarantine = cleanup_quarantine_path(&previous);
+    fs::rename(&previous, &quarantine).map_err(|error| {
+        fanfan_core::AppError::new(
+            "STORAGE_MIGRATION_CLEANUP_FAILED",
+            format!("无法隔离旧数据目录：{error}"),
+            true,
+        )
+    })?;
+    config.cleanup_quarantine = Some(quarantine.to_string_lossy().into_owned());
+    config.updated_at = Some(Utc::now().to_rfc3339());
+    if write_storage_location_config(config_dir, &config).is_err() {
+        // 配置没记下隔离路径就崩溃的话，隔离目录会脱离管理永久泄漏——
+        // 回滚隔离，让旧目录回到原位。
+        let _ = fs::rename(&quarantine, &previous);
+        return Err(fanfan_core::AppError::new(
+            "STORAGE_MIGRATION_CLEANUP_FAILED",
+            "无法保存清理状态，已还原旧数据目录；请检查磁盘空间后重试",
+            true,
+        ));
+    }
+    let freed_bytes = app_data::directory_size(&quarantine).map_err(|error| {
+        fanfan_core::AppError::new("STORAGE_MIGRATION_CLEANUP_FAILED", error.message, true)
+    })?;
+    let removed_entries = app_data::clear_directory_contents(&quarantine).map_err(|error| {
+        fanfan_core::AppError::new("STORAGE_MIGRATION_CLEANUP_FAILED", error.message, true)
+    })?;
+    let _ = fs::remove_dir(&quarantine);
+    config.previous_data_directory = None;
+    config.cleanup_quarantine = None;
+    config.updated_at = Some(Utc::now().to_rfc3339());
+    let _ = write_storage_location_config(config_dir, &config);
+    runtime_log::event(
+        "info",
+        "storage",
+        "storage.migration_cleanup_completed",
+        None,
+        &serde_json::json!({
+            "quarantine_directory": quarantine,
+            "freed_bytes": freed_bytes,
+            "removed_entries": removed_entries,
+        }),
+    );
+    Ok(MigrationCleanupResult {
+        removed_entries,
+        freed_bytes,
+    })
+}
+
+/// 启动兜底删除前的隔离路径安全校验：必须是绝对路径、目录名含隔离标记
+/// `.fanfan-cleanup-`、且不与配置目录或当前活动目录互相包含——
+/// 防止损坏/被篡改的配置让启动兜底静默递归删除无关目录。
+fn quarantine_path_safe(config_dir: &Path, quarantine: &Path, active: Option<&Path>) -> bool {
+    if !quarantine.is_absolute() {
+        return false;
+    }
+    let name = quarantine
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if !name.contains(".fanfan-cleanup-") {
+        return false;
+    }
+    if quarantine == config_dir
+        || path_contains(quarantine, config_dir)
+        || path_contains(config_dir, quarantine)
+    {
+        return false;
+    }
+    if let Some(active) = active {
+        if quarantine == active
+            || path_contains(quarantine, active)
+            || path_contains(active, quarantine)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// 启动兜底：上次清理在隔离后、删除前中断时，删除隔离目录并清空配置。
+/// 只在隔离目录确实不存在后才清配置，删除失败留待下次启动重试。
+fn apply_pending_storage_cleanup(config_dir: &Path) {
+    let mut config = match read_storage_location_config(config_dir) {
+        Ok(config) => config,
+        Err(_) => return,
+    };
+    let Some(quarantine_text) = config.cleanup_quarantine.clone() else {
+        return;
+    };
+    let quarantine = PathBuf::from(&quarantine_text);
+    let active = config
+        .active_data_directory
+        .as_deref()
+        .map(PathBuf::from);
+    if quarantine.is_dir()
+        && !(quarantine_path_safe(config_dir, &quarantine, active.as_deref())
+            && app_data::clear_directory_contents(&quarantine).is_ok()
+            && fs::remove_dir(&quarantine).is_ok())
+    {
+        return;
+    }
+    config.cleanup_quarantine = None;
+    config.previous_data_directory = None;
+    config.updated_at = Some(Utc::now().to_rfc3339());
+    let _ = write_storage_location_config(config_dir, &config);
 }
 
 fn read_storage_location_config(config_dir: &Path) -> std::io::Result<StorageLocationConfig> {
@@ -571,6 +832,48 @@ fn write_storage_location_config(
     let target = config_dir.join(STORAGE_LOCATION_FILE);
     let temporary = config_dir.join(format!("{STORAGE_LOCATION_FILE}.tmp"));
     let backup = config_dir.join(format!("{STORAGE_LOCATION_FILE}.bak"));
+    let payload = serde_json::to_vec_pretty(config)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let mut file = File::create(&temporary)?;
+    file.write_all(&payload)?;
+    file.sync_all()?;
+    if backup.exists() {
+        fs::remove_file(&backup)?;
+    }
+    if target.exists() {
+        fs::rename(&target, &backup)?;
+    }
+    if let Err(error) = fs::rename(&temporary, &target) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, &target);
+        }
+        return Err(error);
+    }
+    if backup.exists() {
+        fs::remove_file(backup)?;
+    }
+    Ok(())
+}
+
+fn read_model_store_location_config(
+    config_dir: &Path,
+) -> std::io::Result<ModelStoreLocationConfig> {
+    let path = config_dir.join(MODEL_STORE_LOCATION_FILE);
+    if !path.is_file() {
+        return Ok(ModelStoreLocationConfig::default());
+    }
+    serde_json::from_slice(&fs::read(path)?)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+fn write_model_store_location_config(
+    config_dir: &Path,
+    config: &ModelStoreLocationConfig,
+) -> std::io::Result<()> {
+    fs::create_dir_all(config_dir)?;
+    let target = config_dir.join(MODEL_STORE_LOCATION_FILE);
+    let temporary = config_dir.join(format!("{MODEL_STORE_LOCATION_FILE}.tmp"));
+    let backup = config_dir.join(format!("{MODEL_STORE_LOCATION_FILE}.bak"));
     let payload = serde_json::to_vec_pretty(config)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let mut file = File::create(&temporary)?;
@@ -849,6 +1152,367 @@ fn copy_directory_verified(source: &Path, target: &Path) -> std::io::Result<()> 
         }
     }
     Ok(())
+}
+
+/// 解析本次启动实际使用的模型仓库根目录。
+/// 无用户配置时维持既有 legacy→durable 迁移行为；存在待执行迁移时复制到
+/// 目标并逐文件校验（copy 非 move，失败保留源、下次启动重试）。
+/// 返回 (active_store, 错误码) —— 错误码仅用于 runtime_log 的 migration_deferred 事件。
+fn resolve_model_store_directory(
+    config_dir: &Path,
+    durable_store: &Path,
+    legacy_roots: &[PathBuf],
+) -> (PathBuf, Option<String>) {
+    apply_pending_model_store_cleanup(config_dir);
+    let mut config = match read_model_store_location_config(config_dir) {
+        Ok(config) => config,
+        Err(_) => ModelStoreLocationConfig::default(),
+    };
+    let configured = config
+        .active_model_store
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute());
+    let Some(configured) = configured else {
+        // 未配置过模型仓库位置：legacy→durable 迁移仍由既有逻辑负责。
+        return {
+            let (path, error) = prepare_durable_model_store(durable_store, legacy_roots);
+            (path, error.map(|e| format!("{:?}", e.kind())))
+        };
+    };
+    if !configured.is_dir() {
+        config.last_error = Some(
+            "已配置的模型仓库位置不可用，翻翻已使用默认位置；请检查目标磁盘后重启".into(),
+        );
+        config.updated_at = Some(Utc::now().to_rfc3339());
+        let _ = write_model_store_location_config(config_dir, &config);
+        runtime_log::event(
+            "warning",
+            "model_store",
+            "model_store.location_unavailable",
+            None,
+            &serde_json::json!({ "configured_store": configured }),
+        );
+        return {
+            let (path, error) = prepare_durable_model_store(durable_store, legacy_roots);
+            (path, error.map(|e| format!("{:?}", e.kind())))
+        };
+    }
+    let Some(pending) = config.pending.clone() else {
+        return (configured, None);
+    };
+    let source = PathBuf::from(&pending.source_directory);
+    let target = PathBuf::from(&pending.target_directory);
+    let result = (|| -> std::io::Result<PathBuf> {
+        if !source.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "source model store is missing",
+            ));
+        }
+        copy_directory_verified(&source, &target)?;
+        let staging_manager = ModelManager::open_store(target.clone())
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        staging_manager
+            .rebase_store_paths(&source)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        fs::write(target.join(MODEL_STORE_READY_MARKER), "FANFAN_MODEL_STORE_V1")?;
+        Ok(target.clone())
+    })();
+    match result {
+        Ok(active) => {
+            // 迁移完成：旧仓库由 pending 转入 previous，供后续手动清理释放磁盘。
+            config.previous_model_store = Some(pending.source_directory);
+            config.active_model_store = Some(active.to_string_lossy().into_owned());
+            config.pending = None;
+            config.last_error = None;
+            config.updated_at = Some(Utc::now().to_rfc3339());
+            let _ = write_model_store_location_config(config_dir, &config);
+            runtime_log::event(
+                "info",
+                "model_store",
+                "model_store.migration_completed",
+                None,
+                &serde_json::json!({ "target_directory": active }),
+            );
+            (active, None)
+        }
+        Err(error) => {
+            config.last_error = Some(
+                "模型仓库迁移未完成，翻翻已继续使用原位置；请检查目标磁盘空间和写入权限后重试"
+                    .into(),
+            );
+            config.updated_at = Some(Utc::now().to_rfc3339());
+            let _ = write_model_store_location_config(config_dir, &config);
+            let error_code = format!("{:?}", error.kind());
+            runtime_log::event(
+                "warning",
+                "model_store",
+                "model_store.migration_failed",
+                None,
+                &serde_json::json!({ "error_code": error_code }),
+            );
+            // copy 非 move：源仓库完整保留，pending 不清除，下次启动自动重试。
+            (source, Some(error_code))
+        }
+    }
+}
+
+/// 清理迁移完成前的旧模型仓库（仅「迁移已完成且切换生效」后允许）。
+/// 与 cleanup_storage_migration 同构：pending 必须为空；active 仓库健康校验
+/// （marker + registry 可打开）；rename 原子隔离后再递归删除，途中崩溃由
+/// 下次启动的 apply_pending_model_store_cleanup 兜底。
+pub(crate) fn cleanup_model_store_migration(
+    config_dir: &Path,
+    active_store: &Path,
+) -> Result<MigrationCleanupResult, fanfan_core::AppError> {
+    let mut config = match read_model_store_location_config(config_dir) {
+        Ok(config) => config,
+        Err(_) => ModelStoreLocationConfig::default(),
+    };
+    if config.pending.is_some() {
+        return Err(fanfan_core::AppError::new(
+            "MODEL_STORE_CLEANUP_PENDING",
+            "模型仓库迁移尚未完成，暂不能清理旧仓库",
+            true,
+        ));
+    }
+    let Some(previous_text) = config.previous_model_store.clone() else {
+        return Err(fanfan_core::AppError::new(
+            "MODEL_STORE_CLEANUP_NOTHING",
+            "没有待清理的旧模型仓库",
+            false,
+        ));
+    };
+    let previous = PathBuf::from(&previous_text);
+    if !previous.is_absolute() || !previous.is_dir() {
+        // 旧仓库已不存在（可能被手动删除）：没有可清理的对象，清掉引用即可，
+        // 避免界面残留"待清理"提示且阻塞后续新迁移。
+        config.previous_model_store = None;
+        config.cleanup_quarantine_store = None;
+        config.updated_at = Some(Utc::now().to_rfc3339());
+        let _ = write_model_store_location_config(config_dir, &config);
+        return Ok(MigrationCleanupResult {
+            removed_entries: 0,
+            freed_bytes: 0,
+        });
+    }
+    // 先 canonicalize：Windows junction/symlink 会绕过纯文本路径比较，
+    // canonicalize 会把 reparse point 解析到真实目标后再比对。
+    let previous_canonical = fs::canonicalize(&previous).unwrap_or_else(|_| previous.clone());
+    let active_canonical = fs::canonicalize(active_store).unwrap_or_else(|_| active_store.to_path_buf());
+    if previous_canonical == active_canonical
+        || path_contains(&previous_canonical, &active_canonical)
+        || path_contains(&active_canonical, &previous_canonical)
+    {
+        return Err(fanfan_core::AppError::new(
+            "MODEL_STORE_CLEANUP_VERIFICATION_FAILED",
+            "旧模型仓库与当前仓库存在重叠，已停止清理",
+            true,
+        ));
+    }
+    if !active_store.is_dir()
+        || !model_store_marker_valid(active_store)
+        // 只读校验：不能用 open_store（会触发下载恢复/清单刷新等写副作用，
+        // 且是第二实例、与在役服务锁不互斥）。
+        || ModelManager::registry_readable(active_store).is_err()
+    {
+        return Err(fanfan_core::AppError::new(
+            "MODEL_STORE_CLEANUP_VERIFICATION_FAILED",
+            "当前模型仓库校验未通过，已停止清理旧仓库",
+            true,
+        ));
+    }
+    // rename 原子隔离：此后即使进程崩溃，旧仓库也只是改名未删，启动兜底会删完。
+    let quarantine = cleanup_quarantine_path(&previous);
+    fs::rename(&previous, &quarantine).map_err(|error| {
+        fanfan_core::AppError::new(
+            "MODEL_STORE_CLEANUP_FAILED",
+            format!("无法隔离旧模型仓库：{error}"),
+            true,
+        )
+    })?;
+    config.cleanup_quarantine_store = Some(quarantine.to_string_lossy().into_owned());
+    config.updated_at = Some(Utc::now().to_rfc3339());
+    if write_model_store_location_config(config_dir, &config).is_err() {
+        // 配置没记下隔离路径就崩溃的话，隔离目录会脱离管理永久泄漏——
+        // 回滚隔离，让旧仓库回到原位。
+        let _ = fs::rename(&quarantine, &previous);
+        return Err(fanfan_core::AppError::new(
+            "MODEL_STORE_CLEANUP_FAILED",
+            "无法保存清理状态，已还原旧模型仓库；请检查磁盘空间后重试",
+            true,
+        ));
+    }
+    let freed_bytes = app_data::directory_size(&quarantine).map_err(|error| {
+        fanfan_core::AppError::new("MODEL_STORE_CLEANUP_FAILED", error.message, true)
+    })?;
+    let removed_entries = app_data::clear_directory_contents(&quarantine).map_err(|error| {
+        fanfan_core::AppError::new("MODEL_STORE_CLEANUP_FAILED", error.message, true)
+    })?;
+    let _ = fs::remove_dir(&quarantine);
+    config.previous_model_store = None;
+    config.cleanup_quarantine_store = None;
+    config.updated_at = Some(Utc::now().to_rfc3339());
+    let _ = write_model_store_location_config(config_dir, &config);
+    runtime_log::event(
+        "info",
+        "model_store",
+        "model_store.migration_cleanup_completed",
+        None,
+        &serde_json::json!({
+            "quarantine_directory": quarantine,
+            "freed_bytes": freed_bytes,
+            "removed_entries": removed_entries,
+        }),
+    );
+    Ok(MigrationCleanupResult {
+        removed_entries,
+        freed_bytes,
+    })
+}
+
+/// 启动兜底：上次模型仓库清理在隔离后、删除前中断时，删除隔离目录并清空配置。
+fn apply_pending_model_store_cleanup(config_dir: &Path) {
+    let mut config = match read_model_store_location_config(config_dir) {
+        Ok(config) => config,
+        Err(_) => return,
+    };
+    let Some(quarantine_text) = config.cleanup_quarantine_store.clone() else {
+        return;
+    };
+    let quarantine = PathBuf::from(&quarantine_text);
+    let active = config.active_model_store.as_deref().map(PathBuf::from);
+    if quarantine.is_dir()
+        && !(quarantine_path_safe(config_dir, &quarantine, active.as_deref())
+            && app_data::clear_directory_contents(&quarantine).is_ok()
+            && fs::remove_dir(&quarantine).is_ok())
+    {
+        return;
+    }
+    config.cleanup_quarantine_store = None;
+    config.previous_model_store = None;
+    config.updated_at = Some(Utc::now().to_rfc3339());
+    let _ = write_model_store_location_config(config_dir, &config);
+}
+
+pub(crate) fn schedule_model_store_migration(
+    config_dir: &Path,
+    current_store: &Path,
+    selected_parent: &Path,
+    authorized_roots: &[PathBuf],
+    base_status: fanfan_core::ModelStoreStatus,
+) -> Result<fanfan_core::ModelStoreStatus, fanfan_core::AppError> {
+    if !selected_parent.is_absolute() || !selected_parent.is_dir() {
+        return Err(fanfan_core::AppError::new(
+            "MODEL_STORE_MIGRATION_TARGET_INVALID",
+            "请选择一个已存在的本地文件夹作为新的模型仓库位置",
+            false,
+        ));
+    }
+    let selected_parent = selected_parent.canonicalize().map_err(|_| {
+        fanfan_core::AppError::new(
+            "MODEL_STORE_MIGRATION_TARGET_INVALID",
+            "无法读取所选模型仓库位置",
+            true,
+        )
+    })?;
+    let selected_text = selected_parent.to_string_lossy();
+    let is_unc = selected_text.starts_with("\\\\")
+        && (!selected_text.starts_with("\\\\?\\")
+            || selected_text
+                .to_ascii_lowercase()
+                .starts_with("\\\\?\\unc\\"));
+    if is_unc {
+        return Err(fanfan_core::AppError::new(
+            "MODEL_STORE_MIGRATION_TARGET_INVALID",
+            "模型仓库只能迁移到本地磁盘，不能使用网络位置",
+            false,
+        ));
+    }
+    let target = selected_parent.join(MODEL_STORE_TARGET_DIRECTORY_NAME);
+    if path_contains(current_store, &target) || path_contains(&target, current_store) {
+        return Err(fanfan_core::AppError::new(
+            "MODEL_STORE_MIGRATION_TARGET_INVALID",
+            "新模型仓库位置不能位于当前模型仓库内部或包含当前仓库",
+            false,
+        ));
+    }
+    if authorized_roots
+        .iter()
+        .any(|root| path_contains(root, &target))
+    {
+        return Err(fanfan_core::AppError::new(
+            "MODEL_STORE_MIGRATION_TARGET_AUTHORIZED_SOURCE",
+            "模型仓库不能放在已授权的资料源目录中",
+            false,
+        ));
+    }
+    if target.exists()
+        && target
+            .read_dir()
+            .map_err(|_| {
+                fanfan_core::AppError::new(
+                    "MODEL_STORE_MIGRATION_TARGET_INVALID",
+                    "无法检查新模型仓库目录",
+                    true,
+                )
+            })?
+            .next()
+            .is_some()
+    {
+        return Err(fanfan_core::AppError::new(
+            "MODEL_STORE_MIGRATION_TARGET_NOT_EMPTY",
+            "所选位置中的FanFanModelStore目录不是空目录，请选择其他位置",
+            false,
+        ));
+    }
+    let mut config = read_model_store_location_config(config_dir).unwrap_or_default();
+    // 上一次迁移的旧仓库还没清理：再迁移会覆盖 previous 引用，旧仓库变成无法
+    // 清理的孤儿——拒绝，要求先清理（前端按钮同时禁用，此处是双保险）。
+    if config
+        .previous_model_store
+        .as_deref()
+        .is_some_and(|path| Path::new(path).is_dir())
+    {
+        return Err(fanfan_core::AppError::new(
+            "MODEL_STORE_MIGRATION_PREVIOUS_PENDING_CLEANUP",
+            "上一次迁移的旧模型仓库尚未清理，请先清理旧仓库后再安排新的迁移",
+            false,
+        ));
+    }
+    config.active_model_store = Some(current_store.to_string_lossy().into_owned());
+    config.pending = Some(PendingModelStoreMigration {
+        source_directory: current_store.to_string_lossy().into_owned(),
+        target_directory: target.to_string_lossy().into_owned(),
+        requested_at: Utc::now().to_rfc3339(),
+    });
+    config.last_error = None;
+    config.updated_at = Some(Utc::now().to_rfc3339());
+    write_model_store_location_config(config_dir, &config).map_err(|_| {
+        fanfan_core::AppError::new(
+            "MODEL_STORE_MIGRATION_SCHEDULE_FAILED",
+            "无法保存模型仓库迁移计划",
+            true,
+        )
+    })?;
+    runtime_log::event(
+        "info",
+        "model_store",
+        "model_store.migration_scheduled",
+        None,
+        &serde_json::json!({
+            "source_directory": current_store,
+            "target_directory": target,
+        }),
+    );
+    Ok(fanfan_core::ModelStoreStatus {
+        migration_state: "migrating".into(),
+        pending_target_directory: Some(target.to_string_lossy().into_owned()),
+        restart_required: true,
+        last_error: None,
+        ..base_status
+    })
 }
 
 fn apply_pending_data_reset(config_dir: &Path, local_data_dir: &Path) -> std::io::Result<()> {
@@ -1190,6 +1854,7 @@ fn is_pdf(path: &Path) -> bool {
 fn initialize_background_services(
     app: tauri::AppHandle,
     data_dir: PathBuf,
+    config_dir: PathBuf,
     durable_model_store: PathBuf,
     legacy_model_roots: Vec<PathBuf>,
     catalog_state: CatalogServiceState,
@@ -1230,14 +1895,14 @@ fn initialize_background_services(
             },
         );
         let (active_model_store, migration_error) =
-            prepare_durable_model_store(&durable_model_store, &legacy_model_roots);
-        if let Some(error) = migration_error {
+            resolve_model_store_directory(&config_dir, &durable_model_store, &legacy_model_roots);
+        if let Some(error_code) = migration_error {
             runtime_log::event(
                 "warning",
                 "model_store",
                 "model_store.migration_deferred",
                 None,
-                &serde_json::json!({ "error_code": format!("{:?}", error.kind()) }),
+                &serde_json::json!({ "error_code": error_code }),
             );
         }
         let model_manager = Arc::new(ModelManager::open_store(active_model_store)?);
@@ -1523,6 +2188,60 @@ fn initialize_background_services(
     }
 }
 
+/// 生成运行时的候选可执行文件（GPU 优先，CPU 兜底）。setup 与手动刷新
+/// 命令共用同一套候选路径，避免两处构造漂移。
+fn generation_runtime_candidates(
+    app: &impl tauri::Manager<tauri::Wry>,
+    data_dir: &Path,
+) -> (Vec<PathBuf>, PathBuf) {
+    let packaged_runtime_root = app
+        .path()
+        .resource_dir()
+        .map(|dir| dir.join("runtime"))
+        .unwrap_or_default();
+    let development_runtime_root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../.artifacts/runtime");
+    let managed_runtime_root = data_dir.join("runtime");
+    let gpu_candidates = [
+        managed_runtime_root.join("llama-cuda/llama-server.exe"),
+        managed_runtime_root.join("llama-vulkan/llama-server.exe"),
+        packaged_runtime_root.join("llama-cuda/llama-server.exe"),
+        packaged_runtime_root.join("llama-vulkan/llama-server.exe"),
+        development_runtime_root.join("llama-cuda/llama-server.exe"),
+        development_runtime_root.join("llama-vulkan/llama-server.exe"),
+    ];
+    let cpu_executable = [
+        managed_runtime_root.join("llama/llama-server.exe"),
+        packaged_runtime_root.join("llama/llama-server.exe"),
+        development_runtime_root.join("llama/llama-server.exe"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .unwrap_or_else(|| development_runtime_root.join("llama/llama-server.exe"));
+    (gpu_candidates.to_vec(), cpu_executable)
+}
+
+/// 手动刷新推理运行时：重新探测 GPU 候选并在成功时换入，复用启动时的
+/// probe+swap 流程（含失败重试）。探测期间不会中断正在进行的推理；
+/// 已在探测中时忽略本次点击，避免并发拉起多个 llama-server。
+static REFRESH_PROBE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+#[tauri::command]
+fn inference_runtime_refresh(app: tauri::AppHandle) -> Result<(), String> {
+    if REFRESH_PROBE_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return Ok(());
+    }
+    let data_dir = app.state::<EnvironmentServiceState>().data_directory.clone();
+    let (gpu_candidates, cpu_executable) = generation_runtime_candidates(&app, &data_dir);
+    let generation = app.state::<GenerationServiceState>().0.clone();
+    let probe_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        background_probe_generation_runtime(probe_app, gpu_candidates, cpu_executable, generation);
+        REFRESH_PROBE_IN_FLIGHT.store(false, Ordering::Release);
+    });
+    Ok(())
+}
+
 /// Probe the GPU runtime candidates off the main thread and swap the
 /// generation runtime once a working GPU backend is found. The swap is
 /// skipped if a CPU instance is already serving so in-flight work is never
@@ -1535,15 +2254,38 @@ fn background_probe_generation_runtime(
 ) {
     let started = Instant::now();
     let mut best: Option<(PathBuf, RuntimeCapability)> = None;
-    for path in gpu_candidates {
-        if !path.is_file() {
-            continue;
+    // GPU 冷启动（驱动/CUDA 上下文）实测 12~25s，一次探测超时并不意味着
+    // 机器没有 GPU——先按 CPU 生效，等 60s 让驱动就绪后重试，最多 3 次。
+    // 全部失败才保持 CPU；任何一次成功后立即 swap，无需重启应用。
+    const PROBE_RETRY_ATTEMPTS: u32 = 3;
+    const PROBE_RETRY_DELAY: Duration = Duration::from_secs(60);
+    for attempt in 0..PROBE_RETRY_ATTEMPTS {
+        for path in &gpu_candidates {
+            if !path.is_file() {
+                continue;
+            }
+            let capability = LocalGenerationRuntime::new(path.clone()).probe_capability();
+            if capability.gpu_available {
+                best = Some((path.clone(), capability));
+                break;
+            }
         }
-        let capability = LocalGenerationRuntime::new(path.clone()).probe_capability();
-        if capability.gpu_available {
-            best = Some((path, capability));
+        if best.is_some() || attempt + 1 >= PROBE_RETRY_ATTEMPTS {
             break;
         }
+        runtime_log::event(
+            "warn",
+            "model.runtime",
+            "probe.retry_scheduled",
+            None,
+            &serde_json::json!({
+                "attempt": attempt + 1,
+                "attempts_total": PROBE_RETRY_ATTEMPTS,
+                "delay_seconds": PROBE_RETRY_DELAY.as_secs(),
+                "error_code": None::<String>,
+            }),
+        );
+        std::thread::sleep(PROBE_RETRY_DELAY);
     }
     let mut fields = serde_json::json!({
         "duration_ms": started.elapsed().as_millis() as u64,
@@ -1553,34 +2295,53 @@ fn background_probe_generation_runtime(
         Some((gpu, capability)) => {
             // 带时限拿锁：推理线程持锁可达数十秒，swap 只是换后续激活的运行时，
             // 没必要无限期等锁——等锁期间 app_status_get 等查询会排队几十秒。
-            let swapped =
-                match crate::commands::app_data::try_lock_generation_until(
-                    &generation,
-                    std::time::Duration::from_secs(3),
-                ) {
-                    Some(mut guard) => {
-                        if guard.is_active() {
-                            false
-                        } else {
-                            *guard = LocalGenerationRuntime::new_with_fallback_and_capability(
-                                gpu.clone(),
-                                cpu_executable,
-                                capability.clone(),
-                            );
-                            true
+            // 一次拿锁失败不代表 GPU 不可用：启动时 VLM/嵌入后台循环正占用
+            // 生成运行时，probe 与它们并发是常态（实测 probe 完成后锁被 VLM
+            // 推理持有，3s 拿锁必然失败）。失败后间隔重试，在推理空隙把 GPU
+            // runtime 换上去，避免整个会话因一次竞争永久留在 CPU。
+            const SWAP_RETRY_ATTEMPTS: u32 = 8;
+            const SWAP_RETRY_DELAY: Duration = Duration::from_secs(15);
+            let mut swapped = false;
+            for attempt in 0..SWAP_RETRY_ATTEMPTS {
+                swapped =
+                    match crate::commands::app_data::try_lock_generation_until(
+                        &generation,
+                        std::time::Duration::from_secs(3),
+                    ) {
+                        Some(mut guard) => {
+                            if guard.is_active() {
+                                // llama 进程存活（推理中）：换掉会中断在途生成，
+                                // 放下锁等下一轮。
+                                drop(guard);
+                                false
+                            } else {
+                                *guard = LocalGenerationRuntime::new_with_fallback_and_capability(
+                                    gpu.clone(),
+                                    cpu_executable.clone(),
+                                    capability.clone(),
+                                );
+                                true
+                            }
                         }
-                    }
-                    None => {
-                        runtime_log::event(
-                            "warn",
-                            "model.runtime",
-                            "probe.swap_skipped",
-                            None,
-                            &serde_json::json!({ "reason": "generation_runtime_locked" }),
-                        );
-                        false
-                    }
-                };
+                        None => false,
+                    };
+                if swapped {
+                    break;
+                }
+                runtime_log::event(
+                    "warn",
+                    "model.runtime",
+                    "probe.swap_retrying",
+                    None,
+                    &serde_json::json!({
+                        "attempt": attempt + 1,
+                        "attempts_total": SWAP_RETRY_ATTEMPTS,
+                        "reason": "generation_runtime_busy",
+                        "delay_seconds": SWAP_RETRY_DELAY.as_secs(),
+                    }),
+                );
+                std::thread::sleep(SWAP_RETRY_DELAY);
+            }
             fields["backend"] = capability.backend.clone().into();
             fields["devices"] = capability.devices.clone().into();
             fields["error_code"] = capability.error_code.clone().into();
@@ -1798,6 +2559,146 @@ mod reset_tests {
     }
 
     #[test]
+    fn model_store_migration_copies_rebases_and_switches_without_removing_source() {
+        let base = std::env::temp_dir().join(format!(
+            "fanfan-model-store-move-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let config_dir = base.join("config");
+        let source = base.join("source-store");
+        let destination_parent = base.join("destination");
+        fs::create_dir_all(&config_dir).expect("create config");
+        fs::create_dir_all(&destination_parent).expect("create destination parent");
+        let model_source = base.join("source-model.gguf");
+        fs::write(&model_source, b"model bytes to migrate").expect("write model source");
+        let manager = ModelManager::open_store(&source).expect("open source store");
+        let artifact = manager
+            .import_artifacts(&[fanfan_core::ModelImportSelection {
+                source_path: model_source.to_string_lossy().into_owned(),
+                role: fanfan_core::ModelRole::Generation,
+            }])
+            .expect("import artifact")
+            .remove(0);
+        let source_hash = sha256_path(Path::new(&artifact.local_path)).expect("source hash");
+
+        let scheduled = schedule_model_store_migration(
+            &config_dir,
+            &source,
+            &destination_parent,
+            &[],
+            manager.store_status().expect("base status"),
+        )
+        .expect("schedule model store migration");
+        assert!(scheduled.restart_required);
+        assert_eq!(scheduled.migration_state, "migrating");
+
+        let expected_target = destination_parent
+            .canonicalize()
+            .expect("canonical destination")
+            .join("FanFanModelStore");
+        let (active, error) =
+            resolve_model_store_directory(&config_dir, &source, std::slice::from_ref(&source));
+        assert!(error.is_none());
+        assert_eq!(active, expected_target);
+        let migrated = ModelManager::open_store(&active).expect("open migrated store");
+        let migrated_artifacts = migrated.list_artifacts().expect("list migrated artifacts");
+        assert_eq!(migrated_artifacts.len(), 1);
+        assert!(Path::new(&migrated_artifacts[0].local_path).starts_with(&active));
+        assert_eq!(
+            sha256_path(Path::new(&migrated_artifacts[0].local_path)).expect("migrated hash"),
+            source_hash
+        );
+        assert!(active.join(MODEL_STORE_READY_MARKER).is_file());
+        // copy 非 move：源仓库与文件完整保留。
+        assert!(Path::new(&artifact.local_path).is_file());
+        let config = read_model_store_location_config(&config_dir).expect("read config");
+        assert!(config.pending.is_none());
+        assert!(config.last_error.is_none());
+        fs::remove_dir_all(base).expect("clean model store move test directory");
+    }
+
+    #[test]
+    fn model_store_migration_keeps_source_when_target_is_blocked() {
+        let base = std::env::temp_dir().join(format!(
+            "fanfan-model-store-move-fail-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let config_dir = base.join("config");
+        let source = base.join("source-store");
+        let destination_parent = base.join("destination");
+        fs::create_dir_all(&config_dir).expect("create config");
+        fs::create_dir_all(&destination_parent).expect("create destination parent");
+        fs::create_dir_all(&source).expect("create source store");
+        fs::write(
+            source.join("registry.json"),
+            b"{}",
+        )
+        .expect("write registry");
+        let status = fanfan_core::ModelStoreStatus {
+            store_path: source.to_string_lossy().into_owned(),
+            migration_state: "ready".into(),
+            installed_artifacts: 0,
+            installed_bytes: 0,
+            integrity_status: "ready".into(),
+            pending_target_directory: None,
+            restart_required: false,
+            last_error: None,
+            previous_model_store: None,
+        };
+        schedule_model_store_migration(
+            &config_dir,
+            &source,
+            &destination_parent,
+            &[],
+            status,
+        )
+        .expect("schedule model store migration");
+        // 用同名文件堵住目标目录，让复制必然失败。
+        fs::write(
+            destination_parent.join("FanFanModelStore"),
+            b"blocked",
+        )
+        .expect("block target");
+
+        let (active, error) =
+            resolve_model_store_directory(&config_dir, &source, &[]);
+        assert!(error.is_some());
+        assert_eq!(active, source);
+        let config = read_model_store_location_config(&config_dir).expect("read config");
+        assert!(config.pending.is_some(), "pending 保留以在下次启动重试");
+        assert!(config.last_error.is_some());
+        fs::remove_dir_all(base).expect("clean model store move fail test directory");
+    }
+
+    #[test]
+    fn model_store_migration_rejects_an_authorized_source_directory() {
+        let base = std::env::temp_dir().join(format!(
+            "fanfan-model-store-safety-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let config_dir = base.join("config");
+        let source = base.join("source-store");
+        let authorized = base.join("authorized");
+        fs::create_dir_all(&config_dir).expect("create config");
+        fs::create_dir_all(&source).expect("create source store");
+        fs::create_dir_all(&authorized).expect("create authorized root");
+        let status = ModelManager::open_store(&source)
+            .expect("open source store")
+            .store_status()
+            .expect("base status");
+        let error = schedule_model_store_migration(
+            &config_dir,
+            &source,
+            &authorized,
+            std::slice::from_ref(&authorized),
+            status,
+        )
+        .expect_err("reject model store inside authorized source");
+        assert_eq!(error.code, "MODEL_STORE_MIGRATION_TARGET_AUTHORIZED_SOURCE");
+        fs::remove_dir_all(base).expect("clean model store safety test directory");
+    }
+
+    #[test]
     fn reset_fallback_quarantines_local_entries_except_the_webview_profile() {
         let base = std::env::temp_dir().join(format!(
             "fanfan-reset-fallback-test-{}",
@@ -1857,5 +2758,324 @@ mod reset_tests {
                     .starts_with("FanFanData.reset-"))
         );
         fs::remove_dir_all(base).expect("clean migrated reset test directory");
+    }
+
+    #[test]
+    fn storage_migration_cleanup_removes_previous_directory_and_keeps_active() {
+        let base = std::env::temp_dir().join(format!(
+            "fanfan-storage-cleanup-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let config_dir = base.join("config");
+        let source = base.join("source");
+        let destination_parent = base.join("destination");
+        fs::create_dir_all(source.join("indexes")).expect("create source");
+        fs::create_dir_all(&destination_parent).expect("create destination parent");
+        fs::write(source.join("fanfan.db"), b"database-v14").expect("write database");
+        fs::write(source.join("indexes").join("active.usearch"), b"vector-index")
+            .expect("write index");
+
+        schedule_storage_migration(&config_dir, &source, &destination_parent, &[])
+            .expect("schedule migration");
+        let active = resolve_application_data_directory(&config_dir, &source);
+        assert!(active.join(MANAGED_STORAGE_MARKER).is_file());
+        let config = read_storage_location_config(&config_dir).expect("read config");
+        assert_eq!(
+            config.previous_data_directory.as_deref(),
+            Some(source.to_string_lossy().as_ref()),
+            "迁移完成后旧目录应记入 previous"
+        );
+
+        let result = cleanup_storage_migration(&config_dir, &active).expect("cleanup previous");
+        assert_eq!(result.removed_entries, 2);
+        assert!(result.freed_bytes > 0);
+        assert!(!source.exists(), "旧目录应已删除");
+        assert!(active.join("fanfan.db").is_file(), "新位置应保持完好");
+        assert!(active.join(MANAGED_STORAGE_MARKER).is_file());
+        let config = read_storage_location_config(&config_dir).expect("read config after cleanup");
+        assert!(config.previous_data_directory.is_none());
+        assert!(config.cleanup_quarantine.is_none());
+        assert!(config.pending.is_none());
+        fs::remove_dir_all(base).expect("clean storage cleanup test directory");
+    }
+
+    #[test]
+    fn storage_migration_cleanup_refuses_while_pending() {
+        let base = std::env::temp_dir().join(format!(
+            "fanfan-storage-cleanup-pending-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let config_dir = base.join("config");
+        let source = base.join("source");
+        let destination_parent = base.join("destination");
+        fs::create_dir_all(&config_dir).expect("create config");
+        fs::create_dir_all(&source).expect("create source");
+        fs::create_dir_all(&destination_parent).expect("create destination parent");
+        schedule_storage_migration(&config_dir, &source, &destination_parent, &[])
+            .expect("schedule migration");
+
+        let error = cleanup_storage_migration(&config_dir, &source).expect_err("refuse while pending");
+        assert_eq!(error.code, "STORAGE_MIGRATION_CLEANUP_PENDING");
+        assert!(source.join("fanfan.db").is_dir() || source.is_dir());
+        fs::remove_dir_all(base).expect("clean storage cleanup pending test directory");
+    }
+
+    #[test]
+    fn storage_migration_cleanup_refuses_when_active_marker_missing() {
+        let base = std::env::temp_dir().join(format!(
+            "fanfan-storage-cleanup-marker-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let config_dir = base.join("config");
+        let source = base.join("source");
+        let destination_parent = base.join("destination");
+        fs::create_dir_all(&config_dir).expect("create config");
+        fs::create_dir_all(source.join("indexes")).expect("create source");
+        fs::create_dir_all(&destination_parent).expect("create destination parent");
+        fs::write(source.join("fanfan.db"), b"database-v14").expect("write database");
+        fs::write(source.join("indexes").join("active.usearch"), b"vector-index")
+            .expect("write index");
+        schedule_storage_migration(&config_dir, &source, &destination_parent, &[])
+            .expect("schedule migration");
+        let active = resolve_application_data_directory(&config_dir, &source);
+        fs::remove_file(active.join(MANAGED_STORAGE_MARKER)).expect("remove active marker");
+
+        let error =
+            cleanup_storage_migration(&config_dir, &active).expect_err("refuse when marker missing");
+        assert_eq!(error.code, "STORAGE_MIGRATION_CLEANUP_VERIFICATION_FAILED");
+        assert!(source.is_dir(), "校验失败时旧目录必须原样保留");
+        assert!(active.join("fanfan.db").is_file());
+        fs::remove_dir_all(base).expect("clean storage cleanup marker test directory");
+    }
+
+    #[test]
+    fn pending_cleanup_quarantine_removed_on_next_resolve() {
+        let base = std::env::temp_dir().join(format!(
+            "fanfan-cleanup-fallback-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let config_dir = base.join("config");
+        let active = base.join("active");
+        let quarantine = base.join("old-data.fanfan-cleanup-20260816-120000");
+        fs::create_dir_all(&config_dir).expect("create config");
+        fs::create_dir_all(&active).expect("create active");
+        fs::create_dir_all(&quarantine).expect("create quarantine");
+        fs::write(quarantine.join("leftover.db"), b"leftover").expect("write leftover");
+        fs::write(active.join("fanfan.db"), b"active-db").expect("write active db");
+        let mut config = StorageLocationConfig::default();
+        config.active_data_directory = Some(active.to_string_lossy().into_owned());
+        config.cleanup_quarantine = Some(quarantine.to_string_lossy().into_owned());
+        config.previous_data_directory = Some(active.to_string_lossy().into_owned());
+        write_storage_location_config(&config_dir, &config).expect("write interrupted config");
+
+        let resolved = resolve_application_data_directory(&config_dir, &active);
+        assert_eq!(resolved, active);
+        assert!(!quarantine.exists(), "启动兜底应删除中断的隔离目录");
+        let config = read_storage_location_config(&config_dir).expect("read config after fallback");
+        assert!(config.cleanup_quarantine.is_none());
+        assert!(config.previous_data_directory.is_none());
+        fs::remove_dir_all(base).expect("clean cleanup fallback test directory");
+    }
+
+    #[test]
+    fn model_store_cleanup_removes_previous_store_and_keeps_active() {
+        let base = std::env::temp_dir().join(format!(
+            "fanfan-model-cleanup-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let config_dir = base.join("config");
+        let source = base.join("source-store");
+        let destination_parent = base.join("destination");
+        fs::create_dir_all(&config_dir).expect("create config");
+        fs::create_dir_all(&destination_parent).expect("create destination parent");
+        let manager = ModelManager::open_store(&source).expect("open source store");
+        let status = manager.store_status().expect("base status");
+        fs::write(source.join("sample-model.gguf"), b"model bytes").expect("write model file");
+        schedule_model_store_migration(
+            &config_dir,
+            &source,
+            &destination_parent,
+            &[],
+            status,
+        )
+        .expect("schedule model store migration");
+        let (active, error) =
+            resolve_model_store_directory(&config_dir, &source, std::slice::from_ref(&source));
+        assert!(error.is_none());
+        let config = read_model_store_location_config(&config_dir).expect("read config");
+        assert_eq!(
+            config.previous_model_store.as_deref(),
+            Some(source.to_string_lossy().as_ref()),
+            "迁移完成后旧仓库应记入 previous"
+        );
+
+        let result = cleanup_model_store_migration(&config_dir, &active).expect("cleanup previous");
+        assert!(result.freed_bytes > 0);
+        assert!(!source.exists(), "旧仓库应已删除");
+        assert!(active.join(MODEL_STORE_READY_MARKER).is_file());
+        let config =
+            read_model_store_location_config(&config_dir).expect("read config after cleanup");
+        assert!(config.previous_model_store.is_none());
+        assert!(config.cleanup_quarantine_store.is_none());
+        fs::remove_dir_all(base).expect("clean model cleanup test directory");
+    }
+
+    #[test]
+    fn model_store_cleanup_refuses_while_pending() {
+        let base = std::env::temp_dir().join(format!(
+            "fanfan-model-cleanup-pending-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let config_dir = base.join("config");
+        let source = base.join("source-store");
+        let destination_parent = base.join("destination");
+        fs::create_dir_all(&config_dir).expect("create config");
+        fs::create_dir_all(&destination_parent).expect("create destination parent");
+        let manager = ModelManager::open_store(&source).expect("open source store");
+        let status = manager.store_status().expect("base status");
+        schedule_model_store_migration(
+            &config_dir,
+            &source,
+            &destination_parent,
+            &[],
+            status,
+        )
+        .expect("schedule model store migration");
+
+        let error = cleanup_model_store_migration(&config_dir, &source)
+            .expect_err("refuse model cleanup while pending");
+        assert_eq!(error.code, "MODEL_STORE_CLEANUP_PENDING");
+        assert!(source.is_dir());
+        fs::remove_dir_all(base).expect("clean model cleanup pending test directory");
+    }
+
+    #[test]
+    fn storage_migration_schedule_refuses_while_previous_awaits_cleanup() {
+        let base = std::env::temp_dir().join(format!(
+            "fanfan-storage-schedule-guard-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let config_dir = base.join("config");
+        let source = base.join("source");
+        let destination_parent = base.join("destination");
+        fs::create_dir_all(source.join("indexes")).expect("create source");
+        fs::create_dir_all(&destination_parent).expect("create destination parent");
+        fs::write(source.join("fanfan.db"), b"database-v14").expect("write database");
+        schedule_storage_migration(&config_dir, &source, &destination_parent, &[])
+            .expect("schedule first migration");
+        resolve_application_data_directory(&config_dir, &source);
+        // 第一次迁移完成但旧数据未清理：再安排新迁移必须被拒绝，否则旧目录
+        // 会从 previous 引用中消失变成无法清理的孤儿。
+        let second_parent = base.join("destination-two");
+        fs::create_dir_all(&second_parent).expect("create second parent");
+        let error = schedule_storage_migration(&config_dir, &source, &second_parent, &[])
+            .expect_err("refuse second migration while previous awaits cleanup");
+        assert_eq!(error.code, "STORAGE_MIGRATION_PREVIOUS_PENDING_CLEANUP");
+        assert!(source.is_dir(), "旧数据保持原样");
+        fs::remove_dir_all(base).expect("clean storage schedule guard test directory");
+    }
+
+    #[test]
+    fn storage_migration_cleanup_clears_reference_when_previous_already_gone() {
+        let base = std::env::temp_dir().join(format!(
+            "fanfan-storage-cleanup-gone-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let config_dir = base.join("config");
+        let source = base.join("source");
+        let destination_parent = base.join("destination");
+        fs::create_dir_all(source.join("indexes")).expect("create source");
+        fs::create_dir_all(&destination_parent).expect("create destination parent");
+        fs::write(source.join("fanfan.db"), b"database-v14").expect("write database");
+        schedule_storage_migration(&config_dir, &source, &destination_parent, &[])
+            .expect("schedule migration");
+        let active = resolve_application_data_directory(&config_dir, &source);
+        fs::remove_dir_all(&source).expect("remove old directory manually");
+
+        let result = cleanup_storage_migration(&config_dir, &active).expect("cleanup no-op");
+        assert_eq!(result.removed_entries, 0);
+        assert_eq!(result.freed_bytes, 0);
+        let config = read_storage_location_config(&config_dir).expect("read config");
+        assert!(config.previous_data_directory.is_none(), "引用应被清空");
+        assert!(active.join("fanfan.db").is_file(), "当前数据不受影响");
+        fs::remove_dir_all(base).expect("clean storage cleanup gone test directory");
+    }
+
+    #[test]
+    fn model_store_schedule_refuses_while_previous_awaits_cleanup() {
+        let base = std::env::temp_dir().join(format!(
+            "fanfan-model-schedule-guard-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let config_dir = base.join("config");
+        let source = base.join("source-store");
+        let destination_parent = base.join("destination");
+        fs::create_dir_all(&config_dir).expect("create config");
+        fs::create_dir_all(&destination_parent).expect("create destination parent");
+        let manager = ModelManager::open_store(&source).expect("open source store");
+        let status = manager.store_status().expect("base status");
+        fs::write(source.join("sample-model.gguf"), b"model bytes").expect("write model file");
+        schedule_model_store_migration(
+            &config_dir,
+            &source,
+            &destination_parent,
+            &[],
+            status,
+        )
+        .expect("schedule first migration");
+        let (_, error) =
+            resolve_model_store_directory(&config_dir, &source, std::slice::from_ref(&source));
+        assert!(error.is_none());
+        // 旧仓库未清理时再安排新迁移必须被拒绝。
+        let second_parent = base.join("destination-two");
+        fs::create_dir_all(&second_parent).expect("create second parent");
+        let manager = ModelManager::open_store(&source).expect("reopen source store");
+        let error = schedule_model_store_migration(
+            &config_dir,
+            &source,
+            &second_parent,
+            &[],
+            manager.store_status().expect("status"),
+        )
+        .expect_err("refuse second model migration while previous awaits cleanup");
+        assert_eq!(error.code, "MODEL_STORE_MIGRATION_PREVIOUS_PENDING_CLEANUP");
+        fs::remove_dir_all(base).expect("clean model schedule guard test directory");
+    }
+
+    #[test]
+    fn model_store_cleanup_clears_reference_when_previous_already_gone() {
+        let base = std::env::temp_dir().join(format!(
+            "fanfan-model-cleanup-gone-test-{}",
+            uuid::Uuid::now_v7()
+        ));
+        let config_dir = base.join("config");
+        let source = base.join("source-store");
+        let destination_parent = base.join("destination");
+        fs::create_dir_all(&config_dir).expect("create config");
+        fs::create_dir_all(&destination_parent).expect("create destination parent");
+        let manager = ModelManager::open_store(&source).expect("open source store");
+        let status = manager.store_status().expect("base status");
+        fs::write(source.join("sample-model.gguf"), b"model bytes").expect("write model file");
+        schedule_model_store_migration(
+            &config_dir,
+            &source,
+            &destination_parent,
+            &[],
+            status,
+        )
+        .expect("schedule migration");
+        let (active, error) =
+            resolve_model_store_directory(&config_dir, &source, std::slice::from_ref(&source));
+        assert!(error.is_none());
+        fs::remove_dir_all(&source).expect("remove old store manually");
+
+        let result = cleanup_model_store_migration(&config_dir, &active).expect("cleanup no-op");
+        assert_eq!(result.removed_entries, 0);
+        assert_eq!(result.freed_bytes, 0);
+        let config =
+            read_model_store_location_config(&config_dir).expect("read config after cleanup");
+        assert!(config.previous_model_store.is_none(), "引用应被清空");
+        assert!(active.join(MODEL_STORE_READY_MARKER).is_file(), "当前仓库不受影响");
+        fs::remove_dir_all(base).expect("clean model cleanup gone test directory");
     }
 }

@@ -128,6 +128,18 @@ const ASK_PHASE_LABELS: Record<string, string> = {
   completed: "回答已完成",
 };
 
+// 回答模式徽标：clarification/extract/find 等非普通回答显示模式标签，
+// 让用户知道当前回答属于哪种处理结果（普通 RAG 回答与闲聊不显示）。
+const ANSWER_MODE_LABELS: Record<string, string> = {
+  clarification: "需要澄清",
+  summary: "文档摘要",
+  compare: "文档对比",
+  extract: "结构化抽取",
+  find: "定位文件",
+  rag_refusal: "未找到资料",
+  unverified: "未验证回答",
+};
+
 const resampleMono = (chunks: Float32Array[], sourceRate: number, targetRate = 16_000): number[] => {
   const sourceLength = chunks.reduce((total, chunk) => total + chunk.length, 0);
   const source = new Float32Array(sourceLength);
@@ -371,7 +383,7 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
   // 意图路由已接入：生成模型就绪且无核心资源压力时，即使索引/Embedding 未就绪也可发送（闲聊路径可行）
   const chatUnavailable = readiness !== null && !readiness.ready && readiness.blockers.some((blocker) => blocker.code === "RAG_GENERATION_MISSING" || blocker.code === "RAG_CORE_MODE");
 
-  const submit = async (questionOverride?: string) => {
+  const submit = async (questionOverride?: string, clarificationSelection: string | null = null) => {
     const trimmed = (questionOverride ?? question).trim();
     if (!trimmed || loading) return;
     if (chatUnavailable) {
@@ -395,6 +407,7 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
         retrieval_limit: 12,
         max_source_files: 8,
         strict_evidence: true,
+        clarification_selection: clarificationSelection,
       });
       activeOperationRef.current = result.operation_id;
       setAskOperationId(result.operation_id);
@@ -702,7 +715,31 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
             <UserMessage text={turn.question} />
             <AssistantMessage>
               <div className="chat-bubble chat-bubble--assistant">
+                {turn.answer.answer_mode !== "generated" && turn.answer.answer_mode !== "chat" && (
+                  <span className={`answer-mode-chip answer-mode-chip--${turn.answer.answer_mode}`}>
+                    {ANSWER_MODE_LABELS[turn.answer.answer_mode] ?? turn.answer.answer_mode}
+                  </span>
+                )}
                 <div className="markdown-body"><MarkdownAnswer text={turn.answer.answer} question={turn.question} /></div>
+                {turn.answer.answer_mode === "clarification" && turn.answer.clarification && (
+                  <div className="clarification-options">
+                    <p className="clarification-options__reason">{turn.answer.clarification.reason}</p>
+                    <div className="clarification-options__list">
+                      {turn.answer.clarification.options.map((option) => (
+                        <button
+                          key={option.file_id}
+                          type="button"
+                          disabled={loading}
+                          onClick={() => void submit(turn.question, option.file_id)}
+                        >
+                          <strong>{option.display_name}</strong>
+                          {option.document_type && <small>{option.document_type}</small>}
+                          {option.signals.length > 0 && <span className="clarification-option__signals">{option.signals.join(" · ")}</span>}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
                 <div className="answer-actions">
                   <AnswerReferences
                     answer={turn.answer}

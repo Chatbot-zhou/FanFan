@@ -134,7 +134,24 @@ def _normalised_result(
     }
 
 
+# 单页识别瞬时失败（onnx 会话竞争、资源抖动、IO 忙）重试两次再上报；
+# 引擎级缺陷（模型缺失、输入非法）不可重试。页级识别实测 ~6s，重试
+# 成本在解析时间预算（OCR_TIME_BUDGET_SECONDS）内可控。
+_RECOGNIZE_RETRY_BACKOFF_SECONDS = (0.5, 1.0)
+
+
 def recognize_image(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, WorkerError | None]:
+    result, error = _recognize_image_once(payload)
+    if error is not None and error.retryable:
+        for backoff in _RECOGNIZE_RETRY_BACKOFF_SECONDS:
+            time.sleep(backoff)
+            result, error = _recognize_image_once(payload)
+            if error is None or not error.retryable:
+                break
+    return result, error
+
+
+def _recognize_image_once(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, WorkerError | None]:
     source_value = payload.get("image_path")
     page_no = payload.get("page_no", 1)
     if not isinstance(source_value, str) or not isinstance(page_no, int) or page_no < 1:

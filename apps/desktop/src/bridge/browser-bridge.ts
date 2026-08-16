@@ -3,6 +3,7 @@ import type {
   AskMessage,
   AskOperationSnapshot,
   AskSessionSummary,
+  AskTraceStage,
   CandidateRoot,
   CollectionRecord,
   CollectionSuggestion,
@@ -25,6 +26,10 @@ import type {
   SearchSession,
   ThemePreference,
   WelcomeState,
+  DocumentProfileInspect,
+  MemoryInspectorView,
+  MemoryRelationStatusRequest,
+  MemoryClearRequest,
 } from "./contracts";
 
 const WELCOME_KEY = "fanfan.welcome.v1";
@@ -353,6 +358,9 @@ export const browserBridge: FanFanBridge = {
   async environment_detect() {
     return defaultEnvironment;
   },
+  async inference_runtime_refresh() {
+    return undefined;
+  },
   async model_state_get() {
     const stored = window.localStorage.getItem(MODEL_KEY);
     if (stored) return JSON.parse(stored) as ModelRuntimeState;
@@ -407,7 +415,13 @@ export const browserBridge: FanFanBridge = {
     return structuredClone(demoDownloadJobs);
   },
   async model_store_status_get() {
-    return { store_path: "C:\\Users\\你\\AppData\\Local\\FanFan\\ModelStore\\v1", migration_state: "ready" as const, installed_artifacts: demoArtifacts.length, installed_bytes: demoArtifacts.reduce((total, artifact) => total + artifact.size_bytes, 0), integrity_status: "registry_loaded" };
+    return { store_path: "C:\\Users\\你\\AppData\\Local\\FanFan\\ModelStore\\v1", migration_state: "ready" as const, installed_artifacts: demoArtifacts.length, installed_bytes: demoArtifacts.reduce((total, artifact) => total + artifact.size_bytes, 0), integrity_status: "registry_loaded", pending_target_directory: null, restart_required: false, last_error: null, previous_model_store: null };
+  },
+  async model_store_migration_schedule() {
+    return { store_path: "C:\\Users\\你\\AppData\\Local\\FanFan\\ModelStore\\v1", migration_state: "migrating" as const, installed_artifacts: demoArtifacts.length, installed_bytes: demoArtifacts.reduce((total, artifact) => total + artifact.size_bytes, 0), integrity_status: "registry_loaded", pending_target_directory: "D:\\模型\\FanFanModelStore", restart_required: true, last_error: null, previous_model_store: null };
+  },
+  async model_store_migration_cleanup() {
+    return { removed_entries: 1, freed_bytes: 0 };
   },
   async model_download_get(job_id) {
     const job = demoDownloadJobs.find((item) => item.job_id === job_id);
@@ -537,6 +551,7 @@ export const browserBridge: FanFanBridge = {
         used_file_ids: [],
         elapsed_ms: search.elapsed_ms,
         answer_mode: "rag_refusal",
+        clarification: null,
         retrieval_channels: ["filename", "fts", "embedding", "rrf"],
         index_coverage: 1,
         degradation_reason: null,
@@ -576,6 +591,7 @@ export const browserBridge: FanFanBridge = {
         used_file_ids: source_files.map((source) => source.file_id),
         elapsed_ms: search.elapsed_ms,
         answer_mode: "generated",
+        clarification: null,
         retrieval_channels: ["filename", "fts", "embedding", "rrf"],
         index_coverage: 1,
         degradation_reason: null,
@@ -877,10 +893,13 @@ export const browserBridge: FanFanBridge = {
     return { categories, total_bytes, data_directory: "应用管理目录", disk_capacity_bytes: 512 * 1024 ** 3, disk_available_bytes: 128 * 1024 ** 3, soft_quota_bytes: 50 * 1024 ** 3, over_soft_quota: false, background_tasks_paused: false, notice: null, measured_at: now() };
   },
   async storage_location_get() {
-    return { active_data_directory: "应用管理目录", pending_target_directory: null, restart_required: false, last_error: null };
+    return { active_data_directory: "应用管理目录", pending_target_directory: null, restart_required: false, last_error: null, previous_data_directory: null };
   },
   async storage_migration_schedule(selected_directory) {
-    return { active_data_directory: "应用管理目录", pending_target_directory: `${selected_directory}\\FanFanData`, restart_required: true, last_error: null };
+    return { active_data_directory: "应用管理目录", pending_target_directory: `${selected_directory}\\FanFanData`, restart_required: true, last_error: null, previous_data_directory: null };
+  },
+  async storage_migration_cleanup() {
+    return { removed_entries: 1, freed_bytes: 0 };
   },
   async cache_clear(category) {
     return { category, removed_entries: 1, freed_bytes: category === "temporary_cache" ? 1_048_576 : 0 };
@@ -932,6 +951,83 @@ export const browserBridge: FanFanBridge = {
   async node_trace_clear() {
     return 2;
   },
+  async ask_trace_get(operationId) {
+    const node = (name: string, output: Record<string, unknown> = {}) => ({ trace_id: `trace-${name}`, flow: "ask", node: name, correlation_id: operationId, session_id: null, entity_id: null, input_json: { question: "你好" }, output_json: output, status: "ok", elapsed_ms: 10, created_at: now() });
+    const stages: AskTraceStage[] = [
+      { node: "source_routing", records: [node("source_routing", { source: "LOCAL", confidence: 0.9, routing_ok: true, routing_raw: "…" })] },
+      { node: "query_parsing", records: [node("query_parsing", { parsed: true, plan: { intent: "DocumentQa", target: { reference: "简历" } } })] },
+      { node: "memory_resolution", records: [node("memory_resolution", { alias_hint_count: 0, memory_resolution_ok: false, valid_memory_scope: [] })] },
+      { node: "document_resolution", records: [node("document_resolution", { status: "Resolved", candidates: [{ file_id: "file-1", score: 0.91 }], resolved_file_ids: ["file-1"] })] },
+      { node: "scope_planning", records: [node("scope_planning", { scope_file_ids: ["file-1"] })] },
+      { node: "query_rewrite", records: [node("query_rewrite", { rewritten_queries: ["LangGraph"], rewritten: true })] },
+      { node: "retrieval", records: [node("retrieval", { channels: ["fts", "embedding", "rrf"], embedding_ms: 320, retrieval_elapsed_ms: 2100, candidates: [{ file_id: "file-1", quote: "……", citations: 1 }] })] },
+      { node: "reranking", records: [node("reranking", { applied: true, scores: [0.83] })] },
+      { node: "generation", records: [node("generation", { raw: '{"claims":[]}' })] },
+      { node: "verification", records: [node("verification", { deterministic: true, supported: true })] },
+      { node: "completed", records: [{ ...node("completed", { answer_mode: "document_qa", claim_count: 4 }), elapsed_ms: 3421 }] },
+    ];
+    return {
+      operation_id: operationId,
+      question: "我的简历里有没有 LangGraph",
+      answer_mode: "document_qa",
+      stages,
+      timing: { source_router_ms: 10, query_parser_ms: 10, context_ms: null, memory_ms: 10, document_resolver_ms: 10, document_recall_ms: null, embedding_ms: 320, fts_ms: null, rerank_ms: 10, generation_ms: 10, verification_ms: 10, total_ms: 3421 },
+      diagnostic_summary: "LOCAL DocumentQa target=简历 memory=miss doc=Resolved(0.91) scope_files=1 retrieval_candidates=12 rerank_top1=0.83 claims=4 1/1 supported total=3421ms",
+    };
+  },
+  async ask_trace_export() {
+    throw new Error("浏览器预览不写入电脑文件，请在翻翻桌面程序中导出。");
+  },
+  async ask_evaluation_run() {
+    throw new Error("浏览器预览不批量运行评估，请在翻翻桌面程序中运行。");
+  },
+  async document_profile_inspect(fileId) {
+    return {
+      file_id: fileId,
+      display_name: "示例简历.pdf",
+      profile: {
+        file_id: fileId,
+        revision_id: "rev-1",
+        title: "示例简历",
+        summary: "浏览器预览演示画像",
+        keywords: ["简历", "示例"],
+        entities: [],
+        document_type: "resume",
+        type_confidence: 0.93,
+        section_titles: ["个人信息", "工作经历"],
+        representative_text_hash: null,
+        updated_at: now(),
+      },
+      embedding_present: true,
+    };
+  },
+  async document_profile_rebuild(request) {
+    const n = request.file_ids?.length ?? 5;
+    return { profiled_files: n, skipped_files: 0 };
+  },
+  async memory_inspector_query(search) {
+    const nowIso = now();
+    const target = search ? `匹配 ${search} 的目标` : "我的简历";
+    return {
+      aliases: search
+        ? [{ alias_id: "alias-1", alias: search, target_type: "file", target_id: "file-1", confidence: 0.9, source_type: "user_explicit", source_id: null, hit_count: 3, last_used_at: nowIso, created_at: nowIso, updated_at: nowIso }]
+        : [],
+      relations: search
+        ? [{ relation_id: "rel-1", subject_type: "entity", subject_id: "ent-1", predicate: "是", object_type: "file", object_id: "file-1", confidence: 0.8, status: "confirmed", source_type: "user_confirmed", source_id: null, created_at: nowIso, updated_at: nowIso }]
+        : [],
+      entities: search
+        ? [{ entity_id: "ent-1", entity_type: "person", canonical_name: target, metadata_json: {}, created_at: nowIso, updated_at: nowIso }]
+        : [],
+    };
+  },
+  async memory_relation_set_status() {},
+  async memory_alias_delete() {},
+  async memory_entity_delete() {},
+  async memory_relation_delete() {},
+  async memory_clear() {
+    return 0;
+  },
+  async ask_session_context_clear() {},
   async diagnostic_event_append() {},
   async diagnostic_export() {
     throw new Error("浏览器预览不写入电脑文件，请在翻翻桌面程序中导出。");

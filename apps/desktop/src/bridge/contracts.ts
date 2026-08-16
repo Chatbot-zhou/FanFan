@@ -477,6 +477,14 @@ export interface ModelStoreStatus {
   installed_artifacts: number;
   installed_bytes: number;
   integrity_status: string;
+  /** 已安排迁移的目标目录（重启后执行）。 */
+  pending_target_directory: string | null;
+  /** 存在待执行的模型仓库迁移时恒为 true，此时应提示用户重启。 */
+  restart_required: boolean;
+  /** 上次迁移/位置解析失败的说明。 */
+  last_error: string | null;
+  /** 迁移完成前的旧模型仓库；非空表示有待清理的旧仓库。 */
+  previous_model_store: string | null;
 }
 
 export interface EnvironmentCheck {
@@ -611,6 +619,22 @@ export interface AskRequest {
   retrieval_limit: number;
   max_source_files: number;
   strict_evidence: true;
+  /** Step 7：用户对 NEED_CLARIFICATION 选项的选择（file_id），随本轮提问一并提交 */
+  clarification_selection: string | null;
+}
+
+export interface ClarificationOption {
+  file_id: string;
+  display_name: string;
+  document_type: string | null;
+  score: number;
+  signals: string[];
+}
+
+export interface ClarificationPayload {
+  reference: string;
+  reason: string;
+  options: ClarificationOption[];
 }
 
 export interface RagReadiness {
@@ -650,7 +674,8 @@ export interface AnswerResult {
   source_files: AnswerSourceFile[];
   used_file_ids: string[];
   elapsed_ms: number;
-  answer_mode: "extractive" | "generated" | "rag_refusal" | "chat" | "unverified";
+  answer_mode: "generated" | "chat" | "rag_refusal" | "unverified" | "clarification" | "summary" | "compare" | "extract" | "find";
+  clarification: ClarificationPayload | null;
   retrieval_channels: string[];
   index_coverage: number;
   degradation_reason: string | null;
@@ -1116,6 +1141,13 @@ export interface StorageLocationStatus {
   pending_target_directory: string | null;
   restart_required: boolean;
   last_error: string | null;
+  /** 迁移完成前的旧数据目录；非空表示有待清理的旧数据。 */
+  previous_data_directory: string | null;
+}
+
+export interface MigrationCleanupResult {
+  removed_entries: number;
+  freed_bytes: number;
 }
 
 export interface CacheClearResult {
@@ -1192,6 +1224,237 @@ export interface NodeTracePage {
   total: number;
 }
 
+/** 一次 Ask 的逐阶段耗时（阶段未出现则为 null） */
+export interface AskTraceTiming {
+  source_router_ms: number | null;
+  query_parser_ms: number | null;
+  context_ms: number | null;
+  memory_ms: number | null;
+  document_resolver_ms: number | null;
+  document_recall_ms: number | null;
+  embedding_ms: number | null;
+  fts_ms: number | null;
+  rerank_ms: number | null;
+  generation_ms: number | null;
+  verification_ms: number | null;
+  total_ms: number | null;
+}
+
+export interface AskTraceStage {
+  /** 阶段节点名（source_routing / query_parsing / …） */
+  node: string;
+  /** 该阶段全部记录（按时间正序） */
+  records: NodeTraceRecord[];
+}
+
+/** Trace Viewer 的一次 Ask 追踪视图 */
+export interface AskTrace {
+  operation_id: string;
+  question: string | null;
+  answer_mode: string | null;
+  stages: AskTraceStage[];
+  timing: AskTraceTiming;
+  diagnostic_summary: string;
+}
+
+/** Debug Trace 导出请求（写文件前需 confirmed） */
+export interface AskTraceExportRequest {
+  operation_id: string;
+  target_path: string;
+  /** 开发选项：保留详细文本（chunk 全文 / 模型 prompt）；默认关闭 */
+  include_detailed_text: boolean;
+  confirmed: boolean;
+}
+
+/** 错误分类（13 类，snake_case；Unknown 兜底；结果文件可人工修改） */
+export type EvaluationErrorCategory =
+  | "router_error"
+  | "query_parse_error"
+  | "context_error"
+  | "memory_error"
+  | "document_resolution_error"
+  | "document_recall_error"
+  | "chunk_retrieval_error"
+  | "rerank_error"
+  | "no_evidence_error"
+  | "generation_error"
+  | "citation_error"
+  | "clarification_error"
+  | "unknown";
+
+/** Ask Evaluation Runner：单条用例评估结果 */
+export interface EvaluationRunResult {
+  case_id: string;
+  /** 该用例运行时的 operation_id（可对应用例打开 Trace Viewer） */
+  operation_id: string;
+  question: string;
+  expected_source: string | null;
+  expected_intent: string | null;
+  expected_file_ids: string[] | null;
+  expected_document_type: string | null;
+  expected_should_find_evidence: boolean | null;
+  actual_source: string | null;
+  actual_intent: string | null;
+  actual_file_ids: string[];
+  actual_document_type: string | null;
+  memory_used: boolean;
+  clarification_used: boolean;
+  retrieval_top_files: string[];
+  rerank_top_files: string[];
+  grounding_status: string | null;
+  answer_mode: string | null;
+  evidence_found: boolean;
+  answer_grounded: boolean;
+  claim_count: number;
+  supported_claim_count: number;
+  latency_ms: number;
+  error_category: EvaluationErrorCategory | null;
+  error_message: string | null;
+  pass_fail: boolean;
+  failed_fields: string[];
+}
+
+/** Ask Evaluation Runner：批量指标（只保证数据可采集） */
+export interface EvaluationRunMetrics {
+  total: number;
+  passed: number;
+  source_router_accuracy: number;
+  intent_accuracy: number;
+  document_resolution_top1_accuracy: number;
+  document_resolution_top3_recall: number;
+  memory_hit_accuracy: number;
+  memory_wrong_hit_rate: number;
+  clarification_rate: number;
+  clarification_success_rate: number;
+  retrieval_evidence_recall: number;
+  no_evidence_false_negative_rate: number;
+  grounded_answer_rate: number;
+  citation_pass_rate: number;
+  avg_total_ms: number;
+  p50_total_ms: number;
+  p95_total_ms: number;
+}
+
+/** Ask Evaluation Runner：批量运行请求（写结果文件前需 confirmed） */
+export interface AskEvaluationRunRequest {
+  target_path: string;
+  output_path: string;
+  confirmed: boolean;
+}
+
+/** Ask Evaluation Runner：批量运行报告（结果同时落盘 output_path） */
+export interface AskEvaluationRunReport {
+  schema_version: number;
+  generated_at: string;
+  run_id: string;
+  total: number;
+  passed: number;
+  failed: number;
+  metrics: EvaluationRunMetrics;
+  results: EvaluationRunResult[];
+}
+
+/** 记忆关系状态 */
+export type MemoryStatus = "candidate" | "confirmed" | "rejected" | "stale";
+/** 记忆来源信任层级 */
+export type MemorySource =
+  | "user_explicit"
+  | "user_confirmed"
+  | "user_selection"
+  | "repeated_usage"
+  | "document_inference"
+  | "model_inference";
+/** 记忆目标类型 */
+export type MemoryTargetType = "entity" | "file" | "collection";
+
+export interface MemoryEntity {
+  entity_id: string;
+  entity_type: string;
+  canonical_name: string;
+  metadata_json: Record<string, unknown>;
+  created_at: UtcDateTime;
+  updated_at: UtcDateTime;
+}
+
+export interface MemoryRelation {
+  relation_id: string;
+  subject_type: MemoryTargetType;
+  subject_id: string;
+  predicate: string;
+  object_type: MemoryTargetType;
+  object_id: string;
+  confidence: number;
+  status: MemoryStatus;
+  source_type: MemorySource;
+  source_id: string | null;
+  created_at: UtcDateTime;
+  updated_at: UtcDateTime;
+}
+
+export interface MemoryAlias {
+  alias_id: string;
+  alias: string;
+  target_type: MemoryTargetType;
+  target_id: string;
+  confidence: number;
+  source_type: MemorySource;
+  source_id: string | null;
+  hit_count: number;
+  last_used_at: UtcDateTime | null;
+  created_at: UtcDateTime;
+  updated_at: UtcDateTime;
+}
+
+/** 文档画像（定位用，绝不作为引用证据） */
+export interface DocumentProfile {
+  file_id: string;
+  revision_id: string;
+  title: string;
+  summary: string;
+  keywords: string[];
+  entities: string[];
+  document_type: string | null;
+  type_confidence: number | null;
+  section_titles: string[];
+  representative_text_hash: string | null;
+  updated_at: UtcDateTime;
+}
+
+export interface ProfileRefreshResult {
+  profiled_files: number;
+  skipped_files: number;
+}
+
+/** Document Profile Inspector：一次查询返回画像详情 + 向量在场状态 */
+export interface DocumentProfileInspect {
+  file_id: string;
+  display_name: string;
+  profile: DocumentProfile | null;
+  embedding_present: boolean;
+}
+
+/** 画像重建请求：file_ids 为 null 表示全部文件；不重建 Chunk Embedding */
+export interface DocumentProfileRebuildRequest {
+  file_ids: string[] | null;
+  confirmation: string;
+}
+
+/** Memory Inspector 视图（最小实现：三张表 + 可选关键字过滤） */
+export interface MemoryInspectorView {
+  aliases: MemoryAlias[];
+  relations: MemoryRelation[];
+  entities: MemoryEntity[];
+}
+
+export interface MemoryRelationStatusRequest {
+  relation_id: string;
+  status: "confirmed" | "rejected";
+}
+
+export interface MemoryClearRequest {
+  confirmation: string;
+}
+
 export interface FanFanBridge {
   startup_get_state(): Promise<StartupState>;
   welcome_get_state(): Promise<WelcomeState>;
@@ -1201,6 +1464,8 @@ export interface FanFanBridge {
   theme_set_preference(preference: ThemePreference, system_dark: boolean): Promise<ThemeState>;
   environment_get_latest(): Promise<EnvironmentCheck | null>;
   environment_detect(): Promise<EnvironmentCheck>;
+  /** 手动重新探测推理运行时（GPU 候选）并刷新当前生效后端。 */
+  inference_runtime_refresh(): Promise<void>;
   model_state_get(): Promise<ModelRuntimeState>;
   model_import_scan(paths: string[]): Promise<ImportCandidate[]>;
   model_import_confirm(selections: Array<{ source_path: string; role: ModelRole }>): Promise<ModelArtifact[]>;
@@ -1275,12 +1540,36 @@ export interface FanFanBridge {
   storage_usage_get(): Promise<StorageUsageSnapshot>;
   storage_location_get(): Promise<StorageLocationStatus>;
   storage_migration_schedule(selected_directory: string, confirmation: "MIGRATE_APPLICATION_STORAGE"): Promise<StorageLocationStatus>;
+  storage_migration_cleanup(confirmation: "CLEANUP_MIGRATED_STORAGE"): Promise<MigrationCleanupResult>;
+  model_store_migration_schedule(selected_directory: string, confirmation: "MIGRATE_MODEL_STORE"): Promise<ModelStoreStatus>;
+  model_store_migration_cleanup(confirmation: "CLEANUP_MIGRATED_MODEL_STORE"): Promise<MigrationCleanupResult>;
   cache_clear(category: "temporary_cache" | "failed_downloads", confirmation: "CLEAR_CACHE"): Promise<CacheClearResult>;
   app_data_reset_schedule(confirmation: "RESET_APPLICATION_DATA"): Promise<void>;
   maintenance_log_query(request: LogQuery): Promise<LogPage>;
   maintenance_logs_clear(): Promise<number>;
   node_trace_query(request: NodeTraceQuery): Promise<NodeTracePage>;
   node_trace_clear(): Promise<number>;
+  /** 一次 Ask 的调试追踪（12+ 阶段分组 + 耗时 + 诊断摘要一行） */
+  ask_trace_get(operation_id: string): Promise<AskTrace>;
+  /** 单次问答导出 Debug Trace JSON（默认脱敏：路径 / chunk 文本 / prompt） */
+  ask_trace_export(request: AskTraceExportRequest): Promise<ExportResult>;
+  /** Ask Evaluation Runner：JSONL/JSON 测试集批量运行问答管线 */
+  ask_evaluation_run(request: AskEvaluationRunRequest): Promise<AskEvaluationRunReport>;
+  /** Document Profile 检视：画像详情 + embedding 在场状态 */
+  document_profile_inspect(file_id: string): Promise<DocumentProfileInspect>;
+  /** 重建 Document Profile（单文件或全部；不重建 Chunk Embedding） */
+  document_profile_rebuild(request: DocumentProfileRebuildRequest): Promise<ProfileRefreshResult>;
+  /** Memory Inspector：三张表 + 可选关键字过滤 */
+  memory_inspector_query(search?: string): Promise<MemoryInspectorView>;
+  /** 记忆关系 confirm / reject（仅 relations 有状态） */
+  memory_relation_set_status(request: MemoryRelationStatusRequest): Promise<void>;
+  memory_alias_delete(alias_id: string): Promise<void>;
+  memory_entity_delete(entity_id: string): Promise<void>;
+  memory_relation_delete(relation_id: string): Promise<void>;
+  /** 清空 Memory（只删 memory_aliases/relations/entities；不删文件/索引/Embedding/Ask History） */
+  memory_clear(request: MemoryClearRequest): Promise<number>;
+  /** 清空 Session Context（有/无 Memory 与有/无 Session Context 的测试四态） */
+  ask_session_context_clear(session_id: string): Promise<void>;
   diagnostic_event_append(request: DiagnosticEventInput): Promise<void>;
   diagnostic_export(target_path: string, confirmed: true): Promise<ExportResult>;
   index_rebuild(confirmation: "REBUILD_INDEX"): Promise<OperationHandle>;
