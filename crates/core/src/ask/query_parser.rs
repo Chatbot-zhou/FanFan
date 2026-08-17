@@ -7,10 +7,28 @@
 //!
 //! Prompt 与解析器集中在本模块；解析失败由调用方回退（不中断问答）。
 
+use crate::ask::query_normalize::{extract_find_reference, is_existence_question};
 use crate::ask::query_plan::{QueryIntent, QueryOperation, QueryPlan, QueryTarget, SourceIntent};
 use crate::contracts::DocumentType;
 use crate::knowledge::fold_recent_history;
 use crate::AskMessage;
+
+/// 文档类型的中文名（用于从「我的简历里有没有写 X」构造 scope 引导词）。
+fn document_type_cn_name(document_type: DocumentType) -> &'static str {
+    match document_type {
+        DocumentType::Resume => "简历",
+        DocumentType::Contract => "合同",
+        DocumentType::Invoice => "发票",
+        DocumentType::Paper => "论文",
+        DocumentType::ProjectDocument => "项目文档",
+        DocumentType::Meeting => "会议纪要",
+        DocumentType::LearningMaterial => "课件",
+        DocumentType::Certificate => "证书",
+        DocumentType::Report => "报告",
+        DocumentType::Spreadsheet => "表格",
+        DocumentType::Other => "",
+    }
+}
 
 /// Query Parser 的输出 JSON Schema（llama.cpp 侧约束解码）。
 pub fn query_parser_schema() -> serde_json::Value {
@@ -106,7 +124,11 @@ pub fn query_parser_prompt(question: &str, history: &[AskMessage]) -> (String, S
 
 规则：
 - 「我的简历里有没有 LangGraph」→ 绝不能把「我的简历 LangGraph」整体作为搜索关键词；必须拆成 target.document_type = "resume"、target.owner = "self"、content_query = "LangGraph"。
-- 「我的简历有什么内容」→ DOCUMENT_SUMMARY（整文摘要），不是普通关键词检索；content_query 为 null，requires_full_document = true。
+- 明确提到某个文档对象（我的简历/那个大模型材料/这份合同）时 requires_document_resolution 必须为 true（先定位文件，再在文件内检索），禁止把它和内容词混成一个检索词。
+- 「我的简历里有没有写 X」「我的简历里有没有提到 X」是存在性问句 → operation = "qa"（回答「有/没有」），绝不是 extract。
+- 「我以前有没有做过 Agent 项目？」是存在性问句 → operation = "qa"；只有明确要清单（「把项目名称提取出来」「列出所有项目」）才是 extract。
+- 「我的资料里是怎么介绍 RAG 的？」「我的文件里有没有提到 Transformer？」→ LIBRARY_QA；content_query 只填真正的内容词（RAG / Transformer），「我的资料里是怎么介绍的」是 scope 引导语，不算内容。
+- 「我的简历有什么内容」「我的简历主要写了什么」→ DOCUMENT_SUMMARY（整文摘要），不是普通关键词检索；content_query 为 null，requires_full_document = true。
 - 「我的简历在哪里」→ DOCUMENT_FIND；content_query 为 null。
 - 「所有文件里哪些提到了 RAG」「我的资料里有没有 LangGraph」→ LIBRARY_QA；target 为空对象，content_query = 实际检索词。
 - 「比较我两个简历版本」→ COMPARE_DOCUMENTS；target 填第一个版本（如「简历」+ owner "self"），secondary_target 填第二个版本（如 reference「第二个版本」），requires_document_resolution = true；分不清先后时 target 填「更早/更常见」的那个，secondary_target 填另一个。
@@ -135,6 +157,214 @@ pub fn query_parser_prompt(question: &str, history: &[AskMessage]) -> (String, S
         question = question.trim()
     ));
     (system, user)
+}
+
+/// 静态 scope 引导短语（长短语在前）。「我的资料里是怎么介绍 RAG 的？」中
+/// 这段引导不算检索内容，剥离后才是真正的 content_query。
+const CONTENT_SCOPE_PREFIXES: &[&str] = &[
+    "我的资料里是怎么介绍",
+    "我的文件里是怎么介绍",
+    "我的知识库里是怎么介绍",
+    "我的资料里有没有提到",
+    "我的文件里有没有提到",
+    "我的知识库里有没有提到",
+    "我的资料里有没有讲",
+    "我的文件里有没有讲",
+    "我的资料里有没有写",
+    "我的文件里有没有写",
+    "我的资料里怎么介绍",
+    "我的文件里怎么介绍",
+    "我的资料里介绍了",
+    "我的文件里介绍了",
+    "我的资料里讲了",
+    "我的文件里讲了",
+    "我的资料里提到",
+    "我的文件里提到",
+    "我的资料里写了",
+    "我的文件里写了",
+    "我的资料里",
+    "我的文件里",
+    "我的知识库里",
+    "我的文档里",
+    "资料里",
+    "文件里",
+    "知识库里",
+    "文档里",
+    "我以前有没有做过",
+    "以前有没有做过",
+    "之前有没有做过",
+];
+
+/// 剥离 content_query 头部的 scope 引导短语与尾部疑问词：
+/// 「我的资料里是怎么介绍 RAG 的？」→「RAG」；「我以前有没有做过 Agent 项目？」
+/// →「Agent 项目」。target 相关的动态引导（我的简历里有没有写）同样参与。
+/// 剥离失败（剩余为空）返回原句。
+pub fn strip_content_scope_prefix(query: &str, plan: &QueryPlan) -> String {
+    let mut prefixes: Vec<String> = CONTENT_SCOPE_PREFIXES.iter().map(|p| p.to_string()).collect();
+    // 动态：target 给出的文档对象（reference/document_name/类型中文名）
+    for raw in [
+        plan.target.reference.as_deref(),
+        plan.target.document_name.as_deref(),
+        plan.target.document_type.map(document_type_cn_name),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let target = raw.trim().trim_start_matches("我的").trim().to_owned();
+        if target.is_empty() || target.chars().count() > 12 {
+            continue;
+        }
+        for suffix in ["里有没有写", "里有没有提到", "里有没有讲", "里怎么介绍", "里有没有", "里怎么", "里"] {
+            prefixes.push(format!("我的{target}{suffix}"));
+            prefixes.push(format!("{target}{suffix}"));
+        }
+    }
+    prefixes.sort_by_key(|prefix| std::cmp::Reverse(prefix.chars().count()));
+
+    let trimmed = query.trim();
+    for prefix in prefixes {
+        if let Some(remainder) = trimmed.strip_prefix(&prefix) {
+            let remainder = remainder
+                .trim()
+                .strip_prefix("关于")
+                .unwrap_or(remainder.trim())
+                .trim()
+                .trim_start_matches(|c: char| matches!(c, '是' | '有' | '：' | ':' | ' '))
+                .trim_end_matches(|c: char| {
+                    matches!(c, '？' | '?' | '！' | '!' | '。' | '、' | '，' | ' ' | '的' | '吗' | '呢' | '啊' | '了')
+                })
+                .trim()
+                .to_owned();
+            if !remainder.is_empty() {
+                return remainder;
+            }
+        }
+    }
+    trimmed.to_owned()
+}
+
+/// 摘要类内容引导（「我的简历主要写了什么」「材料里写了什么」→ DOCUMENT_SUMMARY）。
+fn is_summary_content_question(question: &str) -> bool {
+    let q = question.trim();
+    q.contains("主要写了什么") || q.contains("写了什么") || q.contains("有什么内容")
+        || q.contains("是什么内容") || q.contains("讲了什么") || q.contains("主要内容是")
+        || q.contains("大致内容") || q.contains("是什么样")
+}
+
+/// 解析后确定性修正（在 LLM 输出之上叠加的「明显逻辑规则」，不调阈值）：
+/// - FIND 标记残留 → 覆盖为 DOCUMENT_FIND；
+/// - 存在性问句（有没有/是否…过）→ operation=qa（不是 extract）；
+/// - target 非空 → 强制 requires_document_resolution=true（目标对象必须经
+///   Document Resolver 定位，禁止拿「我的简历」整句去全库检索）；
+/// - 「写了什么/有什么内容」→ DOCUMENT_SUMMARY + requires_full_document=true；
+/// - content_query 剥掉 scope 引导（我的资料里…）与尾随疑问词；
+/// - 回声防护：content_query/target 与历史任一用户问题相同 → 视为解析失败
+///   （0.6B 复读历史问题时返回 None，调用方走确定性回退）。
+pub fn finalize_query_plan(
+    mut plan: QueryPlan,
+    question: &str,
+    history: &[AskMessage],
+) -> Option<QueryPlan> {
+    // 1. FIND 标记残留覆盖（防御：预检通常已拦截，LLM 误判时兜底）
+    if let Some(reference) = extract_find_reference(question) {
+        plan.intent = QueryIntent::DocumentFind;
+        plan.operation = QueryOperation::Find;
+        plan.content_query = None;
+        plan.requires_full_document = false;
+        plan.requires_document_resolution = true;
+        plan.target.reference = Some(reference);
+    }
+    // 2. 存在性问句 → QA（绝不拆条目）
+    if plan.intent != QueryIntent::DocumentFind && is_existence_question(question) {
+        plan.operation = QueryOperation::Qa;
+    }
+    // 3. target 非空且需要定位 → 强制走 Document Resolver
+    let target_non_empty = plan.target.reference.as_deref().is_some_and(|v| !v.trim().is_empty())
+        || plan.target.document_name.as_deref().is_some_and(|v| !v.trim().is_empty())
+        || plan.target.document_type.is_some()
+        || plan.target.entity_name.as_deref().is_some_and(|v| !v.trim().is_empty());
+    let resolver_intents = [
+        QueryIntent::DocumentQa,
+        QueryIntent::DocumentSummary,
+        QueryIntent::MultiDocumentQa,
+        QueryIntent::CompareDocuments,
+        QueryIntent::DocumentFind,
+    ];
+    if target_non_empty && resolver_intents.contains(&plan.intent) {
+        plan.requires_document_resolution = true;
+    }
+    // 4. 摘要类内容问句 → DOCUMENT_SUMMARY（整文摘要，不跑 chunk 检索）
+    if plan.intent == QueryIntent::DocumentQa
+        && target_non_empty
+        && is_summary_content_question(question)
+    {
+        plan.intent = QueryIntent::DocumentSummary;
+        plan.operation = QueryOperation::Summary;
+        plan.requires_full_document = true;
+        plan.content_query = None;
+    }
+    // 6. 回声防护（在 scope 剥离**之前**）：解析结果等于历史任一用户问题
+    // → 解析失败。必须先判——剥离会把复读句拆成残片（「我的资料里有没有
+    // 提到 RAG」→「没有提到 RAG」），残片对比永不相等，防护就失效了。
+    let normalized = |text: &str| -> String {
+        text.trim_matches(|c: char| {
+            matches!(c, '？' | '?' | '！' | '!' | '。' | '、' | '，' | ' ' | '的' | '吗' | '呢' | '啊')
+        })
+        .trim()
+        .to_owned()
+    };
+    let content = plan
+        .content_query
+        .as_deref()
+        .map(normalized)
+        .unwrap_or_default();
+    let reference = plan
+        .target
+        .reference
+        .as_deref()
+        .map(normalized)
+        .unwrap_or_default();
+    let echoes_history = history.iter().any(|message| {
+        if message.role != "user" {
+            return false;
+        }
+        let prior = normalized(&message.content);
+        !prior.is_empty() && (content == prior || reference == prior)
+    });
+    if echoes_history {
+        return None;
+    }
+    // 5. content_query 剥 scope 引导（在目标分离之后，target 动态引导才可用）
+    if let Some(content_query) = plan.content_query.clone() {
+        let stripped = strip_content_scope_prefix(&content_query, &plan);
+        plan.content_query = Some(stripped);
+    }
+    Some(plan)
+}
+
+/// FIND 预检的确定性 plan（不经过 LLM Parser）：问题含「在哪/找一下/哪个文件」
+/// 标记时直接构造 DOCUMENT_FIND plan。「我毕业时候那个材料在哪」→
+/// reference=「我毕业时候那个材料」、owner=self、content_query=null。
+/// `_question` 预留作回声防护的输入，当前 plan 构造不需要它。
+pub fn find_query_plan(_question: &str, reference: &str) -> QueryPlan {
+    QueryPlan {
+        source: SourceIntent::Local,
+        intent: QueryIntent::DocumentFind,
+        operation: QueryOperation::Find,
+        target: QueryTarget {
+            reference: Some(reference.trim().to_owned()),
+            document_type: None,
+            document_name: None,
+            owner: Some("self".to_owned()),
+            entity_type: None,
+            entity_name: None,
+        },
+        content_query: None,
+        requires_document_resolution: true,
+        requires_full_document: false,
+        confidence: 1.0,
+        ..QueryPlan::default()
+    }
 }
 
 /// 解析 Query Parser 输出；解析失败或必填字段非法返回 None（调用方回退）。
@@ -435,5 +665,188 @@ mod tests {
         // 示例覆盖拆分、摘要、全库三种形态
         assert!(user.contains("document_summary"));
         assert!(user.contains("library_qa"));
+    }
+
+    #[test]
+    fn prompt_has_new_phase2_rules() {
+        // Phase 4.1 新增规则：存在性问句 → qa；scope 引导语不算内容；
+        // 提到明确文档对象必须 requires_document_resolution=true
+        let (_, user) = query_parser_prompt("我的资料里是怎么介绍 RAG 的？", &[]);
+        assert!(user.contains("存在性问句"));
+        assert!(user.contains("operation = \"qa\""));
+        assert!(user.contains("scope 引导语"));
+        assert!(user.contains("requires_document_resolution 必须为 true"));
+    }
+
+    #[test]
+    fn finalize_strips_scope_preamble_from_library_qa() {
+        // CASE 2：模型把整句当 content_query → 确定性剥掉「我的资料里是怎么介绍的」
+        let plan = parse_query_plan(r#"{"source":"local","intent":"library_qa","operation":"qa",
+            "target":{"reference":null,"document_type":null,"document_name":null,
+                      "owner":null,"entity_type":null,"entity_name":null},
+            "content_query":"我的资料里是怎么介绍 RAG 的？","requires_document_resolution":false,"confidence":0.8}"#)
+            .unwrap();
+        let question = "我的资料里是怎么介绍 RAG 的？";
+        let plan = finalize_query_plan(plan, question, &[]).unwrap();
+        assert_eq!(plan.content_query.as_deref(), Some("RAG"));
+        assert_eq!(plan.intent, QueryIntent::LibraryQa);
+    }
+
+    #[test]
+    fn finalize_strips_file_scope_and_keeps_library_qa() {
+        // CASE 3：我的文件里有没有提到 Transformer？ → content_query=Transformer
+        let plan = parse_query_plan(r#"{"source":"local","intent":"library_qa","operation":"qa",
+            "target":{"reference":null,"document_type":null,"document_name":null,
+                      "owner":null,"entity_type":null,"entity_name":null},
+            "content_query":"我的资料里有没有提到 Transformer？","requires_document_resolution":false,"confidence":0.8}"#)
+            .unwrap();
+        let question = "我的文件里有没有提到 Transformer？";
+        let plan = finalize_query_plan(plan, question, &[]).unwrap();
+        assert_eq!(plan.content_query.as_deref(), Some("Transformer"));
+        assert_eq!(plan.operation, QueryOperation::Qa);
+    }
+
+    #[test]
+    fn finalize_forces_document_resolution_when_target_present() {
+        // CASE 6：模型把 requires_document_resolution 置 false 但 target 有简历
+        // → 强制 true（目标对象必须经 Document Resolver 定位）
+        let plan = parse_query_plan(r#"{"source":"local","intent":"document_qa","operation":"qa",
+            "target":{"reference":"我的简历","document_type":"resume","document_name":null,
+                      "owner":"self","entity_type":null,"entity_name":null},
+            "content_query":"我的简历里有没有写 LangGraph","requires_document_resolution":false,"confidence":0.7}"#)
+            .unwrap();
+        let question = "我的简历里有没有写 LangGraph？";
+        let plan = finalize_query_plan(plan, question, &[]).unwrap();
+        assert!(plan.requires_document_resolution);
+        // 存在性问句 → qa；content_query 剥掉「我的简历里有没有写」
+        assert_eq!(plan.operation, QueryOperation::Qa);
+        assert_eq!(plan.content_query.as_deref(), Some("LangGraph"));
+    }
+
+    #[test]
+    fn finalize_existence_question_never_extract() {
+        // CASE 4：「我以前有没有做过 Agent 项目？」→ qa，不是 extract
+        let plan = parse_query_plan(r#"{"source":"local","intent":"document_qa","operation":"extract",
+            "target":{"reference":null,"document_type":null,"document_name":null,
+                      "owner":null,"entity_type":null,"entity_name":null},
+            "content_query":"我以前有没有做过 Agent 项目？","requires_document_resolution":false,"confidence":0.8}"#)
+            .unwrap();
+        let question = "我以前有没有做过 Agent 项目？";
+        let plan = finalize_query_plan(plan, question, &[]).unwrap();
+        assert_eq!(plan.operation, QueryOperation::Qa, "存在性问句必须走 qa");
+        // 以前有没有做过 → 剥离后 content_query 为「Agent 项目」
+        assert_eq!(plan.content_query.as_deref(), Some("Agent 项目"));
+    }
+
+    #[test]
+    fn finalize_summary_content_question_becomes_document_summary() {
+        // CASE 5 变体：模型没识别「主要写了什么」→ 确定性改判 DOCUMENT_SUMMARY
+        let plan = parse_query_plan(r#"{"source":"local","intent":"document_qa","operation":"qa",
+            "target":{"reference":"我的简历","document_type":"resume","document_name":null,
+                      "owner":"self","entity_type":null,"entity_name":null},
+            "content_query":"我的简历主要写了什么","requires_document_resolution":true,"confidence":0.8}"#)
+            .unwrap();
+        let question = "我的简历主要写了什么？";
+        let plan = finalize_query_plan(plan, question, &[]).unwrap();
+        assert_eq!(plan.intent, QueryIntent::DocumentSummary);
+        assert_eq!(plan.operation, QueryOperation::Summary);
+        assert!(plan.requires_full_document);
+        assert_eq!(plan.content_query, None);
+    }
+
+    #[test]
+    fn finalize_detects_find_markers_as_backstop() {
+        // CASE 7 兜底：LLM 没识别「在哪」→ 确定性改判 DOCUMENT_FIND
+        let plan = parse_query_plan(r#"{"source":"local","intent":"document_qa","operation":"qa",
+            "target":{"reference":null,"document_type":null,"document_name":null,
+                      "owner":null,"entity_type":null,"entity_name":null},
+            "content_query":"我毕业时候那个材料在哪","requires_document_resolution":false,"confidence":0.7}"#)
+            .unwrap();
+        let question = "我毕业时候那个材料在哪";
+        let plan = finalize_query_plan(plan, question, &[]).unwrap();
+        assert_eq!(plan.intent, QueryIntent::DocumentFind);
+        assert_eq!(plan.operation, QueryOperation::Find);
+        assert_eq!(plan.content_query, None);
+        assert_eq!(plan.target.reference.as_deref(), Some("我毕业时候那个材料"));
+        assert!(plan.requires_document_resolution);
+    }
+
+    #[test]
+    fn finalize_rejects_plan_echoing_history_question() {
+        // CASE 7 回声防护：0.6B 复读历史里的用户问题 → 视为解析失败（None）。
+        // 注意：FIND 确定性改判优先于回声防护——当前问题是 FIND 问句时
+        // 覆盖成 DOCUMENT_FIND 是正确的（见 finalize_detects_find_markers_as_backstop），
+        // 所以这里必须用非 FIND 问句来测回声拒绝。
+        let plan = parse_query_plan(r#"{"source":"local","intent":"document_qa","operation":"qa",
+            "target":{"reference":null,"document_type":null,"document_name":null,
+                      "owner":null,"entity_type":null,"entity_name":null},
+            "content_query":"我的资料里有没有提到 RAG","requires_document_resolution":false,"confidence":0.7}"#)
+            .unwrap();
+        let history = vec![AskMessage {
+            message_id: uuid::Uuid::now_v7(),
+            session_id: uuid::Uuid::now_v7(),
+            role: "user".to_owned(),
+            content: "我的资料里有没有提到 RAG".to_owned(),
+            answer: None,
+            error: None,
+            created_at: chrono::Utc::now(),
+        }];
+        let question = "帮我讲讲 RAG 的检索流程";
+        let result = finalize_query_plan(plan, question, &history);
+        assert!(result.is_none(), "复读历史问题的解析必须判失败");
+    }
+
+    #[test]
+    fn finalize_keeps_plan_when_history_unrelated() {
+        // 历史无关时不误伤：正常解析结果保留
+        let plan = parse_query_plan(r#"{"source":"local","intent":"library_qa","operation":"qa",
+            "target":{"reference":null,"document_type":null,"document_name":null,
+                      "owner":null,"entity_type":null,"entity_name":null},
+            "content_query":"我的资料里有没有提到 Transformer？","requires_document_resolution":false,"confidence":0.8}"#)
+            .unwrap();
+        let history = vec![AskMessage {
+            message_id: uuid::Uuid::now_v7(),
+            session_id: uuid::Uuid::now_v7(),
+            role: "user".to_owned(),
+            content: "你好".to_owned(),
+            answer: None,
+            error: None,
+            created_at: chrono::Utc::now(),
+        }];
+        let plan = finalize_query_plan(plan, "我的文件里有没有提到 Transformer？", &history)
+            .unwrap();
+        assert_eq!(plan.content_query.as_deref(), Some("Transformer"));
+    }
+
+    #[test]
+    fn find_plan_builder_is_deterministic() {
+        // CASE 7：FIND 预检 plan（不经过 LLM）
+        let plan = find_query_plan("我毕业时候那个材料在哪", "我毕业时候那个材料");
+        assert_eq!(plan.intent, QueryIntent::DocumentFind);
+        assert_eq!(plan.operation, QueryOperation::Find);
+        assert_eq!(plan.target.reference.as_deref(), Some("我毕业时候那个材料"));
+        assert_eq!(plan.target.owner.as_deref(), Some("self"));
+        assert_eq!(plan.content_query, None);
+        assert!(plan.requires_document_resolution);
+        assert!(!plan.requires_full_document);
+    }
+
+    #[test]
+    fn strip_scope_handles_target_dynamic_prefixes() {
+        // 动态引导：target=我的简历 时「我的简历里有没有写 LangGraph」→ LangGraph
+        let mut plan = QueryPlan::default();
+        plan.target.document_type = Some(DocumentType::Resume);
+        plan.target.reference = Some("我的简历".to_owned());
+        assert_eq!(
+            strip_content_scope_prefix("我的简历里有没有写 LangGraph", &plan),
+            "LangGraph"
+        );
+        // 类型中文名引导同样生效（即使 reference 为空）
+        let mut plan2 = QueryPlan::default();
+        plan2.target.document_type = Some(DocumentType::Resume);
+        assert_eq!(
+            strip_content_scope_prefix("我的简历里有没有提到 LangGraph", &plan2),
+            "LangGraph"
+        );
     }
 }

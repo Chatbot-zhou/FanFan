@@ -158,7 +158,7 @@ export interface ThemeState {
 }
 
 export interface StartupState {
-  phase: "opening_catalog" | "opening_models" | "recovering_jobs" | "scheduling_background_work" | "ready" | "degraded";
+  phase: "migrating_data" | "opening_catalog" | "opening_models" | "recovering_jobs" | "scheduling_background_work" | "ready" | "degraded";
   ready: boolean;
   progress: number;
   pending_files: number;
@@ -1455,6 +1455,39 @@ export interface MemoryClearRequest {
   confirmation: string;
 }
 
+/** 「使用记忆」总开关（设置 → 记忆；关闭不删除数据，只停用参与） */
+export interface MemorySettings {
+  enabled: boolean;
+  updated_at: UtcDateTime | null;
+}
+
+/**
+ * 记忆摘要 ViewModel（Phase 4.2）：普通用户视角的一条「翻翻记得」。
+ * 不暴露 predicate / source_id / 裸 UUID；id 是 "alias:<uuid>" /
+ * "relation:<uuid>" 形式的视图标识，仅供详情/操作寻址。
+ */
+export interface MemorySummary {
+  id: string;
+  title: string;
+  summary: string;
+  kind: string;
+  status: MemoryStatus;
+  source_label: string;
+  target_display_name: string | null;
+  target_available: boolean;
+  updated_at: UtcDateTime;
+}
+
+/** 记忆摘要列表：confirmed 正常展示；candidate 进「待确认」区域 */
+export interface MemorySummaryList {
+  confirmed: MemorySummary[];
+  candidates: MemorySummary[];
+}
+
+export interface MemorySettingsUpdateRequest {
+  enabled: boolean;
+}
+
 export interface FanFanBridge {
   startup_get_state(): Promise<StartupState>;
   welcome_get_state(): Promise<WelcomeState>;
@@ -1568,6 +1601,20 @@ export interface FanFanBridge {
   memory_relation_delete(relation_id: string): Promise<void>;
   /** 清空 Memory（只删 memory_aliases/relations/entities；不删文件/索引/Embedding/Ask History） */
   memory_clear(request: MemoryClearRequest): Promise<number>;
+  /** 「使用记忆」总开关读取（memory.json 持久化；默认开启） */
+  memory_settings_get(): Promise<MemorySettings>;
+  /** 更新「使用记忆」开关：关闭不删除数据，Memory Resolver/Writer 停用 */
+  memory_settings_update(request: MemorySettingsUpdateRequest): Promise<MemorySettings>;
+  /** 记忆摘要列表（confirmed + candidate 两组；rejected/stale 不展示） */
+  memory_summary_list(): Promise<MemorySummaryList>;
+  /** 单条记忆详情（Drawer/Modal 用） */
+  memory_summary_get(summary_id: string): Promise<MemorySummary>;
+  /** 确认待选记忆：status → confirmed */
+  memory_confirm(summary_id: string): Promise<boolean>;
+  /** 拒绝待选记忆：status → rejected，不再参与解析 */
+  memory_reject(summary_id: string): Promise<boolean>;
+  /** 删除单条记忆（不动文件/索引/Ask History/其他记忆） */
+  memory_delete(summary_id: string): Promise<boolean>;
   /** 清空 Session Context（有/无 Memory 与有/无 Session Context 的测试四态） */
   ask_session_context_clear(session_id: string): Promise<void>;
   diagnostic_event_append(request: DiagnosticEventInput): Promise<void>;

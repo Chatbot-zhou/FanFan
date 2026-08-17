@@ -152,6 +152,7 @@ mod tests {
             confidence: 0.95,
             source_type: MemorySource::UserExplicit,
             source_id: None,
+            status: MemoryStatus::Confirmed,
             hit_count: 3,
             last_used_at: None,
             created_at: Utc::now(),

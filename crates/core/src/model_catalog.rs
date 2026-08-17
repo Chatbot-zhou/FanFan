@@ -544,6 +544,44 @@ pub fn built_in_model_catalog() -> Vec<ModelCatalogEntry> {
             &["huggingface", "modelscope"],
         ),
         catalog_entry(
+            "qwen3-5-2b-q4",
+            ModelRole::Generation,
+            "Qwen3.5",
+            "Qwen3.5 2B · 省内存",
+            "Qwen3.5-2B-Q4_K_M",
+            "新一代 Qwen3.5 轻量主流档，综合能力比 0.8B 明显更强，低配设备也能流畅问答。",
+            &["比 0.8B 质量更高", "原生多模态可转作视觉模型", "8GB 内存即可运行"],
+            &["回答质量受量化影响"],
+            Some(1_280_835_840),
+            3.0,
+            Some(1.8),
+            "快",
+            "Apache-2.0",
+            false,
+            "8GB 内存即可流畅运行；低配设备追求更好质量的升级档",
+            Some("generation_qwen3_5_2b_q4"),
+            &["huggingface", "modelscope"],
+        ),
+        catalog_entry(
+            "qwen3-5-2b-q8",
+            ModelRole::Generation,
+            "Qwen3.5",
+            "Qwen3.5 2B · 质量优先",
+            "Qwen3.5-2B-Q8_0",
+            "新一代 Qwen3.5 轻量高质量档，Q8_0 量化保留更多细节。",
+            &["质量优于同档 Q4 版本", "原生多模态可转作视觉模型"],
+            &["下载与内存占用略高"],
+            Some(2_012_012_800),
+            4.5,
+            Some(2.6),
+            "快",
+            "Apache-2.0",
+            false,
+            "8GB 内存可用；GPU 可进一步降低 CPU 占用",
+            Some("generation_qwen3_5_2b_q8"),
+            &["huggingface", "modelscope"],
+        ),
+        catalog_entry(
             "qwen3-5-4b-q4",
             ModelRole::Generation,
             "Qwen3.5",
@@ -655,6 +693,44 @@ pub fn built_in_model_catalog() -> Vec<ModelCatalogEntry> {
             false,
             "8GB 内存可用；也适用于纯文本问答场景",
             Some("vision_qwen3_5_0_8b_q8"),
+            &["huggingface", "modelscope"],
+        ),
+        catalog_entry(
+            "qwen3-5-vision-2b-q4",
+            ModelRole::Vision,
+            "Qwen3.5",
+            "Qwen3.5 2B · 视觉省内存",
+            "Qwen3.5-2B-Visual-Q4_K_M",
+            "Qwen3.5 原生多模态轻量主流档，图表与文档内嵌图片理解更稳。",
+            &["支持中文图片理解", "同时可作为问答基础模型"],
+            &["图片分析必须串行", "轻量档视觉细节有限"],
+            Some(1_949_063_104),
+            4.5,
+            Some(2.8),
+            "快",
+            "Apache-2.0",
+            false,
+            "8GB 内存首选；也适用于纯文本问答场景",
+            Some("vision_qwen3_5_2b_q4"),
+            &["huggingface", "modelscope"],
+        ),
+        catalog_entry(
+            "qwen3-5-vision-2b-q8",
+            ModelRole::Vision,
+            "Qwen3.5",
+            "Qwen3.5 2B · 视觉质量优先",
+            "Qwen3.5-2B-Visual-Q8_0",
+            "Qwen3.5 原生多模态轻量高质量档，视觉细节更稳。",
+            &["视觉细节更稳", "同时可作为问答基础模型"],
+            &["需要更多内存和显存"],
+            Some(2_680_240_064),
+            6.0,
+            Some(3.8),
+            "快",
+            "Apache-2.0",
+            false,
+            "12GB 内存可用；也适用于纯文本问答场景",
+            Some("vision_qwen3_5_2b_q8"),
             &["huggingface", "modelscope"],
         ),
         catalog_entry(
@@ -1270,12 +1346,16 @@ pub fn locked_download_artifact(model_id: &str, source: ModelSource) -> Option<D
         // 2026-08-15 新增家族
         "generation_qwen3_5_0_8b_q4",
         "generation_qwen3_5_0_8b_q8",
+        "generation_qwen3_5_2b_q4",
+        "generation_qwen3_5_2b_q8",
         "generation_qwen3_5_4b_q4",
         "generation_qwen3_5_4b_q8",
         "generation_qwen3_5_9b_q4",
         "generation_qwen3_5_9b_q8",
         "vision_qwen3_5_0_8b_q4",
         "vision_qwen3_5_0_8b_q8",
+        "vision_qwen3_5_2b_q4",
+        "vision_qwen3_5_2b_q8",
         "vision_qwen3_5_4b_q4",
         "vision_qwen3_5_4b_q8",
         "vision_qwen3_5_9b_q4",
@@ -1638,6 +1718,22 @@ fn resolved_model_edition(edition_id: &str, source: &str) -> Result<ModelEdition
             vec![qwen35_generation_artifact(source, "0.8B", "Q8_0")],
             &["generation"],
         )),
+        "generation_qwen3_5_2b_q4" => Ok(edition(
+            edition_id,
+            "Qwen3.5 2B 省内存",
+            "安装 Qwen3.5 2B Q4_K_M 问答基础模型。",
+            8,
+            vec![qwen35_generation_artifact(source, "2B", "Q4_K_M")],
+            &["generation"],
+        )),
+        "generation_qwen3_5_2b_q8" => Ok(edition(
+            edition_id,
+            "Qwen3.5 2B 质量优先",
+            "安装 Qwen3.5 2B Q8_0 问答基础模型。",
+            8,
+            vec![qwen35_generation_artifact(source, "2B", "Q8_0")],
+            &["generation"],
+        )),
         "generation_qwen3_5_4b_q4" => Ok(edition(
             edition_id,
             "Qwen3.5 4B 省内存",
@@ -1684,6 +1780,22 @@ fn resolved_model_edition(edition_id: &str, source: &str) -> Result<ModelEdition
             "安装 Qwen3.5 0.8B Q8_0 视觉模型与视觉投影文件。",
             8,
             vec![qwen35_vision_artifact(source, "0.8B", "Q8_0")],
+            &["vision"],
+        )),
+        "vision_qwen3_5_2b_q4" => Ok(edition(
+            edition_id,
+            "Qwen3.5 2B 视觉省内存",
+            "安装 Qwen3.5 2B Q4_K_M 视觉模型与视觉投影文件。",
+            8,
+            vec![qwen35_vision_artifact(source, "2B", "Q4_K_M")],
+            &["vision"],
+        )),
+        "vision_qwen3_5_2b_q8" => Ok(edition(
+            edition_id,
+            "Qwen3.5 2B 视觉质量优先",
+            "安装 Qwen3.5 2B Q8_0 视觉模型与视觉投影文件。",
+            12,
+            vec![qwen35_vision_artifact(source, "2B", "Q8_0")],
             &["vision"],
         )),
         "vision_qwen3_5_4b_q4" => Ok(edition(
@@ -2167,6 +2279,14 @@ fn qwen35_specs(size: &str, quant: &str) -> (DownloadSourceSpec, DownloadSourceS
             src_spec("unsloth/Qwen3.5-0.8B-GGUF", "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0", "Qwen3.5-0.8B-Q8_0.gguf", "0ad885ffd4bb022fc4f0d33a3308fa108ef8613159d3b3a67e23abca056b7a6c", 811_843_840),
             src_spec("unsloth/Qwen3.5-0.8B-GGUF", "88467eb7c8e3b6e7894c794f373050d4dbc6ae8a", "Qwen3.5-0.8B-Q8_0.gguf", "0ad885ffd4bb022fc4f0d33a3308fa108ef8613159d3b3a67e23abca056b7a6c", 811_843_840),
         ),
+        ("2B", "Q4_K_M") => (
+            src_spec("unsloth/Qwen3.5-2B-GGUF", "f6d5376be1edb4d416d56da11e5397a961aca8ae", "Qwen3.5-2B-Q4_K_M.gguf", "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223", 1_280_835_840),
+            src_spec("unsloth/Qwen3.5-2B-GGUF", "90057e31161eb95cc0bc1413c4f53b44de9b49c8", "Qwen3.5-2B-Q4_K_M.gguf", "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223", 1_280_835_840),
+        ),
+        ("2B", "Q8_0") => (
+            src_spec("unsloth/Qwen3.5-2B-GGUF", "f6d5376be1edb4d416d56da11e5397a961aca8ae", "Qwen3.5-2B-Q8_0.gguf", "1b04acba824817554f4ce23639bc8495ff70453b8fcb047900c731521021f2c1", 2_012_012_800),
+            src_spec("unsloth/Qwen3.5-2B-GGUF", "90057e31161eb95cc0bc1413c4f53b44de9b49c8", "Qwen3.5-2B-Q8_0.gguf", "1b04acba824817554f4ce23639bc8495ff70453b8fcb047900c731521021f2c1", 2_012_012_800),
+        ),
         ("4B", "Q4_K_M") => (
             src_spec("unsloth/Qwen3.5-4B-GGUF", "e87f176479d0855a907a41277aca2f8ee7a09523", "Qwen3.5-4B-Q4_K_M.gguf", "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4", 2_740_937_888),
             src_spec("unsloth/Qwen3.5-4B-GGUF", "167b4afc359863325cb4164418c715421b4e9118", "Qwen3.5-4B-Q4_K_M.gguf", "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4", 2_740_937_888),
@@ -2192,6 +2312,10 @@ fn qwen35_mmproj_specs(size: &str) -> (DownloadSourceSpec, DownloadSourceSpec) {
         "0.8B" => (
             src_spec("unsloth/Qwen3.5-0.8B-GGUF", "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0", "mmproj-F16.gguf", "56e4c6cfe73b0c82e3e82bc518d7591997e61d81f723fc41a586f4fa69ea2453", 204_987_232),
             src_spec("unsloth/Qwen3.5-0.8B-GGUF", "88467eb7c8e3b6e7894c794f373050d4dbc6ae8a", "mmproj-F16.gguf", "56e4c6cfe73b0c82e3e82bc518d7591997e61d81f723fc41a586f4fa69ea2453", 204_987_232),
+        ),
+        "2B" => (
+            src_spec("unsloth/Qwen3.5-2B-GGUF", "f6d5376be1edb4d416d56da11e5397a961aca8ae", "mmproj-F16.gguf", "7035e9cb8d7c6a9681d07eef9a364783e86ea4cd73faab2eabb4f43a101830c7", 668_227_264),
+            src_spec("unsloth/Qwen3.5-2B-GGUF", "90057e31161eb95cc0bc1413c4f53b44de9b49c8", "mmproj-F16.gguf", "7035e9cb8d7c6a9681d07eef9a364783e86ea4cd73faab2eabb4f43a101830c7", 668_227_264),
         ),
         "4B" => (
             src_spec("unsloth/Qwen3.5-4B-GGUF", "e87f176479d0855a907a41277aca2f8ee7a09523", "mmproj-F16.gguf", "cd88edcf8d031894960bb0c9c5b9b7e1fea6ebee02b9f7ce925a00d12891f864", 672_423_616),
@@ -2735,15 +2859,16 @@ mod tests {
     #[test]
     fn hardware_based_recommendation_fits_ram_and_vram() {
         let catalog = built_in_model_catalog();
-        // 8 GB RAM, unknown GPU: R1 1.5B Q8 (4.5 GB) is the largest generation that
-        // fits 8 GB; BGE-M3 (2.5 GB) is the largest fitting embedding.
+        // 8 GB RAM, unknown GPU: Qwen3.5 2B Q8 is the largest generation that
+        // fits 8 GB (R1 1.5B Q8 was displaced by the Qwen3.5 family additions);
+        // BGE-M3 (2.5 GB) is the largest fitting embedding.
         let ids = recommended_catalog_ids(&catalog, Some(8), None);
         assert_eq!(
             ids,
             vec![
-                "r1-1-5b-q8".to_owned(),
+                "qwen3-5-2b-q8".to_owned(),
                 "bge-m3".to_owned(),
-                "qwen3-vl-2b-q4".to_owned(),
+                "qwen3-5-vision-2b-q8".to_owned(),
             ]
         );
         // 16 GB RAM + 8 GB VRAM: quality-first generation and vision.

@@ -1,0 +1,62 @@
+{
+  "langgraph": {
+    "terms": ["langgraph", "lang graph"],
+    "category": "technical",
+    "answer": "LangGraph 是 LangChain 团队推出的用于构建多节点工作流应用的图编排框架。它把智能体（Agent）的执行流程建模为一张有向图：节点（Node）代表一步操作（调用模型、执行工具、检索资料等），边（Edge）代表状态流转，还支持条件分支、循环、人工介入检查点和状态持久化。常见用途包括多步推理 Agent、自适应 RAG、多智能体协作和需要断点续跑的长任务。与直接用提示词驱动模型相比，LangGraph 的优势在于流程显式可控、可测试、可回放，适合构建生产级复杂智能体系统。"
+  },
+  "rag": {
+    "terms": ["rag", "检索增强生成", "检索增强"],
+    "category": "technical",
+    "answer": "RAG（Retrieval-Augmented Generation，检索增强生成）是一种把外部知识检索与大模型生成结合的技术方案：先根据用户问题从知识库（向量库、全文索引等）检索相关片段，再把检索结果作为上下文交给模型生成答案。它的价值在于：无需重新训练模型即可接入私有/最新知识，通过引用来源降低幻觉，并便于知识更新。典型流程是：文档切分 → 向量化（Embedding）→ 存入向量库 → 检索（可加重排 Rerank）→ 拼装上下文生成。"
+  },
+  "transformer": {
+    "terms": ["transformer"],
+    "category": "technical",
+    "answer": "Transformer 是 2017 年论文《Attention Is All You Need》提出的神经网络架构，核心是自注意力机制（Self-Attention）：每个位置的表示都能直接关注序列中的其他位置，从而并行捕捉长距离依赖。它取代了 RNN 的逐步递归结构，训练速度快、扩展性好，成为现代大语言模型（GPT、LLaMA、Qwen、DeepSeek 等）与多数多模态模型的基础架构。编码器-解码器（机器翻译）、仅解码器（文本生成）与仅编码器（BERT 类理解任务）是其三种主要形态。"
+  },
+  "agent": {
+    "terms": ["agent", "智能体"],
+    "category": "technical",
+    "answer": "Agent（智能体）指能够感知任务目标、自主规划步骤并调用工具完成任务的 AI 系统。与单轮问答不同，Agent 通常包含：任务分解与规划、工具调用（搜索、代码执行、API 操作）、根据中间结果动态调整策略、以及记忆机制。常见框架有 LangGraph、AutoGen 等。衡量 Agent 的关键是任务完成的可靠性、步骤的可控性与失败恢复能力，而不是单步回复的流畅度。"
+  },
+  "embedding": {
+    "terms": ["embedding", "向量化", "向量表示", "嵌入"],
+    "category": "technical",
+    "answer": "Embedding（嵌入/向量化）是把文字、图片等离散内容映射为连续稠密向量的技术，语义相近的内容在向量空间中距离更近。它是语义检索、RAG、聚类与推荐的基础：文档向量入库后，用查询向量做最近邻搜索即可召回语义相关的内容。常用模型如 BGE、text2vec、sentence-transformers 系列，本地部署时通常以 ONNX 或 GGUF 形式运行。"
+  },
+  "rerank": {
+    "terms": ["rerank", "重排", "重排序"],
+    "category": "technical",
+    "answer": "Rerank（重排）是检索流程中的精排步骤：初检（向量检索/全文检索）召回一批候选后，用交叉编码器（Cross-Encoder）对「查询-文档」对逐一精细打分并重新排序，把最相关的结果排到前面。与向量检索的双塔结构相比，交叉编码器能同时读取查询与文档的交互信息，精度更高但计算更贵，因此只用于少量候选的二次排序。常见模型有 bge-reranker 等。"
+  },
+  "fine_tuning": {
+    "terms": ["微调", "fine-tuning", "fine tuning", "finetune"],
+    "category": "technical",
+    "answer": "微调（Fine-tuning）是在预训练模型基础上，用领域数据继续训练以改变其行为或能力的技术。全量微调更新所有参数，成本高；参数高效微调（PEFT）如 LoRA 只训练少量新增参数，显存与存储开销小，是最常用的方案。微调适合固化风格、格式与领域知识；如果只是补充事实性知识，RAG 通常更合适且更易更新。"
+  },
+  "lora": {
+    "terms": ["lora"],
+    "category": "technical",
+    "answer": "LoRA（Low-Rank Adaptation）是一种参数高效微调方法：冻结原始模型权重，在旁边注入一对低秩矩阵（降维-升维）来学习增量更新，训练参数量常常不到全量的 1%。优点是显存占用低、训练快、每个任务的增量可以独立保存与热切换；QLoRA 进一步把基座模型量化到 4bit 后再做 LoRA，让消费级显卡也能微调较大模型。"
+  },
+  "quantization": {
+    "terms": ["量化", "quantization"],
+    "category": "technical",
+    "answer": "量化（Quantization）是把模型权重从 16bit 浮点压缩到更低精度（8bit/4bit 等）的技术，可大幅降低显存与存储占用，让大模型能在消费级设备上运行。GGUF 格式（llama.cpp 生态）的 Q4_K_M、Q5_K_M 等是本地部署常用档位；代价是少量精度损失，通常 4bit 对问答类任务影响不大。"
+  },
+  "gguf": {
+    "terms": ["gguf"],
+    "category": "technical",
+    "answer": "GGUF（GPT-Generated Unified Format）是 llama.cpp 生态使用的模型文件格式，把权重、量化信息与元数据打包为单一文件，支持 Q4/Q5/Q8 等多种量化档位，是本地运行开源大模型（LLaMA、Qwen、DeepSeek 等）的事实标准格式。配合 llama-server 可以在本地以 HTTP 服务方式提供推理接口。"
+  },
+  "llm": {
+    "terms": ["大语言模型", "llm", "large language model"],
+    "category": "technical",
+    "answer": "大语言模型（LLM）是基于海量文本训练的 Transformer 架构生成式模型，通过预测下一个词的方式学习语言与知识，能完成问答、写作、总结、翻译、代码等任务。规模通常以参数量衡量（数十亿到数千亿）；本地部署常用其量化版本（GGUF 等），配合 llama.cpp、Ollama 等运行时可在个人设备上离线使用。"
+  },
+  "prompt": {
+    "terms": ["prompt", "提示词"],
+    "category": "technical",
+    "answer": "提示词（Prompt）是发给大模型的输入指令，决定模型的任务目标、约束与输出格式。工程上常用的技巧包括：给出清晰的角色与任务描述、提供少量示例（few-shot）、要求结构化输出（如 JSON Schema）、限定只能依据给定证据回答等。提示词质量对输出可靠性影响很大，但无法替代检索证据与规则校验。"
+  }
+}

@@ -344,6 +344,10 @@ pub struct AnswerResult {
     pub index_coverage: f64,
     #[serde(default)]
     pub degradation_reason: Option<String>,
+    /// NO_EVIDENCE 的六分类根因（内部诊断，UI 文案不变；仅拒绝路径非空）。
+    /// 见 [`crate::ask::NoEvidenceReason`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_evidence_reason: Option<crate::ask::NoEvidenceReason>,
     /// NEED_CLARIFICATION 载荷（仅 answer_mode = "clarification" 时非空）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clarification: Option<ClarificationPayload>,
@@ -608,6 +612,7 @@ pub fn assemble_extractive_answer(
             retrieval_channels: vec!["filename".into(), "fts".into()],
             index_coverage: 0.0,
             degradation_reason: None,
+            no_evidence_reason: None,
             clarification: None,
         };
     }
@@ -660,6 +665,7 @@ pub fn assemble_extractive_answer(
         retrieval_channels: vec!["filename".into(), "fts".into()],
         index_coverage: 0.0,
         degradation_reason: None,
+        no_evidence_reason: None,
         clarification: None,
     }
 }
@@ -994,14 +1000,26 @@ pub fn parse_rewritten_queries(raw: &str) -> Vec<String> {
     queries
 }
 
-/// 闲聊 persona 的补全 prompt（纯补全非 JSON）：人设 + 对话历史折叠 + 当前问题。
-/// 历史格式与 generation_prompt 一致（「用户：/翻翻：」，每条约 400 字），
-/// 最多折叠 5 轮（5 条用户 + 5 条模型回复）。
+/// 闲聊 persona 的补全 prompt（纯补全非 JSON）：人设 + 回答规则 + 对话历史折叠
+/// + 当前问题。历史格式与 generation_prompt 一致（「用户：/翻翻：」，每条约 400
+/// 字），最多折叠 5 轮（5 条用户 + 5 条模型回复）。
+///
+/// 回答规则分两支（Phase 4.1 技术问答质量修复，CASE 二）：
+/// - 日常闲聊：简短自然、不复读问题、不以「你好！我是翻翻」固定开场；
+/// - 知识/技术问题：定义 → 核心机制 → 适用场景/区别 的结构化回答，不编造人名/
+///   年份/出处/数字，不牺牲准确性迁就口语化，知识不足时明确报告模型能力限制。
+/// 两套规则常驻 system prompt，不依赖关键词判定（闲聊与科普本来就无法硬切）。
 pub fn chat_prompt(request: &AskRequest, history: &[AskMessage]) -> (String, String) {
-    // 角色 + 场景 + 行为三步（手册「角色+场景+结构」三要素）：
-    // 角色（翻翻/本地助手）→ 场景（闲聊、不检索）→ 行为（正面指令：直接
-    // 回答；约束：简短自然、不复读问题、不以「你好！我是翻翻」开场）。
-    let system = "你是翻翻，用户本地资料库中的中文智能助手。当前是闲聊场景，不涉及资料检索，直接自然对话即可。回答简短、自然、口语化，直接回答用户的问题，不要重复用户的话。".to_owned();
+    let system = "你是翻翻，用户本地资料库中的中文智能助手。当前是闲聊场景，不涉及资料检索，直接自然对话即可。\
+\n\n回答规则：\
+\n1. 日常闲聊（寒暄、问候、闲聊话题）：简短、自然、口语化，直接回答，不要重复用户的话，不要以「你好！我是翻翻」之类的固定开场白开头。\
+\n2. 知识或技术问题（例如「Transformer 是什么」「RAG 和微调有什么区别」「帮我解释 LangGraph」）：\
+\n   - 按「定义 → 核心机制 → 适用场景或区别」的结构直接讲清楚概念本身，先给定义再展开；\
+\n   - 可以用类比帮助理解，但不要为了口语化牺牲准确性；\
+\n   - 不编造人名、年份、出处、数字、机构等事实细节，不确定的细节宁可不说；\
+\n   - 对不确定的专有框架/库/工具（尤其是较新的开源项目），宁可简短说明「我对它不够熟悉，可能存在偏差」，也不要编造定义或机制；\
+\n   - 知识超出能力范围时，明确回答「我的知识有限/这部分超出了我的模型能力范围」，不要强行编造。\
+\n3. 回答保持简洁，直接回答问题，不要东拉西扯。".to_owned();
     let mut user = String::new();
     let folded = fold_recent_history(history, 5, 5);
     if !folded.is_empty() {
@@ -1352,6 +1370,22 @@ mod tests {
         let (_, user2) = chat_prompt(&request(), &[]);
         assert!(!user2.contains("对话历史"));
         assert!(user2.starts_with("【当前问题】"));
+    }
+
+    #[test]
+    fn chat_prompt_has_technical_qa_rules() {
+        // CASE 二（GENERAL 质量）：技术问答必须有结构纪律与反编造约束，
+        // 且固定开场白仍被禁止；闲聊分支保持口语化短答
+        let (system, _) = chat_prompt(&request(), &[]);
+        assert!(system.contains("定义 → 核心机制 → 适用场景或区别"), "技术问答结构");
+        assert!(system.contains("不编造人名、年份、出处"), "反编造约束");
+        assert!(system.contains("不要为了口语化牺牲准确性"), "准确性优先");
+        assert!(system.contains("不要以「你好！我是翻翻」之类的固定开场白开头"), "禁固定开场");
+        assert!(system.contains("模型能力范围"), "能力限制要明说");
+        assert!(system.contains("简短、自然、口语化"), "闲聊分支保留");
+        // 模型必须看到「Transformer 是什么」这类问题属于知识问题
+        assert!(system.contains("Transformer 是什么"));
+        assert!(system.contains("RAG 和微调有什么区别"));
     }
 
     #[test]

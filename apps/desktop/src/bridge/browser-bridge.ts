@@ -1027,6 +1027,35 @@ export const browserBridge: FanFanBridge = {
   async memory_clear() {
     return 0;
   },
+  async memory_settings_get() {
+    return { enabled: true, updated_at: null };
+  },
+  async memory_settings_update(request) {
+    return { enabled: request.enabled, updated_at: now() };
+  },
+  async memory_summary_list() {
+    const nowIso = now();
+    return {
+      confirmed: [
+        { id: "alias:demo-1", title: "我的简历", summary: "“我的简历”通常指向《周晨-大模型开发工程师.pdf》", kind: "file_alias", status: "confirmed" as const, source_label: "你在对话中确认过", target_display_name: "周晨-大模型开发工程师.pdf", target_available: true, updated_at: nowIso },
+      ],
+      candidates: [
+        { id: "alias:demo-2", title: "毕业材料", summary: "“毕业材料”可能指《毕业设计答辩.pptx》", kind: "file_alias", status: "candidate" as const, source_label: "翻翻的推测", target_display_name: "毕业设计答辩.pptx", target_available: true, updated_at: nowIso },
+      ],
+    };
+  },
+  async memory_summary_get() {
+    return { id: "alias:demo-1", title: "我的简历", summary: "“我的简历”通常指向《周晨-大模型开发工程师.pdf》", kind: "file_alias", status: "confirmed" as const, source_label: "你在对话中确认过", target_display_name: "周晨-大模型开发工程师.pdf", target_available: true, updated_at: now() };
+  },
+  async memory_confirm() {
+    return true;
+  },
+  async memory_reject() {
+    return true;
+  },
+  async memory_delete() {
+    return true;
+  },
   async ask_session_context_clear() {},
   async diagnostic_event_append() {},
   async diagnostic_export() {

@@ -252,7 +252,8 @@ pub fn document_overview_prompt(
     digests_json: &str,
 ) -> (String, String) {
     let system = "你是翻翻的本地文档总览器。你的任务是基于各章节的摘要，\
-给出一份文档级总览。只能使用提供的章节摘要信息，不得补充外部知识。\
+给出一份文档级总览。只能使用提供的章节摘要信息，不得补充外部知识，\
+不得凭「这类文档通常有什么」补齐章节摘要里不存在的章节或主题。\
 输出严格的 JSON，不要输出 JSON 以外的任何文字。";
     let user = format!(
         "文档名称：{file_name}{}\n\
@@ -262,8 +263,8 @@ pub fn document_overview_prompt(
 \n\
 请输出：\n\
 - overview：一段话总览（这份文档是什么、整体讲什么、面向谁）；\n\
-- overall_summary：全文整体摘要（覆盖各节要点，5~10 句话）；\n\
-- structure：章节结构表，每节给出标题与要点。",
+- overall_summary：全文整体摘要（只覆盖上面真实存在的章节要点，5~10 句话）；\n\
+- structure：章节结构表，只列上面真实出现的章节，每节给出标题与要点。",
         document_type_hint
             .map(|hint| format!("（文档类型：{hint}）"))
             .unwrap_or_default()

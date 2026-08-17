@@ -25,6 +25,15 @@ use crate::contracts::DocumentType;
 // Step 2：文档类型分类器（规则特征 + Embedding 原型相似度）
 // ===========================================================================
 
+/// 按类型取规则关键词（分类器与 Document Resolver 的类型等价回退共用）。
+pub fn type_keywords_for(document_type: DocumentType) -> &'static [&'static str] {
+    TYPE_KEYWORDS
+        .iter()
+        .find(|(candidate, _)| *candidate == document_type)
+        .map(|(_, keywords)| *keywords)
+        .unwrap_or(&[])
+}
+
 /// 每类型的规则关键词（确定性匹配）。文件名只作弱信号（权重最低），
 /// 正文语义（title / section_titles / head text）优先。
 pub const TYPE_KEYWORDS: &[(DocumentType, &[&str])] = &[

@@ -11,6 +11,7 @@ import {
 } from "../model-downloads/model-downloads";
 import { WindowControls } from "../../components/WindowControls";
 import { useAppStore } from "../../state/app-store";
+import { StorageMigrationProgress } from "./StorageMigrationProgress";
 
 interface TitleBarProps {
   model_state: ModelRuntimeState | null;
@@ -147,6 +148,7 @@ export function TitleBar({ model_state, model_downloads = [], notices = [], welc
           </button>
         </Popover>
       )}
+      <StorageMigrationProgress />
       <WindowControls />
     </header>
   );

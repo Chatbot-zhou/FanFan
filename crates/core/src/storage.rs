@@ -53,7 +53,7 @@ use crate::profile_builder::{
     representative_text_hash,
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 29;
+pub const CURRENT_SCHEMA_VERSION: u32 = 30;
 
 type VectorSourceRow = (u64, String, String, String, Vec<f32>);
 type SemanticCandidate = (Uuid, String, f32);
@@ -996,6 +996,17 @@ const MIGRATIONS: &[Migration] = &[
         name: "ask_session_clarification",
         sql: "ALTER TABLE ask_session_context \
               ADD COLUMN pending_clarification_reference TEXT",
+    },
+    Migration {
+        version: 30,
+        name: "memory_alias_status",
+        // Phase 4.2：别名补 status 列（与 memory_relations 同语义），支持
+        // 「待确认的记忆」confirm/reject。回填规则：已存在的可信来源别名
+        // （user_explicit / user_confirmed / user_selection / repeated_usage）
+        // 视为 confirmed；推断类保持 candidate 等待用户确认。
+        sql: "ALTER TABLE memory_aliases ADD COLUMN status TEXT NOT NULL DEFAULT 'candidate'; \
+              UPDATE memory_aliases SET status = 'confirmed' WHERE source_type IN \
+              ('user_explicit', 'user_confirmed', 'user_selection', 'repeated_usage');",
     },
 ];
 
@@ -6658,13 +6669,18 @@ impl CatalogStore {
         if semantic_query.is_some()
             && !crate::indexing::query_has_relevant_evidence(&candidates)
         {
-            return Ok(crate::assemble_extractive_answer(
+            let mut refused = crate::assemble_extractive_answer(
                 request,
                 &session,
                 Vec::new(),
                 started_at,
-            ));
+            );
+            refused.no_evidence_reason = Some(crate::ask::NoEvidenceReason::QueryGateRejected);
+            return Ok(refused);
         }
+        // 融合后有无候选（区分「检索为空」与「有候选但全被相关门槛滤掉」，
+        // 供 NO_EVIDENCE 六分类诊断）
+        let had_candidates = !candidates.is_empty();
         let mut evidence = Vec::new();
         let mut evidence_tokens = 0_u64;
         for candidate in candidates.into_iter().filter(|candidate| {
@@ -6733,6 +6749,15 @@ impl CatalogStore {
         } else {
             vec!["fts".into(), "rrf".into(), "mmr".into()]
         };
+        // NO_EVIDENCE 六分类：拒绝路径必须留下根因（有候选但没证据 = 检索层
+        // 之外的问题，归 TRUE_NO_EVIDENCE；无候选 = CHUNK_RETRIEVAL_EMPTY）。
+        if answer.insufficient_evidence {
+            answer.no_evidence_reason = Some(if had_candidates {
+                crate::ask::NoEvidenceReason::TrueNoEvidence
+            } else {
+                crate::ask::NoEvidenceReason::ChunkRetrievalEmpty
+            });
+        }
         Ok(answer)
     }
 
@@ -8098,30 +8123,39 @@ impl CatalogStore {
         })?;
         let connection = self.connect()?;
         let now = Utc::now().to_rfc3339();
-        let existing: Option<(String, MemorySource)> = connection
+        let existing: Option<(String, MemorySource, MemoryStatus)> = connection
             .query_row(
-                "SELECT alias_id, source_type FROM memory_aliases WHERE alias = ?1 AND target_type = ?2 AND target_id = ?3",
+                "SELECT alias_id, source_type, status FROM memory_aliases WHERE alias = ?1 AND target_type = ?2 AND target_id = ?3",
                 params![alias, input.subject_type.as_storage(), input.subject_id.to_string()],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         MemorySource::parse_storage(&row.get::<_, String>(1)?),
+                        MemoryStatus::parse_storage(&row.get::<_, String>(2)?),
                     ))
                 },
             )
             .optional()
             .map_err(|error| storage_error("MEMORY_ALIAS_READ_FAILED", error, true))?;
-        if let Some((alias_id, existing_source)) = existing {
+        if let Some((alias_id, existing_source, existing_status)) = existing {
             if input.source_type.rank() >= existing_source.rank() {
+                // 用户已拒绝的别名不被推断写入「复活」：rejected 状态保持，
+                // 只刷新来源/置信度；其余情况按写入方状态更新。
+                let next_status = if existing_status == MemoryStatus::Rejected {
+                    existing_status.as_storage()
+                } else {
+                    input.status.as_storage()
+                };
                 connection
                     .execute(
-                        "UPDATE memory_aliases SET confidence = ?2, source_type = ?3, source_id = ?4, updated_at = ?5 WHERE alias_id = ?1",
+                        "UPDATE memory_aliases SET confidence = ?2, source_type = ?3, source_id = ?4, status = ?6, updated_at = ?5 WHERE alias_id = ?1",
                         params![
                             alias_id,
                             f64::from(input.confidence.clamp(0.0, 1.0)),
                             input.source_type.as_storage(),
                             input.source_id,
                             now,
+                            next_status,
                         ],
                     )
                     .map_err(|error| storage_error("MEMORY_ALIAS_WRITE_FAILED", error, true))?;
@@ -8132,13 +8166,14 @@ impl CatalogStore {
         let alias_id = Uuid::now_v7();
         connection
             .execute(
-                "INSERT INTO memory_aliases (alias_id, alias, target_type, target_id, confidence, source_type, source_id, hit_count, last_used_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, NULL, ?8, ?8)",
+                "INSERT INTO memory_aliases (alias_id, alias, target_type, target_id, confidence, status, source_type, source_id, hit_count, last_used_at, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, NULL, ?9, ?9)",
                 params![
                     alias_id.to_string(),
                     alias,
                     input.subject_type.as_storage(),
                     input.subject_id.to_string(),
                     f64::from(input.confidence.clamp(0.0, 1.0)),
+                    input.status.as_storage(),
                     input.source_type.as_storage(),
                     input.source_id,
                     now,
@@ -8146,6 +8181,32 @@ impl CatalogStore {
             )
             .map_err(|error| storage_error("MEMORY_ALIAS_WRITE_FAILED", error, true))?;
         Ok(alias_id)
+    }
+
+    /// 别名 confirm / reject（Phase 4.2「待确认的记忆」）。确认时同时把
+    /// 来源升级为 user_confirmed（用户明确确认候选），拒绝后不再参与
+    /// Memory Resolution（resolver 只取 confirmed）。
+    pub fn update_memory_alias_status(
+        &self,
+        alias_id: Uuid,
+        status: MemoryStatus,
+    ) -> Result<bool, AppError> {
+        let connection = self.connect()?;
+        let now = Utc::now().to_rfc3339();
+        let changed = connection
+            .execute(
+                &format!(
+                    "UPDATE memory_aliases SET status = ?2, updated_at = ?3{} WHERE alias_id = ?1",
+                    if status == MemoryStatus::Confirmed {
+                        ", source_type = 'user_confirmed'"
+                    } else {
+                        ""
+                    }
+                ),
+                params![alias_id.to_string(), status.as_storage(), now],
+            )
+            .map_err(|error| storage_error("MEMORY_ALIAS_WRITE_FAILED", error, true))?;
+        Ok(changed > 0)
     }
 
     /// 别名精确匹配（规范化后等值）。按置信度、使用次数排序返回全部候选，
@@ -8157,7 +8218,7 @@ impl CatalogStore {
         let connection = self.connect()?;
         let mut statement = connection
             .prepare(
-                "SELECT alias_id, alias, target_type, target_id, confidence, source_type, source_id, hit_count, last_used_at, created_at, updated_at FROM memory_aliases WHERE alias = ?1 ORDER BY confidence DESC, hit_count DESC, updated_at DESC LIMIT 20",
+                "SELECT alias_id, alias, target_type, target_id, confidence, source_type, source_id, hit_count, last_used_at, created_at, updated_at, status FROM memory_aliases WHERE alias = ?1 ORDER BY confidence DESC, hit_count DESC, updated_at DESC LIMIT 20",
             )
             .map_err(|error| storage_error("MEMORY_ALIAS_READ_FAILED", error, true))?;
         let rows = statement
@@ -8173,7 +8234,7 @@ impl CatalogStore {
         let connection = self.connect()?;
         let row = connection
             .query_row(
-                "SELECT alias_id, alias, target_type, target_id, confidence, source_type, source_id, hit_count, last_used_at, created_at, updated_at FROM memory_aliases WHERE alias_id = ?1",
+                "SELECT alias_id, alias, target_type, target_id, confidence, source_type, source_id, hit_count, last_used_at, created_at, updated_at, status FROM memory_aliases WHERE alias_id = ?1",
                 params![alias_id.to_string()],
                 map_memory_alias_row,
             );
@@ -8200,7 +8261,7 @@ impl CatalogStore {
         let connection = self.connect()?;
         let mut statement = connection
             .prepare(
-                "SELECT alias_id, alias, target_type, target_id, confidence, source_type, source_id, hit_count, last_used_at, created_at, updated_at FROM memory_aliases ORDER BY updated_at DESC LIMIT ?1",
+                "SELECT alias_id, alias, target_type, target_id, confidence, source_type, source_id, hit_count, last_used_at, created_at, updated_at, status FROM memory_aliases ORDER BY updated_at DESC LIMIT ?1",
             )
             .map_err(|error| storage_error("MEMORY_ALIAS_READ_FAILED", error, true))?;
         let rows = statement
@@ -11398,6 +11459,7 @@ fn map_memory_alias_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryAlias
         target_type: MemoryTargetType::parse_storage(&row.get::<_, String>(2)?),
         target_id: parse_uuid_value(&row.get::<_, String>(3)?).map_err(storage_row_value)?,
         confidence: row.get::<_, f64>(4)? as f32,
+        status: MemoryStatus::parse_storage(&row.get::<_, String>(11)?),
         source_type: MemorySource::parse_storage(&row.get::<_, String>(5)?),
         source_id: row.get(6)?,
         hit_count: row.get::<_, i64>(7)? as u32,
@@ -12513,6 +12575,7 @@ mod tests {
                 (27, "document_profiles_classifier_columns".to_owned()),
                 (28, "memory_layer".to_owned()),
                 (29, "ask_session_clarification".to_owned()),
+                (30, "memory_alias_status".to_owned()),
             ]
         );
         let rules = store.list_exclusion_rules().expect("list exclusion rules");

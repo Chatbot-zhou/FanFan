@@ -17,6 +17,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::AppError;
+
 /// 记忆条目类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -179,6 +181,7 @@ pub struct MemoryAlias {
     pub target_type: MemoryTargetType,
     pub target_id: Uuid,
     pub confidence: f32,
+    pub status: MemoryStatus,
     pub source_type: MemorySource,
     pub source_id: Option<String>,
     pub hit_count: u32,
@@ -219,6 +222,186 @@ pub fn normalize_alias(value: &str) -> Option<String> {
         return None;
     }
     Some(normalized)
+}
+
+// ============================================================
+// Memory Summary ViewModel（Phase 4.2 spec 二十六 / 二十七）
+// ============================================================
+
+/// 记忆摘要（用户可读形态）：Memory UI 的核心单位是「翻翻记得什么」
+/// 的一句话自然语言摘要，而不是数据库记录。前端不组合底层三张表。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemorySummary {
+    /// 稳定视图标识："alias:<uuid>" / "relation:<uuid>"（前端操作回传用，
+    /// 不向普通 UI 暴露内部 UUID 本体以外的表结构细节）
+    pub id: String,
+    /// 卡片标题（如「我的简历」「法律项目」）
+    pub title: String,
+    /// 一句话自然语言摘要（如「“我的简历”通常指向《周晨-大模型开发工程师.pdf》」）
+    pub summary: String,
+    /// 内部分类：file_alias / file_relation / entity_alias / entity_relation / other
+    pub kind: String,
+    /// confirmed → 正式记忆；candidate → 待确认（「翻翻猜测」区）
+    pub status: MemoryStatus,
+    /// 来源的人话标签（「你在对话中确认过」「你主动设置」「翻翻的推测」等）
+    pub source_label: String,
+    /// 目标的显示名（文件名 / 收藏集名 / 实体名；实体别名时可为空）
+    pub target_display_name: Option<String>,
+    /// 目标当前是否可用（文件离线/删除/越权 → false，UI 显示不可用状态）
+    pub target_available: bool,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// 来源 → 用户可读标签（spec 二十六：不展示 predicate/source_id 等术语）。
+pub fn memory_source_label(source: MemorySource) -> &'static str {
+    match source {
+        MemorySource::UserExplicit => "你主动设置",
+        MemorySource::UserConfirmed => "你在对话中确认过",
+        MemorySource::UserSelection => "你选择过该文件",
+        MemorySource::RepeatedUsage => "多次使用后自动记住",
+        MemorySource::DocumentInference => "翻翻从资料中推测",
+        MemorySource::ModelInference => "翻翻的推测",
+    }
+}
+
+/// 目标显示名兜底。
+fn display_name_or_placeholder(name: Option<&str>) -> String {
+    name.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| "一份已不可用的资料".to_owned())
+}
+
+/// 别名 → 记忆摘要视图。`target_name` 为目标文件/收藏集显示名。
+pub fn alias_summary_view(
+    alias: &MemoryAlias,
+    target_name: Option<&str>,
+    target_available: bool,
+) -> MemorySummary {
+    let target = display_name_or_placeholder(target_name);
+    MemorySummary {
+        id: format!("alias:{}", alias.alias_id),
+        title: alias.alias.clone(),
+        summary: format!("“{}”通常指向《{}》", alias.alias, target),
+        kind: match alias.target_type {
+            MemoryTargetType::File => "file_alias",
+            MemoryTargetType::Collection => "collection_alias",
+            MemoryTargetType::Entity => "entity_alias",
+        }
+        .to_owned(),
+        status: alias.status,
+        source_label: memory_source_label(alias.source_type).to_owned(),
+        target_display_name: Some(target),
+        target_available,
+        updated_at: alias.updated_at,
+    }
+}
+
+/// 关系 → 记忆摘要视图。`subject_name` / `object_name` 为两端显示名
+///（文件名 / 收藏集名 / 实体规范名；缺省回退占位）。
+pub fn relation_summary_view(
+    relation: &MemoryRelation,
+    subject_name: Option<&str>,
+    object_name: Option<&str>,
+    target_available: bool,
+) -> MemorySummary {
+    let subject = display_name_or_placeholder(subject_name);
+    let object = display_name_or_placeholder(object_name);
+    MemorySummary {
+        id: format!("relation:{}", relation.relation_id),
+        title: subject.clone(),
+        summary: format!("《{subject}》与《{object}》存在关联（{}）", relation.predicate),
+        kind: match (relation.subject_type, relation.object_type) {
+            (MemoryTargetType::File, MemoryTargetType::File)
+            | (MemoryTargetType::File, MemoryTargetType::Collection)
+            | (MemoryTargetType::Collection, MemoryTargetType::File) => "file_relation",
+            _ => "entity_relation",
+        }
+        .to_owned(),
+        status: relation.status,
+        source_label: memory_source_label(relation.source_type).to_owned(),
+        target_display_name: Some(object),
+        target_available,
+        updated_at: relation.updated_at,
+    }
+}
+
+// ============================================================
+// Memory Settings（Phase 4.2 spec 二十五：「使用记忆」总开关）
+// ============================================================
+
+/// 记忆设置（持久化于应用配置目录 memory.json，与主题设置同一存储模式；
+/// 不另造独立配置文件）。关闭时：不删除 Memory、Resolver/Writer 不参与
+/// 新 Ask；重新开启后原 Memory 继续可用。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemorySettings {
+    #[serde(default = "default_memory_enabled")]
+    pub enabled: bool,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+/// 记忆默认开启（已有行为不因升级改变）。
+fn default_memory_enabled() -> bool {
+    true
+}
+
+impl Default for MemorySettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_memory_enabled(),
+            updated_at: None,
+        }
+    }
+}
+
+/// 记忆设置服务：读/原子写 memory.json（与 ThemeService 同构）。
+#[derive(Debug, Clone)]
+pub struct MemorySettingsService {
+    state_file: std::path::PathBuf,
+}
+
+impl MemorySettingsService {
+    /// `config_dir` 为应用配置目录（与 ThemeService 共用的同一目录）。
+    pub fn new(config_dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            state_file: config_dir.into().join("memory.json"),
+        }
+    }
+
+    pub fn get(&self) -> Result<MemorySettings, AppError> {
+        if !self.state_file.exists() {
+            return Ok(MemorySettings::default());
+        }
+        let bytes = std::fs::read(&self.state_file)
+            .map_err(|error| AppError::local_config(error.to_string(), true))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|error| AppError::local_config(error.to_string(), true))
+    }
+
+    pub fn set_enabled(&self, enabled: bool) -> Result<MemorySettings, AppError> {
+        let settings = MemorySettings {
+            enabled,
+            updated_at: Some(Utc::now()),
+        };
+        let parent = self
+            .state_file
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::create_dir_all(parent)
+            .map_err(|error| AppError::local_config(error.to_string(), true))?;
+        let temporary = self.state_file.with_extension("json.new");
+        let bytes = serde_json::to_vec_pretty(&settings)
+            .map_err(|error| AppError::local_config(error.to_string(), false))?;
+        std::fs::write(&temporary, bytes)
+            .map_err(|error| AppError::local_config(error.to_string(), true))?;
+        if self.state_file.exists() {
+            std::fs::remove_file(&self.state_file)
+                .map_err(|error| AppError::local_config(error.to_string(), true))?;
+        }
+        std::fs::rename(&temporary, &self.state_file)
+            .map_err(|error| AppError::local_config(error.to_string(), true))?;
+        Ok(settings)
+    }
 }
 
 #[cfg(test)]
@@ -286,5 +469,68 @@ mod tests {
                 target
             );
         }
+    }
+
+    /// spec 三十九 1/4/5：默认开启；关闭 → 持久化；重新打开 → 设置恢复。
+    /// 设置只存自身状态文件，不触碰 Memory 数据（关闭不删除）。
+    #[test]
+    fn memory_settings_roundtrip_and_default_enabled() {
+        let directory =
+            std::env::temp_dir().join(format!("fanfan-memory-settings-{}", Uuid::now_v7()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create temp dir");
+
+        let service = MemorySettingsService::new(&directory);
+        // 文件缺失 → 默认开启（既有行为不因升级改变）
+        assert_eq!(service.get().expect("default settings").enabled, true);
+
+        // 关闭 → 持久化到 memory.json
+        let updated = service.set_enabled(false).expect("disable memory");
+        assert!(!updated.enabled);
+        assert!(updated.updated_at.is_some());
+        assert!(directory.join("memory.json").exists());
+        assert!(!service.get().expect("read after disable").enabled);
+
+        // 重新打开 → 原设置继续可用
+        let restored = service.set_enabled(true).expect("enable memory");
+        assert!(restored.enabled);
+        assert!(service.get().expect("read after enable").enabled);
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// spec 三十九 6/12/13：confirmed 摘要正常展示；目标不可用反映在
+    /// target_available；摘要不泄露内部 UUID（id 前缀只是视图标识，
+    /// 普通 UI 不展示）。
+    #[test]
+    fn alias_summary_view_is_user_friendly() {
+        let now = Utc::now();
+        let alias = MemoryAlias {
+            alias_id: Uuid::now_v7(),
+            alias: "我的简历".to_owned(),
+            target_type: MemoryTargetType::File,
+            target_id: Uuid::now_v7(),
+            confidence: 0.95,
+            status: MemoryStatus::Confirmed,
+            source_type: MemorySource::UserConfirmed,
+            source_id: None,
+            hit_count: 2,
+            last_used_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let summary = alias_summary_view(&alias, Some("周晨-大模型开发工程师.pdf"), true);
+        assert_eq!(summary.title, "我的简历");
+        assert!(summary.summary.contains("周晨-大模型开发工程师.pdf"));
+        assert_eq!(summary.source_label, "你在对话中确认过");
+        assert!(summary.target_available);
+        assert_eq!(summary.status, MemoryStatus::Confirmed);
+        // 自然语言摘要里不得出现裸 UUID
+        assert!(!summary.summary.contains(&alias.target_id.to_string()));
+
+        // 目标不可用：available=false + 显示名兜底
+        let stale = alias_summary_view(&alias, None, false);
+        assert!(!stale.target_available);
+        assert!(stale.summary.contains("已不可用"));
     }
 }

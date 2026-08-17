@@ -23,6 +23,8 @@
 //! 各子模块只依赖本模块内的类型与 `crate::knowledge` 的共享 prompt 工具，
 //! 编排逻辑在桌面应用层（app_data.rs）调用，不在此堆 SQL 与模型调用。
 
+pub mod answer_gate;
+pub mod builtin_knowledge;
 pub mod compare;
 pub mod context_resolver;
 pub mod extract;
@@ -31,18 +33,30 @@ pub mod document_retrieval;
 pub mod document_summary;
 pub mod memory_resolver;
 pub mod memory_writer;
+pub mod no_evidence;
+#[cfg(test)]
+pub mod phase_4_2_cases;
+pub mod query_normalize;
 pub mod query_parser;
 pub mod query_plan;
 #[cfg(test)]
 pub mod scenarios;
 pub mod source_router;
 
+pub use answer_gate::{
+    AnswerShape, AnswerabilityInput, AnswerabilityStatus, AnswerabilityVerdict, EvidenceRole,
+    GateEvidence, LOCAL_STRICT_SYSTEM_PROMPT, answer_shape_directive, classify_answer_shape,
+    classify_evidence_role, claim_subject_mismatch, evaluate_answerability,
+    existence_requires_project_context, extract_query_entities, find_external_knowledge_marker,
+    local_no_evidence_answer,
+};
 pub use compare::{
     COMPARE_FALLBACK_ITEMS, COMPARE_MATERIAL_CHARS, COMPARE_MATERIAL_ITEMS, CompareDifference,
     ComparePoint, CompareResults, compare_prompt, compare_schema, parse_compare_results,
 };
 pub use context_resolver::{ContextResolution, ContextSignal, resolve_ambiguous};
 pub use memory_resolver::{MemoryHint, match_alias_hints, match_relation_hints};
+pub use no_evidence::NoEvidenceReason;
 pub use memory_writer::{
     MemoryProposal, MemoryTargetRegistry, MemoryWriterContext, MemoryWriterOutput,
     memory_writer_prompt, memory_writer_schema, parse_writer_output, prewrite_validate,
@@ -67,11 +81,20 @@ pub use document_summary::{
 };
 pub use extract::{
     EXTRACT_MATCH_MIN_LEN, EXTRACT_MATERIAL_CHARS, EXTRACT_MAX_ITEMS, ExtractItem, ExtractResults,
-    extract_prompt, extract_schema, longest_common_substr_len, parse_extract_results,
+    extract_prompt, extract_schema, is_project_list_question, longest_common_substr_len,
+    parse_extract_results,
 };
-pub use query_parser::{parse_query_plan, query_parser_prompt, query_parser_schema};
+pub use query_normalize::{
+    extract_find_reference, is_existence_question, normalize_query_variants,
+};
+pub use query_parser::{
+    find_query_plan, parse_query_plan, query_parser_prompt, query_parser_schema,
+};
 pub use query_plan::{
     DocumentCandidate, DocumentResolution, EvidenceStatus, QueryFilters, QueryIntent,
     QueryOperation, QueryPlan, QueryTarget, ResolutionStatus, SourceIntent,
 };
-pub use source_router::{parse_source_routing, source_router_prompt, source_routing_schema, SourceRouting};
+pub use source_router::{
+    fast_path_greeting, parse_source_routing, source_router_prompt, source_routing_schema,
+    SourceRouting,
+};

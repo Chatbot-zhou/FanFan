@@ -25,6 +25,9 @@ export const RUNTIME_EVENTS = {
   collectionSuggestionPhase: "collection:suggestion_phase",
   visionProgress: "vision:progress",
   visionCompleted: "vision:completed",
+  storageMigrationProgress: "storage:migration-progress",
+  storageMigrationCompleted: "storage:migration-completed",
+  storageMigrationFailed: "storage:migration-failed",
 } as const;
 
 export type RuntimeEventName = typeof RUNTIME_EVENTS[keyof typeof RUNTIME_EVENTS];

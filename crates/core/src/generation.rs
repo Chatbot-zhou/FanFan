@@ -233,14 +233,14 @@ impl LocalGenerationRuntime {
                     "你是本地多模态运行状态检查器，不进行推理说明。",
                     "只回复：就绪",
                     "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
-                    64,
+                    256,
                     None,
                 )?
             } else {
                 self.complete(
                     "你是本地运行状态检查器，不进行推理说明。",
                     "只回复：就绪",
-                    64,
+                    256,
                 )?
             };
             if self_test.trim().is_empty() {
@@ -388,14 +388,14 @@ impl LocalGenerationRuntime {
                 "你是本地多模态运行状态检查器，不进行推理说明。",
                 "只回复：就绪",
                 "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
-                64,
+                256,
                 None,
             )?
         } else {
             self.complete(
                 "你是本地运行状态检查器，不进行推理说明。",
                 "只回复：就绪",
-                64,
+                256,
             )?
         };
         if self_test.trim().is_empty() {
@@ -525,10 +525,22 @@ impl LocalGenerationRuntime {
                 false,
             )
         })?;
-        value
+        let content = value
             .pointer("/choices/0/message/content")
             .and_then(|value| value.as_str())
             .map(str::to_owned)
+            .unwrap_or_default();
+        if !content.trim().is_empty() {
+            return Ok(content);
+        }
+        // 推理模型（如 DeepSeek-R1 系列）的模板强制 <think> 开头，max_tokens
+        // 可能全部消耗在思考段，content 为空而 reasoning_content 有文本。
+        // 这种响应说明模型本身工作正常，回退返回思考文本，避免自检误判失败。
+        value
+            .pointer("/choices/0/message/reasoning_content")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+            .filter(|text| !text.trim().is_empty())
             .ok_or_else(|| {
                 AppError::new(
                     "GENERATION_RESPONSE_INVALID",

@@ -2,7 +2,7 @@ import { create } from "zustand";
 import type { AnswerResult, AppRoute, InboxQuery, SearchRequest, SearchSession } from "../bridge";
 
 type InboxStatus = InboxQuery["status"];
-export type SettingsTab = "roots" | "models" | "index" | "appearance" | "logs";
+export type SettingsTab = "roots" | "models" | "index" | "appearance" | "memory" | "logs";
 export type SearchModifiedWindow = "all" | "7" | "30" | "365";
 export type AskTurn = { question: string; answer: AnswerResult };
 /** 后台分析任务种类：资料关系分析、AI 集合建议分析 */

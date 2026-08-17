@@ -59,6 +59,65 @@ pub fn extract_schema() -> serde_json::Value {
     })
 }
 
+/// 项目清单类问题的标记词（「有啥项目」等口语变体命中任一即套用项目实体规范）。
+const PROJECT_LIST_MARKERS: &[&str] = &[
+    "有哪些项目", "项目名称", "做过哪些项目", "有什么项目", "项目有哪些",
+    "项目列表", "都有什么项目", "哪些项目", "有啥项目", "做了哪些项目",
+];
+
+/// 问题是否为「项目清单」型（CASE 8：item 必须是项目名称实体，不是技术描述）。
+pub fn is_project_list_question(question: &str) -> bool {
+    let folded = question.trim().to_lowercase();
+    PROJECT_LIST_MARKERS
+        .iter()
+        .any(|marker| folded.contains(marker))
+}
+
+/// 叙事句标记：条目含任一即判为「整段描述句」而非实体名称
+///（spec 十二：「大模型不仅负责生成文本，还会根据目标……」不能当 project_name）。
+const NARRATIVE_SENTENCE_MARKERS: &[&str] = &[
+    "不仅", "还会", "而且", "并且", "同时", "以及", "然后", "其次",
+    "是一种", "指的是", "是指", "会根据", "可以用来", "被用来",
+    "负责生成", "选择工具", "读取工具", "判断下一步", "处理复杂",
+];
+/// 条目作为「实体名称」的宽松字符上限（超长几乎必是描述句；不死卡短上限，
+/// 结合叙事标记综合判断——spec 十二「不要死卡字数」）。
+const EXTRACT_ENTITY_MAX_CHARS: usize = 60;
+
+/// 条目是否符合「实体/标题式文本」形态（spec 十二类型验证）。
+///
+/// 项目名称等抽取实体通常是短名词短语；完整陈述句（含叙事连接词、
+/// 谓语描述、多个子句）会被拒绝——即使它与证据有公共子串。
+/// 判据（保守组合，宁可放过短描述、不可错杀真实项目名）：
+/// 1. 非空且不超过 `EXTRACT_ENTITY_MAX_CHARS` 字符；
+/// 2. 不含叙事句标记（「不仅/还会/是一种/会根据…」）；
+/// 3. 不含句末标点（。；！？）且子句数 ≤ 1（至多一个逗号，无顿号列举）。
+pub fn extract_item_is_entity_like(item: &str) -> bool {
+    let trimmed = item.trim();
+    let char_count = trimmed.chars().count();
+    if char_count == 0 || char_count > EXTRACT_ENTITY_MAX_CHARS {
+        return false;
+    }
+    if NARRATIVE_SENTENCE_MARKERS
+        .iter()
+        .any(|marker| trimmed.contains(marker))
+    {
+        return false;
+    }
+    let has_sentence_end = ['。', '；', '！', '？', ';', '!', '?']
+        .iter()
+        .any(|punct| trimmed.contains(*punct));
+    if has_sentence_end {
+        return false;
+    }
+    let comma_count = trimmed
+        .chars()
+        .filter(|ch| *ch == '，' || *ch == ',')
+        .count();
+    let enumeration_count = trimmed.matches('、').count();
+    comma_count <= 1 && enumeration_count == 0
+}
+
 /// 构建抽取 prompt。materials 为已核验的事实句 + 证据原文摘引
 /// （编排层负责按 `EXTRACT_MATERIAL_CHARS` 截断）。
 pub fn extract_prompt(question: &str, materials: &[String]) -> (String, String) {
@@ -72,6 +131,11 @@ pub fn extract_prompt(question: &str, materials: &[String]) -> (String, String) 
         for (index, material) in materials.iter().enumerate() {
             user.push_str(&format!("[M{}] {}\n", index + 1, material));
         }
+    }
+    if is_project_list_question(question) {
+        user.push_str(
+            "\n本次抽取任务是【项目清单】：每个 item 必须是【项目名称】这个实体——简短名词短语（例如「大模型应用开发」「基于 LangGraph 的知识库问答」），严禁输出整段技术点描述或叙事长句；evidence 为材料中支持该项目名称的最短原文片段。",
+        );
     }
     user.push_str(
         "\n请抽取材料中与问题相关的全部条目，输出 items 数组；每条目给出 item（条目内容）与 evidence（材料中支持该条目的最短原文片段）。",
@@ -271,6 +335,74 @@ mod tests {
     fn empty_materials_still_produce_usable_prompt() {
         let (_, user) = extract_prompt("有哪些技能？", &[]);
         assert!(user.contains("（无材料）"));
+    }
+
+    #[test]
+    fn project_list_question_detected() {
+        // CASE 8：项目清单问题必须命中（口语变体）
+        for question in [
+            "我那个大模型的材料里面有啥项目",
+            "我的简历里面有哪些项目？",
+            "做过哪些项目",
+            "项目名称是什么",
+            "我的文件里都有什么项目",
+        ] {
+            assert!(is_project_list_question(question), "{question} 应命中项目清单");
+        }
+        for question in [
+            "我的简历里有没有写 LangGraph",
+            "项目里用了什么技术",
+            "帮我总结一下这个项目",
+            "Transformer 是什么",
+        ] {
+            assert!(!is_project_list_question(question), "{question} 不应命中项目清单");
+        }
+    }
+
+    #[test]
+    fn project_list_prompt_specifies_project_name_entity() {
+        // CASE 8 的 prompt 纪律：item 必须是项目名称实体，不是技术描述
+        let (_, user) = extract_prompt(
+            "我那个大模型的材料里面有啥项目",
+            &["参与大模型应用开发，负责微调训练".to_owned()],
+        );
+        assert!(user.contains("项目清单"));
+        assert!(user.contains("项目名称"));
+        assert!(user.contains("严禁输出整段技术点描述或叙事长句"));
+        // 非项目问题不带项目规范段
+        let (_, user) = extract_prompt("我的简历里有哪些技能？", &["熟悉 Python".to_owned()]);
+        assert!(!user.contains("项目清单"));
+    }
+
+    #[test]
+    fn extract_item_entity_form_validation() {
+        // spec 十二：真实项目名（短名词短语，可含空格/括号/中英混排）→ 通过
+        for item in [
+            "大模型应用开发",
+            "基于 LangGraph 的知识库问答",
+            "法律 RAG 项目（v2）",
+            "智能问答系统",
+        ] {
+            assert!(extract_item_is_entity_like(item), "{item} 应是实体形态");
+        }
+        // 完整描述句 / 叙事长句 → 拒绝（即使与证据有公共子串）
+        for item in [
+            "大模型不仅负责生成文本，还会根据目标判断下一步、选择工具并读取工具结果",
+            "RAG 是一种根据目标选择工具的能力",
+            "该系统会根据目标判断下一步",
+            "负责生成文本以及选择工具",
+        ] {
+            assert!(
+                !extract_item_is_entity_like(item),
+                "{item} 不应通过实体形态验证"
+            );
+        }
+        // 边界：句末标点 / 多子句 / 顿号列举 / 超长 → 拒绝
+        assert!(!extract_item_is_entity_like("智能问答系统。"));
+        assert!(!extract_item_is_entity_like("问答系统，检索，生成，校验"));
+        assert!(!extract_item_is_entity_like("问答、检索、生成"));
+        assert!(!extract_item_is_entity_like(&"很长的项目".repeat(20)));
+        assert!(!extract_item_is_entity_like("   "));
     }
 
     #[test]

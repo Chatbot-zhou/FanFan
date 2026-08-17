@@ -121,6 +121,7 @@ const ASK_PHASE_LABELS: Record<string, string> = {
   hybrid_retrieval: "正在执行混合检索",
   reranking: "正在重排候选证据",
   evidence_selection: "正在筛选证据",
+  answerability_gate: "正在核验证据能否回答问题",
   image_reanalysis: "正在复核候选原图",
   generating: "正在依据证据组织回答",
   citation_validation: "正在逐句核验引用",

@@ -18,13 +18,14 @@ use commands::{
         RuntimeManagerState, ScanCoordinatorState, SidecarClients, SidecarRegistryState,
         SpeechWorkerState, WatcherServiceState, WorkerServiceState,
     },
+    memory_view::{self, MemorySettingsServiceState},
     startup::{StartupServiceState, StartupState},
     theme::ThemeServiceState,
     welcome::WelcomeServiceState,
 };
 use fanfan_core::{
-    CatalogService, IncrementalWatchManager, LocalGenerationRuntime, ModelManager,
-    RuntimeCapability, ThemeService, WelcomeService, WorkerClient, WorkerRole,
+    CatalogService, IncrementalWatchManager, LocalGenerationRuntime, MemorySettingsService,
+    ModelManager, RuntimeCapability, ThemeService, WelcomeService, WorkerClient, WorkerRole,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -100,7 +101,7 @@ pub fn run() {
             let config_dir = app.path().app_config_dir()?;
             let local_data_dir = app.path().app_local_data_dir()?;
             let default_data_dir = app.path().app_data_dir()?;
-            let pre_reset_data_dir =
+            let (pre_reset_data_dir, _) =
                 resolve_application_data_directory(&config_dir, &default_data_dir);
             let durable_model_store = durable_model_store_directory(&local_data_dir)?;
             let legacy_model_roots = unique_paths([
@@ -109,7 +110,8 @@ pub fn run() {
                 local_data_dir.join("models"),
             ]);
             apply_pending_data_reset(&config_dir, &local_data_dir)?;
-            let data_dir = resolve_application_data_directory(&config_dir, &default_data_dir);
+            let (data_dir, pending_migration) =
+                resolve_application_data_directory(&config_dir, &default_data_dir);
             let (log_initialization, log_fallback_error) =
                 match runtime_log::initialize(data_dir.join("logs")) {
                     Ok(initialization) => (initialization, None),
@@ -150,6 +152,9 @@ pub fn run() {
             app.manage(ThemeServiceState(Mutex::new(ThemeService::new(
                 config_dir.clone(),
             ))));
+            app.manage(MemorySettingsServiceState(Mutex::new(
+                MemorySettingsService::new(config_dir.clone()),
+            )));
             app.manage(EnvironmentServiceState {
                 data_directory: data_dir.clone(),
                 config_directory: config_dir.clone(),
@@ -241,6 +246,54 @@ pub fn run() {
             app.manage(AskCoordinatorState::default());
             app.manage(ModelDownloadCoordinatorState::default());
 
+            // 待执行的存储迁移不在此同步复制（数 GB 数据会在主线程上冻结窗口
+            // 数分钟，用户看到的就是黑屏）。改为后台线程执行并按字节上报进度，
+            // initialize_background_services 等迁移结束后再以最终目录打开数据库
+            // （迁移期间数据库必须保持关闭，否则复制的是打开中的库文件）。
+            let (data_dir, migration_result) = match pending_migration {
+                Some(pending) => {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let migration_app = app.handle().clone();
+                    let migration_config_dir = config_dir.clone();
+                    thread::spawn(move || {
+                        let started_at = Instant::now();
+                        let mut last_report_at = Instant::now();
+                        let final_dir = execute_pending_storage_migration(
+                            &migration_config_dir,
+                            &pending,
+                            |progress| {
+                                // 约 200ms 节流一次事件，避免小文件海量 emit；
+                                // 最后一帧（done == total）无条件发出。
+                                let settled = progress.done_bytes == progress.total_bytes;
+                                if settled || last_report_at.elapsed() >= Duration::from_millis(200)
+                                {
+                                    last_report_at = Instant::now();
+                                    let _ = migration_app.emit(
+                                        "storage:migration-progress",
+                                        progress,
+                                    );
+                                }
+                            },
+                        );
+                        let succeeded = final_dir == PathBuf::from(&pending.target_directory);
+                        let _ = tx.send(final_dir);
+                        let _ = migration_app.emit(
+                            if succeeded {
+                                "storage:migration-completed"
+                            } else {
+                                "storage:migration-failed"
+                            },
+                            serde_json::json!({
+                                "succeeded": succeeded,
+                                "elapsed_ms": started_at.elapsed().as_millis() as u64,
+                            }),
+                        );
+                    });
+                    (data_dir, Some(rx))
+                }
+                None => (data_dir, None),
+            };
+
             let startup_app = app.handle().clone();
             tauri::async_runtime::spawn_blocking(move || {
                 initialize_background_services(
@@ -252,6 +305,7 @@ pub fn run() {
                     catalog,
                     models,
                     startup,
+                    migration_result,
                 );
             });
             runtime_log::event(
@@ -367,6 +421,13 @@ pub fn run() {
             app_data::memory_entity_delete,
             app_data::memory_relation_delete,
             app_data::memory_clear,
+            memory_view::memory_settings_get,
+            memory_view::memory_settings_update,
+            memory_view::memory_summary_list,
+            memory_view::memory_summary_get,
+            memory_view::memory_confirm,
+            memory_view::memory_reject,
+            memory_view::memory_delete,
             app_data::ask_session_context_clear,
             app_data::diagnostic_event_append,
             app_data::diagnostic_export,
@@ -555,25 +616,40 @@ pub(crate) fn schedule_storage_migration(
     Ok(storage_location_status(config_dir, current_data_dir))
 }
 
-fn resolve_application_data_directory(config_dir: &Path, default_data_dir: &Path) -> PathBuf {
+/// 解析当前活动数据目录；若存在待执行的存储迁移则一并返回（迁移计划）。
+/// 注意：这里只做解析与残留清理，不执行复制——复制由
+/// execute_pending_storage_migration 在后台线程完成，避免阻塞主线程冻结窗口。
+fn resolve_application_data_directory(
+    config_dir: &Path,
+    default_data_dir: &Path,
+) -> (PathBuf, Option<PendingStorageMigration>) {
     apply_pending_storage_cleanup(config_dir);
-    let mut config = read_storage_location_config(config_dir).unwrap_or_default();
+    let config = read_storage_location_config(config_dir).unwrap_or_default();
     let active = config
         .active_data_directory
         .as_deref()
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .unwrap_or_else(|| default_data_dir.to_path_buf());
-    let Some(pending) = config.pending.clone() else {
-        return active;
-    };
+    (active, config.pending)
+}
+
+/// 在任意线程执行待处理的存储迁移：复制 + 全量哈希校验 + 切换配置。
+/// 成功：previous=source、active=target、pending 清空，返回 target；
+/// 失败：写入 last_error、保留 pending（下次启动重试），返回 source。
+/// report 每处理完一个文件回调一次，由调用方节流上报进度。
+fn execute_pending_storage_migration(
+    config_dir: &Path,
+    pending: &PendingStorageMigration,
+    report: impl FnMut(MigrationProgress),
+) -> PathBuf {
     let source = PathBuf::from(&pending.source_directory);
     let target = PathBuf::from(&pending.target_directory);
-    let result = copy_tree_verified(&source, &target);
-    match result {
+    match copy_tree_verified_with_progress(&source, &target, report) {
         Ok(()) => {
             // 迁移完成：旧目录由 pending 转入 previous，供后续手动清理释放磁盘。
-            config.previous_data_directory = Some(pending.source_directory);
+            let mut config = read_storage_location_config(config_dir).unwrap_or_default();
+            config.previous_data_directory = Some(pending.source_directory.clone());
             config.active_data_directory = Some(target.to_string_lossy().into_owned());
             config.pending = None;
             config.last_error = None;
@@ -592,11 +668,23 @@ fn resolve_application_data_directory(config_dir: &Path, default_data_dir: &Path
             }
         }
         Err(_) => {
+            let mut config = read_storage_location_config(config_dir).unwrap_or_default();
             config.last_error = Some(
-                "存储迁移未完成，翻翻已继续使用原位置；请检查目标磁盘空间和写入权限后重试".into(),
+                "存储迁移未完成，翻翻已继续使用原位置；请检查目标磁盘空间和写入权限后重试"
+                    .into(),
             );
             config.updated_at = Some(Utc::now().to_rfc3339());
             let _ = write_storage_location_config(config_dir, &config);
+            runtime_log::event(
+                "warning",
+                "storage",
+                "storage.migration_failed",
+                None,
+                &serde_json::json!({
+                    "source_directory": source,
+                    "target_directory": target,
+                }),
+            );
             source
         }
     }
@@ -897,7 +985,22 @@ fn write_model_store_location_config(
     Ok(())
 }
 
-fn copy_tree_verified(source: &Path, target: &Path) -> std::io::Result<()> {
+/// 存储迁移进度。phase 区分复制与校验两个阶段，二者各占总字节数的一半权重
+/// 时前端百分比的观感最平滑；这里直接以字节数为准，由前端换算百分比。
+#[derive(Debug, Clone, Copy, Serialize)]
+pub(crate) struct MigrationProgress {
+    pub phase: &'static str,
+    pub done_bytes: u64,
+    pub total_bytes: u64,
+}
+
+/// 复制 + 全量哈希校验 + 写入受管标记。progress 回调在每处理完一个文件后
+/// 触发一次（复制阶段与校验阶段各累计一遍字节数），供上层节流上报进度。
+fn copy_tree_verified_with_progress(
+    source: &Path,
+    target: &Path,
+    mut report: impl FnMut(MigrationProgress),
+) -> std::io::Result<()> {
     if !source.is_absolute() || !source.is_dir() || !target.is_absolute() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -910,15 +1013,38 @@ fn copy_tree_verified(source: &Path, target: &Path) -> std::io::Result<()> {
             "overlapping storage migration paths",
         ));
     }
-    copy_directory_entries(source, target)?;
-    verify_directory_entries(source, target)?;
+    // 先预扫描一遍算总字节数，进度条才有分母。
+    let total_bytes = directory_total_bytes(source)?;
+    let mut done = 0_u64;
+    copy_directory_entries_with_progress(source, target, total_bytes, &mut done, &mut report)?;
+    verify_directory_entries_with_progress(source, target, total_bytes, &mut done, &mut report)?;
     let marker = target.join(MANAGED_STORAGE_MARKER);
     let mut marker_file = File::create(marker)?;
     marker_file.write_all(b"FANFAN_MANAGED_DATA_V1")?;
     marker_file.sync_all()
 }
 
-fn copy_directory_entries(source: &Path, target: &Path) -> std::io::Result<()> {
+fn directory_total_bytes(root: &Path) -> std::io::Result<u64> {
+    let mut total = 0_u64;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_dir() {
+            total = total.saturating_add(directory_total_bytes(&entry.path())?);
+        } else if metadata.file_type().is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Ok(total)
+}
+
+fn copy_directory_entries_with_progress(
+    source: &Path,
+    target: &Path,
+    total_bytes: u64,
+    done: &mut u64,
+    report: &mut impl FnMut(MigrationProgress),
+) -> std::io::Result<()> {
     fs::create_dir_all(target)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
@@ -931,12 +1057,15 @@ fn copy_directory_entries(source: &Path, target: &Path) -> std::io::Result<()> {
         }
         let destination = target.join(entry.file_name());
         if metadata.is_dir() {
-            copy_directory_entries(&entry.path(), &destination)?;
+            copy_directory_entries_with_progress(&entry.path(), &destination, total_bytes, done, report)?;
         } else if metadata.is_file() {
+            let size = metadata.len();
             if destination.is_file()
-                && fs::metadata(&destination)?.len() == metadata.len()
+                && fs::metadata(&destination)?.len() == size
                 && sha256_path(&entry.path())? == sha256_path(&destination)?
             {
+                *done = done.saturating_add(size);
+                report(MigrationProgress { phase: "copying", done_bytes: *done, total_bytes });
                 continue;
             }
             let temporary = destination.with_extension("fanfan-copying");
@@ -955,12 +1084,20 @@ fn copy_directory_entries(source: &Path, target: &Path) -> std::io::Result<()> {
                 fs::remove_file(&destination)?;
             }
             fs::rename(temporary, destination)?;
+            *done = done.saturating_add(size);
+            report(MigrationProgress { phase: "copying", done_bytes: *done, total_bytes });
         }
     }
     Ok(())
 }
 
-fn verify_directory_entries(source: &Path, target: &Path) -> std::io::Result<()> {
+fn verify_directory_entries_with_progress(
+    source: &Path,
+    target: &Path,
+    total_bytes: u64,
+    done: &mut u64,
+    report: &mut impl FnMut(MigrationProgress),
+) -> std::io::Result<()> {
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let destination = target.join(entry.file_name());
@@ -972,7 +1109,7 @@ fn verify_directory_entries(source: &Path, target: &Path) -> std::io::Result<()>
                     "storage migration directory missing",
                 ));
             }
-            verify_directory_entries(&entry.path(), &destination)?;
+            verify_directory_entries_with_progress(&entry.path(), &destination, total_bytes, done, report)?;
         } else if metadata.is_file()
             && (!destination.is_file()
                 || fs::metadata(&destination)?.len() != metadata.len()
@@ -982,6 +1119,9 @@ fn verify_directory_entries(source: &Path, target: &Path) -> std::io::Result<()>
                 std::io::ErrorKind::InvalidData,
                 "storage migration verification failed",
             ));
+        } else if metadata.is_file() {
+            *done = done.saturating_add(metadata.len());
+            report(MigrationProgress { phase: "verifying", done_bytes: *done, total_bytes });
         }
     }
     Ok(())
@@ -990,7 +1130,9 @@ fn verify_directory_entries(source: &Path, target: &Path) -> std::io::Result<()>
 fn sha256_path(path: &Path) -> std::io::Result<String> {
     let mut file = File::open(path)?;
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    // 堆分配而非栈数组：存储迁移复制会在 Tauri setup 的主线程上运行，
+    // 该线程栈仅 1MB（Windows 默认），1MB 栈缓冲会直接触发栈溢出闪退。
+    let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
@@ -1860,6 +2002,7 @@ fn initialize_background_services(
     catalog_state: CatalogServiceState,
     model_state: ModelServiceState,
     startup: StartupServiceState,
+    migration_result: Option<std::sync::mpsc::Receiver<PathBuf>>,
 ) {
     runtime_log::event(
         "info",
@@ -1868,6 +2011,25 @@ fn initialize_background_services(
         None,
         &serde_json::json!({}),
     );
+    // 若有后台存储迁移，先等它结束：迁移成功则以新目录（target）打开数据库，
+    // 失败时执行器已保留 pending 并回退旧目录，这里沿用传来的 source 目录。
+    let data_dir = match migration_result {
+        Some(receiver) => {
+            startup.publish(
+                &app,
+                StartupState {
+                    phase: "migrating_data",
+                    ready: false,
+                    progress: 0.05,
+                    pending_files: 0,
+                    blocker: None,
+                    recovery_actions: Vec::new(),
+                },
+            );
+            receiver.recv().unwrap_or(data_dir)
+        }
+        None => data_dir,
+    };
     startup.publish(
         &app,
         StartupState {
@@ -2299,10 +2461,15 @@ fn background_probe_generation_runtime(
             // 生成运行时，probe 与它们并发是常态（实测 probe 完成后锁被 VLM
             // 推理持有，3s 拿锁必然失败）。失败后间隔重试，在推理空隙把 GPU
             // runtime 换上去，避免整个会话因一次竞争永久留在 CPU。
-            const SWAP_RETRY_ATTEMPTS: u32 = 8;
+            // Phase 4.3 修复：旧窗口 8×15s≈2 分钟内后台推理持续占用时 swap
+            // 永久放弃（trace 实测 8 轮全跳过 → GPU 检测到但全程 CPU）。重试
+            // 上限提到 24（约 7 分钟窗口），且区分两种跳过原因：runtime_active
+            // （推理在途，不能杀）与 lock_timeout（锁竞争）。
+            const SWAP_RETRY_ATTEMPTS: u32 = 24;
             const SWAP_RETRY_DELAY: Duration = Duration::from_secs(15);
             let mut swapped = false;
             for attempt in 0..SWAP_RETRY_ATTEMPTS {
+                let mut skip_reason = "lock_timeout";
                 swapped =
                     match crate::commands::app_data::try_lock_generation_until(
                         &generation,
@@ -2313,6 +2480,7 @@ fn background_probe_generation_runtime(
                                 // llama 进程存活（推理中）：换掉会中断在途生成，
                                 // 放下锁等下一轮。
                                 drop(guard);
+                                skip_reason = "runtime_active";
                                 false
                             } else {
                                 *guard = LocalGenerationRuntime::new_with_fallback_and_capability(
@@ -2336,7 +2504,7 @@ fn background_probe_generation_runtime(
                     &serde_json::json!({
                         "attempt": attempt + 1,
                         "attempts_total": SWAP_RETRY_ATTEMPTS,
-                        "reason": "generation_runtime_busy",
+                        "reason": skip_reason,
                         "delay_seconds": SWAP_RETRY_DELAY.as_secs(),
                     }),
                 );
@@ -2351,6 +2519,23 @@ fn background_probe_generation_runtime(
             fields["backend"] = "cpu".into();
             fields["swapped"] = false.into();
         }
+    }
+    // Phase 4.3 第四部分：GPU 状态日志——探测完成时补显卡名称与显存
+    //（`CUDA available` / GPU / 显存一次打全，与任务要求的启动期排查字段对齐）。
+    let device_strings: Vec<String> = fields["devices"]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some((gpu_name, gpu_memory_bytes)) =
+        app_data::gpu_details_from_devices(Some(&device_strings))
+    {
+        fields["gpu_name"] = gpu_name.into();
+        fields["gpu_memory_mb"] = gpu_memory_bytes.map(|bytes| bytes / (1024 * 1024)).into();
     }
     runtime_log::event("info", "model.runtime", "probe.completed", None, &fields);
     // 探测完成：刷新环境状态（环境页/模型推荐拿到 GPU 信息并落盘），并广播
@@ -2381,6 +2566,16 @@ fn background_probe_generation_runtime(
 #[cfg(test)]
 mod reset_tests {
     use super::*;
+
+    /// 测试辅助：解析并同步执行待处理的存储迁移（等价于旧版同步 resolve），
+    /// 返回迁移完成后的最终活动目录；无 pending 时直接返回当前活动目录。
+    fn execute_pending_migration_for_test(config_dir: &Path, fallback: &Path) -> PathBuf {
+        let (active, pending) = resolve_application_data_directory(config_dir, fallback);
+        match pending {
+            Some(pending) => execute_pending_storage_migration(config_dir, &pending, |_| {}),
+            None => active,
+        }
+    }
 
     #[test]
     fn pending_reset_moves_only_exact_application_directories_to_quarantine() {
@@ -2521,7 +2716,7 @@ mod reset_tests {
             .canonicalize()
             .expect("canonical destination")
             .join("FanFanData");
-        let active = resolve_application_data_directory(&config_dir, &source);
+        let active = execute_pending_migration_for_test(&config_dir, &source);
         assert_eq!(active, expected_target);
         assert_eq!(
             fs::read(active.join("fanfan.db")).expect("read migrated database"),
@@ -2736,7 +2931,7 @@ mod reset_tests {
         fs::write(config_dir.join("fanfan.db"), b"database").expect("write database");
         schedule_storage_migration(&config_dir, &config_dir, &destination_parent, &[])
             .expect("schedule migration");
-        let active = resolve_application_data_directory(&config_dir, &config_dir);
+        let active = execute_pending_migration_for_test(&config_dir, &config_dir);
         assert!(active.join(MANAGED_STORAGE_MARKER).is_file());
         fs::write(
             roaming_parent.join(".com.fanfan.desktop-reset-request"),
@@ -2777,7 +2972,7 @@ mod reset_tests {
 
         schedule_storage_migration(&config_dir, &source, &destination_parent, &[])
             .expect("schedule migration");
-        let active = resolve_application_data_directory(&config_dir, &source);
+        let active = execute_pending_migration_for_test(&config_dir, &source);
         assert!(active.join(MANAGED_STORAGE_MARKER).is_file());
         let config = read_storage_location_config(&config_dir).expect("read config");
         assert_eq!(
@@ -2837,7 +3032,7 @@ mod reset_tests {
             .expect("write index");
         schedule_storage_migration(&config_dir, &source, &destination_parent, &[])
             .expect("schedule migration");
-        let active = resolve_application_data_directory(&config_dir, &source);
+        let active = execute_pending_migration_for_test(&config_dir, &source);
         fs::remove_file(active.join(MANAGED_STORAGE_MARKER)).expect("remove active marker");
 
         let error =
@@ -2868,7 +3063,7 @@ mod reset_tests {
         config.previous_data_directory = Some(active.to_string_lossy().into_owned());
         write_storage_location_config(&config_dir, &config).expect("write interrupted config");
 
-        let resolved = resolve_application_data_directory(&config_dir, &active);
+        let (resolved, _) = resolve_application_data_directory(&config_dir, &active);
         assert_eq!(resolved, active);
         assert!(!quarantine.exists(), "启动兜底应删除中断的隔离目录");
         let config = read_storage_location_config(&config_dir).expect("read config after fallback");
@@ -2963,7 +3158,7 @@ mod reset_tests {
         fs::write(source.join("fanfan.db"), b"database-v14").expect("write database");
         schedule_storage_migration(&config_dir, &source, &destination_parent, &[])
             .expect("schedule first migration");
-        resolve_application_data_directory(&config_dir, &source);
+        execute_pending_migration_for_test(&config_dir, &source);
         // 第一次迁移完成但旧数据未清理：再安排新迁移必须被拒绝，否则旧目录
         // 会从 previous 引用中消失变成无法清理的孤儿。
         let second_parent = base.join("destination-two");
@@ -2989,7 +3184,7 @@ mod reset_tests {
         fs::write(source.join("fanfan.db"), b"database-v14").expect("write database");
         schedule_storage_migration(&config_dir, &source, &destination_parent, &[])
             .expect("schedule migration");
-        let active = resolve_application_data_directory(&config_dir, &source);
+        let active = execute_pending_migration_for_test(&config_dir, &source);
         fs::remove_dir_all(&source).expect("remove old directory manually");
 
         let result = cleanup_storage_migration(&config_dir, &active).expect("cleanup no-op");

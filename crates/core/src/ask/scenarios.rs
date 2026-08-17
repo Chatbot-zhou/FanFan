@@ -29,12 +29,12 @@ use crate::ask::extract::{parse_extract_results, longest_common_substr_len, Extr
 use crate::ask::memory_resolver::{match_alias_hints, match_relation_hints};
 use crate::ask::query_parser::parse_query_plan;
 use crate::ask::query_plan::{
-    DocumentCandidate, QueryIntent, QueryOperation, QueryPlan, ResolutionStatus, SourceIntent,
+    QueryIntent, QueryOperation, QueryPlan, ResolutionStatus, SourceIntent,
 };
 use crate::ask::source_router::parse_source_routing;
 use crate::ask::{EXTRACT_MATCH_MIN_LEN, MAX_CANDIDATE_SCOPE, MEDIUM_CONFIDENCE_THRESHOLD};
 use crate::contracts::{DocumentType, SourceLocator};
-use crate::knowledge::{AnswerMode, AskSessionContext, DocumentProfile, GroundingStatus};
+use crate::knowledge::{AnswerMode, AskSessionContext, DocumentProfile};
 use crate::memory::{
     MemoryAlias, MemoryEntity, MemoryRelation, MemorySource, MemoryStatus, MemoryTargetType,
     normalize_alias,
@@ -82,6 +82,7 @@ fn alias(target_id: Uuid, name: &str, source: MemorySource) -> MemoryAlias {
         confidence: 0.95,
         source_type: source,
         source_id: None,
+        status: MemoryStatus::Confirmed,
         hit_count: 0,
         last_used_at: None,
         created_at: now,

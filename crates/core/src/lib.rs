@@ -25,6 +25,13 @@ pub mod worker;
 // 注意：QueryIntent 与 knowledge::QueryIntent（搜索命令旧类型）、
 // ResolutionStatus 与 organizing::ResolutionStatus 撞名，不在此 glob 导出，
 // 需要的调用方从 ask::query_plan 路径引入。
+pub use ask::answer_gate::{
+    AnswerShape, AnswerabilityInput, AnswerabilityStatus, AnswerabilityVerdict, EvidenceRole,
+    GateEvidence, LOCAL_STRICT_SYSTEM_PROMPT, answer_shape_directive, classify_answer_shape,
+    classify_evidence_role, claim_subject_mismatch, evaluate_answerability,
+    existence_requires_project_context, extract_query_entities, find_external_knowledge_marker,
+    local_no_evidence_answer,
+};
 pub use ask::compare::{
     COMPARE_FALLBACK_ITEMS, COMPARE_MATERIAL_CHARS, COMPARE_MATERIAL_ITEMS, CompareDifference,
     ComparePoint, CompareResults, compare_prompt, compare_schema, parse_compare_results,
@@ -40,7 +47,8 @@ pub use ask::document_retrieval::{
 };
 pub use ask::extract::{
     EXTRACT_MATCH_MIN_LEN, EXTRACT_MATERIAL_CHARS, EXTRACT_MAX_ITEMS, ExtractItem, ExtractResults,
-    extract_prompt, extract_schema, longest_common_substr_len, parse_extract_results,
+    extract_item_is_entity_like, extract_prompt, extract_schema, is_project_list_question,
+    longest_common_substr_len, parse_extract_results,
 };
 pub use ask::document_summary::{
     DocumentOverview, DocumentSection, MAX_SECTION_CHARS, MAX_SECTIONS, SectionChunk,
@@ -49,6 +57,7 @@ pub use ask::document_summary::{
     parse_overview, parse_section_summaries, section_batch_json, section_summary_schema,
 };
 pub use ask::memory_resolver::{MemoryHint, match_alias_hints, match_relation_hints};
+pub use ask::no_evidence::NoEvidenceReason;
 pub use ask::memory_writer::{
     MemoryTargetRegistry, MemoryWriterContext, MemoryWriterOutput, memory_writer_prompt,
     memory_writer_schema, parse_writer_output, prewrite_validate, resolve_proposal_targets,

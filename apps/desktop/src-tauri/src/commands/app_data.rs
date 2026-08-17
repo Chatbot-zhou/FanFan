@@ -26,6 +26,7 @@ use fanfan_core::{
     FilePreview, FileQuery, FileRecord, ImageUnderstandingResult, ImportCandidate, InboxItem,
     InboxPage, InboxQuery, InboxUpdateRequest, IncrementalWatchManager, IndexActivityStats,
     JobRecord, LocalGenerationRuntime, LogPage, LogQuery, MaintenanceSnapshot, MemoryHint,
+    NoEvidenceReason,
     MemoryKind, MemorySource, MemoryStatus, MemoryTargetRegistry, MemoryTargetType,
     MemoryWriteInput, MemoryWriterContext, ModelArtifact,
     ModelCatalogEntry, ModelDownloadFileProgress, ModelDownloadJob, ModelDownloadRemoval,
@@ -43,6 +44,11 @@ use fanfan_core::{
     RuntimeTaskKind, RuntimeTaskRequest, ScopeFilter, SearchMode, SearchRequest, SearchSession,
     SemanticQuery, SourceIntent, SpeechRecognitionRequest, SpeechRecognitionResult,
     SpeechSynthesisRequest, SpeechSynthesisResult, TriageStatus, WorkerClient, WorkerRole,
+    GenerationActivation,
+    AnswerabilityInput, AnswerabilityStatus, GateEvidence, LOCAL_STRICT_SYSTEM_PROMPT,
+    answer_shape_directive, claim_subject_mismatch, evaluate_answerability,
+    existence_requires_project_context, find_external_knowledge_marker,
+    local_no_evidence_answer,
     chat_prompt, is_natural_language_query, match_alias_hints, match_relation_hints,
     memory_writer_prompt, memory_writer_schema, parse_query_intent, parse_query_plan,
     parse_rewritten_queries, parse_source_routing, parse_writer_output, prewrite_validate,
@@ -59,9 +65,15 @@ use fanfan_core::{
     COMPARE_FALLBACK_ITEMS, COMPARE_MATERIAL_CHARS, COMPARE_MATERIAL_ITEMS, CompareResults,
     compare_prompt, compare_schema, parse_compare_results,
     EXTRACT_MATCH_MIN_LEN, EXTRACT_MAX_ITEMS, extract_prompt, extract_schema,
+    extract_item_is_entity_like, is_project_list_question,
     longest_common_substr_len, parse_extract_results,
 };
+use fanfan_core::ask::fast_path_greeting;
+use fanfan_core::ask::builtin_knowledge::lookup_builtin_knowledge;
+use fanfan_core::ask::query_normalize::{extract_find_reference, normalize_query_variants};
+use fanfan_core::ask::query_parser::find_query_plan;
 use fanfan_core::ask::query_plan::{QueryIntent, QueryOperation, ResolutionStatus};
+use fanfan_core::ask::source_router::{SourceRouting, existence_query_hit, personal_reference_hit};
 use fanfan_core::profile_builder::{
     TYPE_PROTOTYPE_TEXTS, TypePrototype, classify_document_type,
 };
@@ -70,6 +82,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
+
+use crate::commands::memory_view::MemorySettingsServiceState;
 
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
@@ -623,7 +637,9 @@ fn disk_space_bytes(_path: &Path) -> Option<(u64, u64)> {
 /// 从 llama.cpp `--list-devices` 探测结果解析 GPU 名称与显存（替代 PowerShell
 /// WMI 探测：每次启动跑 powershell.exe 1-3s，发布后用户机器上一样执行）。
 /// 设备行形如 `CUDA0: NVIDIA GeForce RTX 3060 Laptop GPU: 6144 MiB`。
-fn gpu_details_from_devices(devices: Option<&[String]>) -> Option<(Option<String>, Option<u64>)> {
+pub(crate) fn gpu_details_from_devices(
+    devices: Option<&[String]>,
+) -> Option<(Option<String>, Option<u64>)> {
     let line = devices?
         .iter()
         .find(|line| {
@@ -1812,6 +1828,52 @@ fn run_model_download(
     }
 }
 
+/// 自检输出的可见文本（Phase 4.3）：剥离 thinking 模型的 `<think>…</think>`
+/// 思维链段。思维链未闭合（token 上限截断）时整段丢弃——此时若闭合段外
+/// 已有可见回复仍判定通过；无 `<think>` 标记的普通模型原样返回。
+fn self_test_visible_text(raw: &str) -> String {
+    if !raw.contains("<think>") {
+        return raw.trim().to_owned();
+    }
+    let mut visible = String::new();
+    let mut rest = raw;
+    while let Some(start) = rest.find("<think>") {
+        visible.push_str(&rest[..start]);
+        let after_start = &rest[start + "<think>".len()..];
+        match after_start.find("</think>") {
+            Some(end) => {
+                rest = &after_start[end + "</think>".len()..];
+            }
+            None => {
+                // 未闭合的思维链（截断）：丢弃到结尾
+                rest = "";
+            }
+        }
+    }
+    visible.push_str(rest);
+    visible.trim().to_owned()
+}
+
+/// 模型激活后的 GPU 状态日志（Phase 4.3 第四部分）：device / backend /
+/// gpu_layers / 模型文件一次打全，落 runtime 日志供「GPU 到底有没有用上」
+/// 的启动期排查（与 llama.cpp 的 --list-devices 探测结果一致）。
+fn log_model_activation_gpu_status(model_path: &str, activation: &GenerationActivation) {
+    crate::runtime_log::event(
+        "info",
+        "model.runtime",
+        "activation.gpu_status",
+        None,
+        &serde_json::json!({
+            "model_file": model_path.rsplit(['/', '\\']).next().unwrap_or(model_path),
+            "device": activation.device,
+            "backend": activation.backend,
+            "gpu_layers": activation.gpu_layers,
+            "multimodal": activation.multimodal,
+            "context_size": activation.context_size,
+        }),
+    );
+}
+
 fn self_test_and_activate_downloaded_roles(
     app: &AppHandle,
     catalog: &Arc<CatalogService>,
@@ -1834,13 +1896,18 @@ fn self_test_and_activate_downloaded_roles(
                         true,
                     )
                 })?;
-                runtime.activate(&artifact.local_path, 4096, interactive_inference_threads())?;
+                let activation =
+                    runtime.activate(&artifact.local_path, 4096, interactive_inference_threads())?;
+                // Phase 4.3（Qwen3.5 自检失败修复）：thinking 模型的 chat
+                // template 强制先输出 <think> 思维链，32 token 全部耗在思维链
+                // 上、可见回复 <4 字符 → 误判回滚。上限提高到 96 token 给思维
+                // 链留空间，并按「剥离 <think> 段后的可见文本」判定。
                 let generated = runtime.complete(
                     "你正在执行本地模型健康检查。只需用一句简短中文确认可以回答。",
                     "请回复：翻翻本地模型可以工作。",
-                    32,
+                    96,
                 )?;
-                if generated.trim().chars().count() < 4 {
+                if self_test_visible_text(&generated).chars().count() < 4 {
                     runtime.stop();
                     return Err(AppError::new(
                         "MODEL_SELF_TEST_FAILED",
@@ -1848,6 +1915,7 @@ fn self_test_and_activate_downloaded_roles(
                         true,
                     ));
                 }
+                log_model_activation_gpu_status(&artifact.local_path, &activation);
                 models.activate_artifact(&artifact.artifact_id, None)?;
             }
             (ModelRole::Embedding, ModelFormat::Onnx) => {
@@ -2381,14 +2449,16 @@ pub fn model_artifact_activate(
                     true,
                 )
             })?;
-            runtime.activate(&artifact.local_path, 4096, threads)?;
+            let activation = runtime.activate(&artifact.local_path, 4096, threads)?;
+            // Phase 4.3（Qwen3.5 自检失败修复）：同下载自检——96 token +
+            // 剥离 <think> 思维链后判定可见文本，防止 thinking 模型被误回滚。
             let self_test = runtime.complete(
                 "你正在执行本地模型健康检查。只需用一句简短中文确认可以回答。",
                 "请回复：翻翻本地模型可以工作。",
-                32,
+                96,
             );
             let self_test_failed = match &self_test {
-                Ok(value) => value.trim().chars().count() < 4,
+                Ok(value) => self_test_visible_text(value).chars().count() < 4,
                 Err(_) => true,
             };
             if self_test_failed {
@@ -2399,6 +2469,7 @@ pub fn model_artifact_activate(
                     true,
                 ));
             }
+            log_model_activation_gpu_status(&artifact.local_path, &activation);
             drop(runtime);
             models.activate_artifact(&artifact_id, None)?;
         }
@@ -6120,6 +6191,9 @@ fn run_evaluation_ask(
         generation,
         runtime_manager,
         operation_id,
+        // 评估 runner 是开发诊断工具：固定按「记忆开启」基线运行，
+        // 不读取用户设置，保证评估口径与历史结果可比。
+        true,
         cancelled,
         (&phase, &verified_claim),
     ) {
@@ -6807,6 +6881,7 @@ pub fn ask_start(
             &generation,
             &runtime_manager,
             operation_id,
+            memory_feature_enabled(&app),
             &cancelled,
             (&phase, &verified_claim),
         );
@@ -6893,7 +6968,8 @@ pub fn ask_start(
                 // 异步 Memory Candidate Writer（Step 6）：问答结束后在后台尝试
                 // 提取用户明确表达的关系/别名候选。全程失败静默，绝不影响已
                 // 完成的回答；STRICT：只写 model_inference + candidate。
-                {
+                // 「使用记忆」关闭时跳过（spec 三十八：不新增长期 Memory）。
+                if memory_feature_enabled(&app) {
                     let catalog = Arc::clone(&catalog);
                     let models = Arc::clone(&models);
                     let generation = Arc::clone(&generation);
@@ -7213,6 +7289,7 @@ fn compute_answer(
     generation: &Mutex<LocalGenerationRuntime>,
     runtime_manager: &RuntimeManager,
     operation_id: Uuid,
+    memory_enabled: bool,
     cancelled: &AtomicBool,
     progress: AskProgressCallbacks<'_>,
 ) -> Result<AnswerResult, AppError> {
@@ -7264,25 +7341,88 @@ fn compute_answer(
             &session_context,
             selection,
             operation_id,
+            memory_enabled,
             cancelled,
             progress,
         );
     }
 
-    // 1. Source Router（LOCAL / GENERAL / AMBIGUOUS）
-    let routing_started = Instant::now();
-    let (routing, routing_raw) = {
-        let (system, user) = source_router_prompt(request.question.trim(), &history);
-        let raw = complete_json_with_model(
+    // 0.5 寒暄/助手身份 fast-path（CASE 1：「你好」「你是谁？」等必须稳定
+    // GENERAL）。确定性命中即直接闲聊，不消耗一次 Router LLM 调用；只覆盖
+    // 最明确的寒暄与身份问题，含「我的/资料/文件」等自有资料表达的句子绝不
+    // 命中（fast_path_greeting 内部有 LOCAL_MARKERS 防护，误伤 LOCAL 是更
+    // 严重的错误）。
+    if fast_path_greeting(request.question.trim()) == Some(SourceIntent::General) {
+        trace_node(
+            &catalog,
+            "ask",
+            "source_routing",
+            &operation_id.to_string(),
+            session_id_ref,
+            None,
+            &json!({ "question": request.question }),
+            &json!({
+                "source": "general",
+                "confidence": 1.0,
+                "routing_ok": true,
+                "routing_raw": "deterministic fast_path_greeting",
+            }),
+            "ok",
+            None,
+        );
+        trace_operation_execution(
+            catalog,
+            &operation_id.to_string(),
+            session_id_ref,
+            "general",
+            "chat",
+        );
+        return run_chat_answer(
+            request,
+            catalog,
             generation,
             &generation_artifact,
-            &system,
-            &user,
-            48,
-            &source_routing_schema(),
+            &maintenance,
+            &history,
+            operation_id,
             cancelled,
-        )?;
-        (parse_source_routing(&raw), Some(raw))
+            phase,
+        );
+    }
+
+    // 1. Source Router（LOCAL / GENERAL / AMBIGUOUS）
+    // Phase 4.3 确定性前置检测（CASE 1/2/3）：自有资料表达（我的资料/
+    // 我的简历/毕业时候……）与存在性问句（有没有做过/是否提到……）在
+    // LLM Router **之前**强制 LOCAL。根因：推理模型（DeepSeek-R1/Qwen3.5）
+    // 48 token 截断后路由 JSON 解析必然失败，parse_failed 兜底曾直接进
+    // Chat 自由生成（RAG 定义幻觉 / 简历模板幻觉）。这两类问题的期望
+    // 答案只能是本地证据（有/没有 + 文件依据），规则命中即绕开小模型。
+    let routing_started = Instant::now();
+    let (routing, routing_raw) = {
+        let question = request.question.trim();
+        if let Some(marker) = personal_reference_hit(question) {
+            (
+                Some(SourceRouting { source: SourceIntent::Local, confidence: 1.0 }),
+                Some(format!("deterministic personal_reference_hit:{marker}")),
+            )
+        } else if existence_query_hit(question) {
+            (
+                Some(SourceRouting { source: SourceIntent::Local, confidence: 1.0 }),
+                Some("deterministic existence_query_hit".to_owned()),
+            )
+        } else {
+            let (system, user) = source_router_prompt(question, &history);
+            let raw = complete_json_with_model(
+                generation,
+                &generation_artifact,
+                &system,
+                &user,
+                48,
+                &source_routing_schema(),
+                cancelled,
+            )?;
+            (parse_source_routing(&raw), Some(raw))
+        }
     };
     trace_node(
         &catalog,
@@ -7402,9 +7542,10 @@ fn compute_answer(
             else {
                 // 解析失败：按类型宽检索（不锁文件，退化为全库）
                 return run_retrieval_answer(
-                    request, catalog, models, worker, runtime_manager, generation,
+                    request, request.question.trim(), catalog, models, worker, runtime_manager,
+                    generation,
                     generation_artifact, embedding_for_retrieval(&models)?, maintenance, &history,
-                    operation_id, cancelled, (phase, verified_claim), None, false, false,
+                    operation_id, cancelled, (phase, verified_claim), None, None, false, false,
                 );
             };
             plan.source = SourceIntent::Local;
@@ -7413,7 +7554,7 @@ fn compute_answer(
             return finish_retrieval_with_plan(
                 request, catalog, models, worker, runtime_manager, generation, generation_artifact,
                 embedding_for_retrieval(&models)?, maintenance, &history, &session_context,
-                plan, context_scope, operation_id, cancelled, (phase, verified_claim),
+                plan, context_scope, operation_id, memory_enabled, cancelled, (phase, verified_claim),
             );
         }
     }
@@ -7430,9 +7571,10 @@ fn compute_answer(
             scoped.scope.file_ids = context_scope.clone();
         }
         return run_retrieval_answer(
-            &scoped, catalog, models, worker, runtime_manager, generation, generation_artifact,
+            &scoped, request.question.trim(), catalog, models, worker, runtime_manager,
+            generation, generation_artifact,
             embedding_for_retrieval(&models)?, maintenance, &history, operation_id, cancelled,
-            (phase, verified_claim), None, false, false,
+            (phase, verified_claim), None, None, false, false,
         );
     };
     if routing.source == SourceIntent::Ambiguous && !context_scope.is_empty() {
@@ -7441,10 +7583,33 @@ fn compute_answer(
         plan.requires_document_resolution = false;
         plan.target.document_type = plan.target.document_type.or(session_context.active_document_type);
     }
+    // 解析器兜底（CASE 1）：Router 判 local 但 Parser 输出 general_chat →
+    // 尊重 Parser 的闲聊判定直接聊天（寒暄/身份问题已由 fast-path 拦截，
+    // 这里兜 0.6B 双模型叠加错误；闲聊绝不进检索管线）。
+    if plan.intent == QueryIntent::GeneralChat {
+        trace_operation_execution(
+            catalog,
+            &operation_id.to_string(),
+            session_id_ref,
+            "parser_general_chat",
+            "chat",
+        );
+        return run_chat_answer(
+            request,
+            catalog,
+            generation,
+            &generation_artifact,
+            &maintenance,
+            &history,
+            operation_id,
+            cancelled,
+            phase,
+        );
+    }
     finish_retrieval_with_plan(
         request, catalog, models, worker, runtime_manager, generation, generation_artifact,
         embedding_for_retrieval(&models)?, maintenance, &history, &session_context, plan,
-        context_scope, operation_id, cancelled, (phase, verified_claim),
+        context_scope, operation_id, memory_enabled, cancelled, (phase, verified_claim),
     )
 }
 
@@ -7466,6 +7631,7 @@ fn run_clarified_answer(
     session_context: &AskSessionContext,
     selection: Uuid,
     operation_id: Uuid,
+    memory_enabled: bool,
     cancelled: &AtomicBool,
     progress: AskProgressCallbacks<'_>,
 ) -> Result<AnswerResult, AppError> {
@@ -7479,11 +7645,15 @@ fn run_clarified_answer(
     }
     // USER_SELECTION 记忆：待澄清引用（如「我的简历」）→ 别名指向所选文件。
     // 用户明确选中 = 用户选择来源（rank 4），但严格不自动确认其他推断；
-    // 引用不适合做别名（过长/问句）则不写。
-    if let Some(reference) = session_context
-        .pending_clarification_reference
-        .as_deref()
-        .filter(|reference| is_alias_writable_reference(reference))
+    // 引用不适合做别名（过长/问句）则不写。「使用记忆」关闭时不写长期
+    // Memory（spec 三十八），但下方 Session Context 锁定始终生效——关闭
+    // 长期记忆不影响当前会话连续追问。
+    let mut selection_memory_written = false;
+    if memory_enabled
+        && let Some(reference) = session_context
+            .pending_clarification_reference
+            .as_deref()
+            .filter(|reference| is_alias_writable_reference(reference))
         && let Some(alias) = fanfan_core::normalize_alias(reference)
     {
         let _ = catalog.upsert_memory_alias(&MemoryWriteInput {
@@ -7499,6 +7669,7 @@ fn run_clarified_answer(
             source_id: Some(format!("clarification:{operation_id}")),
             status: MemoryStatus::Confirmed,
         });
+        selection_memory_written = true;
     }
     // 会话上下文锁定所选文件，清除待澄清引用（选择即已消费）
     let mut updated_context = session_context.clone();
@@ -7524,7 +7695,7 @@ fn run_clarified_answer(
         }),
         &json!({
             "selection_valid": true,
-            "memory_written": true,
+            "memory_written": selection_memory_written,
             "locked_scope": vec![selection],
         }),
         "ok",
@@ -7560,6 +7731,7 @@ fn run_clarified_answer(
         plan,
         vec![selection],
         operation_id,
+        memory_enabled,
         cancelled,
         (phase, verified_claim),
     )
@@ -7614,6 +7786,31 @@ fn parse_ask_plan(
     phase: &dyn Fn(&str, f64),
 ) -> Result<Option<QueryPlan>, AppError> {
     phase("query_parsing", 0.12);
+    // CASE 7 确定性 FIND 预检：在哪/在哪里/找一下/哪个文件/我放哪了 等定位
+    // 问句先于 LLM 提取目标引用（「我毕业时候那个材料在哪」→ reference =
+    // 「我毕业时候那个材料」）。0.6B 无法稳定解析这类问句（实测被历史回声
+    // 污染成上一条问题），确定性路径保证 DOCUMENT_FIND 不受模型波动影响；
+    // 无命中 → 走 LLM 解析（finalize 另有 FIND backstop）。
+    if let Some(reference) = extract_find_reference(request.question.trim()) {
+        let plan = find_query_plan(request.question.trim(), &reference);
+        trace_node(
+            catalog,
+            "ask",
+            "query_parsing",
+            &operation_id.to_string(),
+            session_id_ref,
+            None,
+            &json!({ "question": request.question }),
+            &json!({
+                "parsed": true,
+                "plan": plan,
+                "parsing_raw": "deterministic extract_find_reference",
+            }),
+            "ok",
+            None,
+        );
+        return Ok(Some(plan));
+    }
     let (system, user) = query_parser_prompt(request.question.trim(), history);
     let raw = complete_json_with_model(
         generation,
@@ -7644,19 +7841,45 @@ fn parse_ask_plan(
     Ok(plan)
 }
 
+/// 读取「使用记忆」总开关（Phase 4.2 spec 三十八）：设置文件缺失 / 读取
+/// 失败一律按默认开启处理，不因配置异常改变既有问答行为；关闭时
+/// Memory Resolver / Memory Writer 均不参与新 Ask，但已存数据不删除。
+fn memory_feature_enabled(app: &AppHandle) -> bool {
+    let Some(state) = app.try_state::<MemorySettingsServiceState>() else {
+        return true;
+    };
+    state
+        .0
+        .lock()
+        .ok()
+        .and_then(|service| service.get().ok())
+        .map(|settings| settings.enabled)
+        .unwrap_or(true)
+}
+
 /// Memory Resolver 数据装载（Step 6）：可信来源别名 + 已确认关系 → 命中提示。
 /// 任何存储读取失败都静默降级为空（Memory 层出错不得阻断问答）。
-fn load_memory_hints(catalog: &CatalogService, question: &str) -> (Vec<MemoryHint>, Vec<MemoryHint>) {
+/// `memory_enabled = false`（用户在设置中关闭「使用记忆」）时直接返回空，
+/// 跳过 Memory Resolver。
+fn load_memory_hints(
+    catalog: &CatalogService,
+    question: &str,
+    memory_enabled: bool,
+) -> (Vec<MemoryHint>, Vec<MemoryHint>) {
+    if !memory_enabled {
+        return (Vec::new(), Vec::new());
+    }
     let aliases = catalog.list_memory_aliases(500).unwrap_or_default();
     let entities = catalog.list_memory_entities(2000).unwrap_or_default();
     let relations = catalog
         .list_memory_relations(Some(MemoryStatus::Confirmed), 2000)
         .unwrap_or_default();
-    // 只有「可信来源」的别名参与定位（user_explicit / user_confirmed /
-    // user_selection / repeated_usage）；推断类别名是候选，等用户确认，绝不参与。
+    // 只有 confirmed 别名参与定位（Phase 4.2 起以 status 为准：用户在
+    // 「待确认的记忆」里确认 → confirmed；拒绝 → rejected 绝不参与；
+    // 推断类别名保持 candidate 等待用户确认）。与 relations 同口径。
     let trusted_aliases = aliases
         .into_iter()
-        .filter(|alias| alias.source_type.allows_confirmed())
+        .filter(|alias| alias.status == MemoryStatus::Confirmed)
         .collect::<Vec<_>>();
     let alias_hints = match_alias_hints(question, &trusted_aliases);
     let relation_hints = match_relation_hints(question, &entities, &relations);
@@ -7696,9 +7919,13 @@ fn run_document_find_answer(
         .copied()
         .or_else(|| resolution_candidates.first().map(|candidate| candidate.file_id));
     let Some(file_id) = file_id else {
-        let message =
-            "没有在资料中找到你说的文件。可以换一种说法（文件名、类型或内容关键词），或确认资料已完成索引。"
-                .to_owned();
+        // spec 十：FIND 查的是文件不是「信息」——NOT_FOUND 明确指出没有
+        // 匹配该指代的文件，绝不转 Chat Prompt。
+        let reference = extract_find_reference(request.question.trim())
+            .unwrap_or_else(|| compact_for_prompt(request.question.trim(), 40));
+        let message = format!(
+            "没有找到能够匹配「{reference}」的文件。可以换一种说法（文件名、类型或内容关键词），或确认资料已完成索引。"
+        );
         return finish_summary_refusal(request, catalog, operation_id, &message, started, phase);
     };
     let name = file_names
@@ -7727,6 +7954,7 @@ fn run_document_find_answer(
         retrieval_channels: vec!["document_find".into()],
         index_coverage: 0.0,
         degradation_reason: None,
+        no_evidence_reason: None,
         clarification: None,
     };
     trace_node(
@@ -7787,6 +8015,7 @@ fn finish_retrieval_with_plan(
     plan: QueryPlan,
     context_scope: Vec<uuid::Uuid>,
     operation_id: Uuid,
+    memory_enabled: bool,
     cancelled: &AtomicBool,
     progress: AskProgressCallbacks<'_>,
 ) -> Result<AnswerResult, AppError> {
@@ -7799,8 +8028,18 @@ fn finish_retrieval_with_plan(
     let mut resolution_file_names: HashMap<Uuid, String> = HashMap::new();
     if plan.requires_document_resolution && resolved_scope.is_empty() {
         let resolution_started = Instant::now();
+        // 分类器未运行（document_type 全 NULL）时按类型过滤会整空（CASE
+        // 5/8/9 实测 1197 个画像 document_type 全部为 NULL）：回退全量画像，
+        // 由 Resolver 的类型等价（TYPE_KEYWORDS）与词元信号自行定位。
         let profiles_with_names =
             catalog.list_document_profiles(plan.target.document_type, 2000)?;
+        let profiles_with_names = if profiles_with_names.is_empty()
+            && plan.target.document_type.is_some()
+        {
+            catalog.list_document_profiles(None, 2000)?
+        } else {
+            profiles_with_names
+        };
         let mut file_names = HashMap::with_capacity(profiles_with_names.len());
         let profiles = profiles_with_names
             .into_iter()
@@ -7856,7 +8095,8 @@ fn finish_retrieval_with_plan(
     // 定位；命中并验证通过后**以 Memory 定位优先**（用户明确起的别名/已确认关系
     // 是比 Resolver 启发式更强的定位信号，满足「禁止把简历当全库关键词搜索」）。
     let memory_started = Instant::now();
-    let (alias_hints, relation_hints) = load_memory_hints(catalog, request.question.trim());
+    let (alias_hints, relation_hints) =
+        load_memory_hints(catalog, request.question.trim(), memory_enabled);
     let mut memory_scope: Vec<Uuid> = Vec::new();
     let mut memory_resolution_ok = false;
     {
@@ -7925,6 +8165,7 @@ fn finish_retrieval_with_plan(
             "requires_document_resolution": plan.requires_document_resolution,
         }),
         &json!({
+            "memory_enabled": memory_enabled,
             "alias_hint_count": alias_hints.len(),
             "relation_hint_count": relation_hints.len(),
             "alias_hints": alias_hints,
@@ -8049,6 +8290,7 @@ fn finish_retrieval_with_plan(
             retrieval_channels: Vec::new(),
             index_coverage: 0.0,
             degradation_reason: None,
+            no_evidence_reason: None,
             clarification: Some(payload),
         };
         trace_node(
@@ -8059,14 +8301,18 @@ fn finish_retrieval_with_plan(
             request.session_id.map(|id| id.to_string()).as_deref(),
             None,
             &json!({
-                "reference": reference,
-                "candidate_count": resolution_candidates.len(),
-            }),
-            &json!({
-                "answer_mode": result.answer_mode,
-                "options": result.clarification,
-                "question": request.question,
-            }),
+            "reference": reference,
+            "candidate_count": resolution_candidates.len(),
+        }),
+        &json!({
+            "answer_mode": result.answer_mode,
+            "clarification_reason": result
+                .clarification
+                .as_ref()
+                .map(|payload| payload.reason.clone()),
+            "options": result.clarification,
+            "question": request.question,
+        }),
             "ok",
             Some(clarification_started.elapsed().as_millis() as u64),
         );
@@ -8154,8 +8400,16 @@ fn finish_retrieval_with_plan(
             plan.target.document_type,
         );
     }
+    // NO_EVIDENCE 六分类预置（spec 十二）：Document Resolver 未解析出目标
+    //（Unresolved）且 Memory 未消歧 → 后续拒绝路径记 TARGET_NOT_RESOLVED；
+    // 已被 Memory/上下文消歧时根因不在定位层。
+    let resolution_reason = match (resolution_status, memory_resolution_ok) {
+        (Some(ResolutionStatus::Unresolved), false) => Some(NoEvidenceReason::TargetNotResolved),
+        _ => None,
+    };
     run_retrieval_answer(
         &scoped,
+        request.question.trim(),
         catalog,
         models,
         worker,
@@ -8170,6 +8424,7 @@ fn finish_retrieval_with_plan(
         progress,
         // Step 11：EXTRACT operation 随主检索管线走，尾段重组为结构化列表
         Some(plan.operation),
+        resolution_reason,
         // 改写跳过仅用于 DOCUMENT_SUMMARY（已分流）；此处恒为 false
         false,
         // 文档级召回只服务全库资料请求（scope 由 recall 填充）；单文档
@@ -8622,6 +8877,7 @@ fn run_document_summary_answer(
         index_coverage: 0.0,
         degradation_reason: (batch_fallbacks > 0)
             .then(|| format!("有{batch_fallbacks}个摘要批次回退为确定性节内摘录（模型输出未通过解析）")),
+        no_evidence_reason: None,
         clarification: None,
     };
     for claim in &result.claims {
@@ -8644,6 +8900,13 @@ fn run_document_summary_answer(
             "insufficient_evidence": result.insufficient_evidence,
             "degradation_reason": result.degradation_reason,
             "elapsed_ms": result.elapsed_ms,
+            // spec 十八：摘要的证据绑定数（每个 summary bullet 绑定的
+            // EvidenceRef 总量，验证 Summary 不绕过 Citation）
+            "summary_evidence_count": result
+                .claims
+                .iter()
+                .map(|claim| claim.citations.len())
+                .sum::<usize>(),
         }),
         "ok",
         Some(result.elapsed_ms),
@@ -8677,6 +8940,7 @@ fn finish_summary_refusal(
         retrieval_channels: Vec::new(),
         index_coverage: 0.0,
         degradation_reason: None,
+        no_evidence_reason: None,
         clarification: None,
     };
     let session_id = request.session_id.map(|id| id.to_string());
@@ -8803,6 +9067,7 @@ fn run_compare_answer(
         );
         return run_retrieval_answer(
             &scoped,
+            request.question.trim(),
             catalog,
             models,
             worker,
@@ -8815,6 +9080,7 @@ fn run_compare_answer(
             operation_id,
             cancelled,
             progress,
+            None,
             None,
             false,
             false,
@@ -9085,6 +9351,7 @@ fn run_compare_answer(
         index_coverage: 0.0,
         degradation_reason: fallback
             .then(|| "对比生成未通过解析，回退为两侧原文材料并排呈现".to_owned()),
+        no_evidence_reason: None,
         clarification: None,
     };
     for claim in &result.claims {
@@ -9161,6 +9428,99 @@ fn run_chat_answer(
             true,
         ));
     }
+    // Phase 4.3 第三部分：Chat 幻觉最终保护。personal query（我的/我之前/
+    // 我的资料/毕业时候……）出现在 Chat 入口，说明路由/解析链路已把它误判
+    // 为闲聊且 source_files 为空——这类问题的答案只能来自本地证据，自由
+    // 生成必然幻觉（RAG 定义错误 / 通用简历模板）。此处是最后一道闸：
+    // 固定 NO_EVIDENCE 拒绝文案（RagRefusal），绝不调模型。
+    if let Some(marker) = personal_reference_hit(request.question.trim()) {
+        let started_at = Instant::now();
+        let answer = local_no_evidence_answer(request.question.trim(), &[], false);
+        let result = AnswerResult {
+            session_id: request.session_id.unwrap_or_else(Uuid::now_v7),
+            message_id: Uuid::now_v7(),
+            answer: answer.clone(),
+            grounding_status: fanfan_core::GroundingStatus::Insufficient,
+            insufficient_evidence: true,
+            claims: Vec::new(),
+            source_files: Vec::new(),
+            used_file_ids: Vec::new(),
+            elapsed_ms: started_at.elapsed().as_millis() as u64,
+            answer_mode: AnswerMode::RagRefusal,
+            retrieval_channels: Vec::new(),
+            index_coverage: 0.0,
+            degradation_reason: None,
+            no_evidence_reason: Some(NoEvidenceReason::TrueNoEvidence),
+            clarification: None,
+        };
+        let session_id = request.session_id.map(|id| id.to_string());
+        trace_node(
+            catalog,
+            "ask",
+            "chat_guard_blocked",
+            &operation_id.to_string(),
+            session_id.as_deref(),
+            None,
+            &json!({ "question": request.question }),
+            &json!({
+                "guard": "personal_reference_no_evidence",
+                "marker": marker,
+                "answer_mode": result.answer_mode,
+                "answer": result.answer,
+            }),
+            "ok",
+            Some(result.elapsed_ms),
+        );
+        catalog.record_ask_exchange(request, &result)?;
+        phase("completed", 1.0);
+        return Ok(result);
+    }
+    // Phase 4.3 第二部分：builtin_knowledge 优先于 LLM 自由生成（仅
+    // GENERAL 链路；personal query 已被上方 guard 拦截，词条与个人资料
+    // 完全隔离）。本地小模型对 LangGraph/RAG/Transformer 等稳定技术概念
+    // 极易幻觉（实测 LangGraph→GNN、RAG→递归架构），内置词条直接命中
+    // 返回，不消耗一次生成调用。
+    if let Some(hit) = lookup_builtin_knowledge(request.question.trim()) {
+        let started_at = Instant::now();
+        let result = AnswerResult {
+            session_id: request.session_id.unwrap_or_else(Uuid::now_v7),
+            message_id: Uuid::now_v7(),
+            answer: hit.answer.clone(),
+            grounding_status: fanfan_core::GroundingStatus::Insufficient,
+            insufficient_evidence: false,
+            claims: Vec::new(),
+            source_files: Vec::new(),
+            used_file_ids: Vec::new(),
+            elapsed_ms: started_at.elapsed().as_millis() as u64,
+            answer_mode: AnswerMode::Chat,
+            retrieval_channels: Vec::new(),
+            index_coverage: 0.0,
+            degradation_reason: None,
+            no_evidence_reason: None,
+            clarification: None,
+        };
+        let session_id = request.session_id.map(|id| id.to_string());
+        trace_node(
+            catalog,
+            "ask",
+            "builtin_knowledge_hit",
+            &operation_id.to_string(),
+            session_id.as_deref(),
+            None,
+            &json!({ "question": request.question }),
+            &json!({
+                "key": hit.key,
+                "category": hit.category,
+                "answer_mode": result.answer_mode,
+                "answer": result.answer,
+            }),
+            "ok",
+            Some(result.elapsed_ms),
+        );
+        catalog.record_ask_exchange(request, &result)?;
+        phase("completed", 1.0);
+        return Ok(result);
+    }
     phase("chat_generating", 0.7);
     let (system, user) = chat_prompt(request, history);
     let started_at = Instant::now();
@@ -9186,6 +9546,7 @@ fn run_chat_answer(
         retrieval_channels: Vec::new(),
         index_coverage: 0.0,
         degradation_reason: None,
+        no_evidence_reason: None,
         clarification: None,
     };
     let session_id = request.session_id.map(|id| id.to_string());
@@ -9217,6 +9578,9 @@ fn run_chat_answer(
 #[allow(clippy::too_many_arguments)]
 fn run_retrieval_answer(
     request: &AskRequest,
+    // 用户原始问题（request.question 可能已被替换为 content_query 检索词；
+    // Answerability Gate 与回答语义判断必须基于原始问题）。
+    original_question: &str,
     catalog: &CatalogService,
     models: &ModelManager,
     worker: &WorkerClient,
@@ -9230,6 +9594,9 @@ fn run_retrieval_answer(
     cancelled: &AtomicBool,
     progress: AskProgressCallbacks<'_>,
     operation: Option<QueryOperation>,
+    // NO_EVIDENCE 根因预置（spec 十二）：Document Resolver 未解析出目标时
+    // 由调用方传入 TARGET_NOT_RESOLVED，最终拒绝路径据此分类。
+    resolution_reason: Option<NoEvidenceReason>,
     skip_query_rewrite: bool,
     document_recall: bool,
 ) -> Result<AnswerResult, AppError> {
@@ -9301,11 +9668,23 @@ fn run_retrieval_answer(
             parsed
         }
     };
-    let retrieval_questions = if rewritten_queries.is_empty() {
+    let mut retrieval_questions = if rewritten_queries.is_empty() {
         vec![request.question.trim().to_owned()]
     } else {
         rewritten_queries
     };
+    // CASE 9 轻量规范化双路径：拼音混写（开fa→开发）、全半角、大小写等
+    // 变体与原词一起参与检索（原词优先召回，变体补召回；拼音展开只作用于
+    // 「CJK+拼音音节」相邻片段，绝不改写 RAG/LangGraph 等专有名词）。仅单
+    // 检索词时启用，改写已拆分多问题时不再叠加（避免查询膨胀）。
+    if retrieval_questions.len() == 1 {
+        for variant in normalize_query_variants(&retrieval_questions[0])
+            .into_iter()
+            .skip(1)
+        {
+            retrieval_questions.push(variant);
+        }
+    }
     let history_count = history.len();
     let rewritten_marked = retrieval_questions.len() > 1
         || retrieval_questions
@@ -9402,6 +9781,9 @@ fn run_retrieval_answer(
     // 无结果 → 保留 wider chunk retrieval 兜底，绝不中断（增益层，任何
     // 失败都在 run_document_recall 内部吞掉并如实 trace）。
     let mut scoped = request.clone();
+    // 文档级召回为空（spec 十二 DOCUMENT_RECALL_EMPTY 分类依据）：recall 没
+    // 定位到任何相关文档 → 后续 NO_EVIDENCE 的根因记在召回层。
+    let mut document_recall_empty = false;
     if document_recall && scoped.scope.file_ids.is_empty() {
         let recalled = run_document_recall(
             catalog,
@@ -9412,6 +9794,8 @@ fn run_retrieval_answer(
         );
         if !recalled.is_empty() {
             scoped.scope.file_ids = recalled;
+        } else {
+            document_recall_empty = true;
         }
     }
     let mut sub_results = Vec::with_capacity(retrieval_questions.len());
@@ -9463,6 +9847,19 @@ fn run_retrieval_answer(
         None,
     );
     if extractive.insufficient_evidence {
+        // NO_EVIDENCE 六分类（spec 十二）：子查询根因已在 storage 层写入；
+        // 无子查询根因时按阶段优先级取 TARGET_NOT_RESOLVED（调用方预置）>
+        // DOCUMENT_RECALL_EMPTY > TRUE_NO_EVIDENCE。
+        if extractive.no_evidence_reason.is_none() {
+            extractive.no_evidence_reason = Some(
+                resolution_reason
+                    .or_else(|| {
+                        document_recall_empty
+                            .then_some(NoEvidenceReason::DocumentRecallEmpty)
+                    })
+                    .unwrap_or(NoEvidenceReason::TrueNoEvidence),
+            );
+        }
         extractive.answer_mode = AnswerMode::RagRefusal;
         trace_node(
             catalog,
@@ -9479,6 +9876,9 @@ fn run_retrieval_answer(
                 "grounding_status": format!("{:?}", extractive.grounding_status),
                 "insufficient_evidence": true,
                 "degradation_reason": extractive.degradation_reason,
+                "no_evidence_reason": extractive
+                    .no_evidence_reason
+                    .map(|reason| reason.as_str()),
             }),
             "ok",
             Some(extractive.elapsed_ms),
@@ -9576,6 +9976,8 @@ fn run_retrieval_answer(
                     extractive.degradation_reason = Some(
                         "候选证据与问题相关性过低（rerank top-1 低于阈值），已拒绝生成".to_owned(),
                     );
+                    // NO_EVIDENCE 六分类：rerank 拒答根因（spec 十二 RERANK_REJECTED）
+                    extractive.no_evidence_reason = Some(NoEvidenceReason::RerankRejected);
                     trace_node(
                         catalog,
                         "ask",
@@ -9591,6 +9993,7 @@ fn run_retrieval_answer(
                             "grounding_status": format!("{:?}", extractive.grounding_status),
                             "insufficient_evidence": true,
                             "degradation_reason": extractive.degradation_reason,
+                            "no_evidence_reason": "RERANK_REJECTED",
                         }),
                         "ok",
                         Some(extractive.elapsed_ms),
@@ -9674,6 +10077,108 @@ fn run_retrieval_answer(
             }
         }
     }
+    // 6.5 Answerability Gate（Phase 4.2 spec 二/三/五）：最终 Generation 前
+    // 判断「这些 Evidence 是否足够直接回答当前问题」。Embedding/Rerank 分数
+    // 只是召回信号——实体明显不一致（CASE A：RAG 问题 + Agent 证据）或
+    // 存在性断言缺少项目语境证据（概念证据不能证明「做过项目」）时，
+    // 禁止进入普通生成，按 LOCAL 无证据统一文案拒答。
+    phase("answerability_gate", 0.52);
+    let gate_evidence: Vec<GateEvidence> = extractive
+        .claims
+        .iter()
+        .map(|claim| GateEvidence {
+            text: claim.text.clone(),
+            heading: claim
+                .citations
+                .first()
+                .and_then(|citation| citation.locator.heading_path.last().cloned()),
+        })
+        .collect::<Vec<_>>();
+    let gate_plan = QueryPlan {
+        operation: operation.unwrap_or(QueryOperation::Qa),
+        ..QueryPlan::default()
+    };
+    let gate_input = AnswerabilityInput {
+        question: original_question,
+        content_query: Some(request.question.trim()),
+        plan: &gate_plan,
+        evidence: &gate_evidence,
+    };
+    let verdict = evaluate_answerability(&gate_input);
+    trace_node(
+        catalog,
+        "ask",
+        "answerability_gate",
+        &correlation_id,
+        session_id_ref,
+        None,
+        &json!({
+            "question": original_question,
+            "content_query": request.question,
+            "evidence_count": gate_evidence.len(),
+        }),
+        &json!({
+            "answerability_status": verdict.status.as_str(),
+            "answerability_reason": verdict.reason,
+            "answerability_confidence": verdict.confidence,
+            "answer_shape": verdict.answer_shape.as_str(),
+            "query_entities": verdict.query_entities,
+            "evidence_entities": verdict.evidence_entities,
+            "missing_entities": verdict.missing_entities,
+            "evidence_roles": verdict
+                .evidence_roles
+                .iter()
+                .map(|role| role.as_str())
+                .collect::<Vec<_>>(),
+        }),
+        if verdict.status == AnswerabilityStatus::NotAnswerable {
+            "rejected"
+        } else {
+            "ok"
+        },
+        None,
+    );
+    if verdict.status == AnswerabilityStatus::NotAnswerable {
+        // LOCAL 拒答：统一无证据文案（spec 十六），绝不转闲聊、绝不追加通用知识
+        let requires_project = existence_requires_project_context(original_question);
+        extractive.claims.clear();
+        extractive.source_files.clear();
+        extractive.used_file_ids.clear();
+        extractive.insufficient_evidence = true;
+        extractive.grounding_status = fanfan_core::GroundingStatus::Insufficient;
+        extractive.answer =
+            local_no_evidence_answer(original_question, &verdict.missing_entities, requires_project);
+        extractive.answer_mode = AnswerMode::RagRefusal;
+        extractive.degradation_reason =
+            Some(format!("Answerability Gate 拒绝：{}", verdict.reason));
+        extractive.no_evidence_reason = Some(NoEvidenceReason::AnswerabilityRejected);
+        trace_node(
+            catalog,
+            "ask",
+            "completed",
+            &correlation_id,
+            session_id_ref,
+            None,
+            &json!({}),
+            &json!({
+                "answer_mode": "rag_refusal",
+                "answer": extractive.answer,
+                "claim_count": 0,
+                "grounding_status": format!("{:?}", extractive.grounding_status),
+                "insufficient_evidence": true,
+                "degradation_reason": extractive.degradation_reason,
+                "no_evidence_reason": "ANSWERABILITY_REJECTED",
+                "answerability_status": verdict.status.as_str(),
+                "answerability_reason": verdict.reason,
+                "answer_shape": verdict.answer_shape.as_str(),
+            }),
+            "ok",
+            Some(extractive.elapsed_ms),
+        );
+        catalog.record_ask_exchange(request, &extractive)?;
+        phase("completed", 1.0);
+        return Ok(extractive);
+    }
     let mut runtime = generation.lock().map_err(|_| {
         AppError::new(
             "GENERATION_RUNTIME_LOCK_FAILED",
@@ -9702,9 +10207,21 @@ fn run_retrieval_answer(
         );
         prompt.push_str(&image_analysis_context.join("\n"));
     }
+    // Answer Semantics（spec 四）：按 answer_shape 约束回答结构（如
+    // BOOLEAN_EXISTENCE 第一句必须给出存在性结论）；PARTIAL 时限定
+    // 只回答证据明确支持的部分（spec 二）。
+    let mut shape_directive = answer_shape_directive(verdict.answer_shape);
+    if verdict.status == AnswerabilityStatus::Partial {
+        shape_directive.push_str(&format!(
+            "\n【证据覆盖提示】\n当前证据只覆盖了问题的一部分（未覆盖：{}）。只回答证据明确支持的部分，并说明资料只支持哪部分；未覆盖的部分不要猜测，也不要用通用知识补齐。",
+            verdict.missing_entities.join("、")
+        ));
+    }
+    prompt.push_str("\n\n");
+    prompt.push_str(&shape_directive);
     let answer_schema = fanfan_core::grounded_answer_json_schema();
     let mut generated = runtime.complete_json_cancellable(
-        "你是翻翻的本地资料回答器。只能使用用户提供的证据；每个事实必须通过citation_ids关联证据，不得补充外部知识。",
+        LOCAL_STRICT_SYSTEM_PROMPT,
         &prompt,
         768,
         &answer_schema,
@@ -9809,6 +10326,8 @@ fn run_retrieval_answer(
     let candidates = std::mem::take(&mut grounded.claims);
     let candidate_count = candidates.len().max(1);
     let mut rejected_claims = 0_usize;
+    // spec 十八：本轮是否拦截过 LOCAL 外部知识泄漏（completed trace 汇总）
+    let mut local_external_knowledge_blocked = false;
     for (index, claim) in candidates.into_iter().enumerate() {
         if cancelled.load(Ordering::Acquire) {
             return Err(AppError::new("OPERATION_CANCELLED", "问答已取消", false));
@@ -9827,16 +10346,44 @@ fn run_retrieval_answer(
                 .iter()
                 .map(|citation| citation.quote.as_str()),
         );
+        // Unsupported Claim Gate（spec 十五）+ LOCAL 外部知识拦截（spec 六）：
+        // 1) 主体一致性（确定性）：claim 的关键实体必须出现在它自己引用的
+        //    证据里——Evidence 讲 Agent、Claim 说 RAG → UNSUPPORTED；
+        // 2) 非逐字引用的 claim 出现「通常来说/一般来说/建议联系管理员」等
+        //    标记 → 判为混入外部通用知识，拦截（CASE Transformer）。
+        // 逐字引用（deterministic 支持）跳过两项检查——标记若来自证据原文
+        //    则不算外部知识。
+        let quotes: Vec<&str> = claim
+            .citations
+            .iter()
+            .map(|citation| citation.quote.as_str())
+            .collect();
+        let mut unsupported_claim_reason: Option<String> = None;
+        if !deterministically_supported {
+            if let Some(entity) = claim_subject_mismatch(&claim.text, &quotes) {
+                unsupported_claim_reason =
+                    Some(format!("subject_entity_mismatch:{entity}"));
+            } else if let Some(marker) = find_external_knowledge_marker(&claim.text) {
+                unsupported_claim_reason =
+                    Some(format!("external_knowledge_blocked:{marker}"));
+                local_external_knowledge_blocked = true;
+            }
+        }
         let mut llm_verdict = None;
-        let supported = if deterministically_supported {
+        let supported = if unsupported_claim_reason.is_some() {
+            false
+        } else if deterministically_supported {
             true
         } else {
             let verification = complete_with_model(
                 generation,
                 &generation_artifact,
-                "你是严格的中文证据核验员。判断「事实句」是否完全由「原文证据」支持：事实句的每个要点都要能在证据中找到对应文字，证据里没有的内容不能算支持。只输出一个词：SUPPORTED 或 UNSUPPORTED，不要输出解释、标点或多余文字。",
+                "你是严格的中文证据核验员。判断「事实句」是否完全由「原文证据」支持：\
+判断依据是证据是否足以支持事实句中的主体、关系和结论——事实句的每个要点都要能在证据中找到对应文字；\
+主体不同（证据讲的是另一个概念，如证据讲 Agent 而事实句说 RAG）也算 UNSUPPORTED。\
+只输出一个词：SUPPORTED 或 UNSUPPORTED，不要输出解释、标点或多余文字。",
                 &format!(
-                    "【示例一】\n事实句：公司的报销流程是先填单再审批\n原文证据：\n[E1] 报销需先填写报销单，经部门主管审批后方可发放\n输出：SUPPORTED\n\n【示例二】\n事实句：公司的报销上限是五千元\n原文证据：\n[E1] 员工报销需提供正规发票\n输出：UNSUPPORTED\n\n【正式任务】\n事实句：{}\n\n原文证据：\n{}",
+                    "【示例一】\n事实句：公司的报销流程是先填单再审批\n原文证据：\n[E1] 报销需先填写报销单，经部门主管审批后方可发放\n输出：SUPPORTED\n\n【示例二】\n事实句：公司的报销上限是五千元\n原文证据：\n[E1] 员工报销需提供正规发票\n输出：UNSUPPORTED\n\n【示例三】\n事实句：RAG 是一种根据目标判断下一步并选择工具的能力\n原文证据：\n[E1] Agent 根据目标判断下一步、选择工具并读取工具结果\n输出：UNSUPPORTED\n\n【正式任务】\n事实句：{}\n\n原文证据：\n{}",
                     claim.text, evidence
                 ),
                 32,
@@ -9861,6 +10408,10 @@ fn run_retrieval_answer(
                 "deterministic": deterministically_supported,
                 "llm_verdict": llm_verdict,
                 "supported": supported,
+                "unsupported_claim_reason": unsupported_claim_reason,
+                "local_external_knowledge_blocked": unsupported_claim_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.starts_with("external_knowledge_blocked")),
             }),
             "ok",
             None,
@@ -9982,6 +10533,10 @@ fn run_retrieval_answer(
             "insufficient_evidence": grounded.insufficient_evidence,
             "degradation_reason": grounded.degradation_reason,
             "used_file_ids": grounded.used_file_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+            "answerability_status": verdict.status.as_str(),
+            "answerability_reason": verdict.reason,
+            "answer_shape": verdict.answer_shape.as_str(),
+            "local_external_knowledge_blocked": local_external_knowledge_blocked,
         }),
         "ok",
         Some(grounded.elapsed_ms),
@@ -10061,7 +10616,16 @@ fn restructure_as_extract(
     // 每条目 → 确定性证据对齐（最长公共子串；不信任模型自报编号）。
     let mut new_claims = Vec::with_capacity(results.items.len());
     let mut matched_count = 0_usize;
+    // spec 十二类型验证：项目清单的条目必须是「实体/标题式文本」；
+    // 完整描述句（「大模型不仅负责生成文本，还会…」）即使与证据有公共
+    // 子串也当不了 project_name，直接丢弃（宁缺毋滥）。
+    let project_list = is_project_list_question(request.question.trim());
+    let mut rejected_entity_form = 0_usize;
     for item in results.items.iter().take(EXTRACT_MAX_ITEMS) {
+        if project_list && !extract_item_is_entity_like(item.item.trim()) {
+            rejected_entity_form += 1;
+            continue;
+        }
         let mut best: Option<(usize, EvidenceRef)> = None;
         for claim in &grounded.claims {
             for citation in &claim.citations {
@@ -10143,6 +10707,7 @@ fn restructure_as_extract(
             "item_count": grounded.claims.len(),
             "matched_evidence": matched_count,
             "fallback_evidence_used": grounded.claims.len().saturating_sub(matched_count),
+            "rejected_entity_form": rejected_entity_form,
         }),
         "ok",
         Some(started.elapsed().as_millis() as u64),
@@ -10175,6 +10740,10 @@ fn merge_extractive_results(mut results: Vec<AnswerResult>) -> AnswerResult {
         merged.insufficient_evidence = merged.insufficient_evidence && other.insufficient_evidence;
         merged.elapsed_ms = merged.elapsed_ms.saturating_add(other.elapsed_ms);
         merged.source_files.extend(other.source_files);
+        // NO_EVIDENCE 根因：保留第一个子查询的根因（最早发生、最贴近目标）
+        if merged.no_evidence_reason.is_none() {
+            merged.no_evidence_reason = other.no_evidence_reason;
+        }
     }
     merged
 }
@@ -12192,6 +12761,31 @@ mod tests {
         assert!(!claim_support_is_verified("The claim is SUPPORTED"));
     }
 
+    #[test]
+    fn self_test_visible_text_strips_thinking_segments() {
+        // Phase 4.3 CASE F 配套（Qwen3.5 自检失败根因）：thinking 模型的
+        // <think> 思维链剥离后判定可见文本，防 32 token 截断误判回滚。
+        // 闭合思维链：只留可见回复
+        assert_eq!(
+            self_test_visible_text("<think>用户让我确认，我应该简短回复。</think>翻翻本地模型可以工作。"),
+            "翻翻本地模型可以工作。"
+        );
+        // 未闭合（token 截断）：思维链整段丢弃
+        assert_eq!(
+            self_test_visible_text("翻翻已就绪。<think>我再检查一下输出格"),
+            "翻翻已就绪。"
+        );
+        // 纯思维链截断（无可见文本）→ 空串（自检按 <4 字符正确判失败）
+        assert_eq!(self_test_visible_text("<think>好的，我需要确认一下"), "");
+        // 普通模型无 think 标记：原样返回
+        assert_eq!(self_test_visible_text("  翻翻本地模型可以工作。  "), "翻翻本地模型可以工作。");
+        // 多段思维链全部剥离
+        assert_eq!(
+            self_test_visible_text("<think>a</think>中段<think>b</think>尾段"),
+            "中段尾段"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn environment_detection_reads_real_memory_and_disk() {
@@ -12364,6 +12958,7 @@ mod tests {
             retrieval_channels: vec!["fts".into()],
             index_coverage: 1.0,
             degradation_reason: None,
+            no_evidence_reason: None,
             clarification: None,
         };
 
@@ -12421,6 +13016,7 @@ mod tests {
             retrieval_channels: vec!["fts".into()],
             index_coverage: 1.0,
             degradation_reason: None,
+            no_evidence_reason: None,
             clarification: None,
         };
 
@@ -12479,6 +13075,7 @@ mod tests {
             retrieval_channels: vec!["fts".into()],
             index_coverage: 1.0,
             degradation_reason: None,
+            no_evidence_reason: None,
             clarification: None,
         };
 

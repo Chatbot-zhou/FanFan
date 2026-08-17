@@ -897,6 +897,15 @@ impl CatalogService {
         self.store.memory_alias_by_id(alias_id)
     }
 
+    /// 别名 confirm / reject（Phase 4.2「待确认的记忆」）。
+    pub fn update_memory_alias_status(
+        &self,
+        alias_id: Uuid,
+        status: crate::MemoryStatus,
+    ) -> Result<bool, AppError> {
+        self.store.update_memory_alias_status(alias_id, status)
+    }
+
     pub fn bump_memory_alias(&self, alias_id: Uuid) -> Result<bool, AppError> {
         self.store.bump_memory_alias(alias_id)
     }
