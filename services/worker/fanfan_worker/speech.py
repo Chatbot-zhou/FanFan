@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-import base64
-import io
 import math
-import struct
-import wave
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, RLock, Thread
@@ -16,7 +12,6 @@ from .protocol import WorkerError
 
 SESSION_IDLE_SECONDS = 60.0
 MAX_AUDIO_SECONDS = 120.0
-MAX_TTS_CHARACTERS = 4_000
 
 
 @dataclass(slots=True)
@@ -28,7 +23,6 @@ class SpeechSession:
 
 _lock = RLock()
 _asr_sessions: dict[tuple[str, str, int], SpeechSession] = {}
-_tts_sessions: dict[tuple[str, str, str, int], SpeechSession] = {}
 _vad_sessions: dict[tuple[str, int], SpeechSession] = {}
 _reaper_stop = Event()
 
@@ -38,6 +32,7 @@ def recognize_speech(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, Wo
         model = _required_file(payload, "model_path", ".onnx")
         tokens = _required_file(payload, "tokens_path", ".txt")
         vad_model = _required_file(payload, "vad_model_path", ".onnx")
+        arch = _asr_arch(payload)
         sample_rate = _bounded_int(payload.get("sample_rate"), "sample_rate", 8_000, 96_000)
         threads = _bounded_int(payload.get("threads", 1), "threads", 1, 4)
         samples = _audio_samples(payload.get("samples"), sample_rate)
@@ -51,7 +46,7 @@ def recognize_speech(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, Wo
                 "engine": "sherpa_onnx",
                 "vad": "silero",
             }, None
-        recognizer = _get_asr(model, tokens, threads)
+        recognizer = _get_asr(model, tokens, threads, arch)
         stream = recognizer.create_stream()
         stream.accept_waveform(sample_rate, speech_samples)
         recognizer.decode_stream(stream)
@@ -76,47 +71,6 @@ def recognize_speech(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, Wo
         return None, WorkerError("ASR_RECOGNITION_FAILED", str(error), True)
 
 
-def synthesize_speech(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, WorkerError | None]:
-    try:
-        model = _required_file(payload, "model_path", ".onnx")
-        tokens = _required_file(payload, "tokens_path", ".txt")
-        lexicon = _required_file(payload, "lexicon_path", ".txt")
-        threads = _bounded_int(payload.get("threads", 1), "threads", 1, 4)
-        speed = float(payload.get("speed", 1.0))
-        if not 0.5 <= speed <= 2.0:
-            raise ValueError("speed必须在0.5到2.0之间")
-        speaker_id = _bounded_int(payload.get("speaker_id", 0), "speaker_id", 0, 10_000)
-        text = payload.get("text")
-        if not isinstance(text, str) or not text.strip():
-            raise ValueError("text不能为空")
-        text = text.strip()
-        if len(text) > MAX_TTS_CHARACTERS:
-            raise ValueError(f"text不能超过{MAX_TTS_CHARACTERS}个字符")
-        tts = _get_tts(model, tokens, lexicon, threads)
-        audio = tts.generate(text=text, sid=speaker_id, speed=speed)
-        samples = [float(value) for value in audio.samples]
-        sample_rate = int(audio.sample_rate)
-        if not samples or sample_rate <= 0:
-            raise RuntimeError("语音模型没有生成有效音频")
-        wav_bytes = _encode_wav(samples, sample_rate)
-        return {
-            "audio_base64": base64.b64encode(wav_bytes).decode("ascii"),
-            "sample_rate": sample_rate,
-            "duration_ms": round(len(samples) * 1000 / sample_rate),
-            "speaker_id": speaker_id,
-            "speed": speed,
-            "engine": "sherpa_onnx",
-        }, None
-    except ImportError:
-        return None, WorkerError(
-            "SPEECH_RUNTIME_UNAVAILABLE",
-            "语音运行时尚未安装完整，请重新安装翻翻的本地语音组件",
-            False,
-        )
-    except (OSError, RuntimeError, TypeError, ValueError) as error:
-        return None, WorkerError("TTS_SYNTHESIS_FAILED", str(error), True)
-
-
 def self_test_asr(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, WorkerError | None]:
     # 注意：不能走 recognize_speech 的静音探针——VAD 判定无语音会早退，
     # 识别器根本不会被初始化，API 不匹配会静默漏过（曾因 1.13.4 特征配置
@@ -125,8 +79,9 @@ def self_test_asr(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, Worke
     try:
         model = _required_file(payload, "model_path", ".onnx")
         tokens = _required_file(payload, "tokens_path", ".txt")
+        arch = _asr_arch(payload)
         threads = _bounded_int(payload.get("threads", 1), "threads", 1, 4)
-        recognizer = _get_asr(model, tokens, threads)
+        recognizer = _get_asr(model, tokens, threads, arch)
         stream = recognizer.create_stream()
         stream.accept_waveform(16_000, [0.0] * 4_000)
         recognizer.decode_stream(stream)
@@ -142,19 +97,6 @@ def self_test_asr(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, Worke
         return None, WorkerError("MODEL_SELF_TEST_FAILED", str(error), True)
 
 
-def self_test_tts(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, WorkerError | None]:
-    probe = dict(payload)
-    probe.update({"text": "你好", "speed": 1.0, "speaker_id": 0})
-    result, error = synthesize_speech(probe)
-    if error is not None:
-        return None, WorkerError("MODEL_SELF_TEST_FAILED", error.message, error.retryable)
-    return {
-        "status": "ready",
-        "engine": "sherpa_onnx",
-        "duration_ms": result["duration_ms"] if result else 0,
-    }, None
-
-
 def speech_cache_snapshot() -> dict[str, Any]:
     now = monotonic()
     with _lock:
@@ -162,7 +104,6 @@ def speech_cache_snapshot() -> dict[str, Any]:
         return {
             "backend": "sherpa_onnx",
             "asr_session_count": len(_asr_sessions),
-            "tts_session_count": len(_tts_sessions),
             "vad_session_count": len(_vad_sessions),
             "idle_timeout_seconds": int(SESSION_IDLE_SECONDS),
         }
@@ -170,9 +111,8 @@ def speech_cache_snapshot() -> dict[str, Any]:
 
 def clear_speech_sessions() -> int:
     with _lock:
-        count = len(_asr_sessions) + len(_tts_sessions) + len(_vad_sessions)
+        count = len(_asr_sessions) + len(_vad_sessions)
         _asr_sessions.clear()
-        _tts_sessions.clear()
         _vad_sessions.clear()
         return count
 
@@ -223,10 +163,22 @@ def _voice_samples(samples: list[float], sample_rate: int, model: Path, threads:
     return speech
 
 
-def _get_asr(model: Path, tokens: Path, threads: int) -> Any:
+def _asr_arch(payload: dict[str, Any]) -> str:
+    # 支持的 ASR 架构：paraformer（旧默认）/ sense_voice（新版默认）。
+    # 未知或缺失时回退 paraformer，保证旧请求兼容。
+    arch = payload.get("arch", "paraformer")
+    if not isinstance(arch, str):
+        raise ValueError("arch必须是字符串")
+    arch = arch.strip()
+    if arch not in ("paraformer", "sense_voice"):
+        raise ValueError("arch仅支持paraformer或sense_voice")
+    return arch
+
+
+def _get_asr(model: Path, tokens: Path, threads: int, arch: str) -> Any:
     import sherpa_onnx
 
-    key = (str(model.resolve()), str(tokens.resolve()), threads)
+    key = (str(model.resolve()), str(tokens.resolve()), threads, arch)
     now = monotonic()
     with _lock:
         _evict_idle(now)
@@ -235,53 +187,32 @@ def _get_asr(model: Path, tokens: Path, threads: int) -> Any:
             cached.last_used = now
             return cached.engine
     # sherpa-onnx 1.13.4（规划书锁定版本）：OfflineRecognizer 是各架构工厂
-    # 方法的命名空间类，无通用构造函数；Paraformer 模型走 from_paraformer。
+    # 方法的命名空间类，无通用构造函数；不同模型形态走对应工厂方法。
     # （2.x 起改为 OfflineRecognizerConfig + 构造函数，特征配置名也改为
     # OfflineFeatureExtractorConfig。按锁定版本取 1.13.4 的 API。）
-    engine = sherpa_onnx.OfflineRecognizer.from_paraformer(
-        paraformer=str(model),
-        tokens=str(tokens),
-        num_threads=threads,
-        decoding_method="greedy_search",
-        debug=False,
-        provider="cpu",
-    )
+    if arch == "sense_voice":
+        engine = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+            tokens=str(tokens),
+            sense_voice_model=str(model),
+            num_threads=threads,
+            page_index=0,
+            use_itn=True,
+            debugging=False,
+            language="auto",
+            provider="cpu",
+        )
+    else:
+        engine = sherpa_onnx.OfflineRecognizer.from_paraformer(
+            paraformer=str(model),
+            tokens=str(tokens),
+            num_threads=threads,
+            decoding_method="greedy_search",
+            debug=False,
+            provider="cpu",
+        )
     with _lock:
         _asr_sessions.clear()
         _asr_sessions[key] = SpeechSession(engine=engine, last_used=now, threads=threads)
-    return engine
-
-
-def _get_tts(model: Path, tokens: Path, lexicon: Path, threads: int) -> Any:
-    import sherpa_onnx
-
-    key = (str(model.resolve()), str(tokens.resolve()), str(lexicon.resolve()), threads)
-    now = monotonic()
-    with _lock:
-        _evict_idle(now)
-        cached = _tts_sessions.get(key)
-        if cached is not None:
-            cached.last_used = now
-            return cached.engine
-    config = sherpa_onnx.OfflineTtsConfig(
-        model=sherpa_onnx.OfflineTtsModelConfig(
-            vits=sherpa_onnx.OfflineTtsVitsModelConfig(
-                model=str(model),
-                lexicon=str(lexicon),
-                tokens=str(tokens),
-            ),
-            num_threads=threads,
-            debug=False,
-            provider="cpu",
-        ),
-        max_num_sentences=1,
-    )
-    if not config.validate():
-        raise ValueError("TTS模型配置校验失败")
-    engine = sherpa_onnx.OfflineTts(config)
-    with _lock:
-        _tts_sessions.clear()
-        _tts_sessions[key] = SpeechSession(engine=engine, last_used=now, threads=threads)
     return engine
 
 
@@ -315,22 +246,8 @@ def _audio_samples(value: Any, sample_rate: int) -> list[float]:
     return samples
 
 
-def _encode_wav(samples: list[float], sample_rate: int) -> bytes:
-    output = io.BytesIO()
-    with wave.open(output, "wb") as target:
-        target.setnchannels(1)
-        target.setsampwidth(2)
-        target.setframerate(sample_rate)
-        pcm = b"".join(
-            struct.pack("<h", max(-32768, min(32767, round(sample * 32767))))
-            for sample in samples
-        )
-        target.writeframes(pcm)
-    return output.getvalue()
-
-
 def _evict_idle(now: float) -> None:
-    for sessions in (_asr_sessions, _tts_sessions, _vad_sessions):
+    for sessions in (_asr_sessions, _vad_sessions):
         for key in [key for key, value in sessions.items() if now - value.last_used >= SESSION_IDLE_SECONDS]:
             sessions.pop(key, None)
 

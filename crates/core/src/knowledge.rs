@@ -9,93 +9,6 @@ use uuid::Uuid;
 use crate::router::Intent;
 use crate::{AppError, DocumentType, EvidenceRef, ScopeFilter, SearchSession};
 
-/// 查询意图：从自然语言中提取的结构化检索参数
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct QueryIntent {
-    #[serde(default)]
-    pub rewritten_query: String,
-    pub time_hint: Option<TimeHint>,
-    #[serde(default)]
-    pub extension_hints: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TimeHint {
-    pub from: String,
-    pub to: String,
-}
-
-/// 构建查询改写 prompt。只输出 JSON，不输出其他内容。
-pub fn query_understanding_prompt(query: &str, today: &str) -> (String, String) {
-    // 手册要点：字段规则 + 完整输出示例（模型复读示例比读字段定义可靠）。
-    // 示例用「去年的报表」覆盖时间指代与口语词去除两种最常出错的改写。
-    let system =
-        "你是查询理解助手。把自然语言查询转成检索参数，只输出JSON，不要解释或多余文字。".into();
-    let user = format!(
-        r#"【输出格式】
-{{"rewritten_query":"核心关键词","time_hint":null或{{"from":"YYYY-MM-DD","to":"YYYY-MM-DD"}},"extension_hints":["docx","pdf"]}}
-- rewritten_query：去除口语词（"那个""在哪里""帮我找"），保留核心检索关键词
-- time_hint：解析时间指代（"去年""上个月""2025年"），以当前日期 {today} 为基准，仅当明确时才设置
-- extension_hints：用户提到的文件格式（"word文档"→docx，"excel表格"→xlsx，"ppt"→pptx，"pdf"→pdf）
-查询已经是关键词则 rewritten_query 照写；未提及的字段用 null 或空数组。
-
-【示例】
-查询：帮我找找去年那个财务的报表
-输出：{{"rewritten_query":"财务报表","time_hint":{{"from":"{last_year}","to":"{today}"}},"extension_hints":["xlsx","pdf"]}}
-
-查询：{query}"#,
-        today = today,
-        last_year = last_year_of(today),
-        query = query
-    );
-    (system, user)
-}
-
-/// 计算 today（YYYY-MM-DD）对应的去年同日，仅用于查询理解示例。
-/// 解析失败回退 today（示例不参与实际检索，只展示 JSON 形状）。
-fn last_year_of(today: &str) -> String {
-    let year = today.split('-').next().and_then(|part| part.parse::<i32>().ok());
-    match year {
-        Some(year) => format!("{}-{}", year - 1, today.get(5..).unwrap_or("01-01")),
-        None => today.to_owned(),
-    }
-}
-
-/// 解析生成模型返回的 JSON 为 QueryIntent，失败时用原始查询回退
-pub fn parse_query_intent(raw: &str, fallback_query: &str) -> QueryIntent {
-    let json = strip_code_fence(raw);
-    let mut intent: QueryIntent = serde_json::from_str(json).unwrap_or_else(|_| QueryIntent {
-        rewritten_query: String::new(),
-        time_hint: None,
-        extension_hints: Vec::new(),
-    });
-    if intent.rewritten_query.trim().is_empty() {
-        intent.rewritten_query = fallback_query.to_owned();
-    }
-    // 校验时间格式基本合法
-    if let Some(ref hint) = intent.time_hint
-        && (hint.from.len() != 10 || hint.to.len() != 10)
-    {
-        intent.time_hint = None;
-    }
-    intent
-}
-
-/// 判断查询是否需要自然语言理解
-pub fn is_natural_language_query(query: &str) -> bool {
-    let ambiguous_patterns = [
-        Regex::new(r"去年|上个?[月周]|前[几些](天|周|月|年)|最近(几天|几周|几月|一年)").unwrap(),
-        Regex::new(r"这[个些]|那[个些]|上述|前面提到|之前说的").unwrap(),
-    ];
-    let trimmed = query.trim();
-    if trimmed.is_empty() || trimmed.chars().count() > 200 {
-        return false;
-    }
-    ambiguous_patterns
-        .iter()
-        .any(|pattern| pattern.is_match(trimmed))
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AnswerStyle {
@@ -856,7 +769,10 @@ pub fn fold_recent_history(
     let user_from = user_indices.len().saturating_sub(user_limit);
     let assistant_from = assistant_indices.len().saturating_sub(assistant_limit);
     let mut kept = vec![false; history.len()];
-    for &index in user_indices[user_from..].iter().chain(&assistant_indices[assistant_from..]) {
+    for &index in user_indices[user_from..]
+        .iter()
+        .chain(&assistant_indices[assistant_from..])
+    {
         kept[index] = true;
     }
     history
@@ -980,9 +896,9 @@ pub fn parse_rewritten_queries(raw: &str) -> Vec<String> {
     for line in raw.lines() {
         let line = line.trim();
         let line = line
-            .trim_start_matches(|ch| matches!(ch, '-' | '•' | '·' | '#' | ' ' | '\t'))
+            .trim_start_matches(['-', '•', '·', '#', ' ', '\t'])
             .trim_start_matches(|ch: char| ch.is_ascii_digit())
-            .trim_start_matches(|ch| matches!(ch, '.' | '、' | ')' | '）' | ' '));
+            .trim_start_matches(['.', '、', ')', '）', ' ']);
         // 0.6B 复读「改写：」前缀时剥掉，只留问题本身
         let line = line
             .strip_prefix("改写：")
@@ -1002,12 +918,13 @@ pub fn parse_rewritten_queries(raw: &str) -> Vec<String> {
 
 /// 闲聊 persona 的补全 prompt（纯补全非 JSON）：人设 + 回答规则 + 对话历史折叠
 /// + 当前问题。历史格式与 generation_prompt 一致（「用户：/翻翻：」，每条约 400
-/// 字），最多折叠 5 轮（5 条用户 + 5 条模型回复）。
+///   字），最多折叠 5 轮（5 条用户 + 5 条模型回复）。
 ///
 /// 回答规则分两支（Phase 4.1 技术问答质量修复，CASE 二）：
 /// - 日常闲聊：简短自然、不复读问题、不以「你好！我是翻翻」固定开场；
 /// - 知识/技术问题：定义 → 核心机制 → 适用场景/区别 的结构化回答，不编造人名/
 ///   年份/出处/数字，不牺牲准确性迁就口语化，知识不足时明确报告模型能力限制。
+///
 /// 两套规则常驻 system prompt，不依赖关键词判定（闲聊与科普本来就无法硬切）。
 pub fn chat_prompt(request: &AskRequest, history: &[AskMessage]) -> (String, String) {
     let system = "你是翻翻，用户本地资料库中的中文智能助手。当前是闲聊场景，不涉及资料检索，直接自然对话即可。\
@@ -1097,7 +1014,10 @@ mod tests {
         // 序列化：9 个变体 → snake_case
         let serialized = serde_json::to_string(&AnswerMode::Compare).unwrap();
         assert_eq!(serialized, "\"compare\"");
-        assert_eq!(serde_json::to_string(&AnswerMode::Generated).unwrap(), "\"generated\"");
+        assert_eq!(
+            serde_json::to_string(&AnswerMode::Generated).unwrap(),
+            "\"generated\""
+        );
         // 历史数据兼容：旧内部标记 "extractive" → Generated
         let legacy: AnswerMode = serde_json::from_str("\"extractive\"").unwrap();
         assert_eq!(legacy, AnswerMode::Generated);
@@ -1305,7 +1225,10 @@ mod tests {
 
     #[test]
     fn query_rewrite_prompt_injects_history_and_instructs_line_output() {
-        let history = vec![message("user", "报销流程是什么"), message("assistant", "报销分三步。")];
+        let history = vec![
+            message("user", "报销流程是什么"),
+            message("assistant", "报销分三步。"),
+        ];
         let (system, user) = query_rewrite_prompt("那金额上限呢", &history);
         assert!(system.contains("只输出问题"));
         assert!(system.contains("字段 question"));
@@ -1333,7 +1256,10 @@ mod tests {
     fn parse_rewritten_queries_splits_lines_and_dedupes() {
         assert_eq!(
             parse_rewritten_queries("公司的报销流程是什么\n请假规定有哪些"),
-            vec!["公司的报销流程是什么".to_owned(), "请假规定有哪些".to_owned()]
+            vec![
+                "公司的报销流程是什么".to_owned(),
+                "请假规定有哪些".to_owned()
+            ]
         );
         // 空行/重复/列表符号剥离
         assert_eq!(
@@ -1347,7 +1273,10 @@ mod tests {
         assert_eq!(parse_rewritten_queries("   \n \n"), Vec::<String>::new());
         // markdown 符号行剥净后为空
         assert_eq!(parse_rewritten_queries("---\n###"), Vec::<String>::new());
-        assert_eq!(parse_rewritten_queries("## 标题行"), vec!["标题行".to_owned()]);
+        assert_eq!(
+            parse_rewritten_queries("## 标题行"),
+            vec!["标题行".to_owned()]
+        );
     }
 
     #[test]
@@ -1360,7 +1289,10 @@ mod tests {
 
     #[test]
     fn chat_prompt_folds_history_and_question() {
-        let history = vec![message("user", "  你好  呀 "), message("assistant", "你好！")];
+        let history = vec![
+            message("user", "  你好  呀 "),
+            message("assistant", "你好！"),
+        ];
         let (system, user) = chat_prompt(&request(), &history);
         assert!(system.contains("翻翻"));
         assert!(user.contains("用户：你好 呀"));
@@ -1377,10 +1309,16 @@ mod tests {
         // CASE 二（GENERAL 质量）：技术问答必须有结构纪律与反编造约束，
         // 且固定开场白仍被禁止；闲聊分支保持口语化短答
         let (system, _) = chat_prompt(&request(), &[]);
-        assert!(system.contains("定义 → 核心机制 → 适用场景或区别"), "技术问答结构");
+        assert!(
+            system.contains("定义 → 核心机制 → 适用场景或区别"),
+            "技术问答结构"
+        );
         assert!(system.contains("不编造人名、年份、出处"), "反编造约束");
         assert!(system.contains("不要为了口语化牺牲准确性"), "准确性优先");
-        assert!(system.contains("不要以「你好！我是翻翻」之类的固定开场白开头"), "禁固定开场");
+        assert!(
+            system.contains("不要以「你好！我是翻翻」之类的固定开场白开头"),
+            "禁固定开场"
+        );
         assert!(system.contains("模型能力范围"), "能力限制要明说");
         assert!(system.contains("简短、自然、口语化"), "闲聊分支保留");
         // 模型必须看到「Transformer 是什么」这类问题属于知识问题
@@ -1398,8 +1336,14 @@ mod tests {
         }
         let (_, user) = chat_prompt(&request(), &history);
         // 折叠段 5 用户 + 5 翻翻；末尾另有 chat_prompt 追加的一行当前提问
-        let user_lines = user.lines().filter(|line| line.starts_with("用户：")).count();
-        let assistant_lines = user.lines().filter(|line| line.starts_with("翻翻：")).count();
+        let user_lines = user
+            .lines()
+            .filter(|line| line.starts_with("用户："))
+            .count();
+        let assistant_lines = user
+            .lines()
+            .filter(|line| line.starts_with("翻翻："))
+            .count();
         assert_eq!(assistant_lines, 5, "最多折叠 5 条翻翻回复");
         assert_eq!(user_lines, 6, "5 条历史用户消息 + 1 行当前提问");
         assert!(user.contains("用户：第4轮问题"), "最近 5 轮包含第 4 轮");
@@ -1556,10 +1500,12 @@ mod tests {
 
     #[test]
     fn extract_unverified_handles_all_inputs() {
-        let draft = r#"{"claims":[{"text":"报销上限是5000元","citation_ids":["S1"]}],"refusal":null}"#;
+        let draft =
+            r#"{"claims":[{"text":"报销上限是5000元","citation_ids":["S1"]}],"refusal":null}"#;
         assert_eq!(extract_unverified_text(draft), "- 报销上限是5000元");
         // 带 [S\d+] 标记的正文被剥离
-        let dirty = r#"{"claims":[{"text":"规定如下[S1][S2]","citation_ids":["S1"]}],"refusal":null}"#;
+        let dirty =
+            r#"{"claims":[{"text":"规定如下[S1][S2]","citation_ids":["S1"]}],"refusal":null}"#;
         assert_eq!(extract_unverified_text(dirty), "- 规定如下");
         // 多条 claims 逐条 "- " 拼接
         let multi = r#"{"claims":[{"text":"第一点","citation_ids":["S1"]},{"text":"第二点","citation_ids":["S2"]}],"refusal":null}"#;

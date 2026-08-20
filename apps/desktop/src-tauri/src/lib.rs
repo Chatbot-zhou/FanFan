@@ -5,7 +5,10 @@ use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -15,8 +18,8 @@ use commands::{
     app_data::{
         self, AskCoordinatorState, CatalogServiceState, EnvironmentServiceState,
         GenerationServiceState, ModelDownloadCoordinatorState, ModelServiceState,
-        RuntimeManagerState, ScanCoordinatorState, SidecarClients, SidecarRegistryState,
-        SpeechWorkerState, WatcherServiceState, WorkerServiceState,
+        RuntimeManagerState, ScanCoordinatorState, SearchEmbeddingCache, SidecarClients,
+        SidecarRegistryState, SpeechWorkerState, WatcherServiceState, WorkerServiceState,
     },
     memory_view::{self, MemorySettingsServiceState},
     startup::{StartupServiceState, StartupState},
@@ -192,8 +195,10 @@ pub fn run() {
                 running: AtomicBool::new(false),
                 embedding_running: AtomicBool::new(false),
                 embedding_reschedule: AtomicBool::new(false),
+                image_ocr_running: AtomicBool::new(false),
                 vision_running: AtomicBool::new(false),
                 foreground_activity: std::sync::atomic::AtomicU32::new(0),
+                search_embedding_cache: Mutex::new(SearchEmbeddingCache::new()),
             });
             app.manage(SidecarRegistryState(Arc::new(SidecarClients {
                 onnx: onnx_worker,
@@ -268,14 +273,12 @@ pub fn run() {
                                 if settled || last_report_at.elapsed() >= Duration::from_millis(200)
                                 {
                                     last_report_at = Instant::now();
-                                    let _ = migration_app.emit(
-                                        "storage:migration-progress",
-                                        progress,
-                                    );
+                                    let _ =
+                                        migration_app.emit("storage:migration-progress", progress);
                                 }
                             },
                         );
-                        let succeeded = final_dir == PathBuf::from(&pending.target_directory);
+                        let succeeded = final_dir == pending.target_directory;
                         let _ = tx.send(final_dir);
                         let _ = migration_app.emit(
                             if succeeded {
@@ -331,11 +334,12 @@ pub fn run() {
             app_data::rag_readiness_get,
             app_data::model_import_scan,
             app_data::model_import_confirm,
-            app_data::model_artifact_list,
-            app_data::model_role_config_list,
-            app_data::model_catalog_list,
             app_data::model_role_catalog_list,
             app_data::model_preset_list,
+            app_data::model_preset_selected_get,
+            app_data::model_preset_plan,
+            app_data::model_preset_select,
+            app_data::model_preset_recommendation,
             app_data::model_download_start,
             app_data::model_download_list,
             app_data::model_store_status_get,
@@ -346,8 +350,6 @@ pub fn run() {
             app_data::model_download_retry,
             app_data::model_download_switch_source,
             app_data::model_download_remove,
-            app_data::model_artifact_activate,
-            app_data::model_role_disable,
             app_data::home_get_summary,
             app_data::candidate_root_action,
             app_data::search_start,
@@ -359,7 +361,6 @@ pub fn run() {
             app_data::ask_operation_get,
             app_data::ask_cancel,
             app_data::speech_recognize,
-            app_data::speech_synthesize_answer,
             app_data::preview_get,
             app_data::file_open,
             app_data::file_reveal,
@@ -432,6 +433,7 @@ pub fn run() {
             app_data::diagnostic_event_append,
             app_data::diagnostic_export,
             app_data::index_rebuild,
+            app_data::index_stale_check,
             app_data::root_list,
             app_data::root_add,
             app_data::root_disable,
@@ -670,8 +672,7 @@ fn execute_pending_storage_migration(
         Err(_) => {
             let mut config = read_storage_location_config(config_dir).unwrap_or_default();
             config.last_error = Some(
-                "存储迁移未完成，翻翻已继续使用原位置；请检查目标磁盘空间和写入权限后重试"
-                    .into(),
+                "存储迁移未完成，翻翻已继续使用原位置；请检查目标磁盘空间和写入权限后重试".into(),
             );
             config.updated_at = Some(Utc::now().to_rfc3339());
             let _ = write_storage_location_config(config_dir, &config);
@@ -724,9 +725,7 @@ fn cleanup_quarantine_path(previous: &Path) -> PathBuf {
 }
 
 fn storage_marker_valid(data_directory: &Path) -> bool {
-    data_directory
-        .join(MANAGED_STORAGE_MARKER)
-        .is_file()
+    data_directory.join(MANAGED_STORAGE_MARKER).is_file()
         && fs::read_to_string(data_directory.join(MANAGED_STORAGE_MARKER))
             .is_ok_and(|content| content.trim() == "FANFAN_MANAGED_DATA_V1")
 }
@@ -864,13 +863,12 @@ fn quarantine_path_safe(config_dir: &Path, quarantine: &Path, active: Option<&Pa
     {
         return false;
     }
-    if let Some(active) = active {
-        if quarantine == active
+    if let Some(active) = active
+        && (quarantine == active
             || path_contains(quarantine, active)
-            || path_contains(active, quarantine)
-        {
-            return false;
-        }
+            || path_contains(active, quarantine))
+    {
+        return false;
     }
     true
 }
@@ -886,10 +884,7 @@ fn apply_pending_storage_cleanup(config_dir: &Path) {
         return;
     };
     let quarantine = PathBuf::from(&quarantine_text);
-    let active = config
-        .active_data_directory
-        .as_deref()
-        .map(PathBuf::from);
+    let active = config.active_data_directory.as_deref().map(PathBuf::from);
     if quarantine.is_dir()
         && !(quarantine_path_safe(config_dir, &quarantine, active.as_deref())
             && app_data::clear_directory_contents(&quarantine).is_ok()
@@ -1057,7 +1052,13 @@ fn copy_directory_entries_with_progress(
         }
         let destination = target.join(entry.file_name());
         if metadata.is_dir() {
-            copy_directory_entries_with_progress(&entry.path(), &destination, total_bytes, done, report)?;
+            copy_directory_entries_with_progress(
+                &entry.path(),
+                &destination,
+                total_bytes,
+                done,
+                report,
+            )?;
         } else if metadata.is_file() {
             let size = metadata.len();
             if destination.is_file()
@@ -1065,7 +1066,11 @@ fn copy_directory_entries_with_progress(
                 && sha256_path(&entry.path())? == sha256_path(&destination)?
             {
                 *done = done.saturating_add(size);
-                report(MigrationProgress { phase: "copying", done_bytes: *done, total_bytes });
+                report(MigrationProgress {
+                    phase: "copying",
+                    done_bytes: *done,
+                    total_bytes,
+                });
                 continue;
             }
             let temporary = destination.with_extension("fanfan-copying");
@@ -1085,7 +1090,11 @@ fn copy_directory_entries_with_progress(
             }
             fs::rename(temporary, destination)?;
             *done = done.saturating_add(size);
-            report(MigrationProgress { phase: "copying", done_bytes: *done, total_bytes });
+            report(MigrationProgress {
+                phase: "copying",
+                done_bytes: *done,
+                total_bytes,
+            });
         }
     }
     Ok(())
@@ -1109,7 +1118,13 @@ fn verify_directory_entries_with_progress(
                     "storage migration directory missing",
                 ));
             }
-            verify_directory_entries_with_progress(&entry.path(), &destination, total_bytes, done, report)?;
+            verify_directory_entries_with_progress(
+                &entry.path(),
+                &destination,
+                total_bytes,
+                done,
+                report,
+            )?;
         } else if metadata.is_file()
             && (!destination.is_file()
                 || fs::metadata(&destination)?.len() != metadata.len()
@@ -1121,7 +1136,11 @@ fn verify_directory_entries_with_progress(
             ));
         } else if metadata.is_file() {
             *done = done.saturating_add(metadata.len());
-            report(MigrationProgress { phase: "verifying", done_bytes: *done, total_bytes });
+            report(MigrationProgress {
+                phase: "verifying",
+                done_bytes: *done,
+                total_bytes,
+            });
         }
     }
     Ok(())
@@ -1306,10 +1325,7 @@ fn resolve_model_store_directory(
     legacy_roots: &[PathBuf],
 ) -> (PathBuf, Option<String>) {
     apply_pending_model_store_cleanup(config_dir);
-    let mut config = match read_model_store_location_config(config_dir) {
-        Ok(config) => config,
-        Err(_) => ModelStoreLocationConfig::default(),
-    };
+    let mut config = read_model_store_location_config(config_dir).unwrap_or_default();
     let configured = config
         .active_model_store
         .as_deref()
@@ -1323,9 +1339,8 @@ fn resolve_model_store_directory(
         };
     };
     if !configured.is_dir() {
-        config.last_error = Some(
-            "已配置的模型仓库位置不可用，翻翻已使用默认位置；请检查目标磁盘后重启".into(),
-        );
+        config.last_error =
+            Some("已配置的模型仓库位置不可用，翻翻已使用默认位置；请检查目标磁盘后重启".into());
         config.updated_at = Some(Utc::now().to_rfc3339());
         let _ = write_model_store_location_config(config_dir, &config);
         runtime_log::event(
@@ -1358,7 +1373,10 @@ fn resolve_model_store_directory(
         staging_manager
             .rebase_store_paths(&source)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
-        fs::write(target.join(MODEL_STORE_READY_MARKER), "FANFAN_MODEL_STORE_V1")?;
+        fs::write(
+            target.join(MODEL_STORE_READY_MARKER),
+            "FANFAN_MODEL_STORE_V1",
+        )?;
         Ok(target.clone())
     })();
     match result {
@@ -1408,10 +1426,7 @@ pub(crate) fn cleanup_model_store_migration(
     config_dir: &Path,
     active_store: &Path,
 ) -> Result<MigrationCleanupResult, fanfan_core::AppError> {
-    let mut config = match read_model_store_location_config(config_dir) {
-        Ok(config) => config,
-        Err(_) => ModelStoreLocationConfig::default(),
-    };
+    let mut config = read_model_store_location_config(config_dir).unwrap_or_default();
     if config.pending.is_some() {
         return Err(fanfan_core::AppError::new(
             "MODEL_STORE_CLEANUP_PENDING",
@@ -1442,7 +1457,8 @@ pub(crate) fn cleanup_model_store_migration(
     // 先 canonicalize：Windows junction/symlink 会绕过纯文本路径比较，
     // canonicalize 会把 reparse point 解析到真实目标后再比对。
     let previous_canonical = fs::canonicalize(&previous).unwrap_or_else(|_| previous.clone());
-    let active_canonical = fs::canonicalize(active_store).unwrap_or_else(|_| active_store.to_path_buf());
+    let active_canonical =
+        fs::canonicalize(active_store).unwrap_or_else(|_| active_store.to_path_buf());
     if previous_canonical == active_canonical
         || path_contains(&previous_canonical, &active_canonical)
         || path_contains(&active_canonical, &previous_canonical)
@@ -1657,6 +1673,33 @@ pub(crate) fn schedule_model_store_migration(
     })
 }
 
+/// 带重试的目录重命名：`app.restart()` 不经过 `close_requested`，新进程 setup 时
+/// 旧 worker / sidecar 可能刚退出还没完全释放 `data_dir/models` 等目录内文件句柄，
+/// 直接重命名会因 `PermissionDenied` 失败并导致 setup 崩溃（重置后闪退）。这里对
+/// `PermissionDenied` 做有界重试并指数退避，给进程退出留出释放锁的时间。
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_error = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                last_error = Some(error);
+                if attempt + 1 < MAX_ATTEMPTS {
+                    thread::sleep(std::time::Duration::from_millis(200 * (1 << attempt)));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "application reset rename failed after bounded retries",
+        )
+    }))
+}
+
 fn apply_pending_data_reset(config_dir: &Path, local_data_dir: &Path) -> std::io::Result<()> {
     let parent = config_dir.parent().ok_or_else(|| {
         std::io::Error::new(
@@ -1723,7 +1766,7 @@ fn apply_pending_data_reset(config_dir: &Path, local_data_dir: &Path) -> std::io
         }
         if target.join("models").is_dir() {
             quarantine_data_preserving_models(&target, &quarantine, kind == "local")?;
-        } else if let Err(error) = fs::rename(&target, &quarantine) {
+        } else if let Err(error) = rename_with_retry(&target, &quarantine) {
             // The setup hook runs after the main window's WebView2 has already
             // started, so the local data directory's EBWebView profile folder
             // is held open and renaming it fails with ERROR_ACCESS_DENIED —
@@ -1755,7 +1798,7 @@ fn quarantine_local_data_skipping_webview(target: &Path, quarantine: &Path) -> s
         if entry.file_name() == "EBWebView" {
             continue;
         }
-        fs::rename(entry.path(), quarantine.join(entry.file_name()))?;
+        rename_with_retry(&entry.path(), &quarantine.join(entry.file_name()))?;
     }
     clear_webview_profile_cache(&target.join("EBWebView"));
     Ok(())
@@ -1772,7 +1815,7 @@ fn quarantine_data_preserving_models(
         if entry.file_name() == "models" || (preserve_webview && entry.file_name() == "EBWebView") {
             continue;
         }
-        fs::rename(entry.path(), quarantine.join(entry.file_name()))?;
+        rename_with_retry(&entry.path(), &quarantine.join(entry.file_name()))?;
     }
     if preserve_webview {
         clear_webview_profile_cache(&target.join("EBWebView"));
@@ -1993,6 +2036,7 @@ fn is_pdf(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn initialize_background_services(
     app: tauri::AppHandle,
     data_dir: PathBuf,
@@ -2091,7 +2135,41 @@ fn initialize_background_services(
         let ocr_runtime_available = model_manager
             .active_artifact(fanfan_core::ModelRole::Ocr)?
             .is_some();
-        model_state.initialize(model_manager)?;
+        model_state.initialize(Arc::clone(&model_manager))?;
+        // 让持久化的 selected_preset_id 在启动期即驱动运行时：把 preset 各角色
+        // 的 active 指向本地已就绪 artifact，缺的记入报告（下载编排后续补齐）。
+        // 无选中档位时不强制，保持原注册表 active 状态（迁移兼容）。
+        if let Some(preset_id) = catalog.selected_preset_id()? {
+            match model_manager.apply_runtime_plan(&preset_id) {
+                Ok(report) => runtime_log::event(
+                    "info",
+                    "model",
+                    "preset.runtime_plan_applied",
+                    None,
+                    &serde_json::json!({
+                        "preset_id": preset_id,
+                        "ready_count": report.ready.len(),
+                        "missing_count": report.missing.len(),
+                        "missing_roles": report
+                            .missing
+                            .iter()
+                            .map(|item| item.role.directory_name())
+                            .collect::<Vec<_>>(),
+                    }),
+                ),
+                Err(error) => runtime_log::event(
+                    "warning",
+                    "model",
+                    "preset.runtime_plan_failed",
+                    None,
+                    &serde_json::json!({
+                        "preset_id": preset_id,
+                        "error_code": error.code,
+                        "retryable": error.retryable,
+                    }),
+                ),
+            }
+        }
         startup.publish(
             &app,
             StartupState {
@@ -2104,6 +2182,7 @@ fn initialize_background_services(
             },
         );
         catalog.recover_interrupted_parses()?;
+        catalog.recover_interrupted_image_ocr()?;
         catalog.recover_interrupted_image_understanding()?;
         match catalog.sanitize_existing_ocr_attempt_errors() {
             Ok(sanitized) if sanitized > 0 => runtime_log::event(
@@ -2266,6 +2345,7 @@ fn initialize_background_services(
         );
         app_data::spawn_scan_queue(app.clone(), Arc::clone(&catalog), recovered);
         app_data::spawn_parse_pending(app.clone(), Arc::clone(&catalog));
+        app_data::spawn_image_ocr_pending(app.clone(), Arc::clone(&catalog));
         app_data::spawn_image_understanding_pending(app.clone(), Arc::clone(&catalog));
         app_data::spawn_embed_pending(app.clone(), Arc::clone(&catalog));
         #[cfg(debug_assertions)]
@@ -2277,7 +2357,7 @@ fn initialize_background_services(
             {
                 let (edition_id, source) = specification
                     .split_once('@')
-                    .unwrap_or((specification, "huggingface"));
+                    .unwrap_or((specification, "modelscope"));
                 match app_data::queue_evaluation_model_download(
                     &app,
                     Arc::clone(&catalog),
@@ -2393,7 +2473,10 @@ fn inference_runtime_refresh(app: tauri::AppHandle) -> Result<(), String> {
     if REFRESH_PROBE_IN_FLIGHT.swap(true, Ordering::AcqRel) {
         return Ok(());
     }
-    let data_dir = app.state::<EnvironmentServiceState>().data_directory.clone();
+    let data_dir = app
+        .state::<EnvironmentServiceState>()
+        .data_directory
+        .clone();
     let (gpu_candidates, cpu_executable) = generation_runtime_candidates(&app, &data_dir);
     let generation = app.state::<GenerationServiceState>().0.clone();
     let probe_app = app.clone();
@@ -2470,29 +2553,28 @@ fn background_probe_generation_runtime(
             let mut swapped = false;
             for attempt in 0..SWAP_RETRY_ATTEMPTS {
                 let mut skip_reason = "lock_timeout";
-                swapped =
-                    match crate::commands::app_data::try_lock_generation_until(
-                        &generation,
-                        std::time::Duration::from_secs(3),
-                    ) {
-                        Some(mut guard) => {
-                            if guard.is_active() {
-                                // llama 进程存活（推理中）：换掉会中断在途生成，
-                                // 放下锁等下一轮。
-                                drop(guard);
-                                skip_reason = "runtime_active";
-                                false
-                            } else {
-                                *guard = LocalGenerationRuntime::new_with_fallback_and_capability(
-                                    gpu.clone(),
-                                    cpu_executable.clone(),
-                                    capability.clone(),
-                                );
-                                true
-                            }
+                swapped = match crate::commands::app_data::try_lock_generation_until(
+                    &generation,
+                    std::time::Duration::from_secs(3),
+                ) {
+                    Some(mut guard) => {
+                        if guard.is_active() {
+                            // llama 进程存活（推理中）：换掉会中断在途生成，
+                            // 放下锁等下一轮。
+                            drop(guard);
+                            skip_reason = "runtime_active";
+                            false
+                        } else {
+                            *guard = LocalGenerationRuntime::new_with_fallback_and_capability(
+                                gpu.clone(),
+                                cpu_executable.clone(),
+                                capability.clone(),
+                            );
+                            true
                         }
-                        None => false,
-                    };
+                    }
+                    None => false,
+                };
                 if swapped {
                     break;
                 }
@@ -2549,7 +2631,8 @@ fn background_probe_generation_runtime(
     let generation = app.state::<GenerationServiceState>();
     let runtime_state = app_data::inference_runtime_state(&generation).ok();
     if let (Some(models), Some(catalog)) = (models, catalog)
-        && let Ok(state) = app_data::model_state_from_manager(&models, Some(catalog.as_ref()), runtime_state)
+        && let Ok(state) =
+            app_data::model_state_from_manager(&models, Some(catalog.as_ref()), runtime_state)
     {
         let _ = app.emit("model:state", state);
     } else {
@@ -2824,11 +2907,7 @@ mod reset_tests {
         fs::create_dir_all(&config_dir).expect("create config");
         fs::create_dir_all(&destination_parent).expect("create destination parent");
         fs::create_dir_all(&source).expect("create source store");
-        fs::write(
-            source.join("registry.json"),
-            b"{}",
-        )
-        .expect("write registry");
+        fs::write(source.join("registry.json"), b"{}").expect("write registry");
         let status = fanfan_core::ModelStoreStatus {
             store_path: source.to_string_lossy().into_owned(),
             migration_state: "ready".into(),
@@ -2840,23 +2919,12 @@ mod reset_tests {
             last_error: None,
             previous_model_store: None,
         };
-        schedule_model_store_migration(
-            &config_dir,
-            &source,
-            &destination_parent,
-            &[],
-            status,
-        )
-        .expect("schedule model store migration");
+        schedule_model_store_migration(&config_dir, &source, &destination_parent, &[], status)
+            .expect("schedule model store migration");
         // 用同名文件堵住目标目录，让复制必然失败。
-        fs::write(
-            destination_parent.join("FanFanModelStore"),
-            b"blocked",
-        )
-        .expect("block target");
+        fs::write(destination_parent.join("FanFanModelStore"), b"blocked").expect("block target");
 
-        let (active, error) =
-            resolve_model_store_directory(&config_dir, &source, &[]);
+        let (active, error) = resolve_model_store_directory(&config_dir, &source, &[]);
         assert!(error.is_some());
         assert_eq!(active, source);
         let config = read_model_store_location_config(&config_dir).expect("read config");
@@ -2967,8 +3035,11 @@ mod reset_tests {
         fs::create_dir_all(source.join("indexes")).expect("create source");
         fs::create_dir_all(&destination_parent).expect("create destination parent");
         fs::write(source.join("fanfan.db"), b"database-v14").expect("write database");
-        fs::write(source.join("indexes").join("active.usearch"), b"vector-index")
-            .expect("write index");
+        fs::write(
+            source.join("indexes").join("active.usearch"),
+            b"vector-index",
+        )
+        .expect("write index");
 
         schedule_storage_migration(&config_dir, &source, &destination_parent, &[])
             .expect("schedule migration");
@@ -3009,7 +3080,8 @@ mod reset_tests {
         schedule_storage_migration(&config_dir, &source, &destination_parent, &[])
             .expect("schedule migration");
 
-        let error = cleanup_storage_migration(&config_dir, &source).expect_err("refuse while pending");
+        let error =
+            cleanup_storage_migration(&config_dir, &source).expect_err("refuse while pending");
         assert_eq!(error.code, "STORAGE_MIGRATION_CLEANUP_PENDING");
         assert!(source.join("fanfan.db").is_dir() || source.is_dir());
         fs::remove_dir_all(base).expect("clean storage cleanup pending test directory");
@@ -3028,15 +3100,18 @@ mod reset_tests {
         fs::create_dir_all(source.join("indexes")).expect("create source");
         fs::create_dir_all(&destination_parent).expect("create destination parent");
         fs::write(source.join("fanfan.db"), b"database-v14").expect("write database");
-        fs::write(source.join("indexes").join("active.usearch"), b"vector-index")
-            .expect("write index");
+        fs::write(
+            source.join("indexes").join("active.usearch"),
+            b"vector-index",
+        )
+        .expect("write index");
         schedule_storage_migration(&config_dir, &source, &destination_parent, &[])
             .expect("schedule migration");
         let active = execute_pending_migration_for_test(&config_dir, &source);
         fs::remove_file(active.join(MANAGED_STORAGE_MARKER)).expect("remove active marker");
 
-        let error =
-            cleanup_storage_migration(&config_dir, &active).expect_err("refuse when marker missing");
+        let error = cleanup_storage_migration(&config_dir, &active)
+            .expect_err("refuse when marker missing");
         assert_eq!(error.code, "STORAGE_MIGRATION_CLEANUP_VERIFICATION_FAILED");
         assert!(source.is_dir(), "校验失败时旧目录必须原样保留");
         assert!(active.join("fanfan.db").is_file());
@@ -3057,10 +3132,12 @@ mod reset_tests {
         fs::create_dir_all(&quarantine).expect("create quarantine");
         fs::write(quarantine.join("leftover.db"), b"leftover").expect("write leftover");
         fs::write(active.join("fanfan.db"), b"active-db").expect("write active db");
-        let mut config = StorageLocationConfig::default();
-        config.active_data_directory = Some(active.to_string_lossy().into_owned());
-        config.cleanup_quarantine = Some(quarantine.to_string_lossy().into_owned());
-        config.previous_data_directory = Some(active.to_string_lossy().into_owned());
+        let config = StorageLocationConfig {
+            active_data_directory: Some(active.to_string_lossy().into_owned()),
+            cleanup_quarantine: Some(quarantine.to_string_lossy().into_owned()),
+            previous_data_directory: Some(active.to_string_lossy().into_owned()),
+            ..StorageLocationConfig::default()
+        };
         write_storage_location_config(&config_dir, &config).expect("write interrupted config");
 
         let (resolved, _) = resolve_application_data_directory(&config_dir, &active);
@@ -3086,14 +3163,8 @@ mod reset_tests {
         let manager = ModelManager::open_store(&source).expect("open source store");
         let status = manager.store_status().expect("base status");
         fs::write(source.join("sample-model.gguf"), b"model bytes").expect("write model file");
-        schedule_model_store_migration(
-            &config_dir,
-            &source,
-            &destination_parent,
-            &[],
-            status,
-        )
-        .expect("schedule model store migration");
+        schedule_model_store_migration(&config_dir, &source, &destination_parent, &[], status)
+            .expect("schedule model store migration");
         let (active, error) =
             resolve_model_store_directory(&config_dir, &source, std::slice::from_ref(&source));
         assert!(error.is_none());
@@ -3128,14 +3199,8 @@ mod reset_tests {
         fs::create_dir_all(&destination_parent).expect("create destination parent");
         let manager = ModelManager::open_store(&source).expect("open source store");
         let status = manager.store_status().expect("base status");
-        schedule_model_store_migration(
-            &config_dir,
-            &source,
-            &destination_parent,
-            &[],
-            status,
-        )
-        .expect("schedule model store migration");
+        schedule_model_store_migration(&config_dir, &source, &destination_parent, &[], status)
+            .expect("schedule model store migration");
 
         let error = cleanup_model_store_migration(&config_dir, &source)
             .expect_err("refuse model cleanup while pending");
@@ -3210,14 +3275,8 @@ mod reset_tests {
         let manager = ModelManager::open_store(&source).expect("open source store");
         let status = manager.store_status().expect("base status");
         fs::write(source.join("sample-model.gguf"), b"model bytes").expect("write model file");
-        schedule_model_store_migration(
-            &config_dir,
-            &source,
-            &destination_parent,
-            &[],
-            status,
-        )
-        .expect("schedule first migration");
+        schedule_model_store_migration(&config_dir, &source, &destination_parent, &[], status)
+            .expect("schedule first migration");
         let (_, error) =
             resolve_model_store_directory(&config_dir, &source, std::slice::from_ref(&source));
         assert!(error.is_none());
@@ -3251,14 +3310,8 @@ mod reset_tests {
         let manager = ModelManager::open_store(&source).expect("open source store");
         let status = manager.store_status().expect("base status");
         fs::write(source.join("sample-model.gguf"), b"model bytes").expect("write model file");
-        schedule_model_store_migration(
-            &config_dir,
-            &source,
-            &destination_parent,
-            &[],
-            status,
-        )
-        .expect("schedule migration");
+        schedule_model_store_migration(&config_dir, &source, &destination_parent, &[], status)
+            .expect("schedule migration");
         let (active, error) =
             resolve_model_store_directory(&config_dir, &source, std::slice::from_ref(&source));
         assert!(error.is_none());
@@ -3270,7 +3323,10 @@ mod reset_tests {
         let config =
             read_model_store_location_config(&config_dir).expect("read config after cleanup");
         assert!(config.previous_model_store.is_none(), "引用应被清空");
-        assert!(active.join(MODEL_STORE_READY_MARKER).is_file(), "当前仓库不受影响");
+        assert!(
+            active.join(MODEL_STORE_READY_MARKER).is_file(),
+            "当前仓库不受影响"
+        );
         fs::remove_dir_all(base).expect("clean model cleanup gone test directory");
     }
 }

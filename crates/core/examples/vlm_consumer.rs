@@ -67,7 +67,11 @@ fn run() -> Result<(), AppError> {
     }
     if let Some(file_id) = argument_value("--retry-ocr") {
         let file_id = uuid::Uuid::parse_str(&file_id).map_err(|error| {
-            AppError::new("VLM_CONSUMER_INVALID_FILE_ID", format!("file_id 无效: {error}"), false)
+            AppError::new(
+                "VLM_CONSUMER_INVALID_FILE_ID",
+                format!("file_id 无效: {error}"),
+                false,
+            )
         })?;
         catalog.retry_ocr(&file_id)?;
         println!("已重试 OCR: file_id={file_id}（重新排队为 pending,等待解析侧car重渲页面）");
@@ -78,15 +82,13 @@ fn run() -> Result<(), AppError> {
         backfill_embeddings(&repository_root, &manager, &catalog)?;
         return Ok(());
     }
-    let vision = manager
-        .active_artifact(ModelRole::Vision)?
-        .ok_or_else(|| {
-            AppError::new(
-                "VLM_CONSUMER_VISION_UNAVAILABLE",
-                "本地评测需要已通过完整性检查的视觉语言模型",
-                false,
-            )
-        })?;
+    let vision = manager.active_artifact(ModelRole::Vision)?.ok_or_else(|| {
+        AppError::new(
+            "VLM_CONSUMER_VISION_UNAVAILABLE",
+            "本地评测需要已通过完整性检查的视觉语言模型",
+            false,
+        )
+    })?;
     let projector = manager.vision_projector_path(&vision)?;
     let (total, ready, pending) = catalog.image_understanding_stats()?;
     println!(
@@ -98,10 +100,7 @@ fn run() -> Result<(), AppError> {
     }
 
     let mut runtime = select_generation_runtime(&repository_root, &data_directory)?;
-    let context_size = vision
-        .context_length
-        .unwrap_or(4_096)
-        .clamp(2_048, 8_192);
+    let context_size = vision.context_length.unwrap_or(4_096).clamp(2_048, 8_192);
     let model_artifact_id = vision.artifact_id.to_string();
     let cancelled = AtomicBool::new(false);
     let started = Instant::now();
@@ -119,7 +118,16 @@ fn run() -> Result<(), AppError> {
             println!("队列已空,结束");
             break;
         };
-        match process_one(&catalog, &mut runtime, &cancelled, &vision.local_path, &projector, context_size, &model_artifact_id, &pending) {
+        match process_one(
+            &catalog,
+            &mut runtime,
+            &cancelled,
+            &vision.local_path,
+            &projector,
+            context_size,
+            &model_artifact_id,
+            &pending,
+        ) {
             Ok(()) => {
                 processed += 1;
                 if catalog.promote_ocr_pending_file_when_assets_ready(&pending.file_id)? {
@@ -160,6 +168,7 @@ fn run() -> Result<(), AppError> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_one(
     catalog: &CatalogStore,
     runtime: &mut LocalGenerationRuntime,
@@ -171,7 +180,12 @@ fn process_one(
     pending: &PendingImageUnderstanding,
 ) -> Result<(), AppError> {
     if !runtime.is_active() {
-        runtime.activate_multimodal(model_path, projector.to_string_lossy().as_ref(), context_size, 4)?;
+        runtime.activate_multimodal(
+            model_path,
+            projector.to_string_lossy().as_ref(),
+            context_size,
+            4,
+        )?;
     }
     let text = runtime.describe_image_cancellable(
         "你是本地离线图片理解助手。",
@@ -211,35 +225,22 @@ struct VisionJson {
 
 fn parse_vision_json(text: &str) -> Result<VisionJson, AppError> {
     let trimmed = text.trim();
-    let start = trimmed.find('{').ok_or_else(|| {
-        AppError::new(
-            "VLM_JSON_INVALID",
-            "多模态模型响应缺少JSON对象",
-            false,
-        )
-    })?;
-    let end = trimmed.rfind('}').ok_or_else(|| {
-        AppError::new(
-            "VLM_JSON_INVALID",
-            "多模态模型响应缺少JSON结束符",
-            false,
-        )
-    })?;
-    let value: serde_json::Value = serde_json::from_str(&trimmed[start..=end]).map_err(|error| {
-        AppError::new("VLM_JSON_INVALID", format!("JSON解析失败: {error}"), false)
-    })?;
+    let start = trimmed
+        .find('{')
+        .ok_or_else(|| AppError::new("VLM_JSON_INVALID", "多模态模型响应缺少JSON对象", false))?;
+    let end = trimmed
+        .rfind('}')
+        .ok_or_else(|| AppError::new("VLM_JSON_INVALID", "多模态模型响应缺少JSON结束符", false))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&trimmed[start..=end]).map_err(|error| {
+            AppError::new("VLM_JSON_INVALID", format!("JSON解析失败: {error}"), false)
+        })?;
     let summary = value
         .get("summary")
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            AppError::new(
-                "VLM_JSON_INVALID",
-                "多模态模型响应缺少summary字段",
-                false,
-            )
-        })?;
+        .ok_or_else(|| AppError::new("VLM_JSON_INVALID", "多模态模型响应缺少summary字段", false))?;
     let strings = |key: &str| -> Vec<String> {
         value
             .get(key)
@@ -287,10 +288,7 @@ fn requeue_failed_files(catalog: &CatalogStore) -> Result<u64, AppError> {
         for item in page.items {
             match catalog.retry_inbox_item(&item.inbox_id) {
                 Ok(_) => requeued += 1,
-                Err(error) => eprintln!(
-                    "重试失败: inbox_id={} code={}",
-                    item.inbox_id, error.code
-                ),
+                Err(error) => eprintln!("重试失败: inbox_id={} code={}", item.inbox_id, error.code),
             }
         }
         if page.has_more {

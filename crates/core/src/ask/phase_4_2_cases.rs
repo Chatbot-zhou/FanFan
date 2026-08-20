@@ -15,15 +15,15 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::ask::answer_gate::{
-    AnswerabilityInput, AnswerabilityStatus, AnswerShape, GateEvidence, answer_shape_directive,
-    classify_answer_shape, claim_subject_mismatch, evaluate_answerability,
+    AnswerShape, AnswerabilityInput, AnswerabilityStatus, GateEvidence, answer_shape_directive,
+    claim_subject_mismatch, classify_answer_shape, evaluate_answerability,
     existence_requires_project_context, find_external_knowledge_marker, local_no_evidence_answer,
 };
 use crate::ask::document_resolver::{ResolverInput, resolve_documents};
 use crate::ask::document_summary::{SectionChunk, build_document_sections};
-use crate::ask::extract::{extract_item_is_entity_like, is_project_list_question};
+use crate::ask::extract::{extract_item_is_entity_like, extract_prompt};
 use crate::ask::query_parser::parse_query_plan;
-use crate::ask::query_plan::{QueryIntent, ResolutionStatus};
+use crate::ask::query_plan::{QueryIntent, QueryOperation, QuestionShape, ResolutionStatus};
 use crate::ask::source_router::parse_source_routing;
 use crate::contracts::{DocumentType, SourceLocator};
 use crate::knowledge::{AskSessionContext, DocumentProfile};
@@ -32,7 +32,10 @@ use crate::knowledge::{AskSessionContext, DocumentProfile};
 
 /// 构造 QA（operation=answer）计划：与真实 Query Parser 输出同构，
 /// Answerability Gate / answer_shape 走「普通回答」语义。
-fn qa_answer_plan(reference: &str, content_query: Option<&str>) -> crate::ask::query_plan::QueryPlan {
+fn qa_answer_plan(
+    reference: &str,
+    content_query: Option<&str>,
+) -> crate::ask::query_plan::QueryPlan {
     let content_query_json = content_query
         .map(|query| format!("\"{query}\""))
         .unwrap_or_else(|| "null".to_owned());
@@ -113,8 +116,14 @@ fn case_1_rag_question_rejects_agent_evidence() {
         content_query: Some("RAG"),
         plan: &plan,
         evidence: &[
-            evidence("RAG（检索增强生成）先检索知识库再生成回答，缓解幻觉。", None),
-            evidence("retrieval-augmented generation 通过检索外部知识增强上下文。", None),
+            evidence(
+                "RAG（检索增强生成）先检索知识库再生成回答，缓解幻觉。",
+                None,
+            ),
+            evidence(
+                "retrieval-augmented generation 通过检索外部知识增强上下文。",
+                None,
+            ),
         ],
     };
     let verdict = evaluate_answerability(&answerable);
@@ -136,15 +145,18 @@ fn case_1_rag_question_rejects_agent_evidence() {
 #[test]
 fn case_2_agent_project_existence_needs_project_context() {
     let question = "我以前有没有做过 Agent 项目？";
-    let plan = qa_answer_plan("我的经历", Some("Agent 项目"));
+    // LLM Parser 输出：存在性断言 + 需要项目语境证据
+    let mut plan = qa_answer_plan("我的经历", Some("Agent 项目"));
+    plan.question_shape = QuestionShape::BooleanExistence;
+    plan.requires_project_context = true;
     let shape = classify_answer_shape(question, &plan);
     assert_eq!(shape, AnswerShape::BooleanExistence);
     // 生成指令必须约束第一条 claim 给出存在性结论
     let directive = answer_shape_directive(shape);
     assert!(directive.contains("第一条"));
 
-    // 「有没有做过项目」需要 PROJECT_CONTEXT 证据
-    assert!(existence_requires_project_context(question));
+    // 「有没有做过项目」需要 PROJECT_CONTEXT 证据（依据 LLM 解析字段）
+    assert!(existence_requires_project_context(question, &plan));
 
     // 纯概念证据 → 不可回答为「有」
     let concept_only = AnswerabilityInput {
@@ -152,7 +164,10 @@ fn case_2_agent_project_existence_needs_project_context() {
         content_query: Some("Agent 项目"),
         plan: &plan,
         evidence: &[
-            evidence("Agent 是一种能够感知环境、自主决策的智能体。", Some("Agent 概念")),
+            evidence(
+                "Agent 是一种能够感知环境、自主决策的智能体。",
+                Some("Agent 概念"),
+            ),
             evidence("Agent 会选择工具并读取工具结果。", None),
         ],
     };
@@ -268,12 +283,7 @@ fn case_5_graduation_material_multiple_candidates_require_clarification() {
     file_names.insert(design.file_id, "毕业设计.docx".to_owned());
     file_names.insert(defense.file_id, "毕业答辩材料.pptx".to_owned());
     let session = AskSessionContext::default();
-    let input = ResolverInput::new(
-        &plan,
-        &session,
-        vec![thesis, design, defense],
-        file_names,
-    );
+    let input = ResolverInput::new(&plan, &session, vec![thesis, design, defense], file_names);
     let resolution = resolve_documents(&input);
     assert_eq!(
         resolution.status,
@@ -285,19 +295,37 @@ fn case_5_graduation_material_multiple_candidates_require_clarification() {
 
 // ------------------------------------------------------ CASE 6：项目抽取验证
 
-/// CASE 6：「我那个大模型的材料里面有啥项目」——项目清单问题命中抽取
-/// 规范；模型输出的完整描述句必须被类型验证拒绝（不是项目名称实体）。
+/// CASE 6：「我那个大模型的材料里面有啥项目」——LLM Query Parser 语义判定
+/// 为实体清单（requires_entity_items=true），prompt 追加实体规范；模型输出
+/// 的完整描述句必须被类型验证拒绝（不是项目名称实体）。
 #[test]
 fn case_6_project_extract_rejects_narrative_sentences() {
     let question = "我那个大模型的材料里面有啥项目";
-    assert!(is_project_list_question(question));
+    // LLM Query Parser 语义判断：项目清单 → operation=extract + requires_entity_items=true
+    let plan = crate::ask::query_plan::QueryPlan {
+        operation: QueryOperation::Extract,
+        question_shape: QuestionShape::List,
+        requires_entity_items: true,
+        ..crate::ask::query_plan::QueryPlan::default()
+    };
+    assert!(plan.requires_entity_items);
+    // 实体规范写入抽取 prompt（不再用关键词表猜「项目清单」）
+    let (_, user) = extract_prompt(
+        question,
+        plan.requires_entity_items,
+        &["大模型应用开发".to_owned()],
+    );
+    assert!(user.contains("实体/名称"));
+    assert!(user.contains("严禁输出整段技术点描述或叙事长句"));
 
     // 真实事故输出：整段描述句 → 拒绝
     let narrative = "大模型不仅负责生成文本，还会根据目标判断下一步、选择工具并读取工具结果";
     assert!(!extract_item_is_entity_like(narrative));
 
     // 概念定义句 → 拒绝（不是项目名）
-    assert!(!extract_item_is_entity_like("Agent 是一种能够自主决策的智能体"));
+    assert!(!extract_item_is_entity_like(
+        "Agent 是一种能够自主决策的智能体"
+    ));
 
     // 真实项目名（短实体/标题式）→ 接受
     assert!(extract_item_is_entity_like("法律RAG项目"));
@@ -317,7 +345,10 @@ fn case_7_langgraph_routes_to_general_model_capability_noted() {
         r#"{"source":"general","confidence":0.9,"reason":"通用技术概念解释"}"#,
     )
     .expect("general routing fixture parses");
-    assert_eq!(routing.source, crate::ask::query_plan::SourceIntent::General);
+    assert_eq!(
+        routing.source,
+        crate::ask::query_plan::SourceIntent::General
+    );
     // 能力限制记录：LOCAL 严格证据约束不适用于 GENERAL，但本地资料
     // 回答永远不串用 GENERAL 模型知识（两模式 prompt 完全分离）。
     assert!(crate::ask::answer_gate::LOCAL_STRICT_SYSTEM_PROMPT.contains("LOCAL STRICT MODE"));

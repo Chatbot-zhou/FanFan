@@ -22,8 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ask::query_normalize::is_existence_question;
-use crate::ask::query_plan::{QueryIntent, QueryOperation, QueryPlan};
+use crate::ask::query_plan::{QueryIntent, QueryOperation, QueryPlan, QuestionShape};
 
 // ============================================================
 // AnswerShape（spec 四：QA 类型需要专门 Answer Semantics）
@@ -67,33 +66,12 @@ impl AnswerShape {
     }
 }
 
-/// 清单型问题标记（「有哪些/哪些/列一下」）。
-const LIST_MARKERS: &[&str] = &[
-    "有哪些", "哪些项目", "哪些技能", "哪些内容", "都有什么", "都有哪些",
-    "列一下", "列出来", "清单", "列表", "有几", "什么项目",
-];
-/// 描述型问题标记（「是什么/怎么介绍/描述」）。
-const DESCRIPTION_MARKERS: &[&str] = &[
-    "是什么", "什么是", "怎么介绍", "如何介绍", "介绍一下", "介绍下",
-    "描述", "解释", "讲解", "讲了什么", "说的是什么", "是怎么",
-];
-/// 事实查询标记（数字/时间/人名等精确值）。
-const FACT_MARKERS: &[&str] = &[
-    "多少", "几号", "几点", "什么时候", "日期", "价格", "金额", "费用",
-    "编号", "电话", "邮箱", "地址", "版本号", "截止", "到期", "谁",
-];
-/// 概括型问题标记。
-const SUMMARY_MARKERS: &[&str] = &[
-    "主要写了什么", "主要写什么", "主要讲了什么", "总结一下", "概括",
-    "摘要", "主要内容", "写了啥", "讲了啥",
-];
-/// 定位型问题标记。
-const LOCATION_MARKERS: &[&str] = &["在哪", "在哪儿", "哪个位置", "第几页", "位置", "哪里"];
-
-/// 从问题与 QueryPlan 确定性推导回答语义形态。
-/// operation 优先（compare / find / summary / extract 是结构性意图），
-/// 其后按标记词长度优先匹配（「有哪些项目」是 List 而非 Description）。
-pub fn classify_answer_shape(question: &str, plan: &QueryPlan) -> AnswerShape {
+/// 从 QueryPlan 推导回答语义形态（AI 优先）：intent / operation /
+/// question_shape 全部来自 LLM QueryParser 的语义解析输出，此处只做
+/// 「结构化意图 → 回答形态」的映射，不再用问题关键词表（有哪些/多少/
+/// 在哪/是什么…）硬编码猜测形态。
+pub fn classify_answer_shape(_question: &str, plan: &QueryPlan) -> AnswerShape {
+    // 结构性意图优先（来自 LLM Parser 的 intent / operation）
     match plan.intent {
         QueryIntent::CompareDocuments => return AnswerShape::Compare,
         QueryIntent::DocumentFind => return AnswerShape::Location,
@@ -103,26 +81,15 @@ pub fn classify_answer_shape(question: &str, plan: &QueryPlan) -> AnswerShape {
     if plan.operation == QueryOperation::Extract {
         return AnswerShape::Extract;
     }
-    let folded = question.trim().to_lowercase();
-    if is_existence_question(question) {
-        return AnswerShape::BooleanExistence;
+    // 其余形态由 LLM Parser 的 question_shape 语义判断决定
+    match plan.question_shape {
+        QuestionShape::BooleanExistence => AnswerShape::BooleanExistence,
+        QuestionShape::List => AnswerShape::List,
+        QuestionShape::Location => AnswerShape::Location,
+        QuestionShape::Summary => AnswerShape::Summary,
+        QuestionShape::Fact => AnswerShape::FactLookup,
+        QuestionShape::Description => AnswerShape::Description,
     }
-    if SUMMARY_MARKERS.iter().any(|marker| folded.contains(marker)) {
-        return AnswerShape::Summary;
-    }
-    if LIST_MARKERS.iter().any(|marker| folded.contains(marker)) {
-        return AnswerShape::List;
-    }
-    if LOCATION_MARKERS.iter().any(|marker| folded.contains(marker)) {
-        return AnswerShape::Location;
-    }
-    if DESCRIPTION_MARKERS.iter().any(|marker| folded.contains(marker)) {
-        return AnswerShape::Description;
-    }
-    if FACT_MARKERS.iter().any(|marker| folded.contains(marker)) {
-        return AnswerShape::FactLookup;
-    }
-    AnswerShape::Description
 }
 
 /// 各形态的生成约束（追加到 generation prompt 尾部，紧邻输出位置）。
@@ -171,18 +138,25 @@ pub fn answer_shape_directive(shape: AnswerShape) -> String {
 
 /// 抽取实体时忽略的英文功能词（问题句式词，不是实体）。
 const ENGLISH_STOPWORDS: &[&str] = &[
-    "the", "a", "an", "is", "are", "was", "were", "be", "been", "what", "which",
-    "who", "whose", "how", "why", "when", "where", "of", "in", "on", "at", "for",
-    "to", "and", "or", "not", "no", "do", "does", "did", "have", "has", "had",
-    "my", "me", "i", "you", "your", "it", "its", "this", "that", "these",
-    "those", "with", "about", "there", "here", "can", "could", "should", "would",
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "what", "which", "who", "whose",
+    "how", "why", "when", "where", "of", "in", "on", "at", "for", "to", "and", "or", "not", "no",
+    "do", "does", "did", "have", "has", "had", "my", "me", "i", "you", "your", "it", "its", "this",
+    "that", "these", "those", "with", "about", "there", "here", "can", "could", "should", "would",
 ];
 
 /// 实体等价变体表（通用机制，非针对单一问题的硬编码）：常见技术缩写 ↔
 /// 中英文全称。命中任一变体即视为「证据中出现了该实体」。表保持保守——
 /// 只收真实通行的展开，避免把缩写错误扩大成别的概念。
 const ENTITY_VARIANTS: &[(&str, &[&str])] = &[
-    ("rag", &["检索增强", "retrieval augmented", "retrieval-augmented", "retrieval augmented generation"]),
+    (
+        "rag",
+        &[
+            "检索增强",
+            "retrieval augmented",
+            "retrieval-augmented",
+            "retrieval augmented generation",
+        ],
+    ),
     ("llm", &["大模型", "大语言模型", "large language model"]),
     ("agent", &["智能体"]),
     ("nlp", &["自然语言处理", "natural language processing"]),
@@ -197,10 +171,7 @@ const ENTITY_VARIANTS: &[(&str, &[&str])] = &[
 /// 实体在证据中的变体展开（小写；无变体的实体返回自身）。
 fn entity_surface_forms(entity: &str) -> Vec<String> {
     let mut forms = vec![entity.to_owned()];
-    if let Some((_, variants)) = ENTITY_VARIANTS
-        .iter()
-        .find(|(key, _)| *key == entity)
-    {
+    if let Some((_, variants)) = ENTITY_VARIANTS.iter().find(|(key, _)| *key == entity) {
         forms.extend(variants.iter().map(|variant| (*variant).to_owned()));
     }
     forms
@@ -215,7 +186,9 @@ fn entity_appears_in(entity: &str, evidence_lower: &str) -> bool {
     for form in entity_surface_forms(entity) {
         let form_lower = form.to_lowercase();
         // 中文变体（含 CJK）按子串命中（中文没有词边界）
-        let has_cjk = form_lower.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch));
+        let has_cjk = form_lower
+            .chars()
+            .any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch));
         if has_cjk {
             if evidence_lower.contains(&form_lower) {
                 return true;
@@ -313,17 +286,47 @@ impl EvidenceRole {
 
 /// 项目语境标记：出现即认为该证据处于「项目经历」语境。
 const PROJECT_CONTEXT_MARKERS: &[&str] = &[
-    "项目经历", "项目经验", "项目名称", "项目背景", "项目简介",
-    "负责", "参与开发", "参与设计", "主导", "职责", "成果", "交付",
-    "系统设计", "架构设计", "落地", "上线",
+    "项目经历",
+    "项目经验",
+    "项目名称",
+    "项目背景",
+    "项目简介",
+    "负责",
+    "参与开发",
+    "参与设计",
+    "主导",
+    "职责",
+    "成果",
+    "交付",
+    "系统设计",
+    "架构设计",
+    "落地",
+    "上线",
 ];
 /// 概念解释标记。
 const CONCEPT_MARKERS: &[&str] = &[
-    "是一种", "是 一种", "指的是", "是指", "定义为", "概念", "定义",
-    "原理", "会根据", "可以用来", "被用来",
+    "是一种",
+    "是 一种",
+    "指的是",
+    "是指",
+    "定义为",
+    "概念",
+    "定义",
+    "原理",
+    "会根据",
+    "可以用来",
+    "被用来",
 ];
 /// 人物信息标记。
-const PERSON_MARKERS: &[&str] = &["姓名", "联系方式", "电话", "邮箱", "个人简介", "性别", "出生"];
+const PERSON_MARKERS: &[&str] = &[
+    "姓名",
+    "联系方式",
+    "电话",
+    "邮箱",
+    "个人简介",
+    "性别",
+    "出生",
+];
 /// 文档元数据标记。
 const METADATA_MARKERS: &[&str] = &["基本信息", "目录", "标题", "版本", "编制", "页数"];
 
@@ -369,13 +372,12 @@ pub fn classify_evidence_role(text: &str, heading: Option<&str>) -> EvidenceRole
 }
 
 /// 存在性断言是否要求项目语境证据（「我以前有没有做过 Agent 项目？」）。
-/// 命中条件：存在性问句 + 含「项目」+ 含「做过/参与/开发/负责/经历」。
-pub fn existence_requires_project_context(question: &str) -> bool {
-    is_existence_question(question)
-        && question.contains("项目")
-        && ["做过", "参与", "开发", "负责", "经历", "参加"]
-            .iter()
-            .any(|marker| question.contains(marker))
+/// 判定依据来自 LLM QueryParser 输出的 requires_project_context 字段——
+/// 模型语义判断「问题是否断言了做过/参与过某类项目经历」，不再用关键词
+/// 表（有没有 + 项目 + 做过…）硬编码猜测。
+pub fn existence_requires_project_context(question: &str, plan: &QueryPlan) -> bool {
+    let _ = question;
+    plan.requires_project_context && plan.question_shape == QuestionShape::BooleanExistence
 }
 
 // ============================================================
@@ -512,10 +514,8 @@ pub fn evaluate_answerability(input: &AnswerabilityInput) -> AnswerabilityVerdic
     }
 
     // 规则 3：项目存在性断言需要 PROJECT 语境证据（spec 五）
-    let requires_project = existence_requires_project_context(input.question);
-    if requires_project
-        && !evidence_roles.iter().any(|role| *role == EvidenceRole::Project)
-    {
+    let requires_project = existence_requires_project_context(input.question, input.plan);
+    if requires_project && !evidence_roles.contains(&EvidenceRole::Project) {
         return AnswerabilityVerdict {
             status: AnswerabilityStatus::NotAnswerable,
             confidence: 0.2,
@@ -580,9 +580,20 @@ pub const LOCAL_STRICT_SYSTEM_PROMPT: &str = "你是翻翻的本地资料回答�
 /// 领域，如 BERT、GPT……」的后半句不允许）。标记保持具体短语，
 /// 降低与证据原文的误撞率。
 pub const EXTERNAL_KNOWLEDGE_MARKERS: &[&str] = &[
-    "一般来说", "通常来说", "根据一般知识", "根据常识", "根据通用知识",
-    "建议联系管理员", "联系资料库管理员", "联系管理员", "最新版本可能有",
-    "通常用于", "通常会", "一般会", "你可以参考", "你可以查阅",
+    "一般来说",
+    "通常来说",
+    "根据一般知识",
+    "根据常识",
+    "根据通用知识",
+    "建议联系管理员",
+    "联系资料库管理员",
+    "联系管理员",
+    "最新版本可能有",
+    "通常用于",
+    "通常会",
+    "一般会",
+    "你可以参考",
+    "你可以查阅",
     "一般来说包括",
 ];
 
@@ -605,7 +616,8 @@ pub fn local_no_evidence_answer(
 ) -> String {
     if requires_project_context {
         return "目前资料中没有找到能够证明这一点的项目记录（项目经历/负责/成果等）,\
-因此暂时无法确认。".to_owned();
+因此暂时无法确认。"
+            .to_owned();
     }
     if let Some(entity) = missing_entities.first() {
         return format!("当前资料中没有找到明确提到 {entity} 的内容。");
@@ -622,7 +634,13 @@ pub fn local_no_evidence_answer(
 /// 这类 claim 的证据本来就不含被问实体。
 pub fn claim_subject_mismatch(claim_text: &str, evidence_quotes: &[&str]) -> Option<String> {
     const NEGATIVE_MARKERS: &[&str] = &[
-        "没有找到", "未找到", "未提及", "没有提到", "未出现", "不足以", "无法确认",
+        "没有找到",
+        "未找到",
+        "未提及",
+        "没有提到",
+        "未出现",
+        "不足以",
+        "无法确认",
     ];
     if NEGATIVE_MARKERS
         .iter()
@@ -655,6 +673,9 @@ mod tests {
             source: SourceIntent::Local,
             intent,
             operation,
+            question_shape: QuestionShape::Description,
+            requires_project_context: false,
+            requires_entity_items: false,
             target: QueryTarget::default(),
             secondary_target: None,
             content_query: None,
@@ -676,8 +697,9 @@ mod tests {
 
     #[test]
     fn classifies_boolean_existence() {
-        // CASE 2：「我以前有没有做过 Agent 项目？」
-        let p = plan(QueryIntent::DocumentQa, QueryOperation::Qa);
+        // 存在性形态来自 LLM Parser 的 question_shape（不再是问题关键词判定）
+        let mut p = plan(QueryIntent::DocumentQa, QueryOperation::Qa);
+        p.question_shape = QuestionShape::BooleanExistence;
         assert_eq!(
             classify_answer_shape("我以前有没有做过 Agent 项目？", &p),
             AnswerShape::BooleanExistence
@@ -695,26 +717,31 @@ mod tests {
             classify_answer_shape("我的资料里是怎么介绍 RAG 的？", &qa),
             AnswerShape::Description
         );
+        // 形态由 LLM Parser 的 question_shape 决定（不再是关键词标记）
+        let mut list_plan = qa.clone();
+        list_plan.question_shape = QuestionShape::List;
         assert_eq!(
-            classify_answer_shape("我的简历里面有哪些项目", &qa),
+            classify_answer_shape("我的简历里面有哪些项目", &list_plan),
             AnswerShape::List
         );
+        let mut fact_plan = qa.clone();
+        fact_plan.question_shape = QuestionShape::Fact;
         assert_eq!(
-            classify_answer_shape("合同金额是多少", &qa),
+            classify_answer_shape("合同金额是多少", &fact_plan),
             AnswerShape::FactLookup
         );
         assert_eq!(
-            classify_answer_shape("我的简历主要写了什么？", &plan(
-                QueryIntent::DocumentSummary,
-                QueryOperation::Summary
-            )),
+            classify_answer_shape(
+                "我的简历主要写了什么？",
+                &plan(QueryIntent::DocumentSummary, QueryOperation::Summary)
+            ),
             AnswerShape::Summary
         );
         assert_eq!(
-            classify_answer_shape("随便问点什么", &plan(
-                QueryIntent::CompareDocuments,
-                QueryOperation::Compare
-            )),
+            classify_answer_shape(
+                "随便问点什么",
+                &plan(QueryIntent::CompareDocuments, QueryOperation::Compare)
+            ),
             AnswerShape::Compare
         );
     }
@@ -774,11 +801,20 @@ mod tests {
 
     #[test]
     fn existence_requires_project_detection() {
-        // CASE 2
-        assert!(existence_requires_project_context("我以前有没有做过 Agent 项目？"));
-        // 「资料里有没有提到 X」不需要项目语境（是「提到」断言）
+        // 依据 LLM Parser 的 requires_project_context + question_shape
+        let mut project = plan(QueryIntent::DocumentQa, QueryOperation::Qa);
+        project.question_shape = QuestionShape::BooleanExistence;
+        project.requires_project_context = true;
+        assert!(existence_requires_project_context(
+            "我以前有没有做过 Agent 项目？",
+            &project
+        ));
+        // 「资料里有没有提到 X」LLM 不判需要项目语境 → false
+        let mut mention = plan(QueryIntent::DocumentQa, QueryOperation::Qa);
+        mention.question_shape = QuestionShape::BooleanExistence;
         assert!(!existence_requires_project_context(
-            "我的文件里有没有提到 Transformer？"
+            "我的文件里有没有提到 Transformer？",
+            &mention
         ));
     }
 
@@ -825,7 +861,10 @@ mod tests {
     #[test]
     fn case_b_agent_project_existence_needs_project_evidence() {
         // CASE 2：普通 Agent 概念证据不能证明「做过 Agent 项目」
-        let p = plan(QueryIntent::LibraryQa, QueryOperation::Qa);
+        // LLM Parser 输出：存在性断言 + 需要项目语境证据
+        let mut p = plan(QueryIntent::LibraryQa, QueryOperation::Qa);
+        p.question_shape = QuestionShape::BooleanExistence;
+        p.requires_project_context = true;
         let concept = evidence("Agent 是一种…会根据目标选择工具。", None);
         let input = AnswerabilityInput {
             question: "我以前有没有做过 Agent 项目？",
@@ -913,17 +952,21 @@ mod tests {
         );
         assert_eq!(mismatch.as_deref(), Some("rag"));
         // 主体一致 → 放行
-        assert!(claim_subject_mismatch(
-            "RAG 通过先检索再生成缓解幻觉。",
-            &["RAG（检索增强生成）先检索资料再生成回答。"],
-        )
-        .is_none());
+        assert!(
+            claim_subject_mismatch(
+                "RAG 通过先检索再生成缓解幻觉。",
+                &["RAG（检索增强生成）先检索资料再生成回答。"],
+            )
+            .is_none()
+        );
         // 负向 claim 跳过（其证据本来就不含被问实体）
-        assert!(claim_subject_mismatch(
-            "资料中没有找到 LangGraph 相关的项目记录。",
-            &["项目经历：基于 RAG 的问答系统。"],
-        )
-        .is_none());
+        assert!(
+            claim_subject_mismatch(
+                "资料中没有找到 LangGraph 相关的项目记录。",
+                &["项目经历：基于 RAG 的问答系统。"],
+            )
+            .is_none()
+        );
         // 无实体的纯中文 claim 跳过
         assert!(claim_subject_mismatch("合同要求分期付款。", &["付款方式为分期支付。"]).is_none());
     }

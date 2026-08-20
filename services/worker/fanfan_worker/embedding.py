@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .protocol import WorkerError
-from .runtime_cache import get_onnx_session
+from .runtime_cache import get_onnx_session, run_with_cpu_fallback
 
 
 def encode_texts(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, WorkerError | None]:
@@ -13,6 +13,7 @@ def encode_texts(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, Worker
     texts = payload.get("texts")
     max_length = payload.get("max_length", 512)
     threads = payload.get("threads", 2)
+    gpu_min_free_mb = payload.get("gpu_min_free_mb")
     if not isinstance(model_path_value, str) or not model_path_value:
         return None, WorkerError("EMBEDDING_MODEL_PATH_REQUIRED", "缺少ONNX向量模型路径", False)
     model_path = Path(model_path_value)
@@ -24,6 +25,12 @@ def encode_texts(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, Worker
         return None, WorkerError("EMBEDDING_INPUT_INVALID", "max_length必须在16到1024之间", False)
     if not isinstance(threads, int) or not 1 <= threads <= 8:
         return None, WorkerError("EMBEDDING_INPUT_INVALID", "线程数必须在1到8之间", False)
+    if gpu_min_free_mb is not None and (
+        not isinstance(gpu_min_free_mb, int)
+        or isinstance(gpu_min_free_mb, bool)
+        or not 512 <= gpu_min_free_mb <= 16_384
+    ):
+        return None, WorkerError("EMBEDDING_INPUT_INVALID", "GPU显存门槛必须在512到16384MiB之间", False)
     tokenizer_path_value = payload.get("tokenizer_path")
     tokenizer_path = Path(tokenizer_path_value) if isinstance(tokenizer_path_value, str) and tokenizer_path_value else model_path.parent / "tokenizer.json"
     if not tokenizer_path.is_file():
@@ -41,8 +48,10 @@ def encode_texts(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, Worker
         input_ids = np.asarray([item.ids for item in encoded], dtype=np.int64)
         attention_mask = np.asarray([item.attention_mask for item in encoded], dtype=np.int64)
         type_ids = np.asarray([item.type_ids for item in encoded], dtype=np.int64)
-        session = get_onnx_session(model_path, threads)
-        available_inputs = {item.name for item in session.get_inputs()}
+        handle = get_onnx_session(
+            model_path, threads, gpu_min_free_mb=gpu_min_free_mb
+        )
+        available_inputs = {item.name for item in handle.session.get_inputs()}
         feed: dict[str, Any] = {}
         for name in available_inputs:
             lowered = name.lower()
@@ -54,7 +63,9 @@ def encode_texts(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, Worker
                 feed[name] = input_ids
         if not feed:
             return None, WorkerError("EMBEDDING_MODEL_INCOMPATIBLE", "无法识别向量模型输入字段", False)
-        output = session.run(None, feed)[0]
+        output, handle = run_with_cpu_fallback(
+            handle, model_path, threads, feed
+        )
         array = np.asarray(output, dtype=np.float32)
         if array.ndim == 3:
             mask = attention_mask[..., None].astype(np.float32)
@@ -67,6 +78,14 @@ def encode_texts(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, Worker
         dimension = int(array.shape[1])
         if dimension <= 0 or any(not math.isfinite(float(value)) for vector in vectors for value in vector):
             return None, WorkerError("EMBEDDING_OUTPUT_INVALID", "向量模型返回了无效数值", False)
-        return {"vectors": vectors, "dimension": dimension, "model_path": str(model_path), "tokenizer_path": str(tokenizer_path)}, None
+        return {
+            "vectors": vectors,
+            "dimension": dimension,
+            "model_path": str(model_path),
+            "tokenizer_path": str(tokenizer_path),
+            "device": handle.device,
+            "execution_provider": handle.execution_provider,
+            "fallback_reason": handle.fallback_reason,
+        }, None
     except Exception as error:
         return None, WorkerError("EMBEDDING_INFERENCE_FAILED", str(error), True)

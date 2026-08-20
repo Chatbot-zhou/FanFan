@@ -59,26 +59,28 @@ pub fn extract_schema() -> serde_json::Value {
     })
 }
 
-/// 项目清单类问题的标记词（「有啥项目」等口语变体命中任一即套用项目实体规范）。
-const PROJECT_LIST_MARKERS: &[&str] = &[
-    "有哪些项目", "项目名称", "做过哪些项目", "有什么项目", "项目有哪些",
-    "项目列表", "都有什么项目", "哪些项目", "有啥项目", "做了哪些项目",
-];
-
-/// 问题是否为「项目清单」型（CASE 8：item 必须是项目名称实体，不是技术描述）。
-pub fn is_project_list_question(question: &str) -> bool {
-    let folded = question.trim().to_lowercase();
-    PROJECT_LIST_MARKERS
-        .iter()
-        .any(|marker| folded.contains(marker))
-}
-
 /// 叙事句标记：条目含任一即判为「整段描述句」而非实体名称
 ///（spec 十二：「大模型不仅负责生成文本，还会根据目标……」不能当 project_name）。
 const NARRATIVE_SENTENCE_MARKERS: &[&str] = &[
-    "不仅", "还会", "而且", "并且", "同时", "以及", "然后", "其次",
-    "是一种", "指的是", "是指", "会根据", "可以用来", "被用来",
-    "负责生成", "选择工具", "读取工具", "判断下一步", "处理复杂",
+    "不仅",
+    "还会",
+    "而且",
+    "并且",
+    "同时",
+    "以及",
+    "然后",
+    "其次",
+    "是一种",
+    "指的是",
+    "是指",
+    "会根据",
+    "可以用来",
+    "被用来",
+    "负责生成",
+    "选择工具",
+    "读取工具",
+    "判断下一步",
+    "处理复杂",
 ];
 /// 条目作为「实体名称」的宽松字符上限（超长几乎必是描述句；不死卡短上限，
 /// 结合叙事标记综合判断——spec 十二「不要死卡字数」）。
@@ -120,7 +122,15 @@ pub fn extract_item_is_entity_like(item: &str) -> bool {
 
 /// 构建抽取 prompt。materials 为已核验的事实句 + 证据原文摘引
 /// （编排层负责按 `EXTRACT_MATERIAL_CHARS` 截断）。
-pub fn extract_prompt(question: &str, materials: &[String]) -> (String, String) {
+///
+/// `requires_entity_items` 由 LLM Query Parser 语义判断（QueryPlan 字段）：
+/// 为 true 时问题要求清单条目必须是「实体/名称形式」（如项目名称），
+/// prompt 追加实体规范约束；不再用「有哪些项目」等关键词表硬编码判断。
+pub fn extract_prompt(
+    question: &str,
+    requires_entity_items: bool,
+    materials: &[String],
+) -> (String, String) {
     let system = "你是翻翻的结构化抽取助手。用户的问题要求从本地资料中抽取一份条目清单（如项目列表、技能列表、条款、日期、联系方式等）。只从提供的材料中抽取，每条目只保留材料里出现的内容；不得编造、不得合并材料中不存在的细节。只输出规定 JSON，不要输出 Markdown、代码块或解释。"
         .into();
     let mut user = String::new();
@@ -132,9 +142,9 @@ pub fn extract_prompt(question: &str, materials: &[String]) -> (String, String) 
             user.push_str(&format!("[M{}] {}\n", index + 1, material));
         }
     }
-    if is_project_list_question(question) {
+    if requires_entity_items {
         user.push_str(
-            "\n本次抽取任务是【项目清单】：每个 item 必须是【项目名称】这个实体——简短名词短语（例如「大模型应用开发」「基于 LangGraph 的知识库问答」），严禁输出整段技术点描述或叙事长句；evidence 为材料中支持该项目名称的最短原文片段。",
+            "\n本次抽取任务的条目必须是【实体/名称】形式：每个 item 是简短名词短语（例如「大模型应用开发」「基于 LangGraph 的知识库问答」），严禁输出整段技术点描述或叙事长句；evidence 为材料中支持该条目名称的最短原文片段。",
         );
     }
     user.push_str(
@@ -200,14 +210,11 @@ fn tolerant_json_object(raw: &str) -> Option<serde_json::Value> {
     if let Some(rest) = trimmed
         .strip_prefix("```json")
         .or_else(|| trimmed.strip_prefix("```"))
+        && let Some(stripped) = rest.strip_suffix("```")
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(stripped.trim())
+        && value.is_object()
     {
-        if let Some(stripped) = rest.strip_suffix("```") {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(stripped.trim())
-                && value.is_object()
-            {
-                return Some(value);
-            }
-        }
+        return Some(value);
     }
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
         && value.is_object()
@@ -247,16 +254,22 @@ fn tolerant_json_object(raw: &str) -> Option<serde_json::Value> {
 /// 最长公共子串长度（按 Unicode 字符计，忽略空白）。用于把模型抽取出的
 /// 条目确定性对齐到真实证据 chunk——对齐只看逐字符重叠，不信任模型编号。
 pub fn longest_common_substr_len(left: &str, right: &str) -> usize {
-    let left = left.chars().filter(|ch| !ch.is_whitespace()).collect::<Vec<_>>();
-    let right = right.chars().filter(|ch| !ch.is_whitespace()).collect::<Vec<_>>();
+    let left = left
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<Vec<_>>();
+    let right = right
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<Vec<_>>();
     if left.is_empty() || right.is_empty() {
         return 0;
     }
     let mut dp = vec![0usize; right.len()];
     let mut best = 0usize;
-    for i in 0..left.len() {
+    for (i, left_char) in left.iter().enumerate() {
         for j in (0..right.len()).rev() {
-            if left[i] == right[j] {
+            if *left_char == right[j] {
                 dp[j] = if i == 0 || j == 0 { 1 } else { dp[j - 1] + 1 };
                 best = best.max(dp[j]);
             } else {
@@ -323,7 +336,11 @@ mod tests {
     fn prompt_injects_question_and_materials() {
         let (system, user) = extract_prompt(
             "我的简历里面有哪些项目？",
-            &["项目经历：大模型应用开发".to_owned(), "项目经历：知识库问答".to_owned()],
+            true,
+            &[
+                "项目经历：大模型应用开发".to_owned(),
+                "项目经历：知识库问答".to_owned(),
+            ],
         );
         assert!(system.contains("结构化抽取助手"));
         assert!(user.contains("我的简历里面有哪些项目？"));
@@ -333,45 +350,26 @@ mod tests {
 
     #[test]
     fn empty_materials_still_produce_usable_prompt() {
-        let (_, user) = extract_prompt("有哪些技能？", &[]);
+        let (_, user) = extract_prompt("有哪些技能？", false, &[]);
         assert!(user.contains("（无材料）"));
     }
 
     #[test]
-    fn project_list_question_detected() {
-        // CASE 8：项目清单问题必须命中（口语变体）
-        for question in [
-            "我那个大模型的材料里面有啥项目",
-            "我的简历里面有哪些项目？",
-            "做过哪些项目",
-            "项目名称是什么",
-            "我的文件里都有什么项目",
-        ] {
-            assert!(is_project_list_question(question), "{question} 应命中项目清单");
-        }
-        for question in [
-            "我的简历里有没有写 LangGraph",
-            "项目里用了什么技术",
-            "帮我总结一下这个项目",
-            "Transformer 是什么",
-        ] {
-            assert!(!is_project_list_question(question), "{question} 不应命中项目清单");
-        }
-    }
-
-    #[test]
-    fn project_list_prompt_specifies_project_name_entity() {
-        // CASE 8 的 prompt 纪律：item 必须是项目名称实体，不是技术描述
+    fn entity_items_flag_injects_entity_rule() {
+        // LLM Parser 判定 requires_entity_items=true（如项目清单）：prompt 追加
+        // 实体/名称规范，条目必须是项目名称这类实体，不是整段技术描述。
         let (_, user) = extract_prompt(
             "我那个大模型的材料里面有啥项目",
+            true,
             &["参与大模型应用开发，负责微调训练".to_owned()],
         );
-        assert!(user.contains("项目清单"));
-        assert!(user.contains("项目名称"));
+        assert!(user.contains("实体/名称"));
         assert!(user.contains("严禁输出整段技术点描述或叙事长句"));
-        // 非项目问题不带项目规范段
-        let (_, user) = extract_prompt("我的简历里有哪些技能？", &["熟悉 Python".to_owned()]);
-        assert!(!user.contains("项目清单"));
+        // 非实体清单（日期/条款等）：不带实体规范段
+        let (_, user) =
+            extract_prompt("我的简历里有哪些技能？", false, &["熟悉 Python".to_owned()]);
+        assert!(!user.contains("实体/名称"));
+        assert!(!user.contains("严禁输出整段技术点描述或叙事长句"));
     }
 
     #[test]
@@ -409,14 +407,23 @@ mod tests {
     fn longest_common_substr_basics() {
         assert_eq!(longest_common_substr_len("abc", "bc"), 2);
         assert_eq!(longest_common_substr_len("abc", "xyz"), 0);
-        assert_eq!(longest_common_substr_len("大模型应用开发", "大模型应用开发"), 7);
+        assert_eq!(
+            longest_common_substr_len("大模型应用开发", "大模型应用开发"),
+            7
+        );
         assert_eq!(longest_common_substr_len("", "abc"), 0);
     }
 
     #[test]
     fn longest_common_substr_ignores_whitespace() {
         // 换行/空格不影响对齐（证据摘引常有行内换行）
-        assert_eq!(longest_common_substr_len("大 模型应用", "大模型应用开发"), 5);
-        assert_eq!(longest_common_substr_len("LangGraph 知识库", "LangGraph知识库问答"), 12);
+        assert_eq!(
+            longest_common_substr_len("大 模型应用", "大模型应用开发"),
+            5
+        );
+        assert_eq!(
+            longest_common_substr_len("LangGraph 知识库", "LangGraph知识库问答"),
+            12
+        );
     }
 }

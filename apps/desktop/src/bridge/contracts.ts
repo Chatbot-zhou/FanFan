@@ -181,7 +181,6 @@ export interface ModelRuntimeState {
     vision: boolean;
     reranker: boolean;
     ocr: boolean;
-    tts: boolean;
     asr: boolean;
   };
   rag_complete: boolean;
@@ -235,7 +234,7 @@ export interface InferenceBudget {
 }
 
 export type RuntimeBackendKind = "llama_cpp" | "onnx_runtime" | "sherpa_onnx" | "paddle_ocr" | "parser";
-export type RuntimeTaskKind = "cancel" | "preview" | "speech_recognition" | "speech_synthesis" | "ask" | "deep_image_analysis" | "search" | "embedding" | "rerank" | "incremental_index" | "ocr" | "image_understanding" | "collection_analysis" | "maintenance" | "parse";
+export type RuntimeTaskKind = "cancel" | "preview" | "speech_recognition" | "ask" | "deep_image_analysis" | "search" | "embedding" | "rerank" | "incremental_index" | "ocr" | "image_understanding" | "collection_analysis" | "maintenance" | "parse";
 export type RuntimeTaskState = "queued" | "running" | "completed" | "cancelled" | "failed";
 
 export interface RuntimeResourceBudget {
@@ -307,24 +306,7 @@ export interface SpeechRecognitionSession {
   completed_at: UtcDateTime;
 }
 
-export interface SpeechSynthesisResult {
-  audio_base64: string;
-  sample_rate: number;
-  duration_ms: number;
-  speaker_id: number;
-  speed: number;
-  engine: "sherpa_onnx" | string;
-}
-
-export interface SpeechSynthesisSession {
-  session_id: string;
-  status: "completed";
-  message_id: string;
-  result: SpeechSynthesisResult;
-  completed_at: UtcDateTime;
-}
-
-export type ModelRole = "generation" | "embedding" | "vision" | "reranker" | "ocr" | "tts" | "asr" | "router";
+export type ModelRole = "generation" | "embedding" | "vision" | "reranker" | "ocr" | "asr" | "router";
 export type ModelFormat = "gguf" | "onnx";
 
 export interface ImportCandidate {
@@ -359,14 +341,6 @@ export interface ModelArtifact {
   license_name: string | null;
   status: string;
   imported_at: UtcDateTime;
-}
-
-export interface ModelRoleConfig {
-  role: ModelRole;
-  active_artifact_id: string | null;
-  required_for: string;
-  optional: boolean;
-  load_policy: "on_demand" | "background_index" | "serial_on_demand";
 }
 
 export interface ModelEdition {
@@ -421,13 +395,85 @@ export interface ModelCatalogEntry {
   supported_sources: Array<"huggingface" | "modelscope">;
 }
 
+/** 能力档案：业务代码只判断 `capability_profile`，不得判断具体模型名。 */
+export interface CapabilityProfile {
+  generation: boolean;
+  embedding: boolean;
+  reranker: boolean;
+  ocr: boolean;
+  asr: boolean;
+}
+
+/** 预设目标硬件要求（区别于运行时硬件检测的 HardwareProfile）。 */
+export interface PresetHardwareProfile {
+  min_ram_gb: number;
+  min_vram_gb: number | null;
+  description: string;
+}
+
+export interface GenerationRuntimeConfig {
+  context_length: number;
+  max_output_tokens: number;
+  threads: number;
+  batch_size: number;
+  device_default: string;
+  keep_alive_seconds: number;
+}
+
+export interface EmbeddingRuntimeConfig {
+  device_default: string;
+  batch_size: number;
+}
+
+export interface RerankerRuntimeConfig {
+  enabled: boolean;
+  device_default: string;
+  batch_size: number;
+  top_k: number;
+}
+
+export interface OcrRuntimeConfig {
+  worker_count: number;
+  device_default: string;
+}
+
+export interface SpeechRuntimeConfig {
+  device_default: string;
+}
+
+export interface RuntimeProfile {
+  generation: GenerationRuntimeConfig;
+  embedding: EmbeddingRuntimeConfig;
+  reranker: RerankerRuntimeConfig;
+  ocr: OcrRuntimeConfig;
+  asr: SpeechRuntimeConfig;
+}
+
+/** 统一官方四档模型配置预设。模型引用均为 ModelCatalog 的 catalog_id。 */
 export interface ModelPreset {
   preset_id: string;
-  name: string;
+  display_name: string;
   description: string;
-  recommended_memory_gb: number;
-  role_catalog_ids: string[];
-  edition_id: string;
+  generation: string;
+  embedding: string;
+  reranker: string | null;
+  asr: string | null;
+  ocr: string;
+  hardware_profile: PresetHardwareProfile;
+  capability_profile: CapabilityProfile;
+  runtime_profile: RuntimeProfile;
+}
+
+/** 选中档位后 `model_preset_select` 的返回：档位内各角色就绪 / 缺失清单。 */
+export interface PresetPlanItem {
+  role: ModelRole;
+  catalog_id: string;
+}
+
+export interface PresetPlanReport {
+  preset_id: string;
+  ready: PresetPlanItem[];
+  missing: PresetPlanItem[];
 }
 
 export type ModelDownloadStatus = "queued" | "running" | "paused" | "completed" | "failed" | "cancelled";
@@ -554,7 +600,7 @@ export interface HomeSummary {
 export interface SearchRequest {
   query: string;
   scope: ScopeFilter;
-  mode: "hybrid" | "filename" | "fulltext" | "semantic";
+  mode: "hybrid" | "filename" | "fulltext";
   sort: "relevance" | "modified_desc" | "name_asc";
   page_size: number;
   cursor: string | null;
@@ -595,6 +641,7 @@ export interface SearchResult {
   match_reasons: Array<"filename" | "path" | "fulltext" | "semantic" | "time_filter">;
   locator: SourceLocator | null;
   revision_id: string | null;
+  image_asset_id: string | null;
   scores: SearchScore;
 }
 
@@ -686,6 +733,13 @@ export interface OperationHandle {
   kind: "ask" | "index_rebuild" | "background_cleanup";
   status: "queued" | "running" | "completed" | "failed" | "cancelled";
   created_at: UtcDateTime;
+}
+
+/** Embedding 换代回落后是否需要在模型设置页提示“重建索引”。 */
+export interface IndexStaleStatus {
+  stale: boolean;
+  active_embedding_artifact_id: string | null;
+  index_embedding_artifact_id: string | null;
 }
 
 export interface AskOperationSnapshot {
@@ -1027,9 +1081,12 @@ export interface ImageAsset {
   sha256: string;
   locator: SourceLocator;
   ocr_text: string | null;
+  ocr_confidence: number | null;
+  ocr_engine: string | null;
+  vision_route_reason: string | null;
   description: string | null;
   vision_model_id: string | null;
-  status: "pending_understanding" | "processing" | "ready" | "failed";
+  status: "pending_ocr" | "ocr_processing" | "pending_understanding" | "processing" | "ready" | "failed";
   error: AppError | null;
 }
 
@@ -1502,11 +1559,16 @@ export interface FanFanBridge {
   model_state_get(): Promise<ModelRuntimeState>;
   model_import_scan(paths: string[]): Promise<ImportCandidate[]>;
   model_import_confirm(selections: Array<{ source_path: string; role: ModelRole }>): Promise<ModelArtifact[]>;
-  model_artifact_list(): Promise<ModelArtifact[]>;
-  model_role_config_list(): Promise<ModelRoleConfig[]>;
-  model_catalog_list(source: "huggingface" | "modelscope"): Promise<ModelEdition[]>;
   model_role_catalog_list(): Promise<ModelCatalogEntry[]>;
   model_preset_list(): Promise<ModelPreset[]>;
+  /** 当前选定的官方模型预设 id；未选择（含旧版逐角色配置）时返回 null。 */
+  model_preset_selected_get(): Promise<string | null>;
+  /** 只读评估选定档位后的就绪/缺失清单：不持久化、不切换运行时，用于选择前先弹下载确认框。 */
+  model_preset_plan(preset_id: string): Promise<PresetPlanReport>;
+  /** 选定官方模型预设并持久化（仅保存 preset_id，不保存展示名）；返回就绪/缺失清单。 */
+  model_preset_select(preset_id: string): Promise<PresetPlanReport>;
+  /** 依据当前硬件检测返回推荐的官方预设 id（recommended ≠ 强制）。 */
+  model_preset_recommendation(): Promise<string>;
   model_download_start(edition_id: ModelEdition["edition_id"], source: "huggingface" | "modelscope", confirmed: true): Promise<ModelDownloadJob>;
   model_download_list(): Promise<ModelDownloadJob[]>;
   model_store_status_get(): Promise<ModelStoreStatus>;
@@ -1517,8 +1579,6 @@ export interface FanFanBridge {
   model_download_retry(job_id: string): Promise<ModelDownloadJob>;
   model_download_switch_source(job_id: string, source: "huggingface" | "modelscope"): Promise<ModelDownloadJob>;
   model_download_remove(job_id: string): Promise<ModelDownloadRemoval>;
-  model_artifact_activate(artifact_id: string): Promise<ModelRuntimeState>;
-  model_role_disable(role: ModelRole): Promise<ModelRuntimeState>;
   home_get_summary(local_date: string): Promise<HomeSummary>;
   candidate_root_action(candidate_id: string, action: "add" | "ignore"): Promise<CandidateRoot>;
   search_start(request: SearchRequest): Promise<SearchSession>;
@@ -1531,7 +1591,6 @@ export interface FanFanBridge {
   ask_operation_get(operation_id: string): Promise<AskOperationSnapshot>;
   ask_cancel(operation_id: string): Promise<AskOperationSnapshot>;
   speech_recognize(request: SpeechRecognitionInput): Promise<SpeechRecognitionSession>;
-  speech_synthesize_answer(message_id: string, speed: number, speaker_id?: number): Promise<SpeechSynthesisSession>;
   answer_export(message_id: string, target_path: string, format: "md" | "txt", confirmation: "EXPORT_NEW_FILE"): Promise<ExportResult>;
   preview_get(file_id: string, offset?: number, limit?: number, anchor_node_id?: string | null): Promise<FilePreview>;
   file_open(file_id: string): Promise<void>;
@@ -1620,6 +1679,8 @@ export interface FanFanBridge {
   diagnostic_event_append(request: DiagnosticEventInput): Promise<void>;
   diagnostic_export(target_path: string, confirmed: true): Promise<ExportResult>;
   index_rebuild(confirmation: "REBUILD_INDEX"): Promise<OperationHandle>;
+  /** 查询 Embedding 换代回落的索引代际状态；stale=true 提示需重建索引 */
+  index_stale_check(): Promise<IndexStaleStatus>;
   root_list(): Promise<RootRecord[]>;
   root_add(request: AddRootRequest): Promise<RootRecord>;
   root_disable(root_id: string): Promise<void>;

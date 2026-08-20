@@ -13,7 +13,7 @@ describe("SearchPage", () => {
 
   it("shows channel availability, match reasons and a real source locator", async () => {
     render(<SearchPage />);
-    const input = screen.getByPlaceholderText("例如：去年那个关于RAG召回率优化的文档");
+    const input = screen.getByPlaceholderText("输入关键词");
     fireEvent.change(input, { target: { value: "RAG" } });
     fireEvent.click(screen.getByRole("button", { name: "搜索" }));
 
@@ -46,7 +46,7 @@ describe("SearchPage", () => {
     await choose("资料类型", "PDF");
     await choose("修改时间", "最近30天");
     await choose("结果排序", "最近修改");
-    fireEvent.change(screen.getByPlaceholderText("例如：去年那个关于RAG召回率优化的文档"), { target: { value: "设计" } });
+    fireEvent.change(screen.getByPlaceholderText("输入关键词"), { target: { value: "设计" } });
     fireEvent.click(screen.getByRole("button", { name: "搜索" }));
 
     expect(await screen.findByText(/找到/)).toBeInTheDocument();
@@ -55,5 +55,38 @@ describe("SearchPage", () => {
       sort: "modified_desc",
       scope: expect.objectContaining({ extensions: ["pdf"], modified_from: expect.any(String) }),
     }));
+  });
+
+  it("shows the exact cached image when image text is the search hit", async () => {
+    vi.spyOn(bridge, "search_start").mockResolvedValue({
+      search_id: "018f0000-0000-7000-8000-000000000710",
+      status: "completed",
+      channels: { filename: "completed", fulltext: "completed", semantic: "unavailable" },
+      results: [{
+        file_id: "018f0000-0000-7000-8000-000000000711",
+        name: "季度图表.docx",
+        extension: "docx",
+        display_path: "资料/季度图表.docx",
+        modified_at: "2026-08-20T08:00:00Z",
+        snippet: "图片说明：柱状图显示第二季度收入明显增长。",
+        match_reasons: ["fulltext"],
+        locator: null,
+        revision_id: "018f0000-0000-7000-8000-000000000712",
+        image_asset_id: "018f0000-0000-7000-8000-000000000713",
+        scores: { filename: null, fulltext: 0.9, semantic: null, fused: 0.9 },
+      }],
+      next_cursor: null,
+      elapsed_ms: 5,
+    });
+    render(<SearchPage />);
+    fireEvent.change(screen.getByPlaceholderText("输入关键词"), { target: { value: "第二季度收入" } });
+    fireEvent.click(screen.getByRole("button", { name: "搜索" }));
+
+    const image = await screen.findByRole("img", { name: "搜索命中的图片：季度图表.docx" });
+    expect(image).toHaveAttribute(
+      "src",
+      "http://fanfan-image.localhost/018f0000-0000-7000-8000-000000000713",
+    );
+    expect(screen.getByText("图片内容命中")).toBeInTheDocument();
   });
 });

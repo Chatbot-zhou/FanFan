@@ -20,12 +20,12 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::ask::context_resolver::resolve_ambiguous;
-use crate::ask::document_resolver::{resolve_documents, ResolverInput};
+use crate::ask::document_resolver::{ResolverInput, resolve_documents};
 use crate::ask::document_retrieval::rank_document_candidates;
 use crate::ask::document_summary::{
-    build_document_sections, merge_tail_sections, parse_section_summaries, SectionChunk,
+    SectionChunk, build_document_sections, merge_tail_sections, parse_section_summaries,
 };
-use crate::ask::extract::{parse_extract_results, longest_common_substr_len, ExtractResults};
+use crate::ask::extract::{ExtractResults, longest_common_substr_len, parse_extract_results};
 use crate::ask::memory_resolver::{match_alias_hints, match_relation_hints};
 use crate::ask::query_parser::parse_query_plan;
 use crate::ask::query_plan::{
@@ -92,12 +92,20 @@ fn alias(target_id: Uuid, name: &str, source: MemorySource) -> MemoryAlias {
 
 /// 模拟编排层「Document Resolver → 澄清候选组装」（finish_retrieval_with_plan 4.6 分支）。
 /// 返回候选清单（file_id, 展示信号）——桌面层再包成 ClarificationOption。
-fn clarification_options_from(resolution: &crate::ask::query_plan::DocumentResolution) -> Vec<(Uuid, f32, Vec<String>)> {
+fn clarification_options_from(
+    resolution: &crate::ask::query_plan::DocumentResolution,
+) -> Vec<(Uuid, f32, Vec<String>)> {
     resolution
         .candidates
         .iter()
         .take(MAX_CANDIDATE_SCOPE)
-        .map(|candidate| (candidate.file_id, candidate.score, candidate.signals.clone()))
+        .map(|candidate| {
+            (
+                candidate.file_id,
+                candidate.score,
+                candidate.signals.clone(),
+            )
+        })
         .collect()
 }
 
@@ -114,7 +122,8 @@ fn retrieval_question_from(plan: &QueryPlan) -> Option<String> {
 /// 计划层不产生任何检索意图（无 target、无 content_query、无文件锁定）。
 #[test]
 fn scenario_a_general_chat_never_starts_retrieval() {
-    let routing = parse_source_routing(r#"{"source":"general","confidence":0.95}"#).expect("routing parses");
+    let routing =
+        parse_source_routing(r#"{"source":"general","confidence":0.95}"#).expect("routing parses");
     assert_eq!(routing.source, SourceIntent::General);
     assert!((routing.confidence - 0.95).abs() < 1e-6);
 
@@ -137,7 +146,8 @@ fn scenario_a_general_chat_never_starts_retrieval() {
 /// 携带真正要查的内容（Transformer），target 为空——检索范围是整个资料库。
 #[test]
 fn scenario_b_library_qa_requests_local_retrieval() {
-    let routing = parse_source_routing(r#"{"source":"local","confidence":0.9}"#).expect("routing parses");
+    let routing =
+        parse_source_routing(r#"{"source":"local","confidence":0.9}"#).expect("routing parses");
     assert_eq!(routing.source, SourceIntent::Local);
 
     let plan = parse_query_plan(
@@ -161,7 +171,8 @@ fn scenario_b_library_qa_requests_local_retrieval() {
 /// Unresolved（编排层回退 GENERAL_CHAT，把"猜"的权利留给用户澄清）。
 #[test]
 fn scenario_c_ambiguous_without_context_never_guesses_files() {
-    let routing = parse_source_routing(r#"{"source":"ambiguous","confidence":0.6}"#).expect("routing parses");
+    let routing =
+        parse_source_routing(r#"{"source":"ambiguous","confidence":0.6}"#).expect("routing parses");
     assert_eq!(routing.source, SourceIntent::Ambiguous);
 
     let context = AskSessionContext::default();
@@ -209,14 +220,23 @@ fn scenario_e_close_resumes_ask_user_to_choose() {
 
     let plan = resume_projects_plan();
     let session = AskSessionContext::default();
-    let input = ResolverInput::new(&plan, &session, vec![resume_a.clone(), resume_b.clone()], file_names);
+    let input = ResolverInput::new(
+        &plan,
+        &session,
+        vec![resume_a.clone(), resume_b.clone()],
+        file_names,
+    );
     let resolution = resolve_documents(&input);
     assert_eq!(resolution.status, ResolutionStatus::MultipleCandidates);
 
     // 桌面层组装澄清选项（4.6 分支）：take(MAX_CANDIDATE_SCOPE)，含两份
     let options = clarification_options_from(&resolution);
     assert_eq!(options.len(), 2);
-    assert!(options.iter().all(|(_, score, _)| *score >= MEDIUM_CONFIDENCE_THRESHOLD));
+    assert!(
+        options
+            .iter()
+            .all(|(_, score, _)| *score >= MEDIUM_CONFIDENCE_THRESHOLD)
+    );
     // 澄清载荷语义：reference 保留原话，供选择后写 USER_SELECTION 别名
     let reference = plan.target.reference.clone().expect("reference present");
     assert_eq!(reference, "我的简历");
@@ -343,7 +363,11 @@ fn scenario_h_compare_dual_targets_route_to_compare_pipeline() {
     assert_eq!(secondary.document_type, Some(DocumentType::Resume));
 
     // 与桌面层 operation_execution 的分类表达式一致
-    let pipeline = if plan.intent == QueryIntent::CompareDocuments { "document_compare" } else { "chunk_rag" };
+    let pipeline = if plan.intent == QueryIntent::CompareDocuments {
+        "document_compare"
+    } else {
+        "chunk_rag"
+    };
     assert_eq!(pipeline, "document_compare");
 }
 
@@ -353,7 +377,8 @@ fn scenario_h_compare_dual_targets_route_to_compare_pipeline() {
 /// fallback，此处验证对齐判定本身）。
 #[test]
 fn scenario_i_extract_items_align_with_evidence() {
-    let raw = r#"{"items":[{"item":"大模型应用开发项目","evidence":"负责 RAG 检索链路的设计与实现"}]}"#;
+    let raw =
+        r#"{"items":[{"item":"大模型应用开发项目","evidence":"负责 RAG 检索链路的设计与实现"}]}"#;
     let results: ExtractResults = parse_extract_results(raw).expect("extract results parse");
     assert_eq!(results.items.len(), 1);
     let item = &results.items[0];
@@ -369,7 +394,10 @@ fn scenario_i_extract_items_align_with_evidence() {
         .max_by_key(|quote| longest_common_substr_len(&item.item, quote))
         .expect("quotes non-empty");
     let match_len = longest_common_substr_len(&item.item, best);
-    assert!(match_len >= EXTRACT_MATCH_MIN_LEN, "对齐长度 {match_len} 应达到 {EXTRACT_MATCH_MIN_LEN}");
+    assert!(
+        match_len >= EXTRACT_MATCH_MIN_LEN,
+        "对齐长度 {match_len} 应达到 {EXTRACT_MATCH_MIN_LEN}"
+    );
     assert!(best.contains("大模型应用开发"), "应选中含条目的引用");
 }
 
@@ -392,7 +420,11 @@ fn scenario_j_find_resolves_file_without_chunk_rag() {
     assert!(!plan.requires_full_document);
 
     // 目标解析：单简历 → Resolved 锁定文件
-    let resume = profile(Uuid::now_v7(), Some(DocumentType::Resume), "大模型开发工程师-周晨");
+    let resume = profile(
+        Uuid::now_v7(),
+        Some(DocumentType::Resume),
+        "大模型开发工程师-周晨",
+    );
     let mut file_names = HashMap::new();
     file_names.insert(resume.file_id, "大模型开发工程师-周晨.pdf".to_owned());
     let session = AskSessionContext::default();
@@ -414,7 +446,11 @@ fn scenario_k_local_no_evidence_never_becomes_chat() {
     plan.content_query = Some("身份证号".to_owned());
 
     // 目标锁定不依赖 content_query（画像层面没有身份证号信号也必须锁简历）
-    let resume = profile(Uuid::now_v7(), Some(DocumentType::Resume), "大模型开发工程师-周晨");
+    let resume = profile(
+        Uuid::now_v7(),
+        Some(DocumentType::Resume),
+        "大模型开发工程师-周晨",
+    );
     let mut file_names = HashMap::new();
     file_names.insert(resume.file_id, "大模型开发工程师-周晨.pdf".to_owned());
     let session = AskSessionContext::default();
@@ -471,13 +507,20 @@ fn scenario_l_memory_alias_and_relation_locate_first() {
         created_at: now,
         updated_at: now,
     };
-    let relation_hints = match_relation_hints("周晨的简历里有什么？", &[person.clone()], &[confirmed.clone()]);
+    let relation_hints = match_relation_hints(
+        "周晨的简历里有什么？",
+        std::slice::from_ref(&person),
+        std::slice::from_ref(&confirmed),
+    );
     assert_eq!(relation_hints.len(), 1);
     assert_eq!(relation_hints[0].target_id, resume_id);
     assert_eq!(relation_hints[0].kind, "relation");
 
     // 3. candidate 关系绝不参与定位（memory_resolver 约束）
-    let candidate = MemoryRelation { status: MemoryStatus::Candidate, ..confirmed };
+    let candidate = MemoryRelation {
+        status: MemoryStatus::Candidate,
+        ..confirmed
+    };
     assert!(match_relation_hints("周晨的简历里有什么？", &[person], &[candidate]).is_empty());
 }
 
@@ -510,19 +553,33 @@ fn scenario_m_memory_write_roundtrip_changes_future_resolution() {
 #[test]
 fn scenario_n_answer_mode_serde_and_legacy_tolerance() {
     let modes = [
-        AnswerMode::Generated, AnswerMode::Chat, AnswerMode::RagRefusal,
-        AnswerMode::Unverified, AnswerMode::Clarification, AnswerMode::Summary,
-        AnswerMode::Compare, AnswerMode::Extract, AnswerMode::Find,
+        AnswerMode::Generated,
+        AnswerMode::Chat,
+        AnswerMode::RagRefusal,
+        AnswerMode::Unverified,
+        AnswerMode::Clarification,
+        AnswerMode::Summary,
+        AnswerMode::Compare,
+        AnswerMode::Extract,
+        AnswerMode::Find,
     ];
     for mode in modes {
         let json = serde_json::to_value(mode).expect("serialize");
         let text = json.as_str().expect("string");
-        assert_eq!(AnswerMode::parse_lenient(text), Some(mode), "roundtrip {text}");
+        assert_eq!(
+            AnswerMode::parse_lenient(text),
+            Some(mode),
+            "roundtrip {text}"
+        );
     }
     // legacy 中间态 → Generated；未知 → Generated
-    assert_eq!(AnswerMode::parse_lenient("extractive"), Some(AnswerMode::Generated));
+    assert_eq!(
+        AnswerMode::parse_lenient("extractive"),
+        Some(AnswerMode::Generated)
+    );
     assert_eq!(AnswerMode::parse_lenient("future_mode"), None);
-    let unknown: AnswerMode = serde_json::from_str(r#""future_mode""#).expect("tolerant deserialize");
+    let unknown: AnswerMode =
+        serde_json::from_str(r#""future_mode""#).expect("tolerant deserialize");
     assert_eq!(unknown, AnswerMode::Generated);
 }
 
@@ -543,11 +600,18 @@ fn scenario_o_content_query_never_concatenates_target() {
     assert_eq!(plan.target.document_type, Some(DocumentType::Resume));
     let retrieval_question = retrieval_question_from(&plan).expect("content query present");
     assert_eq!(retrieval_question, "LangGraph");
-    assert!(!retrieval_question.contains("简历"), "目标词不得拼回检索 Query");
+    assert!(
+        !retrieval_question.contains("简历"),
+        "目标词不得拼回检索 Query"
+    );
     assert!(!retrieval_question.contains("我的"));
 
     // 解析到文件后，检索范围 = [简历]，检索词 = LangGraph（scope 与 query 解耦）
-    let resume = profile(Uuid::now_v7(), Some(DocumentType::Resume), "大模型开发工程师-周晨");
+    let resume = profile(
+        Uuid::now_v7(),
+        Some(DocumentType::Resume),
+        "大模型开发工程师-周晨",
+    );
     let mut file_names = HashMap::new();
     file_names.insert(resume.file_id, "大模型开发工程师-周晨.pdf".to_owned());
     let session = AskSessionContext::default();
@@ -561,8 +625,16 @@ fn scenario_o_content_query_never_concatenates_target() {
 /// 折算；低于 MIN_SCORE 不进候选；TOP_N 截断。
 #[test]
 fn scenario_p_document_recall_fuses_metadata_and_vector() {
-    let resume = profile(Uuid::now_v7(), Some(DocumentType::Resume), "大模型开发工程师-周晨");
-    let report = profile(Uuid::now_v7(), Some(DocumentType::Report), "2025 年度述职报告");
+    let resume = profile(
+        Uuid::now_v7(),
+        Some(DocumentType::Resume),
+        "大模型开发工程师-周晨",
+    );
+    let report = profile(
+        Uuid::now_v7(),
+        Some(DocumentType::Report),
+        "2025 年度述职报告",
+    );
     let unrelated = profile(Uuid::now_v7(), None, "七月发票");
 
     let mut resume_typed = resume;
@@ -582,8 +654,17 @@ fn scenario_p_document_recall_fuses_metadata_and_vector() {
     ]);
     let question_vector = vec![0.8f32, 0.2, 0.15, 0.9];
 
-    let ranked = rank_document_candidates("有没有 LangGraph 项目的内容？", Some(&question_vector), &profiles, &vectors);
-    assert_eq!(ranked.first().expect("best candidate").file_id, resume_typed.file_id, "实体+向量命中应排第一");
+    let ranked = rank_document_candidates(
+        "有没有 LangGraph 项目的内容？",
+        Some(&question_vector),
+        &profiles,
+        &vectors,
+    );
+    assert_eq!(
+        ranked.first().expect("best candidate").file_id,
+        resume_typed.file_id,
+        "实体+向量命中应排第一"
+    );
     let best = &ranked[0];
     assert!(best.signals.iter().any(|signal| signal == "entity_match"));
     assert!(best.signals.iter().any(|signal| signal == "vector_match"));
@@ -598,13 +679,28 @@ fn scenario_p_document_recall_fuses_metadata_and_vector() {
     // 全零向量不致 panic（cosine 返回 0），候选按 metadata-only 折算
     // （0.8×metadata，不加 vector_match 信号）
     let zero_vectors = HashMap::from([(resume_typed.file_id, vec![0.0f32; 4])]);
-    let ranked_zero = rank_document_candidates("周晨的项目", Some(&question_vector), &profiles, &zero_vectors);
+    let ranked_zero = rank_document_candidates(
+        "周晨的项目",
+        Some(&question_vector),
+        &profiles,
+        &zero_vectors,
+    );
     assert_eq!(ranked_zero.len(), 1);
     assert_eq!(ranked_zero[0].file_id, resume_typed.file_id);
-    assert!(!ranked_zero[0].signals.iter().any(|signal| signal == "vector_match"));
+    assert!(
+        !ranked_zero[0]
+            .signals
+            .iter()
+            .any(|signal| signal == "vector_match")
+    );
 
     // 元数据零命中的画像即使向量相近也不被硬拉（preselect 只在粗筛集内做向量）
     let unrelated_profile = (unrelated.clone(), "七月发票.pdf".to_owned());
-    let ranked_unrelated = rank_document_candidates("LangGraph", Some(&question_vector), &[unrelated_profile], &vectors);
+    let ranked_unrelated = rank_document_candidates(
+        "LangGraph",
+        Some(&question_vector),
+        &[unrelated_profile],
+        &vectors,
+    );
     assert!(ranked_unrelated.is_empty(), "无关画像不进入召回候选");
 }

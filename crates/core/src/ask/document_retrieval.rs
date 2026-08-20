@@ -70,10 +70,15 @@ pub fn score_document_metadata(
         signals.push("title_match".to_owned());
     }
     // 类型（中文展示名 + 英文变体名）。
-    let type_hit = [profile.document_type.map(|t| t.display_name()).unwrap_or(""),
-            profile.document_type.map(|t| t.as_str()).unwrap_or("")]
-        .iter()
-        .any(|candidate| signal_in_question(candidate, question));
+    let type_hit = [
+        profile
+            .document_type
+            .map(|t| t.display_name())
+            .unwrap_or(""),
+        profile.document_type.map(|t| t.as_str()).unwrap_or(""),
+    ]
+    .iter()
+    .any(|candidate| signal_in_question(candidate, question));
     if type_hit {
         score += 0.35;
         signals.push("type_match".to_owned());
@@ -171,11 +176,19 @@ pub fn rank_document_candidates(
             if vector_score > 0.0 {
                 signals.push("vector_match".to_owned());
             }
-            DocumentCandidateMatch { file_id, score, signals }
+            DocumentCandidateMatch {
+                file_id,
+                score,
+                signals,
+            }
         })
         .collect();
 
-    ranked.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     ranked.truncate(DOCUMENT_RECALL_TOP_N);
     ranked.retain(|candidate| candidate.score >= DOCUMENT_RECALL_MIN_SCORE);
     ranked
@@ -245,7 +258,9 @@ fn shared_phrase(question: &str, signal: &str) -> bool {
 /// 剥离扩展名："述职报告.docx" → "述职报告"（"a.b.docx" → "a.b"）。
 fn strip_extension(file_name: &str) -> String {
     match file_name.rsplit_once('.') {
-        Some((stem, extension)) if !stem.is_empty() && extension.chars().all(|c| !c.is_whitespace()) => {
+        Some((stem, extension))
+            if !stem.is_empty() && extension.chars().all(|c| !c.is_whitespace()) =>
+        {
             stem.to_owned()
         }
         _ => file_name.to_owned(),
@@ -286,7 +301,8 @@ mod tests {
     #[test]
     fn metadata_title_hit_scores_high() {
         let profile = mk_profile(1, "2025 年度述职报告", vec![]);
-        let (score, signals) = score_document_metadata("给我找一下我的述职报告", &profile, "述职报告.docx");
+        let (score, signals) =
+            score_document_metadata("给我找一下我的述职报告", &profile, "述职报告.docx");
         assert!(score >= 0.45, "title signal must fire, got {score}");
         assert!(signals.contains(&"title_match".to_owned()));
     }
@@ -296,14 +312,18 @@ mod tests {
         let mut profile = mk_profile(2, "张三个人简历", vec![]);
         profile.document_type = Some(DocumentType::Resume);
         let (score, signals) = score_document_metadata("我的简历在哪里", &profile, "resume.pdf");
-        assert!(score >= 0.35, "type signal must fire via 中文名, got {score}");
+        assert!(
+            score >= 0.35,
+            "type signal must fire via 中文名, got {score}"
+        );
         assert!(signals.contains(&"type_match".to_owned()));
     }
 
     #[test]
     fn metadata_keyword_hit() {
         let profile = mk_profile(3, "会议纪要 2026-01", vec!["RAG", "向量检索"]);
-        let (score, signals) = score_document_metadata("哪些资料提到向量检索", &profile, "meeting.txt");
+        let (score, signals) =
+            score_document_metadata("哪些资料提到向量检索", &profile, "meeting.txt");
         assert!(score >= 0.30);
         assert!(signals.contains(&"keyword_match".to_owned()));
     }
@@ -313,7 +333,10 @@ mod tests {
         // 标题比问题长且只共享核心片段："述职报告备份" ↔ "找一下述职报告"。
         let profile = mk_profile(9, "述职报告备份", vec![]);
         let (score, signals) = score_document_metadata("找一下述职报告", &profile, "backup.docx");
-        assert!(score >= 0.45, "shared-phrase title match must fire, got {score}");
+        assert!(
+            score >= 0.45,
+            "shared-phrase title match must fire, got {score}"
+        );
         assert!(signals.contains(&"title_match".to_owned()));
         // 反向验证：标题确实与问题无关时不误报。
         let unrelated = mk_profile(10, "工作计划与排期", vec![]);
@@ -352,8 +375,14 @@ mod tests {
     #[test]
     fn ranking_fuses_metadata_and_vector() {
         let profiles = vec![
-            (mk_profile(1, "述职报告", vec![]), "述职报告.docx".to_owned()),
-            (mk_profile(2, "述职报告备份", vec![]), "述职报告备份.docx".to_owned()),
+            (
+                mk_profile(1, "述职报告", vec![]),
+                "述职报告.docx".to_owned(),
+            ),
+            (
+                mk_profile(2, "述职报告备份", vec![]),
+                "述职报告备份.docx".to_owned(),
+            ),
         ];
         let mut vectors = HashMap::new();
         // 两画像元数据同分（都是 title_match）；向量分决定排序。
@@ -383,7 +412,10 @@ mod tests {
         for id in 1..=100u32 {
             profiles.push((mk_profile(id, "随机文件", vec![]), "f.txt".to_owned()));
         }
-        profiles.push((mk_profile(101, "述职报告", vec![]), "述职报告.docx".to_owned()));
+        profiles.push((
+            mk_profile(101, "述职报告", vec![]),
+            "述职报告.docx".to_owned(),
+        ));
         let ranked = rank_document_candidates("找一下述职报告", None, &profiles, &HashMap::new());
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].file_id, Uuid::from_u128(101));
@@ -392,7 +424,12 @@ mod tests {
     #[test]
     fn ranking_caps_at_top_n() {
         let profiles: Vec<(DocumentProfile, String)> = (1..=20u32)
-            .map(|id| (mk_profile(id, "述职报告", vec![]), "述职报告.docx".to_owned()))
+            .map(|id| {
+                (
+                    mk_profile(id, "述职报告", vec![]),
+                    "述职报告.docx".to_owned(),
+                )
+            })
             .collect();
         let ranked = rank_document_candidates("找一下述职报告", None, &profiles, &HashMap::new());
         assert!(ranked.len() <= DOCUMENT_RECALL_TOP_N, "must cap at TOP_N");
@@ -412,7 +449,10 @@ mod tests {
         assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
         assert_eq!(cosine_similarity(&[], &[]), 0.0);
         let value = cosine_similarity(&[1.0, 2.0], &[2.0, 4.0]);
-        assert!((value - 1.0).abs() < 1e-5, "collinear vectors -> 1.0, got {value}");
+        assert!(
+            (value - 1.0).abs() < 1e-5,
+            "collinear vectors -> 1.0, got {value}"
+        );
     }
 
     #[test]

@@ -14,11 +14,10 @@ use fanfan_core::{
     EvaluationScorecard, EvaluationSplit, LocalGenerationRuntime, ModelArtifact, ModelManager,
     ModelRegistryState, ModelRole, ParseStatus, RagEvaluationCase, RagQualityMetrics,
     RelationEvaluationCase, RelationQuery, RelationType, ScopeFilter, SearchEvaluationCase,
-    SearchMode, SearchRequest, SearchSort, SemanticQuery, SpeechRecognitionRequest,
-    SpeechSynthesisRequest, WorkerClient, WorkerRole, apply_grounded_generation,
-    create_encrypted_evaluation_snapshot, generation_prompt, grounded_answer_json_schema,
-    inspect_runtime_log_privacy, materialize_evaluation_snapshot, persist_evaluation_run,
-    score_rag_cases, score_relation_cases, score_search_cases,
+    SearchMode, SearchRequest, SearchSort, SemanticQuery, SpeechRecognitionRequest, WorkerClient,
+    WorkerRole, apply_grounded_generation, create_encrypted_evaluation_snapshot, generation_prompt,
+    grounded_answer_json_schema, inspect_runtime_log_privacy, materialize_evaluation_snapshot,
+    persist_evaluation_run, score_rag_cases, score_relation_cases, score_search_cases,
 };
 use sha2::{Digest, Sha256};
 
@@ -246,9 +245,9 @@ fn run() -> Result<(), fanfan_core::AppError> {
         not_evaluated_component("relations_and_collections", 10.0)
     };
     let media_component = if argument_present("--with-media") {
-        evaluate_ocr_asr_tts(&worker_ocr, &worker_speech, &manager)?
+        evaluate_ocr_asr(&worker_ocr, &worker_speech, &manager)?
     } else {
-        not_evaluated_component("ocr_asr_tts", 10.0)
+        not_evaluated_component("ocr_asr", 10.0)
     };
     let runtime_component = evaluate_runtime_recovery_logging(&integrity, &log_privacy);
     let source_hash_after = source_manifest_hash(&files)?;
@@ -321,7 +320,7 @@ fn run() -> Result<(), fanfan_core::AppError> {
     Ok(())
 }
 
-fn evaluate_ocr_asr_tts(
+fn evaluate_ocr_asr(
     worker_ocr: &WorkerClient,
     worker_speech: &WorkerClient,
     manager: &ModelManager,
@@ -345,6 +344,7 @@ fn evaluate_ocr_asr_tts(
                         cls.to_string_lossy().into_owned(),
                         dictionary.to_string_lossy().into_owned(),
                         2,
+                        ocr_version_for(&artifact),
                     )
                     .is_ok_and(|result| result.status == "ready")
             }
@@ -371,8 +371,8 @@ fn evaluate_ocr_asr_tts(
                         .self_test_asr(
                             artifact.local_path.clone(),
                             tokens.to_string_lossy().into_owned(),
-                            vad.to_string_lossy().into_owned(),
                             2,
+                            asr_arch_for(&artifact),
                         )
                         .is_ok_and(|result| result.status == "ready");
                     let silence_safe = ready
@@ -384,6 +384,7 @@ fn evaluate_ocr_asr_tts(
                                 samples: vec![0.0; 16_000],
                                 sample_rate: 16_000,
                                 threads: 2,
+                                arch: asr_arch_for(&artifact),
                             })
                             .is_ok_and(|result| result.text.trim().is_empty());
                     (ready, silence_safe)
@@ -405,60 +406,9 @@ fn evaluate_ocr_asr_tts(
     }
     metrics.insert("asr_self_test_ready".into(), f64::from(asr_ready));
     metrics.insert("asr_silence_safe".into(), f64::from(silence_safe));
-
-    let (tts_ready, tts_generated) =
-        if let Some(artifact) = manager.active_artifact(ModelRole::Tts)? {
-            let tokens = artifact_companion_path(&artifact, |name| name.contains("tokens"));
-            let lexicon = artifact_companion_path(&artifact, |name| name.contains("lexicon"));
-            match (tokens, lexicon) {
-                (Some(tokens), Some(lexicon)) => {
-                    samples += 2;
-                    let ready = worker_speech
-                        .self_test_tts(
-                            artifact.local_path.clone(),
-                            tokens.to_string_lossy().into_owned(),
-                            lexicon.to_string_lossy().into_owned(),
-                            2,
-                        )
-                        .is_ok_and(|result| result.status == "ready");
-                    let generated = ready
-                        && worker_speech
-                            .synthesize_speech(&SpeechSynthesisRequest {
-                                model_path: artifact.local_path.clone(),
-                                tokens_path: tokens.to_string_lossy().into_owned(),
-                                lexicon_path: lexicon.to_string_lossy().into_owned(),
-                                text: "翻翻本地语音测试".into(),
-                                speaker_id: 0,
-                                speed: 1.0,
-                                threads: 2,
-                            })
-                            .is_ok_and(|result| {
-                                !result.audio_base64.is_empty()
-                                    && result.sample_rate > 0
-                                    && result.duration_ms > 0
-                            });
-                    (ready, generated)
-                }
-                _ => (false, false),
-            }
-        } else {
-            (false, false)
-        };
-    if tts_ready {
-        earned += 1.0;
-    } else {
-        failures.push("tts_runtime_or_package_unavailable".into());
-    }
-    if tts_generated {
-        earned += 1.0;
-    } else {
-        failures.push("tts_generation_failed".into());
-    }
-    metrics.insert("tts_self_test_ready".into(), f64::from(tts_ready));
-    metrics.insert("tts_audio_generated".into(), f64::from(tts_generated));
     failures.push("ocr_asr_controlled_quality_corpus_pending".into());
     Ok(EvaluationComponentScore {
-        component: "ocr_asr_tts".into(),
+        component: "ocr_asr".into(),
         earned,
         maximum: 10.0,
         sample_count: samples,
@@ -481,6 +431,22 @@ fn artifact_companion_path(
         .find(|name| predicate(&name.to_ascii_lowercase()))
         .map(|name| parent.join(name))
         .filter(|path| path.is_file())
+}
+
+/// 由 ModelArtifact 推导 ASR 架构（sense_voice / paraformer），经 catalog_id 判断。
+fn asr_arch_for(artifact: &ModelArtifact) -> String {
+    match artifact.catalog_id.as_deref() {
+        Some(id) if id.contains("sense") => "sense_voice".to_owned(),
+        _ => "paraformer".to_owned(),
+    }
+}
+
+/// 由 ModelArtifact 推导 OCR 版本（PPOCRV6 / PPOCRV5），经 catalog_id 判断。
+fn ocr_version_for(artifact: &ModelArtifact) -> String {
+    match artifact.catalog_id.as_deref() {
+        Some(id) if id.contains("v6") => "PPOCRV6".to_owned(),
+        _ => "PPOCRV5".to_owned(),
+    }
 }
 
 fn evaluate_runtime_recovery_logging(
@@ -792,7 +758,7 @@ fn run_rag_evaluation(
             };
             let rewritten =
                 rewrite_followup_for_evaluation(&mut runtime, &cancelled, &history, followup)?;
-            let vector = encode_queries(worker, embedding, &[rewritten.clone()])?
+            let vector = encode_queries(worker, embedding, std::slice::from_ref(&rewritten))?
                 .into_iter()
                 .next()
                 .ok_or_else(|| {

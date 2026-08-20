@@ -14,9 +14,7 @@ from .speech import (
     clear_speech_sessions,
     recognize_speech,
     self_test_asr,
-    self_test_tts,
     speech_cache_snapshot,
-    synthesize_speech,
 )
 from .paddle_ocr import (
     clear_ocr_session,
@@ -24,6 +22,7 @@ from .paddle_ocr import (
     recognize_image,
     self_test_ocr,
 )
+from .image_ocr import route_image_ocr
 
 
 class WorkerService:
@@ -99,14 +98,12 @@ class WorkerService:
             return self._result(request, self_test_asr(request.payload))
         if request.operation == "speech.recognize":
             return self._result(request, recognize_speech(request.payload))
-        if request.operation == "speech.tts_self_test":
-            return self._result(request, self_test_tts(request.payload))
-        if request.operation == "speech.synthesize":
-            return self._result(request, synthesize_speech(request.payload))
         if request.operation == "ocr.self_test":
             return self._result(request, self_test_ocr(request.payload))
         if request.operation == "ocr.recognize":
             return self._result(request, recognize_image(request.payload))
+        if request.operation == "ocr.route_image":
+            return self._result(request, route_image_ocr(request.payload))
         if request.operation == "document.probe":
             return self._probe_document(request)
         if request.operation == "document.parse":

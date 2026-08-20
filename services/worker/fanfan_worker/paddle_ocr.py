@@ -25,7 +25,7 @@ def _required_path(payload: dict[str, Any], key: str, suffixes: tuple[str, ...])
     return path
 
 
-def _configuration(payload: dict[str, Any]) -> tuple[Path, Path, Path, Path, int]:
+def _configuration(payload: dict[str, Any]) -> tuple[Path, Path, Path, Path, int, str]:
     model = _required_path(payload, "model_path", (".onnx",))
     detector = _required_path(payload, "det_model_path", (".onnx",))
     classifier = _required_path(payload, "cls_model_path", (".onnx",))
@@ -33,13 +33,27 @@ def _configuration(payload: dict[str, Any]) -> tuple[Path, Path, Path, Path, int
     threads = payload.get("threads", 1)
     if not isinstance(threads, int) or isinstance(threads, bool) or threads < 1 or threads > 4:
         raise ValueError("threads must be between 1 and 4")
-    return model, detector, classifier, dictionary, threads
+    ocr_version = payload.get("ocr_version", "PPOCRV5")
+    if not isinstance(ocr_version, str):
+        raise ValueError("ocr_version must be a string")
+    ocr_version = ocr_version.strip()
+    if ocr_version not in ("PPOCRV4", "PPOCRV5", "PPOCRV6"):
+        raise ValueError("ocr_version must be one of PPOCRV4/PPOCRV5/PPOCRV6")
+    return model, detector, classifier, dictionary, threads, ocr_version
+
+
+def _model_type_for(ocr_version: str) -> Any:
+    # RapidOCR 的 v6 路由只支持 TINY/SMALL/MEDIUM，MOBILE 会解析不到模型键；
+    # v4/v5 则使用 MOBILE。此处按 ocr_version 动态选择，兼容新旧模型。
+    from rapidocr import ModelType
+
+    return ModelType.SMALL if ocr_version == "PPOCRV6" else ModelType.MOBILE
 
 
 def _engine(payload: dict[str, Any]) -> Any:
     global _ENGINE, _ENGINE_KEY, _LAST_USED
-    model, detector, classifier, dictionary, threads = _configuration(payload)
-    key = (str(model), str(detector), str(classifier), str(dictionary), threads)
+    model, detector, classifier, dictionary, threads, ocr_version = _configuration(payload)
+    key = (str(model), str(detector), str(classifier), str(dictionary), threads, ocr_version)
     with _LOCK:
         if _ENGINE is not None and _ENGINE_KEY == key:
             _LAST_USED = time.monotonic()
@@ -50,12 +64,15 @@ def _engine(payload: dict[str, Any]) -> Any:
             # ONNX Runtime is deliberately kept on the CPU here. OCR runs as a
             # low-priority background task and must not contend with the LLM/VLM
             # for the user's small GPU. The RuntimeManager caps it at 1-2 cores.
+            version = OCRVersion[ocr_version]
+            detect_type = _model_type_for(ocr_version)
+            recog_type = _model_type_for(ocr_version)
             engine = RapidOCR(
                 params={
                     "Det.engine_type": EngineType.ONNXRUNTIME,
                     "Det.lang_type": LangDet.CH,
-                    "Det.model_type": ModelType.MOBILE,
-                    "Det.ocr_version": OCRVersion.PPOCRV5,
+                    "Det.model_type": detect_type,
+                    "Det.ocr_version": version,
                     "Det.model_path": str(detector),
                     "Cls.engine_type": EngineType.ONNXRUNTIME,
                     "Cls.model_type": ModelType.MOBILE,
@@ -63,8 +80,8 @@ def _engine(payload: dict[str, Any]) -> Any:
                     "Cls.model_path": str(classifier),
                     "Rec.engine_type": EngineType.ONNXRUNTIME,
                     "Rec.lang_type": LangRec.CH,
-                    "Rec.model_type": ModelType.MOBILE,
-                    "Rec.ocr_version": OCRVersion.PPOCRV5,
+                    "Rec.model_type": recog_type,
+                    "Rec.ocr_version": version,
                     "Rec.model_path": str(model),
                     "Rec.rec_keys_path": str(dictionary),
                     "EngineConfig.onnxruntime.intra_op_num_threads": threads,
@@ -79,10 +96,21 @@ def _engine(payload: dict[str, Any]) -> Any:
         return engine
 
 
+def _display_version(payload: dict[str, Any]) -> str:
+    # 展示用模型版本号由 ocr_version 推导；缺省回退 PP-OCRv5-mobile。
+    ocr_version = payload.get("ocr_version", "PPOCRV5")
+    if ocr_version == "PPOCRV6":
+        return "PP-OCRv6-small"
+    if ocr_version == "PPOCRV4":
+        return "PP-OCRv4-mobile"
+    return "PP-OCRv5-mobile"
+
+
 def _normalised_result(
     result: Any,
     page_no: int,
     image_size: tuple[int, int] | None = None,
+    model_version: str = "PP-OCRv5-mobile",
 ) -> dict[str, Any]:
     image = getattr(result, "img", None)
     height = int(getattr(image, "shape", (0, 0))[0]) if image is not None else 0
@@ -127,7 +155,7 @@ def _normalised_result(
         )
     return {
         "engine": "rapidocr-onnxruntime",
-        "model_version": "PP-OCRv5-mobile",
+        "model_version": model_version,
         "page_count": 1,
         "lines": lines,
         "elapsed_ms": int(float(getattr(result, "elapse", 0.0) or 0.0) * 1000),
@@ -169,7 +197,12 @@ def _recognize_image_once(payload: dict[str, Any]) -> tuple[dict[str, Any] | Non
         after = source.stat()
         if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
             return None, WorkerError("FILE_CHANGED_DURING_PARSE", "The source image changed during OCR", True)
-        return _normalised_result(result, page_no, image_size), None
+        return _normalised_result(
+            result,
+            page_no,
+            image_size,
+            model_version=_display_version(payload),
+        ), None
     except FileNotFoundError:
         return None, WorkerError("OCR_INPUT_INVALID", "OCR input or model file does not exist", False)
     except (OSError, ValueError) as error:
@@ -185,11 +218,11 @@ def self_test_ocr(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, Worke
         import numpy as np
 
         result = _engine(payload)(np.full((64, 192, 3), 255, dtype=np.uint8), use_det=True, use_cls=True, use_rec=True)
-        _normalised_result(result, 1, (192, 64))
+        _normalised_result(result, 1, (192, 64), model_version=_display_version(payload))
         return {
             "status": "ready",
             "engine": "rapidocr-onnxruntime",
-            "model_version": "PP-OCRv5-mobile",
+            "model_version": _display_version(payload),
             "duration_ms": int(float(getattr(result, "elapse", 0.0) or 0.0) * 1000),
         }, None
     except FileNotFoundError:

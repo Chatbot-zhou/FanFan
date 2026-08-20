@@ -40,70 +40,153 @@ pub const TYPE_KEYWORDS: &[(DocumentType, &[&str])] = &[
     (
         DocumentType::Resume,
         &[
-            "简历", "求职意向", "教育背景", "工作经历", "项目经历", "技能特长", "自我评价",
-            "resume", "curriculum vitae", "objective",
+            "简历",
+            "求职意向",
+            "教育背景",
+            "工作经历",
+            "项目经历",
+            "技能特长",
+            "自我评价",
+            "resume",
+            "curriculum vitae",
+            "objective",
         ],
     ),
     (
         DocumentType::Contract,
         &[
-            "合同", "甲方", "乙方", "条款", "违约责任", "合同期限", "签署日期", "合同编号",
-            "contract", "agreement", "breach", "party",
+            "合同",
+            "甲方",
+            "乙方",
+            "条款",
+            "违约责任",
+            "合同期限",
+            "签署日期",
+            "合同编号",
+            "contract",
+            "agreement",
+            "breach",
+            "party",
         ],
     ),
     (
         DocumentType::Invoice,
         &[
-            "发票", "发票号码", "税额", "纳税人识别号", "价税合计", "开票日期", "invoice", "tax",
+            "发票",
+            "发票号码",
+            "税额",
+            "纳税人识别号",
+            "价税合计",
+            "开票日期",
+            "invoice",
+            "tax",
             "vat",
         ],
     ),
     (
         DocumentType::Paper,
         &[
-            "论文", "摘要", "引言", "参考文献", "实验方法", "doi", "paper", "abstract",
-            "references", "citation",
+            "论文",
+            "摘要",
+            "引言",
+            "参考文献",
+            "实验方法",
+            "doi",
+            "paper",
+            "abstract",
+            "references",
+            "citation",
         ],
     ),
     (
         DocumentType::ProjectDocument,
         &[
-            "项目", "需求", "实施方案", "里程碑", "交付物", "项目范围", "项目计划", "project",
-            "requirement", "milestone", "deliverable",
+            "项目",
+            "需求",
+            "实施方案",
+            "里程碑",
+            "交付物",
+            "项目范围",
+            "项目计划",
+            "project",
+            "requirement",
+            "milestone",
+            "deliverable",
         ],
     ),
     (
         DocumentType::Meeting,
         &[
-            "会议纪要", "会议议程", "参会人员", "议题", "决议", "行动项", "会议时间", "meeting",
-            "minutes", "agenda",
+            "会议纪要",
+            "会议议程",
+            "参会人员",
+            "议题",
+            "决议",
+            "行动项",
+            "会议时间",
+            "meeting",
+            "minutes",
+            "agenda",
         ],
     ),
     (
         DocumentType::LearningMaterial,
         &[
-            "课程", "讲义", "教材", "知识点", "练习题", "课件", "学习目标", "course", "lecture",
-            "textbook", "syllabus",
+            "课程",
+            "讲义",
+            "教材",
+            "知识点",
+            "练习题",
+            "课件",
+            "学习目标",
+            "course",
+            "lecture",
+            "textbook",
+            "syllabus",
         ],
     ),
     (
         DocumentType::Certificate,
         &[
-            "证书", "认证", "颁发", "考核", "资格", "证书编号", "certificate", "certification",
-            "credential", "award",
+            "证书",
+            "认证",
+            "颁发",
+            "考核",
+            "资格",
+            "证书编号",
+            "certificate",
+            "certification",
+            "credential",
+            "award",
         ],
     ),
     (
         DocumentType::Report,
         &[
-            "报告", "总结", "分析", "结论", "建议", "统计数据", "report", "analysis", "conclusion",
+            "报告",
+            "总结",
+            "分析",
+            "结论",
+            "建议",
+            "统计数据",
+            "report",
+            "analysis",
+            "conclusion",
             "summary",
         ],
     ),
     (
         DocumentType::Spreadsheet,
         &[
-            "表格", "数据", "统计表", "汇总", "明细", "工作表", "excel", "spreadsheet", "sheet",
+            "表格",
+            "数据",
+            "统计表",
+            "汇总",
+            "明细",
+            "工作表",
+            "excel",
+            "spreadsheet",
+            "sheet",
             "cell",
         ],
     ),
@@ -285,7 +368,10 @@ fn best_rule_type(
             continue;
         }
         let confidence = (hits / RULE_SCORE_CAP).min(1.0);
-        if best.as_ref().is_none_or(|(_, current)| confidence > *current) {
+        if best
+            .as_ref()
+            .is_none_or(|(_, current)| confidence > *current)
+        {
             best = Some((*document_type, confidence));
         }
     }
@@ -293,9 +379,9 @@ fn best_rule_type(
 }
 
 /// Embedding 原型相似度：返回相似度最高的 (类型, 余弦相似度)。
-fn best_prototype_type<'a>(
+fn best_prototype_type(
     vector: &[f32],
-    prototypes: &'a [TypePrototype<'_>],
+    prototypes: &[TypePrototype<'_>],
 ) -> Option<(DocumentType, f32)> {
     let mut best: Option<(DocumentType, f32)> = None;
     for prototype in prototypes {
@@ -303,7 +389,10 @@ fn best_prototype_type<'a>(
         if similarity < PROTOTYPE_MIN_SIMILARITY {
             continue;
         }
-        if best.as_ref().is_none_or(|(_, current)| similarity > *current) {
+        if best
+            .as_ref()
+            .is_none_or(|(_, current)| similarity > *current)
+        {
             best = Some((prototype.document_type, similarity));
         }
     }
@@ -318,7 +407,11 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
     let norm_a = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if !norm_a.is_finite() || !norm_b.is_finite() || norm_a <= f32::EPSILON || norm_b <= f32::EPSILON {
+    if !norm_a.is_finite()
+        || !norm_b.is_finite()
+        || norm_a <= f32::EPSILON
+        || norm_b <= f32::EPSILON
+    {
         return 0.0;
     }
     (dot / (norm_a * norm_b)).clamp(0.0, 1.0)
@@ -552,7 +645,10 @@ mod tests {
         );
         let (document_type, confidence) = result.expect("agreement locks");
         assert_eq!(document_type, DocumentType::Resume);
-        assert!(confidence >= 0.6, "一致时置信度从 0.6 起跳，实际 {confidence}");
+        assert!(
+            confidence >= 0.6,
+            "一致时置信度从 0.6 起跳，实际 {confidence}"
+        );
     }
 
     #[test]
@@ -576,14 +672,19 @@ mod tests {
         assert_eq!(cosine_similarity(&[1.0], &[]), 0.0);
         let (a, b) = (vec![3.0, 4.0], vec![6.0, 8.0]);
         let similarity = cosine_similarity(&a, &b);
-        assert!((similarity - 1.0).abs() < 1e-5, "同向向量余弦应≈1，实际 {similarity}");
+        assert!(
+            (similarity - 1.0).abs() < 1e-5,
+            "同向向量余弦应≈1，实际 {similarity}"
+        );
     }
 
     fn rows(items: &[(&str, &str)]) -> Vec<(u64, String)> {
         items
             .iter()
             .enumerate()
-            .map(|(index, (ordinal, json))| (ordinal.parse().unwrap_or(index as u64), (*json).to_owned()))
+            .map(|(index, (ordinal, json))| {
+                (ordinal.parse().unwrap_or(index as u64), (*json).to_owned())
+            })
             .collect()
     }
 
@@ -597,7 +698,11 @@ mod tests {
             ("4", r#"["项目经历","LangGraph 多智能体"]"#),
             ("5", r#"["教育背景","北京大学"]"#), // 重复 → 去重
         ]);
-        let titles = extract_section_titles(source.iter().map(|(ordinal, json)| (*ordinal, json.as_str())));
+        let titles = extract_section_titles(
+            source
+                .iter()
+                .map(|(ordinal, json)| (*ordinal, json.as_str())),
+        );
         assert_eq!(
             titles,
             vec!["教育背景", "北京大学", "项目经历", "LangGraph 多智能体"]
@@ -612,8 +717,11 @@ mod tests {
             ("2", r#"["项目经历"]"#),
             ("3", r#"{broken"#),
         ]);
-        let titles =
-            extract_section_titles(source.iter().map(|(ordinal, json)| (*ordinal, json.as_str())));
+        let titles = extract_section_titles(
+            source
+                .iter()
+                .map(|(ordinal, json)| (*ordinal, json.as_str())),
+        );
         assert_eq!(titles, vec!["项目经历"]);
     }
 
@@ -622,39 +730,59 @@ mod tests {
         let source = (0..200)
             .map(|index| (index as u64, format!(r#"["第{index}节"]"#)))
             .collect::<Vec<_>>();
-        let titles =
-            extract_section_titles(source.iter().map(|(ordinal, json)| (*ordinal, json.as_str())));
+        let titles = extract_section_titles(
+            source
+                .iter()
+                .map(|(ordinal, json)| (*ordinal, json.as_str())),
+        );
         assert_eq!(titles.len(), MAX_SECTION_TITLES);
     }
 
     #[test]
     fn picks_head_mid_tail_without_underflow() {
         let empty: Vec<String> = Vec::new();
-        assert_eq!(pick_head_mid_tail(&empty), (String::new(), String::new(), String::new()));
+        assert_eq!(
+            pick_head_mid_tail(&empty),
+            (String::new(), String::new(), String::new())
+        );
 
         let one = vec!["仅一段".to_owned()];
         let (head, mid, tail) = pick_head_mid_tail(&one);
-        assert_eq!((head.as_str(), mid.as_str(), tail.as_str()), ("仅一段", "仅一段", "仅一段"));
+        assert_eq!(
+            (head.as_str(), mid.as_str(), tail.as_str()),
+            ("仅一段", "仅一段", "仅一段")
+        );
 
         let three = vec!["头".to_owned(), "中".to_owned(), "尾".to_owned()];
         let (head, mid, tail) = pick_head_mid_tail(&three);
-        assert_eq!((head.as_str(), mid.as_str(), tail.as_str()), ("头", "中", "尾"));
+        assert_eq!(
+            (head.as_str(), mid.as_str(), tail.as_str()),
+            ("头", "中", "尾")
+        );
     }
 
     #[test]
     fn representative_text_is_bounded_and_deterministic() {
         let sections = vec!["项目经历".to_owned(), "教育背景".to_owned()];
-        let text = build_representative_text("大模型开发工程师-周晨", &sections, "头段", "中段", "尾段");
+        let text =
+            build_representative_text("大模型开发工程师-周晨", &sections, "头段", "中段", "尾段");
         assert!(text.contains("大模型开发工程师-周晨"));
         assert!(text.contains("项目经历"));
         assert!(text.contains("头段"));
         assert!(text.chars().count() <= REPRESENTATIVE_TEXT_LIMIT);
-        let again = build_representative_text("大模型开发工程师-周晨", &sections, "头段", "中段", "尾段");
+        let again =
+            build_representative_text("大模型开发工程师-周晨", &sections, "头段", "中段", "尾段");
         assert_eq!(text, again);
         // hash 稳定且随内容变化
-        assert_eq!(representative_text_hash(&text), representative_text_hash(&text));
+        assert_eq!(
+            representative_text_hash(&text),
+            representative_text_hash(&text)
+        );
         let changed = build_representative_text("其他标题", &sections, "头段", "中段", "尾段");
-        assert_ne!(representative_text_hash(&text), representative_text_hash(&changed));
+        assert_ne!(
+            representative_text_hash(&text),
+            representative_text_hash(&changed)
+        );
     }
 
     #[test]

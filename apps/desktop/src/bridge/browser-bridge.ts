@@ -13,7 +13,6 @@ import type {
   HomeSummary,
   InboxPage,
   ModelCatalogEntry,
-  ModelEdition,
   ModelDownloadJob,
   ModelPreset,
   ModelRuntimeState,
@@ -30,6 +29,10 @@ import type {
   MemoryInspectorView,
   MemoryRelationStatusRequest,
   MemoryClearRequest,
+  IndexStaleStatus,
+  ModelRole,
+  PresetPlanItem,
+  PresetPlanReport,
 } from "./contracts";
 
 const WELCOME_KEY = "fanfan.welcome.v1";
@@ -191,7 +194,7 @@ const defaultModelState: ModelRuntimeState = {
   runtime_backend: null,
   inference_runtime: defaultInferenceRuntime,
   checked_at: now(),
-  capabilities: { generation: false, embedding: false, vision: false, reranker: false, ocr: false, tts: false, asr: false },
+  capabilities: { generation: false, embedding: false, vision: false, reranker: false, ocr: false, asr: false },
   rag_complete: false,
   semantic_index_coverage: 0,
   embedding_migration: null,
@@ -199,43 +202,89 @@ const defaultModelState: ModelRuntimeState = {
 
 let demoArtifacts: ModelArtifact[] = [];
 let demoDownloadJobs: ModelDownloadJob[] = [];
+let demoSelectedPresetId: string | null = "smooth";
 const demoActiveRoles = new Set<string>();
-const demoEmbeddingArtifact: ModelEdition["artifacts"][number] = {
-  model_id: "bge-small-zh-v1.5-onnx-int8",
-  role: "embedding",
-  format: "onnx",
-  source: "huggingface",
-  repository_id: "onnx-community/bge-small-zh-v1.5-ONNX",
-  revision: "9507db33464b5da99a532ac26b2a251767cbc62b",
-  file_name: "model_quantized.onnx",
-  url: "https://huggingface.co/",
-  sha256: "99a6e522710c00220c89f8c52e0cc5aa09d4cbb1c34c0e932eab3a9dfdc65df3",
-  size_bytes: 168_002,
-  companion_files: [
-    { file_name: "model_quantized.onnx_data", remote_path: "onnx/model_quantized.onnx_data", url: "https://huggingface.co/", sha256: "952623481ca8beea884e3d3c9ecaf8a3c7bf1d0c21de29e970cd31af9d37a90b", size_bytes: 23_774_208 },
-    { file_name: "tokenizer.json", remote_path: "tokenizer.json", url: "https://huggingface.co/", sha256: "3d09c84edca9190e376e5dd8de731aa4d36b12f97f1a359f837e43390b0a4f8e", size_bytes: 362_603 },
-  ],
-  license_name: "MIT",
-  query_prefix: "为这个句子生成表示以用于检索相关文章：",
-  max_length: 512,
-};
-const demoModelEditions: ModelEdition[] = [
-  { edition_id: "light", name: "轻量版", description: "0.6B 本地生成模型与中文语义检索组件", recommended_memory_gb: 8, download_size_bytes: 663_751_501, capabilities: ["generation", "embedding", "rag"], artifacts: [{ model_id: "Qwen3-0.6B-Q8_0", role: "generation", format: "gguf", source: "huggingface", repository_id: "Qwen/Qwen3-0.6B-GGUF", revision: "1eaf4d9657fe65ad10a51eab76a8db5b363bddaa", file_name: "Qwen3-0.6B-Q8_0.gguf", url: "https://huggingface.co/", sha256: "9465e63e7ce6826db57337865524b63eb4cda2ed96645ea2961819577e8c2031", size_bytes: 639_446_688, companion_files: [], license_name: "Apache-2.0", query_prefix: null, max_length: null }, demoEmbeddingArtifact] },
-  { edition_id: "standard", name: "标准版", description: "4B 本地生成模型与中文语义检索组件", recommended_memory_gb: 12, download_size_bytes: 2_521_585_069, capabilities: ["generation", "embedding", "rag"], artifacts: [{ model_id: "Qwen3-4B-Q4_K_M", role: "generation", format: "gguf", source: "huggingface", repository_id: "Qwen/Qwen3-4B-GGUF", revision: "a9a60d009fa7ff9606305047c2bf77ac25dbec49", file_name: "Qwen3-4B-Q4_K_M.gguf", url: "https://huggingface.co/", sha256: "7485fe1dba41cf264d151854608429340702f1f212eaec0ad44391f06366bdf5", size_bytes: 2_497_280_256, companion_files: [], license_name: "Apache-2.0", query_prefix: null, max_length: null }, demoEmbeddingArtifact] },
-];
 const demoModelPresets: ModelPreset[] = [
-  { preset_id: "light", name: "推荐省内存组合", description: "Qwen3 0.6B + BGE-small", recommended_memory_gb: 8, role_catalog_ids: ["qwen3-0.6b-q8", "bge-small-zh-int8"], edition_id: "light" },
-  { preset_id: "standard", name: "推荐质量组合", description: "Qwen3 4B + BGE-small", recommended_memory_gb: 12, role_catalog_ids: ["qwen3-4b-q4", "bge-small-zh-int8"], edition_id: "standard" },
+  {
+    preset_id: "basic",
+    display_name: "轻量模式",
+    description: "最低资源占用，8GB 内存、无独立显卡也能完成基础搜索与 RAG。",
+    generation: "qwen3-5-0-8b-q4",
+    embedding: "bge-small-zh-int8",
+    reranker: null,
+    asr: null,
+    ocr: "ppocr-v6-small",
+    hardware_profile: { min_ram_gb: 8, min_vram_gb: null, description: "8GB 内存，无独立 GPU 亦可运行" },
+    capability_profile: { generation: true, embedding: true, reranker: false, ocr: true, asr: false },
+    runtime_profile: {
+      generation: { context_length: 4096, max_output_tokens: 1024, threads: 4, batch_size: 512, device_default: "auto", keep_alive_seconds: 300 },
+      embedding: { device_default: "auto", batch_size: 256 },
+      reranker: { enabled: false, device_default: "auto", batch_size: 32, top_k: 20 },
+      ocr: { worker_count: 1, device_default: "cpu" },
+      asr: { device_default: "cpu" },
+    },
+  },
+  {
+    preset_id: "smooth",
+    display_name: "标准模式",
+    description: "适合大多数配备独显的电脑，完整问答、智能检索、语音输入、增强 OCR。",
+    generation: "qwen3-5-2b-q4",
+    embedding: "bge-small-zh-int8",
+    reranker: "bge-reranker-base-int8",
+    asr: "sensevoice-small",
+    ocr: "ppocr-v6-small",
+    hardware_profile: { min_ram_gb: 16, min_vram_gb: 4, description: "16GB 内存 / 4GB 显存" },
+    capability_profile: { generation: true, embedding: true, reranker: true, ocr: true, asr: true },
+    runtime_profile: {
+      generation: { context_length: 8192, max_output_tokens: 2048, threads: 8, batch_size: 512, device_default: "auto", keep_alive_seconds: 300 },
+      embedding: { device_default: "auto", batch_size: 256 },
+      reranker: { enabled: true, device_default: "auto", batch_size: 32, top_k: 20 },
+      ocr: { worker_count: 2, device_default: "cpu" },
+      asr: { device_default: "cpu" },
+    },
+  },
+  {
+    preset_id: "balanced",
+    display_name: "增强模式",
+    description: "更高的问答质量与更稳定的 Query Understanding、跨文档检索与综合。",
+    generation: "qwen3-5-4b-q4",
+    embedding: "bge-m3",
+    reranker: "bge-reranker-base-int8",
+    asr: "sensevoice-small",
+    ocr: "ppocr-v6-medium",
+    hardware_profile: { min_ram_gb: 32, min_vram_gb: 8, description: "32GB 内存 / 约 8GB 显存" },
+    capability_profile: { generation: true, embedding: true, reranker: true, ocr: true, asr: true },
+    runtime_profile: {
+      generation: { context_length: 16384, max_output_tokens: 3072, threads: 8, batch_size: 512, device_default: "auto", keep_alive_seconds: 300 },
+      embedding: { device_default: "auto", batch_size: 256 },
+      reranker: { enabled: true, device_default: "auto", batch_size: 32, top_k: 20 },
+      ocr: { worker_count: 2, device_default: "cpu" },
+      asr: { device_default: "cpu" },
+    },
+  },
+  {
+    preset_id: "high",
+    display_name: "旗舰模式",
+    description: "翻翻最高质量本地配置，适合 32GB+ 内存与 12GB+ 显存的工作站。",
+    generation: "qwen3-5-9b-q4",
+    embedding: "bge-m3",
+    reranker: "bge-reranker-base-int8",
+    asr: "sensevoice-small",
+    ocr: "ppocr-v6-medium",
+    hardware_profile: { min_ram_gb: 32, min_vram_gb: 12, description: "32GB+ 内存 / 建议 12GB~16GB+ 显存" },
+    capability_profile: { generation: true, embedding: true, reranker: true, ocr: true, asr: true },
+    runtime_profile: {
+      generation: { context_length: 32768, max_output_tokens: 4096, threads: 8, batch_size: 256, device_default: "auto", keep_alive_seconds: 300 },
+      embedding: { device_default: "auto", batch_size: 256 },
+      reranker: { enabled: true, device_default: "auto", batch_size: 32, top_k: 20 },
+      ocr: { worker_count: 4, device_default: "cpu" },
+      asr: { device_default: "cpu" },
+    },
+  },
 ];
 const demoRoleCatalog: ModelCatalogEntry[] = [
-  ["qwen3-0.6b-q8", "generation", "Qwen3", "Qwen3 0.6B · 省内存", "Qwen3-0.6B-Q8_0", "低资源设备上的基础中文证据问答。", 639_446_688, 2, 1.2, "较快", true, "8GB 内存可用", "generation_qwen3_0_6b", ["huggingface", "modelscope"]],
-  ["qwen3-1.7b-q8", "generation", "Qwen3", "Qwen3 1.7B · 均衡", "Qwen3-1.7B-Q8_0", "回答质量与资源占用之间更均衡。", 1_834_426_016, 4, 2.4, "中等", true, "当前设备优先推荐", "generation_qwen3_1_7b", ["huggingface"]],
-  ["qwen3-4b-q4", "generation", "Qwen3", "Qwen3 4B · 质量优先", "Qwen3-4B-Q4_K_M", "更擅长跨文件综合和复杂追问。", 2_497_280_256, 7, 4.5, "较慢", false, "建议 12GB 以上内存", "generation_qwen3_4b", ["huggingface", "modelscope"]],
-  ["bge-small-zh-int8", "embedding", "BGE", "BGE-small-zh-v1.5 · 默认", "bge-small-zh-v1.5-onnx-int8", "中文资料检索的轻量向量模型。", 24_304_813, 1, null, "快", true, "所有受支持设备均推荐", "embedding_bge_small", ["huggingface", "modelscope"]],
-  ["bge-base-zh", "embedding", "BGE", "BGE-base-zh-v1.5 · 精度优先", "bge-base-zh-v1.5-onnx", "更大的中文向量模型。", null, 2.5, null, "中等", false, "远程构建完成基准前仅支持本地导入", null, []],
-  ["qwen3-vl-2b-q4", "vision", "Qwen3-VL", "Qwen3-VL 2B · 省显存", "Qwen3VL-2B-Instruct-Q4_K_M", "理解图片、图表和文档内嵌图片。", 1_552_463_168, 5, 3.2, "较慢", true, "4GB 显存优先选择", "vision_qwen3_vl_2b_q4", ["huggingface"]],
-  ["qwen3-vl-2b-q8", "vision", "Qwen3-VL", "Qwen3-VL 2B · 质量优先", "Qwen3VL-2B-Instruct-Q8_0", "保留更多视觉细节。", 2_279_480_640, 7, 5, "慢", false, "建议显存高于 6GB", "vision_qwen3_vl_2b_q8", ["huggingface"]],
-  ["bge-reranker-base-int8", "reranker", "BGE Reranker", "BGE Reranker Base · 可选", "bge-reranker-base-onnx-int8", "对少量混合召回候选做相关性复核。", 296_335_457, 2, null, "中等", false, "更重视速度时可不配置", "reranker_bge_base_int8", ["huggingface"]],
+  ["bge-small-zh-int8", "embedding", "BGE", "BGE-small-zh-v1.5 · 默认", "bge-small-zh-v1.5-onnx-int8", "中文资料检索的轻量向量模型。", 24_304_813, 1, null, "快", true, "所有受支持设备均推荐", "embedding_bge_small", ["modelscope"]],
+  ["bge-reranker-base-int8", "reranker", "BGE Reranker", "BGE Reranker Base · 可选", "bge-reranker-base-onnx-int8", "对少量混合召回候选做相关性复核。", 296_335_457, 2, null, "中等", false, "更重视速度时可不配置", "reranker_bge_base_int8", ["modelscope"]],
 ].map(([catalog_id, role, family, name, model_id, description, download_size_bytes, estimated_memory_gb, estimated_vram_gb, cpu_speed, recommended, device_guidance, install_edition_id, supported_sources]) => ({
   catalog_id: catalog_id as string,
   role: role as ModelCatalogEntry["role"],
@@ -375,39 +424,109 @@ export const browserBridge: FanFanBridge = {
     demoArtifacts = [...demoArtifacts, ...installed];
     return installed;
   },
-  async model_artifact_list() {
-    return structuredClone(demoArtifacts);
-  },
-  async model_role_config_list() {
-    return ([
-      ["generation", "严格证据问答与回答组织", false, "on_demand"],
-      ["embedding", "语义检索与文档关系", false, "background_index"],
-      ["vision", "图片、图表与扫描页理解", false, "serial_on_demand"],
-      ["reranker", "候选证据精排", true, "on_demand"],
-    ] as const).map(([role, required_for, optional, load_policy]) => ({
-      role,
-      required_for,
-      optional,
-      load_policy,
-      active_artifact_id: demoArtifacts.find((artifact) => artifact.role === role && demoActiveRoles.has(role))?.artifact_id ?? null,
-    }));
-  },
-  async model_catalog_list(_source) {
-    return structuredClone(demoModelEditions);
-  },
   async model_role_catalog_list() {
     return structuredClone(demoRoleCatalog);
   },
   async model_preset_list() {
     return structuredClone(demoModelPresets);
   },
+  async model_preset_selected_get() {
+    return demoSelectedPresetId;
+  },
+  async model_preset_plan(preset_id) {
+    // 只读预览：计算就绪/缺失清单但不持久化选中档位，供前端先弹下载确认框。
+    const preset = demoModelPresets.find((item) => item.preset_id === preset_id);
+    if (!preset) throw new Error("未知的模型档位");
+    const roleOf = (catalogId: string) => demoArtifacts.some((artifact) => artifact.model_id === catalogId);
+    const readyRoles = new Set(demoArtifacts.map((artifact) => artifact.role));
+    const planItems = (catalogId: string, role: ModelRole): PresetPlanItem => ({ role, catalog_id: catalogId });
+    const candidates: Array<[ModelRole, string]> = [
+      ["generation", preset.generation],
+      ["embedding", preset.embedding],
+      ...(preset.reranker ? ([["reranker", preset.reranker]] as Array<[ModelRole, string]>) : []),
+      ["ocr", preset.ocr],
+      ...(preset.asr ? ([["asr", preset.asr]] as Array<[ModelRole, string]>) : []),
+    ];
+    const report: PresetPlanReport = {
+      preset_id,
+      ready: candidates.filter(([role, catalogId]) => readyRoles.has(role) && roleOf(catalogId)).map(([role, catalogId]) => planItems(catalogId, role as ModelRole)),
+      missing: candidates.filter(([role, catalogId]) => !(readyRoles.has(role) && roleOf(catalogId))).map(([role, catalogId]) => planItems(catalogId, role as ModelRole)),
+    };
+    return structuredClone(report);
+  },
+  async model_preset_select(preset_id) {
+    const preset = demoModelPresets.find((item) => item.preset_id === preset_id);
+    if (!preset) throw new Error("未知的模型档位");
+    demoSelectedPresetId = preset_id;
+    const roleOf = (catalogId: string) => demoArtifacts.some((artifact) => artifact.model_id === catalogId);
+    const readyRoles = new Set(demoArtifacts.map((artifact) => artifact.role));
+    const planItems = (catalogId: string, role: ModelRole): PresetPlanItem => ({ role, catalog_id: catalogId });
+    const candidates: Array<[ModelRole, string]> = [
+      ["generation", preset.generation],
+      ["embedding", preset.embedding],
+      ...(preset.reranker ? ([["reranker", preset.reranker]] as Array<[ModelRole, string]>) : []),
+      ["ocr", preset.ocr],
+      ...(preset.asr ? ([["asr", preset.asr]] as Array<[ModelRole, string]>) : []),
+    ];
+    const report: PresetPlanReport = {
+      preset_id,
+      ready: candidates.filter(([role, catalogId]) => readyRoles.has(role) && roleOf(catalogId)).map(([role, catalogId]) => planItems(catalogId, role as ModelRole)),
+      missing: candidates.filter(([role, catalogId]) => !(readyRoles.has(role) && roleOf(catalogId))).map(([role, catalogId]) => planItems(catalogId, role as ModelRole)),
+    };
+    return structuredClone(report);
+  },
+  async model_preset_recommendation() {
+    return "smooth";
+  },
   async model_download_start(edition_id, source) {
-    const edition = demoModelEditions.find((item) => item.edition_id === edition_id);
-    if (!edition) throw new Error("模型版本不存在");
-    const installed = edition.artifacts.map<ModelArtifact>((artifact) => ({ artifact_id: crypto.randomUUID(), role: artifact.role, format: artifact.format, model_id: artifact.model_id, model_version: null, source, repository_id: artifact.repository_id, revision: artifact.revision, sha256: artifact.sha256, size_bytes: artifact.size_bytes, local_path: `C:\\Users\\你\\AppData\\Roaming\\com.fanfan.desktop\\models\\${artifact.file_name}`, quantization: artifact.role === "generation" ? (edition_id === "standard" ? "Q4_K_M" : "Q8_0") : null, context_length: null, embedding_dimension: artifact.role === "embedding" ? 512 : null, query_prefix: artifact.query_prefix, max_length: artifact.max_length, license_name: artifact.license_name, status: "ready", imported_at: now() }));
-    demoArtifacts = [...demoArtifacts, ...installed];
-    installed.forEach((artifact) => demoActiveRoles.add(artifact.role));
-    const job: ModelDownloadJob = { job_id: crypto.randomUUID(), edition_id, edition_name: edition.name, source, status: "completed", phase: "completed", downloaded_bytes: edition.download_size_bytes, total_bytes: edition.download_size_bytes, progress: 1, bytes_per_second: 0, eta_seconds: null, retry_count: 0, current_file: null, files: edition.artifacts.flatMap((artifact) => [{ role: artifact.role, file_name: artifact.file_name, downloaded_bytes: artifact.size_bytes, total_bytes: artifact.size_bytes, status: "completed" }, ...artifact.companion_files.map((file) => ({ role: artifact.role, file_name: file.file_name, downloaded_bytes: file.size_bytes, total_bytes: file.size_bytes, status: "completed" }))]), installed_artifact_ids: installed.map((artifact) => artifact.artifact_id), profile_id: crypto.randomUUID(), error: null, activation_status: "active", activation_error: null, created_at: now(), updated_at: now() };
+    const entry = demoRoleCatalog.find((item) => item.install_edition_id === edition_id);
+    if (!entry) throw new Error("模型版本不存在");
+    const artifact: ModelArtifact = {
+      artifact_id: crypto.randomUUID(),
+      role: entry.role,
+      format: entry.role === "generation" ? "gguf" : "onnx",
+      model_id: entry.model_id,
+      model_version: null,
+      source,
+      repository_id: null,
+      revision: null,
+      sha256: "0".repeat(64),
+      size_bytes: entry.download_size_bytes ?? 0,
+      local_path: `C:\\Users\\你\\AppData\\Roaming\\com.fanfan.desktop\\models\\${entry.model_id}`,
+      quantization: entry.role === "generation" ? "Q4_K_M" : null,
+      context_length: null,
+      embedding_dimension: entry.role === "embedding" ? 512 : null,
+      query_prefix: entry.role === "embedding" ? "为这个句子生成表示以用于检索相关文章：" : null,
+      max_length: entry.role === "embedding" ? 512 : null,
+      license_name: entry.license_name,
+      status: "ready",
+      imported_at: now(),
+    };
+    demoArtifacts = [...demoArtifacts, artifact];
+    demoActiveRoles.add(artifact.role);
+    const job: ModelDownloadJob = {
+      job_id: crypto.randomUUID(),
+      edition_id,
+      edition_name: entry.name,
+      source,
+      status: "completed",
+      phase: "completed",
+      downloaded_bytes: entry.download_size_bytes ?? 0,
+      total_bytes: entry.download_size_bytes ?? 0,
+      progress: 1,
+      bytes_per_second: 0,
+      eta_seconds: null,
+      retry_count: 0,
+      current_file: null,
+      files: [{ role: artifact.role, file_name: artifact.model_id, downloaded_bytes: artifact.size_bytes, total_bytes: artifact.size_bytes, status: "completed" }],
+      installed_artifact_ids: [artifact.artifact_id],
+      profile_id: crypto.randomUUID(),
+      error: null,
+      activation_status: "active",
+      activation_error: null,
+      created_at: now(),
+      updated_at: now(),
+    };
     demoDownloadJobs = [job, ...demoDownloadJobs];
     return structuredClone(job);
   },
@@ -462,16 +581,6 @@ export const browserBridge: FanFanBridge = {
   async model_download_remove(job_id) {
     return browserBridge.model_download_cancel(job_id);
   },
-  async model_artifact_activate(artifact_id) {
-    const artifact = demoArtifacts.find((item) => item.artifact_id === artifact_id);
-    if (!artifact) throw new Error("模型组件不存在");
-    demoActiveRoles.add(artifact.role);
-    return { ...defaultModelState, status: "ready", runtime_backend: "cpu", capabilities: { ...defaultModelState.capabilities, [artifact.role]: true } };
-  },
-  async model_role_disable(role) {
-    demoActiveRoles.delete(role);
-    return { ...defaultModelState };
-  },
   async home_get_summary(local_date) {
     return makeSummary(local_date);
   },
@@ -495,6 +604,7 @@ export const browserBridge: FanFanBridge = {
         match_reasons: (index === 0 ? ["filename", "fulltext"] : ["fulltext"]) as Array<"filename" | "fulltext">,
         locator: { kind: file.extension === "pdf" ? "pdf" as const : file.extension === "xlsx" ? "spreadsheet" as const : "docx" as const, page_no: file.extension === "pdf" ? 3 : null, slide_no: null, sheet_name: file.extension === "xlsx" ? "评估结果" : null, cell_range: file.extension === "xlsx" ? "B4:F12" : null, paragraph_no: file.extension === "docx" ? 18 : null, line_start: null, line_end: null, shape_no: null, bbox: null, heading_path: ["检索优化"] },
         revision_id: "018f0000-0000-7000-8000-000000000601",
+        image_asset_id: null,
         scores: { filename: index === 0 ? 0.9 : null, fulltext: 0.8, semantic: null, fused: 0.03 },
       }));
       const offset = request.cursor?.startsWith("demo:") ? Number(request.cursor.slice(5)) || 0 : 0;
@@ -657,9 +767,6 @@ export const browserBridge: FanFanBridge = {
   },
   async speech_recognize() {
     throw new Error("浏览器预览无法访问本机麦克风语音运行时，请在翻翻桌面程序中使用。");
-  },
-  async speech_synthesize_answer() {
-    throw new Error("浏览器预览无法访问本地语音合成运行时，请在翻翻桌面程序中使用。");
   },
   async answer_export(_message_id, target_path, format) {
     return { target_path, format, row_count: 0, size_bytes: 0, sha256: "0".repeat(64) };
@@ -1060,6 +1167,9 @@ export const browserBridge: FanFanBridge = {
   async diagnostic_event_append() {},
   async diagnostic_export() {
     throw new Error("浏览器预览不写入电脑文件，请在翻翻桌面程序中导出。");
+  },
+  async index_stale_check(): Promise<IndexStaleStatus> {
+    return { stale: false, active_embedding_artifact_id: null, index_embedding_artifact_id: null };
   },
   async index_rebuild() {
     return { operation_id: crypto.randomUUID(), kind: "index_rebuild" as const, status: "queued" as const, created_at: now() };

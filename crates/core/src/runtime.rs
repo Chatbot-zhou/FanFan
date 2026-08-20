@@ -26,7 +26,6 @@ pub enum RuntimeTaskKind {
     Cancel,
     Preview,
     SpeechRecognition,
-    SpeechSynthesis,
     Ask,
     DeepImageAnalysis,
     Search,
@@ -44,10 +43,7 @@ impl RuntimeTaskKind {
     pub fn default_priority(self) -> u8 {
         match self {
             Self::Cancel | Self::Preview => 0,
-            Self::SpeechRecognition
-            | Self::SpeechSynthesis
-            | Self::Ask
-            | Self::DeepImageAnalysis => 1,
+            Self::SpeechRecognition | Self::Ask | Self::DeepImageAnalysis => 1,
             Self::Search | Self::Embedding | Self::Rerank => 2,
             Self::IncrementalIndex => 3,
             Self::Ocr
@@ -61,7 +57,7 @@ impl RuntimeTaskKind {
     pub fn is_heavy(self) -> bool {
         matches!(
             self,
-            Self::Ask | Self::DeepImageAnalysis | Self::ImageUnderstanding
+            Self::Ask | Self::DeepImageAnalysis | Self::ImageUnderstanding | Self::IncrementalIndex
         )
     }
 
@@ -714,7 +710,9 @@ mod tests {
             loaded_at,
             last_used_at: loaded_at,
         };
-        manager.register_instance(instance.clone()).expect("register");
+        manager
+            .register_instance(instance.clone())
+            .expect("register");
         instance.memory_bytes = 2_000_000_000;
         instance.status = "idle".into();
         manager.sync_instance(instance.clone()).expect("sync");

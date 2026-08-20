@@ -54,9 +54,10 @@ pub fn match_alias_hints(question: &str, aliases: &[MemoryAlias]) -> Vec<MemoryH
     let mut hints = Vec::new();
     let mut matched_keys: Vec<String> = Vec::new();
     for alias in sorted {
-        if matched_keys.iter().any(|key| {
-            key.as_str() != alias.alias && key.contains(alias.alias.as_str())
-        }) {
+        if matched_keys
+            .iter()
+            .any(|key| key.as_str() != alias.alias && key.contains(alias.alias.as_str()))
+        {
             continue; // 已被更长别名覆盖的子串别名：不抢命中
         }
         if question_key.contains(&alias.alias) {
@@ -108,23 +109,22 @@ pub fn match_relation_hints(
             .as_deref()
             .is_some_and(|name| !name.is_empty() && question_key.contains(name));
         // 问题提到的必须是实体端；另一端是检索目标。
-        let (mentioned_entity_name, target_type, target_id) = if subject_mentioned
-            && relation.object_type != MemoryTargetType::Entity
-        {
-            (
-                subject_name.unwrap_or_default(),
-                relation.object_type,
-                relation.object_id,
-            )
-        } else if object_mentioned && relation.subject_type != MemoryTargetType::Entity {
-            (
-                object_name.unwrap_or_default(),
-                relation.subject_type,
-                relation.subject_id,
-            )
-        } else {
-            continue;
-        };
+        let (mentioned_entity_name, target_type, target_id) =
+            if subject_mentioned && relation.object_type != MemoryTargetType::Entity {
+                (
+                    subject_name.unwrap_or_default(),
+                    relation.object_type,
+                    relation.object_id,
+                )
+            } else if object_mentioned && relation.subject_type != MemoryTargetType::Entity {
+                (
+                    object_name.unwrap_or_default(),
+                    relation.subject_type,
+                    relation.subject_id,
+                )
+            } else {
+                continue;
+            };
         hints.push(MemoryHint {
             matched_text: mentioned_entity_name,
             kind: "relation",

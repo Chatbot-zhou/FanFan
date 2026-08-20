@@ -103,9 +103,9 @@ export function MemoryPanel() {
       {error && <p role="alert" className="inline-error">{error}</p>}
       <section>
         <h2>记忆</h2>
-        <p>翻翻可以记住你确认过的文件关系、名称和常用称呼，帮助以后更准确地理解「我的简历」「那个项目」等表达。记忆仅保存在本地。</p>
+        <p>翻翻可以记住你确认过的文件关系、名称和常用称呼。记忆仅保存在本地。</p>
         <div className="memory-switch">
-          <span>使用记忆<small>允许翻翻在对话中使用已保存的记忆来理解你的指代和常用资料。关闭不会删除已保存的记忆；当前会话的上下文仍然可用。</small></span>
+          <span>使用记忆<small>允许翻翻在对话中使用已保存的记忆来理解你的指代和常用资料。</small></span>
           <button
             type="button"
             role="switch"
@@ -117,7 +117,6 @@ export function MemoryPanel() {
             <i />
           </button>
         </div>
-        <p className="memory-privacy-note">记忆保存在你的设备本地，不会作为文件内容的替代来源。回答资料问题时，翻翻仍会重新读取原始文件并提供依据。</p>
       </section>
 
       <section>

@@ -19,6 +19,20 @@ export const MODEL_DOWNLOAD_PHASE_LABELS: Record<ModelDownloadJob["phase"], stri
   cancelled: "已取消",
 };
 
+/**
+ * 下载卡片展示的模型主名：只保留名称本身，剔除名称后方的附加说明文字，保证
+ * 展示的专业性与简洁性。分两类处理：
+ *   1. 「省内存」等资源特性附加词 —— 目录源头（model_catalog.rs）已清理，此处
+ *      兜底历史版本遗留的下载任务快照（downloads.json 中仍存旧名）；
+ *   2. 「 · 说明」形式的用途/性质后缀 —— 只保留「 · 」之前的主名部分。
+ */
+export function cleanModelDisplayName(name: string): string {
+  let cleaned = name.replace(/省内存/g, "").trim();
+  const separator = cleaned.indexOf(" · ");
+  if (separator >= 0) cleaned = cleaned.slice(0, separator);
+  return cleaned.trim();
+}
+
 const ACTIVE_STATUSES = new Set<ModelDownloadJob["status"]>(["queued", "running", "paused"]);
 
 export interface ModelDownloadSummary {
@@ -46,10 +60,9 @@ export function visibleModelDownloadJobs(
   return jobs
     .filter((job) => {
       if (modelDownloadNeedsAttention(job) || modelDownloadIsActive(job)) return true;
-      if (job.status === "cancelled") return false;
-      if (job.status !== "completed") return true;
-      const updatedAt = Date.parse(job.updated_at);
-      return Number.isFinite(updatedAt) && updatedAt >= sessionStartedAt;
+      // 已完成或已取消的任务不再展示，避免列表堆积。
+      if (job.status === "completed" || job.status === "cancelled") return false;
+      return true;
     })
     .sort((left, right) => {
       const createdDelta = Date.parse(left.created_at) - Date.parse(right.created_at);

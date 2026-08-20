@@ -1,4 +1,4 @@
-import { AudioOutlined, CaretRightOutlined, CloseOutlined, CopyOutlined, EllipsisOutlined, FileSearchOutlined, FileTextOutlined, PauseOutlined, QuestionCircleOutlined, SendOutlined, SoundOutlined, StopOutlined, UserOutlined, WarningOutlined } from "@ant-design/icons";
+import { AudioOutlined, CloseOutlined, EllipsisOutlined, FileSearchOutlined, FileTextOutlined, QuestionCircleOutlined, SendOutlined, StopOutlined, UserOutlined, WarningOutlined } from "@ant-design/icons";
 import { Dropdown, Input, Modal } from "antd";
 import { isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -49,7 +49,7 @@ const MarkdownAnswer = ({ text, question }: { text: string; question: string }) 
 // 引用文件过多（超过阈值）时折叠为单个"引用了 N 个文件"胶囊，点击展开
 const REFS_COLLAPSE_THRESHOLD = 3;
 
-// 回答下方的引用文件标签：胶囊排列在操作栏（导出/朗读）最左侧；
+// 回答下方的引用文件标签：胶囊排列在操作栏（导出）最左侧；
 // 点击文件胶囊展开该文件被引用的具体事实（润色句）与原文（quote），
 // 每条可"查看原文"跳转整页预览。
 function AnswerReferences({ answer, question, expanded, activeFile, onToggleRefs, onSelectFile, onOpenPreview }: {
@@ -67,32 +67,36 @@ function AnswerReferences({ answer, question, expanded, activeFile, onToggleRefs
   const citationsOf = (fileId: string) => answer.claims
     .flatMap((claim) => claim.citations.map((citation) => ({ claimText: claim.text, citation })))
     .filter((item) => item.citation.file_id === fileId);
+  // 胶囊行与引用详情分离：详情作为 answer-actions 的独立换行子元素，
+  // 展开时不再撑满/挤压操作行，操作按钮保持原尺寸。
   return (
-    <div className="answer-refs">
-      {collapsed ? (
-        <button type="button" className="source-chip source-chip--collapse" onClick={onToggleRefs} title="展开全部引用文件">
-          <FileTextOutlined /> 引用了 {files.length} 个文件
-        </button>
-      ) : (
-        <>
-          {files.length > REFS_COLLAPSE_THRESHOLD && (
-            <button type="button" className="source-chip source-chip--collapse" onClick={onToggleRefs} title="折叠引用文件">
-              <FileTextOutlined /> 引用了 {files.length} 个文件
-            </button>
-          )}
-          {files.map((source) => (
-            <button
-              key={source.file_id}
-              type="button"
-              className={`source-chip${activeFile === source.file_id ? " source-chip--active" : ""}`}
-              title={source.display_path}
-              onClick={() => onSelectFile(activeFile === source.file_id ? null : source.file_id)}
-            >
-              <FileTextOutlined /> {source.display_name}
-            </button>
-          ))}
-        </>
-      )}
+    <>
+      <div className="answer-refs">
+        {collapsed ? (
+          <button type="button" className="source-chip source-chip--collapse" onClick={onToggleRefs} title="展开全部引用文件">
+            <FileTextOutlined /> 引用了 {files.length} 个文件
+          </button>
+        ) : (
+          <>
+            {files.length > REFS_COLLAPSE_THRESHOLD && (
+              <button type="button" className="source-chip source-chip--collapse" onClick={onToggleRefs} title="折叠引用文件">
+                <FileTextOutlined /> 引用了 {files.length} 个文件
+              </button>
+            )}
+            {files.map((source) => (
+              <button
+                key={source.file_id}
+                type="button"
+                className={`source-chip${activeFile === source.file_id ? " source-chip--active" : ""}`}
+                title={source.display_path}
+                onClick={() => onSelectFile(activeFile === source.file_id ? null : source.file_id)}
+              >
+                <FileTextOutlined /> {source.display_name}
+              </button>
+            ))}
+          </>
+        )}
+      </div>
       {activeFile !== null && (
         <div className="answer-ref-detail">
           <h2>{files.find((file) => file.file_id === activeFile)?.display_name ?? "引用详情"}</h2>
@@ -108,7 +112,7 @@ function AnswerReferences({ answer, question, expanded, activeFile, onToggleRefs
           ))}
         </div>
       )}
-    </div>
+    </>
   );
 }
 
@@ -213,22 +217,17 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
   const [preview, setPreview] = useState<FilePreview | null>(null);
   const [previewLoading, setPreviewLoading] = useState<string | null>(null);
   const [readiness, setReadiness] = useState<RagReadiness | null>(null);
-  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   // 每条回答的引用文件标签状态：折叠区是否展开、正在查看引文的文件
   const [refsExpanded, setRefsExpanded] = useState<Record<string, boolean>>({});
   const [activeRefFile, setActiveRefFile] = useState<Record<string, string | null>>({});
   const [recording, setRecording] = useState(false);
   const [recognizing, setRecognizing] = useState(false);
-  const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
-  const [speechLoadingMessageId, setSpeechLoadingMessageId] = useState<string | null>(null);
-  const [speechPaused, setSpeechPaused] = useState(false);
   const audioContextRef = useRef<AudioContext | null>(null);
   const recordingStreamRef = useRef<MediaStream | null>(null);
   const recordingProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const recordingSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const recordingChunksRef = useRef<Float32Array[]>([]);
   const recordingTimerRef = useRef<number | null>(null);
-  const playbackRef = useRef<HTMLAudioElement | null>(null);
   const scope = useMemo(() => ({ root_ids: [], collection_ids: scopeCollectionIds, file_ids: [], extensions: [], modified_from: null, modified_to: null, availability: "present" as const }), [scopeCollectionIds]);
   const addScopeCollection = (value: string) => {
     if (!value || scopeCollectionIds.includes(value)) return;
@@ -460,15 +459,6 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
     }
   };
 
-  const copyAnswer = async (answer: AnswerResult) => {
-    setError(null);
-    try {
-      await navigator.clipboard.writeText(answer.answer);
-      setCopiedMessageId(answer.message_id);
-      window.setTimeout(() => setCopiedMessageId((current) => current === answer.message_id ? null : current), 1600);
-    } catch (actionError) { setError(errorMessage(actionError)); }
-  };
-
   const releaseRecordingResources = async () => {
     if (recordingTimerRef.current !== null) window.clearTimeout(recordingTimerRef.current);
     recordingTimerRef.current = null;
@@ -547,62 +537,12 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
     }
   };
 
-  const stopPlayback = () => {
-    const playback = playbackRef.current;
-    if (playback) {
-      playback.pause();
-      playback.currentTime = 0;
-    }
-    playbackRef.current = null;
-    setSpeakingMessageId(null);
-    setSpeechPaused(false);
-    setSpeechLoadingMessageId(null);
-  };
-
-  const readAnswer = async (answer: AnswerResult) => {
-    if (speakingMessageId === answer.message_id && playbackRef.current) {
-      if (playbackRef.current.paused) {
-        await playbackRef.current.play();
-        setSpeechPaused(false);
-      } else {
-        playbackRef.current.pause();
-        setSpeechPaused(true);
-      }
-      return;
-    }
-    if (!model_state?.capabilities.tts) {
-      setError("尚未配置可用的语音合成模型，请先到本地模型中配置 TTS。");
-      return;
-    }
-    stopPlayback();
-    setError(null);
-    setSpeakingMessageId(answer.message_id);
-    setSpeechLoadingMessageId(answer.message_id);
-    try {
-      const session = await bridge.speech_synthesize_answer(answer.message_id, 1.0, 0);
-      const playback = new Audio(`data:audio/wav;base64,${session.result.audio_base64}`);
-      playback.onended = stopPlayback;
-      playback.onerror = () => {
-        stopPlayback();
-        setError("生成的语音无法播放，请重试。");
-      };
-      playbackRef.current = playback;
-      await playback.play();
-      setSpeechLoadingMessageId(null);
-    } catch (actionError) {
-      stopPlayback();
-      setSpeechLoadingMessageId(null);
-      setError(errorMessage(actionError));
-    }
-  };
-
   useEffect(() => () => {
     if (recordingTimerRef.current !== null) window.clearTimeout(recordingTimerRef.current);
     recordingProcessorRef.current?.disconnect();
     recordingSourceRef.current?.disconnect();
     recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
     void audioContextRef.current?.close();
-    playbackRef.current?.pause();
   }, []);
 
   const openRename = (session: AskSessionSummary) => {
@@ -716,11 +656,6 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
             <UserMessage text={turn.question} />
             <AssistantMessage>
               <div className="chat-bubble chat-bubble--assistant">
-                {turn.answer.answer_mode !== "generated" && turn.answer.answer_mode !== "chat" && (
-                  <span className={`answer-mode-chip answer-mode-chip--${turn.answer.answer_mode}`}>
-                    {ANSWER_MODE_LABELS[turn.answer.answer_mode] ?? turn.answer.answer_mode}
-                  </span>
-                )}
                 <div className="markdown-body"><MarkdownAnswer text={turn.answer.answer} question={turn.question} /></div>
                 {turn.answer.answer_mode === "clarification" && turn.answer.clarification && (
                   <div className="clarification-options">
@@ -742,6 +677,14 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
                   </div>
                 )}
                 <div className="answer-actions">
+                  {turn.answer.source_files.length === 0 && turn.answer.answer_mode !== "generated" && turn.answer.answer_mode !== "chat" && (
+                    <span
+                      className={`answer-mode-chip answer-mode-chip--inline answer-mode-chip--${turn.answer.answer_mode}`}
+                      title={turn.answer.answer_mode === "rag_refusal" ? "当前资料中未找到足够依据" : undefined}
+                    >
+                      {ANSWER_MODE_LABELS[turn.answer.answer_mode] ?? turn.answer.answer_mode}
+                    </span>
+                  )}
                   <AnswerReferences
                     answer={turn.answer}
                     question={turn.question}
@@ -751,11 +694,6 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
                     onSelectFile={(fileId) => setActiveRefFile((prev) => ({ ...prev, [turn.answer.message_id]: fileId }))}
                     onOpenPreview={(fileId, nodeId) => void showPreview(fileId, nodeId)}
                   />
-                  <button type="button" onClick={() => void copyAnswer(turn.answer)}><CopyOutlined /> {copiedMessageId === turn.answer.message_id ? "已复制" : "复制"}</button>
-                  <button type="button" disabled={speechLoadingMessageId === turn.answer.message_id} onClick={() => void readAnswer(turn.answer)}>
-                    {speechLoadingMessageId === turn.answer.message_id ? <><SoundOutlined /> 正在生成语音</> : speakingMessageId === turn.answer.message_id ? speechPaused ? <><CaretRightOutlined /> 继续朗读</> : <><PauseOutlined /> 暂停朗读</> : <><SoundOutlined /> 朗读</>}
-                  </button>
-                  {speakingMessageId === turn.answer.message_id && <button type="button" onClick={stopPlayback}><StopOutlined /> 停止</button>}
                 </div>
                 {isLast && preview && <div className="answer-preview" aria-label={`${preview.file.display_name}原文预览`}>
                   <header><strong>{preview.file.display_name}</strong><small>{displayPath(preview.file.display_path)}</small></header>

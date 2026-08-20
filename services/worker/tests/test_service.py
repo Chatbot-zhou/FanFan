@@ -43,9 +43,8 @@ class WorkerServiceTests(unittest.TestCase):
         cases = [
             ("parse", ["health.check", "document.probe", "document.parse", "export.write"]),
             ("onnx", ["health.check", "embedding.encode", "rerank.score"]),
-            ("ocr", ["health.check", "ocr.self_test", "ocr.recognize"]),
-            ("speech", ["health.check", "speech.asr_self_test", "speech.recognize",
-                        "speech.tts_self_test", "speech.synthesize"]),
+            ("ocr", ["health.check", "ocr.self_test", "ocr.recognize", "ocr.route_image"]),
+            ("speech", ["health.check", "speech.asr_self_test", "speech.recognize"]),
         ]
         for role, supported in cases:
             service = WorkerService(role)
@@ -55,7 +54,7 @@ class WorkerServiceTests(unittest.TestCase):
                     f"{role} 应支持 {operation}",
                 )
             for operation in ["document.parse", "embedding.encode", "ocr.recognize",
-                              "speech.recognize", "rerank.score"]:
+                              "ocr.route_image", "speech.recognize", "rerank.score"]:
                 if operation not in supported:
                     self.assertFalse(
                         service.supports(operation),

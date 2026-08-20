@@ -7,7 +7,7 @@ const job = (jobId: string, name: string, status: ModelDownloadJob["status"] = "
   job_id: jobId,
   edition_id: `edition-${jobId}`,
   edition_name: name,
-  source: "huggingface",
+  source: "modelscope",
   status,
   phase: status === "paused" ? "paused" : "downloading",
   downloaded_bytes: 50,
@@ -48,7 +48,7 @@ describe("ModelDownloadList", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("网络连接已中断");
   });
 
-  it("separates resume, retry, source switch and removal semantics", () => {
+  it("separates resume, retry and removal semantics", () => {
     const onAction = vi.fn();
     const failed = {
       ...job("failed", "失败模型", "failed"),
@@ -59,7 +59,6 @@ describe("ModelDownloadList", () => {
 
     expect(screen.getByRole("button", { name: "继续" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "切换来源" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "移除任务" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "继续/重试" })).not.toBeInTheDocument();
   });

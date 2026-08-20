@@ -134,7 +134,9 @@ fn parse_compare_results_lenient(value: &serde_json::Value) -> Option<CompareRes
                         .and_then(|point| point.as_str())
                         .map(|point| point.trim())
                         .filter(|point| !point.is_empty())
-                        .map(|point| ComparePoint { point: point.to_owned() })
+                        .map(|point| ComparePoint {
+                            point: point.to_owned(),
+                        })
                 })
                 .collect::<Vec<_>>()
         })
@@ -180,7 +182,11 @@ fn parse_compare_results_lenient(value: &serde_json::Value) -> Option<CompareRes
     if similarities.is_empty() && differences.is_empty() && conclusion.is_empty() {
         return None;
     }
-    Some(CompareResults { similarities, differences, conclusion })
+    Some(CompareResults {
+        similarities,
+        differences,
+        conclusion,
+    })
 }
 
 /// 容错 JSON 对象提取：剥 ```json fence → 直接 parse → 平衡花括号回退。
@@ -190,14 +196,11 @@ fn tolerant_json_object(raw: &str) -> Option<serde_json::Value> {
     if let Some(rest) = trimmed
         .strip_prefix("```json")
         .or_else(|| trimmed.strip_prefix("```"))
+        && let Some(stripped) = rest.strip_suffix("```")
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(stripped.trim())
+        && value.is_object()
     {
-        if let Some(stripped) = rest.strip_suffix("```") {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(stripped.trim())
-                && value.is_object()
-            {
-                return Some(value);
-            }
-        }
+        return Some(value);
     }
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
         && value.is_object()
@@ -246,7 +249,10 @@ mod tests {
         let parsed = parse_compare_results(raw).expect("parses");
         assert_eq!(parsed.similarities.len(), 1);
         assert_eq!(parsed.differences.len(), 1);
-        assert_eq!(parsed.differences[0].left_evidence, "项目一、项目二、项目三");
+        assert_eq!(
+            parsed.differences[0].left_evidence,
+            "项目一、项目二、项目三"
+        );
         assert_eq!(parsed.conclusion, "B 是 A 的精简版");
     }
 
@@ -272,14 +278,22 @@ mod tests {
     #[test]
     fn rejects_empty_results() {
         assert!(parse_compare_results("{}").is_none());
-        assert!(parse_compare_results(r#"{"similarities":[],"differences":[],"conclusion":""}"#).is_none());
+        assert!(
+            parse_compare_results(r#"{"similarities":[],"differences":[],"conclusion":""}"#)
+                .is_none()
+        );
         assert!(parse_compare_results("not json").is_none());
     }
 
     #[test]
     fn schema_requires_all_sections() {
         let schema = compare_schema();
-        let required: Vec<_> = schema["required"].as_array().unwrap().iter().map(|value| value.as_str().unwrap()).collect();
+        let required: Vec<_> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
         assert!(required.contains(&"similarities"));
         assert!(required.contains(&"differences"));
         assert!(required.contains(&"conclusion"));

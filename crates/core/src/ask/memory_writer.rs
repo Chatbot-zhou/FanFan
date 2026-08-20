@@ -499,7 +499,10 @@ mod tests {
                 MemoryStatus::Confirmed,
             )],
         };
-        assert!(prewrite_validate(output).is_empty(), "普通问答绝不写 Memory");
+        assert!(
+            prewrite_validate(output).is_empty(),
+            "普通问答绝不写 Memory"
+        );
     }
 
     #[test]
@@ -530,8 +533,24 @@ mod tests {
         let output = MemoryWriterOutput {
             should_write: true,
             memories: vec![
-                proposal(MemoryKind::Alias, "周晨.pdf", None, None, Some("   "), 0.9, MemoryStatus::Candidate),
-                proposal(MemoryKind::Alias, "周晨.pdf", None, None, Some("我的 简历"), 0.9, MemoryStatus::Candidate),
+                proposal(
+                    MemoryKind::Alias,
+                    "周晨.pdf",
+                    None,
+                    None,
+                    Some("   "),
+                    0.9,
+                    MemoryStatus::Candidate,
+                ),
+                proposal(
+                    MemoryKind::Alias,
+                    "周晨.pdf",
+                    None,
+                    None,
+                    Some("我的 简历"),
+                    0.9,
+                    MemoryStatus::Candidate,
+                ),
             ],
         };
         let validated = prewrite_validate(output);
@@ -544,8 +563,24 @@ mod tests {
         let output = MemoryWriterOutput {
             should_write: true,
             memories: vec![
-                proposal(MemoryKind::Relation, "周晨", None, None, None, 0.8, MemoryStatus::Candidate),
-                proposal(MemoryKind::Relation, "周晨", Some("is_about"), None, None, 0.8, MemoryStatus::Candidate),
+                proposal(
+                    MemoryKind::Relation,
+                    "周晨",
+                    None,
+                    None,
+                    None,
+                    0.8,
+                    MemoryStatus::Candidate,
+                ),
+                proposal(
+                    MemoryKind::Relation,
+                    "周晨",
+                    Some("is_about"),
+                    None,
+                    None,
+                    0.8,
+                    MemoryStatus::Candidate,
+                ),
                 proposal(
                     MemoryKind::Relation,
                     "周晨",
@@ -705,7 +740,10 @@ mod tests {
             ),
         ];
         let writes = resolve_proposal_targets(proposals, &registry());
-        assert!(writes.is_empty(), "无法解析到合法目标的一律丢弃，绝不写悬空记忆");
+        assert!(
+            writes.is_empty(),
+            "无法解析到合法目标的一律丢弃，绝不写悬空记忆"
+        );
     }
 
     #[test]
@@ -754,7 +792,9 @@ mod tests {
     #[test]
     fn alias_to_unknown_collection_is_dropped() {
         let mut collection_registry = registry();
-        collection_registry.collections.push((uuid::Uuid::now_v7(), "法律项目"));
+        collection_registry
+            .collections
+            .push((uuid::Uuid::now_v7(), "法律项目"));
         let proposals = vec![proposal(
             MemoryKind::Alias,
             "不存在的收藏集",

@@ -13,69 +13,56 @@ use std::{
 };
 
 use chrono::Utc;
+use fanfan_core::ask::builtin_knowledge::lookup_builtin_knowledge;
+use fanfan_core::ask::query_normalize::normalize_query_variants;
+use fanfan_core::ask::query_plan::{QueryIntent, QueryOperation, ResolutionStatus};
+use fanfan_core::ask::source_router::{SourceRouting, personal_reference_hit};
+use fanfan_core::profile_builder::{TYPE_PROTOTYPE_TEXTS, TypePrototype, classify_document_type};
 use fanfan_core::{
     AddRootRequest, AiRuntimeSnapshot, AnswerClaim, AnswerMode, AnswerResult, AnswerSourceFile,
-    AppError, AskMessage, EvidenceRef, GroundingStatus, SupportStatus,
-    AskMessagePage, AskRequest, AskSessionContext, AskSessionPage, CandidateRoot, CatalogService,
-    ChunkEmbeddingInput, ClarificationOption, ClarificationPayload, CollectionModelReview,
-    CollectionRecord, CollectionRule, CollectionSuggestion, CollectionSuggestionPage,
-    DocumentCandidate,
-    CollectionSuggestionQuery, CollectionSuggestionRefreshResult, CollectionSuggestionUpdateRequest,
-    CreateCollectionRequest, DegradationLevel, DocumentType, DownloadFile, DownloadedModelMetadata,
-    DocumentProfile, EmbeddingRequest, ExclusionRule, ExclusionRuleInput, ExportResult, FilePage,
-    FilePreview, FileQuery, FileRecord, ImageUnderstandingResult, ImportCandidate, InboxItem,
+    AnswerabilityInput, AnswerabilityStatus, AppError, AskEvaluationRunReport,
+    AskEvaluationRunRequest, AskMessage, AskMessagePage, AskRequest, AskSessionContext,
+    AskSessionPage, AskTrace, AskTraceExport, AskTraceExportRequest, AskTraceStage, AskTraceTiming,
+    COMPARE_FALLBACK_ITEMS, COMPARE_MATERIAL_CHARS, COMPARE_MATERIAL_ITEMS, CandidateRoot,
+    CatalogService, ChunkEmbeddingInput, ClarificationOption, ClarificationPayload,
+    CollectionModelReview, CollectionRecord, CollectionRule, CollectionSuggestion,
+    CollectionSuggestionPage, CollectionSuggestionQuery, CollectionSuggestionRefreshResult,
+    CollectionSuggestionUpdateRequest, CompareResults, CreateCollectionRequest,
+    DOCUMENT_RECALL_TOP_N, DOCUMENT_RECALL_VECTOR_CANDIDATES, DegradationLevel, DocumentCandidate,
+    DocumentOverview, DocumentProfile, DocumentProfileInspect, DocumentProfileRebuildRequest,
+    DocumentType, DownloadFile, DownloadedModelMetadata, EXTRACT_MATCH_MIN_LEN, EXTRACT_MAX_ITEMS,
+    EmbeddingRequest, EvidenceRef, ExclusionRule, ExclusionRuleInput, ExportResult, FilePage,
+    FilePreview, FileQuery, FileRecord, GateEvidence, GenerationActivation, GroundingStatus,
+    ImageOcrResult, ImageOcrRoutingRequest, ImageUnderstandingResult, ImportCandidate, InboxItem,
     InboxPage, InboxQuery, InboxUpdateRequest, IncrementalWatchManager, IndexActivityStats,
-    JobRecord, LocalGenerationRuntime, LogPage, LogQuery, MaintenanceSnapshot, MemoryHint,
-    NoEvidenceReason,
-    MemoryKind, MemorySource, MemoryStatus, MemoryTargetRegistry, MemoryTargetType,
-    MemoryWriteInput, MemoryWriterContext, ModelArtifact,
-    ModelCatalogEntry, ModelDownloadFileProgress, ModelDownloadJob, ModelDownloadRemoval,
-    ModelEdition, ModelFormat, ModelImportSelection, ModelManager, ModelPreset, ModelRole,
-    ModelRoleConfig, ModelSource, ModelStoreStatus, NodeTracePage, NodeTraceQuery,
-    AskTrace, AskTraceExport, AskTraceExportRequest, AskTraceStage, AskTraceTiming,
-    NodeTraceRecord, OcrRuntimeConfig,
-    DocumentProfileInspect, DocumentProfileRebuildRequest, MemoryInspectorView,
-    MemoryRelationStatusRequest, MemoryClearRequest, ProfileRefreshResult,
-    AskEvaluationRunRequest, AskEvaluationRunReport,
-    ParseMetrics, ParseOutcome, ParseRequest, ParseResult, PendingEmbeddingActivation, QueryPlan,
-    RagReadiness, RelationGroupPage, RelationGroupQuery, RelationPage, RelationQuery,
+    JobRecord, LOCAL_STRICT_SYSTEM_PROMPT, LocalGenerationRuntime, LogPage, LogQuery,
+    MAX_CANDIDATE_SCOPE, MAX_SECTION_CHARS, MAX_SECTIONS, MaintenanceSnapshot, MemoryClearRequest,
+    MemoryHint, MemoryInspectorView, MemoryKind, MemoryRelationStatusRequest, MemorySource,
+    MemoryStatus, MemoryTargetRegistry, MemoryTargetType, MemoryWriteInput, MemoryWriterContext,
+    ModelArtifact, ModelCatalogEntry, ModelDownloadFileProgress, ModelDownloadJob,
+    ModelDownloadRemoval, ModelEdition, ModelFormat, ModelImportSelection, ModelManager,
+    ModelPreset, ModelRole, ModelSource, ModelStoreStatus, NoEvidenceReason, NodeTracePage,
+    NodeTraceQuery, NodeTraceRecord, OcrRuntimeConfig, OperationTraceInput, ParseMetrics,
+    ParseOutcome, ParseRequest, ParseResult, PendingEmbeddingActivation, ProfileRefreshResult,
+    QueryPlan, RagReadiness, RelationGroupPage, RelationGroupQuery, RelationPage, RelationQuery,
     RelationRefreshResult, RerankRequest, ResolverInput, RootRecord, RuntimeBackendKind,
     RuntimeCapability, RuntimeInstanceState, RuntimeManager, RuntimeResourceBudget,
     RuntimeTaskKind, RuntimeTaskRequest, ScopeFilter, SearchMode, SearchRequest, SearchSession,
-    SemanticQuery, SourceIntent, SpeechRecognitionRequest, SpeechRecognitionResult,
-    SpeechSynthesisRequest, SpeechSynthesisResult, TriageStatus, WorkerClient, WorkerRole,
-    GenerationActivation,
-    AnswerabilityInput, AnswerabilityStatus, GateEvidence, LOCAL_STRICT_SYSTEM_PROMPT,
-    answer_shape_directive, claim_subject_mismatch, evaluate_answerability,
-    existence_requires_project_context, find_external_knowledge_marker,
-    local_no_evidence_answer,
-    chat_prompt, is_natural_language_query, match_alias_hints, match_relation_hints,
-    memory_writer_prompt, memory_writer_schema, parse_query_intent, parse_query_plan,
-    parse_rewritten_queries, parse_source_routing, parse_writer_output, prewrite_validate,
-    query_parser_prompt, query_parser_schema, query_rewrite_prompt, query_understanding_prompt,
-    resolve_ambiguous, resolve_documents, resolve_proposal_targets, source_router_prompt,
-    MAX_CANDIDATE_SCOPE,
-    source_routing_schema, strip_long_path_prefix,
-    DocumentOverview, SectionChunk, SectionSummary, StructureEntry,
-    build_document_sections, digests_json, document_overview_prompt, document_summary_prompt,
-    merge_tail_sections, overview_schema, parse_overview, parse_section_summaries,
-    section_summary_schema, MAX_SECTION_CHARS, MAX_SECTIONS,
-    DOCUMENT_RECALL_TOP_N, DOCUMENT_RECALL_VECTOR_CANDIDATES, preselect_document_profiles,
-    rank_document_candidates,
-    COMPARE_FALLBACK_ITEMS, COMPARE_MATERIAL_CHARS, COMPARE_MATERIAL_ITEMS, CompareResults,
-    compare_prompt, compare_schema, parse_compare_results,
-    EXTRACT_MATCH_MIN_LEN, EXTRACT_MAX_ITEMS, extract_prompt, extract_schema,
-    extract_item_is_entity_like, is_project_list_question,
-    longest_common_substr_len, parse_extract_results,
-};
-use fanfan_core::ask::fast_path_greeting;
-use fanfan_core::ask::builtin_knowledge::lookup_builtin_knowledge;
-use fanfan_core::ask::query_normalize::{extract_find_reference, normalize_query_variants};
-use fanfan_core::ask::query_parser::find_query_plan;
-use fanfan_core::ask::query_plan::{QueryIntent, QueryOperation, ResolutionStatus};
-use fanfan_core::ask::source_router::{SourceRouting, existence_query_hit, personal_reference_hit};
-use fanfan_core::profile_builder::{
-    TYPE_PROTOTYPE_TEXTS, TypePrototype, classify_document_type,
+    SectionChunk, SectionSummary, SemanticQuery, SourceIntent, SpeechRecognitionRequest,
+    SpeechRecognitionResult, StructureEntry, SupportStatus, TraceFeatureType, TraceNodeInput,
+    TraceNodeMeta, TriageStatus, WorkerClient, WorkerRole, answer_shape_directive,
+    build_document_sections, chat_prompt, claim_subject_mismatch, compare_prompt, compare_schema,
+    digests_json, document_overview_prompt, document_summary_prompt, evaluate_answerability,
+    existence_requires_project_context, extract_item_is_entity_like, extract_prompt,
+    extract_schema, find_external_knowledge_marker, local_no_evidence_answer,
+    longest_common_substr_len, match_alias_hints, match_relation_hints, memory_writer_prompt,
+    memory_writer_schema, merge_tail_sections, overview_schema, parse_compare_results,
+    parse_extract_results, parse_overview, parse_query_plan, parse_rewritten_queries,
+    parse_section_summaries, parse_source_routing, parse_writer_output,
+    preselect_document_profiles, prewrite_validate, query_parser_prompt, query_parser_schema,
+    query_rewrite_prompt, rank_document_candidates, resolve_ambiguous, resolve_documents,
+    resolve_proposal_targets, section_summary_schema, source_router_prompt, source_routing_schema,
+    strip_long_path_prefix,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -159,8 +146,75 @@ pub struct WorkerServiceState {
     pub running: AtomicBool,
     pub embedding_running: AtomicBool,
     pub embedding_reschedule: AtomicBool,
+    pub image_ocr_running: AtomicBool,
     pub vision_running: AtomicBool,
     pub foreground_activity: AtomicU32,
+    pub search_embedding_cache: Mutex<SearchEmbeddingCache>,
+}
+
+/// 搜索查询 embedding 编码缓存：同一关键词在 TTL 内重复搜索时复用查询向量，
+/// 避免每次搜索都跨进程调用 onnx worker 重新编码（冷启动/会话重建可达秒级）。
+/// 只缓存查询向量（每个查询一条），不缓存任何资料内容，无隐私风险。
+pub struct SearchEmbeddingCache {
+    entries: HashMap<SearchEmbeddingKey, SearchEmbeddingValue>,
+}
+
+/// 缓存键：模型 + 规范化后的查询文本。
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct SearchEmbeddingKey {
+    model_artifact_id: String,
+    query: String,
+}
+
+struct SearchEmbeddingValue {
+    vector: Vec<f32>,
+    expires_at: Instant,
+}
+
+/// 查询向量缓存有效期：与 embedding worker 会话缓存保留期（300s）对齐，
+/// 过短导致冷启动反复出现，过长则占用少量内存。
+const SEARCH_EMBEDDING_CACHE_TTL: Duration = Duration::from_secs(300);
+/// 查询向量缓存条数上限，超限先清过期项、再兜底清空（搜索查询量远达不到）。
+const SEARCH_EMBEDDING_CACHE_MAX: usize = 64;
+
+impl SearchEmbeddingCache {
+    pub fn new() -> Self {
+        SearchEmbeddingCache {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// 命中且未过期返回查询向量；过期项在此惰性清理。
+    fn get(&mut self, key: &SearchEmbeddingKey) -> Option<Vec<f32>> {
+        let now = Instant::now();
+        let expired = self
+            .entries
+            .iter()
+            .filter_map(|(k, v)| (k == key && v.expires_at <= now).then_some(k.clone()))
+            .collect::<Vec<_>>();
+        for stale in expired {
+            self.entries.remove(&stale);
+        }
+        self.entries.get(key).map(|value| value.vector.clone())
+    }
+
+    /// 写入查询向量缓存；超容量时清理过期项，仍超则清空兜底。
+    fn put(&mut self, key: SearchEmbeddingKey, vector: Vec<f32>) {
+        if self.entries.len() >= SEARCH_EMBEDDING_CACHE_MAX {
+            let now = Instant::now();
+            self.entries.retain(|_, value| value.expires_at > now);
+            if self.entries.len() >= SEARCH_EMBEDDING_CACHE_MAX {
+                self.entries.clear();
+            }
+        }
+        self.entries.insert(
+            key,
+            SearchEmbeddingValue {
+                vector,
+                expires_at: Instant::now() + SEARCH_EMBEDDING_CACHE_TTL,
+            },
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -183,27 +237,10 @@ pub struct SpeechRecognitionSession {
     completed_at: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct SpeechSynthesisSession {
-    session_id: Uuid,
-    status: &'static str,
-    message_id: Uuid,
-    result: SpeechSynthesisResult,
-    completed_at: String,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct SpeechRecognitionInput {
     samples: Vec<f32>,
     sample_rate: u32,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SpeechSynthesisInput {
-    message_id: Uuid,
-    #[serde(default)]
-    speaker_id: u32,
-    speed: f32,
 }
 
 struct ForegroundActivityGuard<'a>(&'a AtomicU32);
@@ -512,7 +549,6 @@ pub struct ModelCapabilities {
     vision: bool,
     reranker: bool,
     ocr: bool,
-    tts: bool,
     asr: bool,
 }
 
@@ -673,7 +709,10 @@ pub(crate) fn gpu_details_from_devices(
         }
     }
     // 剥掉 backend 前缀："CUDA0: " → 纯显卡名
-    let name = name.split_once(':').map(|(_, rest)| rest.trim()).unwrap_or(name);
+    let name = name
+        .split_once(':')
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or(name);
     Some(((!name.is_empty()).then(|| name.to_owned()), memory_gb))
 }
 
@@ -695,7 +734,10 @@ fn read_environment_cache(data_directory: &Path) -> Option<(Option<String>, Opti
         return None;
     }
     Some((
-        value.get("gpu_name").and_then(Value::as_str).map(str::to_owned),
+        value
+            .get("gpu_name")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         value.get("gpu_memory_gb").and_then(Value::as_u64),
     ))
 }
@@ -923,28 +965,6 @@ pub fn model_import_confirm(
 }
 
 #[tauri::command(async)]
-pub fn model_artifact_list(
-    models: State<'_, ModelServiceState>,
-) -> Result<Vec<ModelArtifact>, AppError> {
-    models.get()?.list_artifacts()
-}
-
-#[tauri::command(async)]
-pub fn model_role_config_list(
-    models: State<'_, ModelServiceState>,
-) -> Result<Vec<ModelRoleConfig>, AppError> {
-    models.get()?.role_configs()
-}
-
-#[tauri::command(async)]
-pub fn model_catalog_list(source: String) -> Result<Vec<ModelEdition>, AppError> {
-    ["light", "standard"]
-        .into_iter()
-        .map(|edition_id| fanfan_core::model_edition_by_id(edition_id, &source))
-        .collect()
-}
-
-#[tauri::command(async)]
 pub fn model_role_catalog_list(
     environment: State<'_, EnvironmentServiceState>,
 ) -> Vec<ModelCatalogEntry> {
@@ -980,6 +1000,100 @@ pub fn model_role_catalog_list(
 #[tauri::command(async)]
 pub fn model_preset_list() -> Vec<ModelPreset> {
     fanfan_core::built_in_model_presets()
+}
+
+/// 读取用户当前选定的官方模型预设 id（未选择时返回 `None`）。
+#[tauri::command(async)]
+pub fn model_preset_selected_get(
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<Option<String>, AppError> {
+    catalog.get()?.selected_preset_id()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ModelPresetSelectRequest {
+    preset_id: String,
+}
+
+/// 只读地评估「选中某档位后的就绪 / 缺失清单」：不持久化 preset_id、不切换运行时、
+/// 不写库。供前端在选择档位前先弹「下载缺失模型」确认框，用户确认后才真正切换。
+#[tauri::command(async)]
+pub fn model_preset_plan(
+    request: ModelPresetSelectRequest,
+    models: State<'_, ModelServiceState>,
+) -> Result<fanfan_core::PresetPlanReport, AppError> {
+    models.get()?.plan_preset(&request.preset_id)
+}
+
+/// 选中官方档位：持久化 preset_id，并把各角色 active 对齐到「已就绪且 catalog_id
+/// 与预设一致」的本地 artifact；缺的记入返回报告的 `missing`（由前端触发下载）。
+#[tauri::command(async)]
+pub fn model_preset_select(
+    request: ModelPresetSelectRequest,
+    app: AppHandle,
+    catalog: State<'_, CatalogServiceState>,
+    models: State<'_, ModelServiceState>,
+) -> Result<fanfan_core::PresetPlanReport, AppError> {
+    let catalog = catalog.get()?;
+    catalog.set_selected_preset_id(&request.preset_id)?;
+    let report = models.get()?.apply_runtime_plan(&request.preset_id)?;
+    let _ = app.emit(
+        "model:preset-selected",
+        &json!({ "preset_id": request.preset_id, "ready_count": report.ready.len(), "missing_count": report.missing.len() }),
+    );
+    Ok(report)
+}
+
+/// 基于本机硬件档案返回官方推荐档位（内存/显存决定，推荐不等于强制）。
+#[tauri::command(async)]
+pub fn model_preset_recommendation(
+    environment: State<'_, EnvironmentServiceState>,
+) -> Result<String, AppError> {
+    let cached = environment
+        .latest
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    let check = match cached {
+        Some(check) => check,
+        None => detect_environment(
+            &environment.data_directory,
+            None,
+            read_environment_cache(&environment.data_directory),
+        ),
+    };
+    Ok(fanfan_core::recommended_preset_id(check.memory_total_gb, check.gpu_memory_gb).to_owned())
+}
+
+/// 清点当前索引陈旧状态：比较「当前激活 Embedding artifact」与「active 向量索引代
+/// 实际采用的模型」是否一致，供前端提示重建索引。
+#[derive(Debug, Serialize, Default)]
+pub struct IndexStaleStatus {
+    stale: bool,
+    active_embedding_artifact_id: Option<String>,
+    index_embedding_artifact_id: Option<String>,
+}
+
+#[tauri::command(async)]
+pub fn index_stale_check(
+    models: State<'_, ModelServiceState>,
+    catalog: State<'_, CatalogServiceState>,
+) -> Result<IndexStaleStatus, AppError> {
+    let active_id = models
+        .get()?
+        .active_artifact(ModelRole::Embedding)?
+        .map(|artifact| artifact.artifact_id.to_string());
+    let index_id = catalog.get()?.active_index_model_artifact_id()?;
+    let stale = match (&active_id, &index_id) {
+        (Some(active), Some(index)) => active != index,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    Ok(IndexStaleStatus {
+        stale,
+        active_embedding_artifact_id: active_id,
+        index_embedding_artifact_id: index_id,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1018,6 +1132,7 @@ pub async fn model_download_start(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn begin_model_download(
     app: AppHandle,
     catalog: Arc<CatalogService>,
@@ -1101,8 +1216,8 @@ pub fn model_store_status_get(
     models: State<'_, ModelServiceState>,
 ) -> Result<ModelStoreStatus, AppError> {
     let mut status = models.get()?.store_status()?;
-    let config = crate::read_model_store_location_config(&environment.config_directory)
-        .unwrap_or_default();
+    let config =
+        crate::read_model_store_location_config(&environment.config_directory).unwrap_or_default();
     status.pending_target_directory = config
         .pending
         .as_ref()
@@ -1605,6 +1720,15 @@ fn run_model_download(
                     max_length: artifact.max_length,
                 },
             )?;
+            // 回填 catalog_id，让 apply_runtime_plan 能匹配到已安装的 artifact，
+            // 避免切换 Preset 时已下载模型被误判为 missing 而重复下载。
+            let catalog_id = fanfan_core::built_in_model_catalog()
+                .iter()
+                .find(|entry| entry.install_edition_id.as_deref() == Some(job.edition_id.as_str()))
+                .map(|entry| entry.catalog_id.clone());
+            if let Some(cat_id) = catalog_id {
+                let _ = models.bind_artifact_catalog_id(&installed_artifact.artifact_id, &cat_id);
+            }
             installed.push(installed_artifact);
             job.installed_artifact_ids = installed
                 .iter()
@@ -1653,17 +1777,18 @@ fn run_model_download(
                 file.status = "completed".into();
                 file.downloaded_bytes = file.total_bytes;
             }
+            job.status = "completed".into();
+            job.phase = "completed".into();
+            persist_download_job(app, models, &mut job)?;
+            let _ = app.emit("model:download_completed", &job);
+            // 任务完成并自检通过后从下载列表移除，避免列表堆积。
+            let _ = models.remove_download_job(&job.job_id);
+            // embedding 模型下载完成后立即转入后台进程建立语义索引：
+            // 索引构建由独立后台线程（spawn_embed_pending）执行，进度与结果
+            // 通过 embedding:index_phase / embedding:failed 事件单独上报，
+            // 不再作为下载任务阶段展示在下载界面。
             if embedding_indexing {
-                job.status = "running".into();
-                job.phase = "indexing".into();
-                persist_download_job(app, models, &mut job)?;
                 spawn_embed_pending(app.clone(), Arc::clone(catalog));
-                let _ = app.emit("model:download_indexing", &job);
-            } else {
-                job.status = "completed".into();
-                job.phase = "completed".into();
-                persist_download_job(app, models, &mut job)?;
-                let _ = app.emit("model:download_completed", &job);
             }
             return Ok::<(), AppError>(());
         }
@@ -1748,28 +1873,6 @@ fn run_model_download(
             }
         };
         job.profile_id = Some(profile.profile_id);
-        if profile.status == "indexing" {
-            job.status = "running".into();
-            job.phase = "indexing".into();
-            job.progress = 1.0;
-            job.current_file = None;
-            job.bytes_per_second = 0;
-            job.eta_seconds = None;
-            job.error = None;
-            persist_download_job(app, models, &mut job)?;
-            for artifact in &edition.artifacts {
-                if let Ok(staging) = models.download_artifact_staging_directory(
-                    artifact.source,
-                    &edition.edition_id,
-                    artifact.role,
-                ) {
-                    let _ = fs::remove_dir_all(staging);
-                }
-            }
-            spawn_embed_pending(app.clone(), Arc::clone(catalog));
-            let _ = app.emit("model:download_indexing", &job);
-            return Ok::<(), AppError>(());
-        }
         job.status = "completed".into();
         job.phase = "completed".into();
         job.current_file = None;
@@ -1790,8 +1893,14 @@ fn run_model_download(
                 let _ = fs::remove_dir_all(staging);
             }
         }
+        // embedding 模型下载完成后立即转入后台进程执行：下载任务至此完成并从
+        // 列表移除；语义索引（含首次激活切换与增量嵌入）由后台线程
+        // spawn_embed_pending 自动构建，进度与结果经 embedding:index_phase /
+        // embedding:failed 事件单独上报，不在下载界面展示索引阶段。
         spawn_embed_pending(app.clone(), Arc::clone(catalog));
         let _ = app.emit("model:download_completed", &job);
+        // 任务完成并自检通过后从下载列表移除，避免列表堆积。
+        let _ = models.remove_download_job(&job.job_id);
         Ok::<(), AppError>(())
     })();
 
@@ -1874,6 +1983,7 @@ fn log_model_activation_gpu_status(model_path: &str, activation: &GenerationActi
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn self_test_and_activate_downloaded_roles(
     app: &AppHandle,
     catalog: &Arc<CatalogService>,
@@ -1896,18 +2006,40 @@ fn self_test_and_activate_downloaded_roles(
                         true,
                     )
                 })?;
-                let activation =
-                    runtime.activate(&artifact.local_path, 4096, interactive_inference_threads())?;
-                // Phase 4.3（Qwen3.5 自检失败修复）：thinking 模型的 chat
-                // template 强制先输出 <think> 思维链，32 token 全部耗在思维链
-                // 上、可见回复 <4 字符 → 误判回滚。上限提高到 96 token 给思维
-                // 链留空间，并按「剥离 <think> 段后的可见文本」判定。
-                let generated = runtime.complete(
-                    "你正在执行本地模型健康检查。只需用一句简短中文确认可以回答。",
-                    "请回复：翻翻本地模型可以工作。",
-                    96,
+                let activation = runtime.activate(
+                    &artifact.local_path,
+                    4096,
+                    interactive_inference_threads(),
                 )?;
-                if self_test_visible_text(&generated).chars().count() < 4 {
+                // Phase 4.3（Qwen3.5 自检失败修复）：thinking 模型的 chat
+                // template 可能强制先输出  thinking 思维链，也可能按
+                // 可见回复过短或纯思维链（如「好的」）不应被误判回滚，
+                // 判定标准统一改为下方注释描述的非空检查。
+                let generated = runtime.complete(
+                    "你是本地模型健康检查器，直接输出答案，不要展开推理。",
+                    "请用一句完整中文句子回复：翻翻本地模型可以正常工作。",
+                    256,
+                )?;
+                let visible = self_test_visible_text(&generated);
+                // 自检只验证本地推理能产出文本：可见文本或原始输出任一非空
+                // 即通过；两者皆空才判定失败，避免 2B Q4 thinking 模型给出
+                // 短确认（如「好的」）或纯思维链时被误判回滚。
+                if visible.trim().is_empty() && generated.trim().is_empty() {
+                    crate::runtime_log::event(
+                        "error",
+                        "model.download",
+                        "self_test.generation_empty",
+                        None,
+                        &serde_json::json!({
+                            "model_file": artifact
+                                .local_path
+                                .rsplit(['/', '\\'])
+                                .next()
+                                .unwrap_or(&artifact.local_path),
+                            "generated_length": generated.chars().count(),
+                            "generated_snippet": generated.chars().take(120).collect::<String>(),
+                        }),
+                    );
                     runtime.stop();
                     return Err(AppError::new(
                         "MODEL_SELF_TEST_FAILED",
@@ -2001,21 +2133,14 @@ fn self_test_and_activate_downloaded_roles(
                 models.activate_artifact(&artifact.artifact_id, None)?;
             }
             (ModelRole::Ocr, ModelFormat::Onnx) => {
+                let (det_file, cls_file, dict_file) = ocr_companion_file_names(artifact);
                 ocr.self_test_ocr(
                     artifact.local_path.clone(),
-                    model_companion_path(artifact, "ch_PP-OCRv5_mobile_det.onnx")?,
-                    model_companion_path(artifact, "ch_ppocr_mobile_v2.0_cls_infer.onnx")?,
-                    model_companion_path(artifact, "ppocrv5_dict.txt")?,
+                    model_companion_path(artifact, &det_file)?,
+                    model_companion_path(artifact, &cls_file)?,
+                    model_companion_path(artifact, &dict_file)?,
                     1,
-                )?;
-                models.activate_artifact(&artifact.artifact_id, None)?;
-            }
-            (ModelRole::Tts, ModelFormat::Onnx) => {
-                speech.self_test_tts(
-                    artifact.local_path.clone(),
-                    model_companion_path(artifact, "tokens.txt")?,
-                    model_companion_path(artifact, "lexicon.txt")?,
-                    1,
+                    ocr_version_for(artifact),
                 )?;
                 models.activate_artifact(&artifact.artifact_id, None)?;
             }
@@ -2023,8 +2148,8 @@ fn self_test_and_activate_downloaded_roles(
                 speech.self_test_asr(
                     artifact.local_path.clone(),
                     model_companion_path(artifact, "tokens.txt")?,
-                    model_companion_path(artifact, "silero_vad.onnx")?,
                     1,
+                    asr_arch_for(artifact),
                 )?;
                 models.activate_artifact(&artifact.artifact_id, None)?;
             }
@@ -2333,253 +2458,6 @@ fn hide_process_window(command: &mut Command) {
 #[cfg(not(windows))]
 fn hide_process_window(_command: &mut Command) {}
 
-#[derive(Debug, Deserialize)]
-pub struct ModelArtifactActionRequest {
-    artifact_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ModelRoleActionRequest {
-    role: ModelRole,
-}
-
-#[tauri::command(async)]
-pub fn model_role_disable(
-    request: ModelRoleActionRequest,
-    catalog: State<'_, CatalogServiceState>,
-    models: State<'_, ModelServiceState>,
-    generation: State<'_, GenerationServiceState>,
-) -> Result<ModelRuntimeState, AppError> {
-    let started = Instant::now();
-    let models = models.get()?;
-    let catalog = catalog.get()?;
-    if request.role == ModelRole::Generation {
-        generation
-            .0
-            .lock()
-            .map_err(|_| {
-                AppError::new(
-                    "GENERATION_RUNTIME_LOCK_FAILED",
-                    "生成运行时状态已损坏",
-                    true,
-                )
-            })?
-            .stop();
-    }
-    models.deactivate_role(request.role)?;
-    crate::runtime_log::event(
-        "info",
-        "model.runtime",
-        "model.role_disabled",
-        None,
-        &json!({
-            "role": request.role,
-            "duration_ms": started.elapsed().as_millis(),
-        }),
-    );
-    model_state_from_manager(
-        &models,
-        Some(&catalog),
-        Some(inference_runtime_state(&generation)?),
-    )
-}
-
-#[tauri::command(async)]
-pub fn model_artifact_activate(
-    request: ModelArtifactActionRequest,
-    app: AppHandle,
-    catalog: State<'_, CatalogServiceState>,
-    models: State<'_, ModelServiceState>,
-    sidecars: State<'_, SidecarRegistryState>,
-    speech: State<'_, SpeechWorkerState>,
-    generation: State<'_, GenerationServiceState>,
-) -> Result<ModelRuntimeState, AppError> {
-    let models = models.get()?;
-    let catalog = catalog.get()?;
-    let artifact_id = Uuid::parse_str(&request.artifact_id)
-        .map_err(|error| AppError::new("MODEL_ACTIVATION_INVALID", error.to_string(), false))?;
-    let artifact = models.artifact_by_id(&artifact_id)?;
-    let started = Instant::now();
-    crate::runtime_log::event(
-        "info",
-        "model.runtime",
-        "model.activation_started",
-        Some(&artifact_id.to_string()),
-        &json!({
-            "artifact_id": artifact_id,
-            "role": artifact.role,
-            "format": artifact.format,
-        }),
-    );
-    match (artifact.role, artifact.format) {
-        (ModelRole::Embedding, ModelFormat::Onnx) => {
-            let tokenizer_path = PathBuf::from(&artifact.local_path)
-                .parent()
-                .map(|parent| parent.join("tokenizer.json"))
-                .ok_or_else(|| {
-                    AppError::new("EMBEDDING_TOKENIZER_UNAVAILABLE", "模型目录无效", false)
-                })?;
-            let response = sidecars.0.onnx.encode_embeddings(&EmbeddingRequest {
-                model_path: artifact.local_path.clone(),
-                tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
-                texts: vec!["拾起散落的信息，连接过去的自己".into()],
-                max_length: 128,
-                threads: 2,
-            })?;
-            if response.dimension == 0
-                || response.vectors.len() != 1
-                || response.vectors[0].len() != response.dimension as usize
-                || response.vectors[0].iter().any(|value| !value.is_finite())
-            {
-                return Err(AppError::new(
-                    "MODEL_SELF_TEST_FAILED",
-                    "语义模型自检返回了无效维度或向量",
-                    true,
-                ));
-            }
-            models.begin_embedding_activation(&artifact_id, response.dimension)?;
-            spawn_embed_pending(app.clone(), Arc::clone(&catalog));
-        }
-        (ModelRole::Generation, ModelFormat::Gguf) => {
-            let threads = interactive_inference_threads();
-            let mut runtime = generation.0.lock().map_err(|_| {
-                AppError::new(
-                    "GENERATION_RUNTIME_LOCK_FAILED",
-                    "生成运行时状态已损坏",
-                    true,
-                )
-            })?;
-            let activation = runtime.activate(&artifact.local_path, 4096, threads)?;
-            // Phase 4.3（Qwen3.5 自检失败修复）：同下载自检——96 token +
-            // 剥离 <think> 思维链后判定可见文本，防止 thinking 模型被误回滚。
-            let self_test = runtime.complete(
-                "你正在执行本地模型健康检查。只需用一句简短中文确认可以回答。",
-                "请回复：翻翻本地模型可以工作。",
-                96,
-            );
-            let self_test_failed = match &self_test {
-                Ok(value) => self_test_visible_text(value).chars().count() < 4,
-                Err(_) => true,
-            };
-            if self_test_failed {
-                runtime.stop();
-                return Err(AppError::new(
-                    "MODEL_SELF_TEST_FAILED",
-                    "生成模型没有通过最小本地推理自检，已回滚",
-                    true,
-                ));
-            }
-            log_model_activation_gpu_status(&artifact.local_path, &activation);
-            drop(runtime);
-            models.activate_artifact(&artifact_id, None)?;
-        }
-        (ModelRole::Vision, ModelFormat::Gguf) => {
-            let projector = models.vision_projector_path(&artifact)?;
-            let threads = interactive_inference_threads();
-            generation
-                .0
-                .lock()
-                .map_err(|_| {
-                    AppError::new(
-                        "VISION_RUNTIME_LOCK_FAILED",
-                        "图片理解运行时状态已损坏",
-                        true,
-                    )
-                })?
-                .activate_multimodal(
-                    &artifact.local_path,
-                    &projector.to_string_lossy(),
-                    4096,
-                    threads,
-                )?;
-            models.activate_artifact(&artifact_id, None)?;
-            spawn_image_understanding_pending(app.clone(), Arc::clone(&catalog));
-        }
-        (ModelRole::Reranker, ModelFormat::Onnx) => {
-            let tokenizer_path = PathBuf::from(&artifact.local_path)
-                .parent()
-                .map(|parent| parent.join("tokenizer.json"))
-                .ok_or_else(|| {
-                    AppError::new("RERANK_TOKENIZER_UNAVAILABLE", "模型目录无效", false)
-                })?;
-            let response = sidecars.0.onnx.rerank(&RerankRequest {
-                model_path: artifact.local_path.clone(),
-                tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
-                query: "哪段资料描述了本地知识库？".into(),
-                documents: vec![
-                    "翻翻在本地建立可检索的资料知识库。".into(),
-                    "今天窗外天气晴朗。".into(),
-                ],
-                max_length: artifact.max_length.unwrap_or(512),
-                threads: 2,
-            })?;
-            if response.scores.len() != 2
-                || response.scores.iter().any(|score| !score.is_finite())
-                || response.scores[0] <= response.scores[1]
-            {
-                return Err(AppError::new(
-                    "MODEL_SELF_TEST_FAILED",
-                    "重排模型自检返回了无效分数",
-                    true,
-                ));
-            }
-            models.activate_artifact(&artifact_id, None)?;
-        }
-        (ModelRole::Ocr, ModelFormat::Onnx) => {
-            sidecars.0.ocr.self_test_ocr(
-                artifact.local_path.clone(),
-                model_companion_path(&artifact, "ch_PP-OCRv5_mobile_det.onnx")?,
-                model_companion_path(&artifact, "ch_ppocr_mobile_v2.0_cls_infer.onnx")?,
-                model_companion_path(&artifact, "ppocrv5_dict.txt")?,
-                1,
-            )?;
-            models.activate_artifact(&artifact_id, None)?;
-        }
-        (ModelRole::Tts, ModelFormat::Onnx) => {
-            speech.0.self_test_tts(
-                artifact.local_path.clone(),
-                model_companion_path(&artifact, "tokens.txt")?,
-                model_companion_path(&artifact, "lexicon.txt")?,
-                1,
-            )?;
-            models.activate_artifact(&artifact_id, None)?;
-        }
-        (ModelRole::Asr, ModelFormat::Onnx) => {
-            speech.0.self_test_asr(
-                artifact.local_path.clone(),
-                model_companion_path(&artifact, "tokens.txt")?,
-                model_companion_path(&artifact, "silero_vad.onnx")?,
-                1,
-            )?;
-            models.activate_artifact(&artifact_id, None)?;
-        }
-        _ => {
-            return Err(AppError::new(
-                "MODEL_RUNTIME_UNSUPPORTED",
-                "当前模型角色或格式尚未接入本地运行时",
-                false,
-            ));
-        }
-    }
-    let state = model_state_from_manager(
-        &models,
-        Some(&catalog),
-        Some(inference_runtime_state(&generation)?),
-    )?;
-    crate::runtime_log::event(
-        "info",
-        "model.runtime",
-        "model.activation_completed",
-        Some(&artifact_id.to_string()),
-        &json!({
-            "artifact_id": artifact_id,
-            "role": artifact.role,
-            "elapsed_ms": started.elapsed().as_millis() as u64,
-        }),
-    );
-    Ok(state)
-}
-
 fn default_inference_runtime_state() -> InferenceRuntimeState {
     let hardware = current_hardware_profile(&[]);
     let budget = current_inference_budget(hardware.memory_total_bytes);
@@ -2643,16 +2521,17 @@ pub(crate) fn inference_runtime_state(
     //（CPU 生效中），绝不在此同步启动 llama-server --list-devices——冷 GPU
     // 可达数十秒，曾导致标题栏/模型页整窗卡死。后台探测完成会发 model:state
     // 事件驱动前端刷新，前后端状态始终一致。
-    let capability = runtime.current_capability().cloned().unwrap_or_else(|| {
-        RuntimeCapability {
+    let capability = runtime
+        .current_capability()
+        .cloned()
+        .unwrap_or_else(|| RuntimeCapability {
             executable_available: true,
             backend: "cpu".into(),
             devices: Vec::new(),
             gpu_available: false,
             checked_at: chrono::Utc::now(),
             error_code: None,
-        }
-    });
+        });
     let device_names = runtime
         .active_device()
         .map(|device| vec![device.to_owned()])
@@ -2748,7 +2627,6 @@ pub(crate) fn model_state_from_manager(
         vision: models.active_artifact(ModelRole::Vision)?.is_some(),
         reranker: models.active_artifact(ModelRole::Reranker)?.is_some(),
         ocr: models.active_artifact(ModelRole::Ocr)?.is_some(),
-        tts: models.active_artifact(ModelRole::Tts)?.is_some(),
         asr: models.active_artifact(ModelRole::Asr)?.is_some(),
     };
     let any_active = capabilities.generation
@@ -2756,7 +2634,6 @@ pub(crate) fn model_state_from_manager(
         || capabilities.vision
         || capabilities.reranker
         || capabilities.ocr
-        || capabilities.tts
         || capabilities.asr;
     let semantic_index_coverage = match (catalog, active_embedding.as_ref()) {
         (Some(catalog), Some(embedding)) => catalog
@@ -2922,13 +2799,12 @@ pub fn home_get_summary(
         }).collect::<Vec<_>>(),
         "candidate_roots": candidates
     });
-    if active_scan.is_none() {
-        if let Ok(mut cache) = HOME_SUMMARY_CACHE
+    if active_scan.is_none()
+        && let Ok(mut cache) = HOME_SUMMARY_CACHE
             .get_or_init(|| Mutex::new((Instant::now(), String::new(), Value::Null)))
             .lock()
-        {
-            *cache = (Instant::now(), request.local_date.clone(), summary.clone());
-        }
+    {
+        *cache = (Instant::now(), request.local_date.clone(), summary.clone());
     }
     Ok(summary)
 }
@@ -3464,6 +3340,15 @@ pub fn collection_suggestion_refresh(
         &json!({ "max_files": request.max_files }),
     );
     let catalog = catalog.get()?;
+    // 操作级追踪：SMART_COLLECTION 链路入口。
+    let operation_trace = ActiveOperationTrace::begin(
+        &catalog,
+        &correlation_id,
+        None,
+        TraceFeatureType::SmartCollection,
+        &json!({ "max_files": request.max_files }),
+        None,
+    );
     if catalog.maintenance_snapshot()?.degradation_level == "core" {
         return Err(AppError::new(
             "COLLECTION_AI_PAUSED_CORE_MODE",
@@ -3681,23 +3566,26 @@ pub fn collection_suggestion_refresh(
                     generation.0.as_ref(),
                     &generation_artifact,
                     "你是本地文档集合命名助手。只根据给定分组内的资料命名，不得增删成员。名称必须概括成员的共同主题、文档类型和用途，禁止直接复制任一文件名，也禁止使用‘相关资料’‘文档集合’等空泛名称。只输出JSON对象：{\"suggested_name\":\"不超过40字\",\"description\":\"不超过200字的说明\"}。",
-                    &format!("请给这个同主题资料分组起名并写说明，可参考每个成员的内容片段：\n{candidate_json}"),
+                    &format!(
+                        "请给这个同主题资料分组起名并写说明，可参考每个成员的内容片段：\n{candidate_json}"
+                    ),
                     320,
                     &cancelled,
                 );
                 // 命名只是润色：任何失败都保留规则名，不丢弃建议、不阻塞主流程。
-                let (decision, parsed) = match raw_review.as_deref().map(parse_collection_model_review) {
-                    Ok(Ok(review)) => match catalog.apply_collection_model_naming(
-                        &suggestion.suggestion_id,
-                        &review,
-                        &generation_artifact.artifact_id.to_string(),
-                    ) {
-                        Ok(_) => ("applied".into(), true),
-                        Err(error) => (format!("kept_rule_name:{error}"), true),
-                    },
-                    Ok(Err(_)) => ("kept_rule_name:parse_failed".into(), false),
-                    Err(error) => (format!("kept_rule_name:model_error:{error}"), false),
-                };
+                let (decision, parsed) =
+                    match raw_review.as_deref().map(parse_collection_model_review) {
+                        Ok(Ok(review)) => match catalog.apply_collection_model_naming(
+                            &suggestion.suggestion_id,
+                            &review,
+                            &generation_artifact.artifact_id.to_string(),
+                        ) {
+                            Ok(_) => ("applied".into(), true),
+                            Err(error) => (format!("kept_rule_name:{error}"), true),
+                        },
+                        Ok(Err(_)) => ("kept_rule_name:parse_failed".into(), false),
+                        Err(error) => (format!("kept_rule_name:model_error:{error}"), false),
+                    };
                 trace_node(
                     &catalog,
                     "collection",
@@ -3720,9 +3608,7 @@ pub fn collection_suggestion_refresh(
             }
         }
         // 3. 收敛结果：rerank 作废的建议从返回值剔除，与库内状态一致。
-        result
-            .suggestion_ids
-            .retain(|id| !discarded.contains(id));
+        result.suggestion_ids.retain(|id| !discarded.contains(id));
         result
             .seed_file_id_by_suggestion
             .retain(|id, _| !discarded.contains(id));
@@ -3741,6 +3627,7 @@ pub fn collection_suggestion_refresh(
             "elapsed_ms": started.elapsed().as_millis() as u64,
         }),
     );
+    operation_trace.complete(&catalog, "ok");
     Ok(result)
 }
 
@@ -3852,6 +3739,15 @@ pub fn relation_refresh(
         &json!({ "max_files": request.max_files }),
     );
     let catalog = catalog.get()?;
+    // 操作级追踪：FILE_RELATION 链路入口。
+    let operation_trace = ActiveOperationTrace::begin(
+        &catalog,
+        &correlation_id,
+        None,
+        TraceFeatureType::FileRelation,
+        &json!({ "max_files": request.max_files }),
+        None,
+    );
     let exact_started = Instant::now();
     let mut result = catalog.refresh_file_relations(request.max_files)?;
     trace_node(
@@ -3871,20 +3767,23 @@ pub fn relation_refresh(
         Some(exact_started.elapsed().as_millis() as u64),
     );
     let semantic_started = Instant::now();
-    let semantic_found = if let Some(embedding) = models.get()?.active_artifact(ModelRole::Embedding)? {
-        let (semantic, contains) = catalog.refresh_semantic_file_relations(
-            &embedding.artifact_id.to_string(),
-            request.max_files,
-        )?;
-        result.semantic_related_pairs = semantic;
-        result.contains_or_summarizes_pairs = contains;
-        Some((semantic, contains, embedding.artifact_id.to_string()))
-    } else {
-        None
-    };
+    let semantic_found =
+        if let Some(embedding) = models.get()?.active_artifact(ModelRole::Embedding)? {
+            let (semantic, contains) = catalog.refresh_semantic_file_relations(
+                &embedding.artifact_id.to_string(),
+                request.max_files,
+            )?;
+            result.semantic_related_pairs = semantic;
+            result.contains_or_summarizes_pairs = contains;
+            Some((semantic, contains, embedding.artifact_id.to_string()))
+        } else {
+            None
+        };
     // 聚类：把成对的边按连通分量聚成组（重复组/版本族/同主题组/摘要组）
     result.groups_created = catalog.refresh_relation_groups(
-        semantic_found.as_ref().map(|(_, _, artifact_id)| artifact_id.as_str()),
+        semantic_found
+            .as_ref()
+            .map(|(_, _, artifact_id)| artifact_id.as_str()),
     )?;
     let (semantic_related, contains_pairs) = match semantic_found {
         Some((semantic, contains, _)) => (Some(semantic), Some(contains)),
@@ -3919,6 +3818,7 @@ pub fn relation_refresh(
             "elapsed_ms": started.elapsed().as_millis() as u64,
         }),
     );
+    operation_trace.complete(&catalog, "ok");
     Ok(result)
 }
 
@@ -4217,6 +4117,7 @@ pub async fn speech_recognize(
         runtime_request.timeout = Duration::from_secs(30);
         runtime_request.idempotency_key = Some(format!("speech:asr:{session_id}"));
         let lease = runtime.acquire(runtime_request)?;
+        let arch = asr_arch_for(&artifact);
         match speech_worker.recognize_speech(&SpeechRecognitionRequest {
             model_path: artifact.local_path,
             tokens_path,
@@ -4224,6 +4125,7 @@ pub async fn speech_recognize(
             samples: request.samples,
             sample_rate: request.sample_rate,
             threads,
+            arch,
         }) {
             Ok(result) => {
                 lease.complete();
@@ -4246,87 +4148,63 @@ pub async fn speech_recognize(
     Ok(result)
 }
 
-#[tauri::command]
-pub async fn speech_synthesize_answer(
-    request: SpeechSynthesisInput,
-    app: AppHandle,
-    catalog: State<'_, CatalogServiceState>,
-    models: State<'_, ModelServiceState>,
-    worker: State<'_, SpeechWorkerState>,
-    runtime_manager: State<'_, RuntimeManagerState>,
-) -> Result<SpeechSynthesisSession, AppError> {
-    if !(0.5..=2.0).contains(&request.speed) || request.speaker_id > 10_000 {
-        return Err(AppError::new(
-            "TTS_OPTIONS_INVALID",
-            "语速或音色参数无效",
-            false,
-        ));
+/// 依据 artifact 的角色型号判定 ASR 运行架构（`sense_voice` / `paraformer`）。
+/// 复用于语音自检与识别请求，避免各处硬编码；缺省按 paraformer 兼容旧模型。
+fn asr_arch_for(artifact: &ModelArtifact) -> String {
+    let id = artifact
+        .catalog_id
+        .as_deref()
+        .or(Some(artifact.model_id.as_str()))
+        .unwrap_or("");
+    if id.contains("sense") {
+        "sense_voice".to_owned()
+    } else {
+        "paraformer".to_owned()
     }
-    let catalog = catalog.get()?;
-    let answer = catalog.answer_result(&request.message_id)?;
-    catalog.validate_answer_evidence(&answer)?;
-    if answer.answer.trim().is_empty() || answer.answer.chars().count() > 4_000 {
-        return Err(AppError::new(
-            "TTS_TEXT_INVALID",
-            "当前回答为空或过长，无法安全朗读",
-            false,
-        ));
+}
+
+/// 依据 artifact 的角色型号判定 OCR 版本形态（`PPOCRV6` / `PPOCRV5`）。
+/// 复用于 OCR 自检与解析运行时；缺省按 PPOCRV5 兼容旧模型。
+fn ocr_version_for(artifact: &ModelArtifact) -> String {
+    let id = artifact
+        .catalog_id
+        .as_deref()
+        .or(Some(artifact.model_id.as_str()))
+        .unwrap_or("");
+    if id.contains("v6") || id.contains("ppocr-v6") {
+        "PPOCRV6".to_owned()
+    } else {
+        "PPOCRV5".to_owned()
     }
-    let artifact = models
-        .get()?
-        .active_artifact(ModelRole::Tts)?
-        .ok_or_else(|| AppError::new("TTS_MODEL_UNAVAILABLE", "请先配置语音合成模型", false))?;
-    let tokens_path = model_companion_path(&artifact, "tokens.txt")?;
-    let lexicon_path = model_companion_path(&artifact, "lexicon.txt")?;
-    let speech_worker = worker.0.clone();
-    let runtime = runtime_manager.0.clone();
-    let session_id = Uuid::now_v7();
-    let message_id = request.message_id;
-    let threads = runtime
-        .snapshot()?
-        .budget
-        .foreground_cpu_threads
-        .clamp(1, 2);
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        let mut runtime_request = RuntimeTaskRequest::interactive(
-            RuntimeTaskKind::SpeechSynthesis,
-            RuntimeBackendKind::SherpaOnnx,
-        );
-        runtime_request.model_id = Some(artifact.artifact_id.to_string());
-        runtime_request.cpu_threads = threads;
-        runtime_request.memory_bytes = 768 * 1024 * 1024;
-        runtime_request.timeout = Duration::from_secs(45);
-        runtime_request.idempotency_key = Some(format!("speech:tts:{message_id}:{session_id}"));
-        let lease = runtime.acquire(runtime_request)?;
-        match speech_worker.synthesize_speech(&SpeechSynthesisRequest {
-            model_path: artifact.local_path,
-            tokens_path,
-            lexicon_path,
-            text: answer.answer,
-            speaker_id: request.speaker_id,
-            speed: request.speed,
-            threads,
-        }) {
-            Ok(result) => {
-                lease.complete();
-                Ok(SpeechSynthesisSession {
-                    session_id,
-                    status: "completed",
-                    message_id,
-                    result,
-                    completed_at: Utc::now().to_rfc3339(),
-                })
-            }
-            Err(error) => {
-                lease.fail(error.code.clone());
-                Err(error)
-            }
-        }
-    })
-    .await
-    .map_err(|error| AppError::new("TTS_TASK_FAILED", error.to_string(), true))??;
-    let _ = app.emit("tts:chunk", &result);
-    Ok(result)
+}
+
+/// 依据 artifact 的 OCR 版本与尺寸，返回配套文件名 (det, cls, dict)。
+/// v6 的检测文件名按 small/medium 后缀区分，分类器与词典命名也随 v6 变更，
+/// 不能沿用 v5 的旧命名（否则激活自检与运行时都会因找不到配套文件失败）。
+fn ocr_companion_file_names(artifact: &ModelArtifact) -> (String, String, String) {
+    let id = artifact
+        .catalog_id
+        .as_deref()
+        .or(Some(artifact.model_id.as_str()))
+        .unwrap_or("");
+    if ocr_version_for(artifact) == "PPOCRV6" {
+        let size = if id.contains("small") {
+            "small"
+        } else {
+            "medium"
+        };
+        (
+            format!("PP-OCRv6_det_{size}.onnx"),
+            "ch_ppocr_mobile_v2.0_cls_mobile.onnx".to_owned(),
+            "ppocrv6_dict.txt".to_owned(),
+        )
+    } else {
+        (
+            "ch_PP-OCRv5_mobile_det.onnx".to_owned(),
+            "ch_ppocr_mobile_v2.0_cls_infer.onnx".to_owned(),
+            "ppocrv5_dict.txt".to_owned(),
+        )
+    }
 }
 
 fn model_companion_path(artifact: &ModelArtifact, file_name: &str) -> Result<String, AppError> {
@@ -4360,12 +4238,14 @@ fn active_ocr_runtime(app: &AppHandle, threads: u32) -> Result<Option<OcrRuntime
     let Some(artifact) = manager.active_artifact(ModelRole::Ocr)? else {
         return Ok(None);
     };
+    let (det_file, cls_file, dict_file) = ocr_companion_file_names(&artifact);
     Ok(Some(OcrRuntimeConfig {
         model_path: artifact.local_path.clone(),
-        det_model_path: model_companion_path(&artifact, "ch_PP-OCRv5_mobile_det.onnx")?,
-        cls_model_path: model_companion_path(&artifact, "ch_ppocr_mobile_v2.0_cls_infer.onnx")?,
-        dictionary_path: model_companion_path(&artifact, "ppocrv5_dict.txt")?,
+        det_model_path: model_companion_path(&artifact, &det_file)?,
+        cls_model_path: model_companion_path(&artifact, &cls_file)?,
+        dictionary_path: model_companion_path(&artifact, &dict_file)?,
         threads: threads.clamp(1, 2),
+        ocr_version: ocr_version_for(&artifact),
     }))
 }
 
@@ -4403,9 +4283,7 @@ const RERANK_TOP_EVIDENCE: usize = 3;
 /// 节点记录的每候选 score 实测调优。
 const RERANK_NO_EVIDENCE_THRESHOLD: f32 = 0.1;
 
-fn cached_index_activity_stats(
-    catalog: &CatalogService,
-) -> Result<IndexActivityStats, AppError> {
+fn cached_index_activity_stats(catalog: &CatalogService) -> Result<IndexActivityStats, AppError> {
     let cache = INDEX_STATS_CACHE.get_or_init(|| {
         Mutex::new((
             Instant::now() - INDEX_STATS_CACHE_TTL,
@@ -4434,6 +4312,19 @@ pub fn app_status_get(
     worker: State<'_, WorkerServiceState>,
     runtime_manager: State<'_, RuntimeManagerState>,
 ) -> Result<AppStatusSnapshot, AppError> {
+    // 合并并发轮询：前端多个组件会同时请求状态快照，400ms 内复用计算结果，
+    // 避免在后台任务繁忙时反复触发 DB 统计与运行时检查造成竞争（曾出现
+    // 同一毫秒 4 次并发调用、单次耗时 1.3~3.5s 的卡顿）。
+    const SNAPSHOT_TTL: Duration = Duration::from_millis(400);
+    static CACHE: OnceLock<Mutex<(Instant, Option<AppStatusSnapshot>)>> = OnceLock::new();
+    let cache = CACHE
+        .get_or_init(|| Mutex::new((Instant::now() - SNAPSHOT_TTL - Duration::from_secs(1), None)));
+    let mut guard = cache
+        .lock()
+        .map_err(|_| AppError::new("STATUS_CACHE_LOCK", "状态快照缓存锁定失败", false))?;
+    if guard.1.is_some() && guard.0.elapsed() < SNAPSHOT_TTL {
+        return Ok(guard.1.clone().expect("缓存命中必然存在快照"));
+    }
     let catalog = catalog.get()?;
     let roots = catalog.list_roots()?;
     let active_scan = catalog.latest_active_scan_job()?;
@@ -4466,7 +4357,7 @@ pub fn app_status_get(
         inference_runtime.pressure_reason =
             Some("正在优先处理搜索或问答，后台模型任务已让出".into());
     }
-    Ok(AppStatusSnapshot {
+    let snapshot = AppStatusSnapshot {
         local_only: true,
         source_files_readonly: true,
         roots,
@@ -4476,7 +4367,10 @@ pub fn app_status_get(
         ai_runtime: runtime_manager.0.snapshot()?,
         recovery_actions,
         checked_at,
-    })
+    };
+    guard.0 = Instant::now();
+    guard.1 = Some(snapshot.clone());
+    Ok(snapshot)
 }
 
 /// sidecar 角色 → 运行时后端展示名（设置页「运行时状态」实例列表）。
@@ -4672,13 +4566,7 @@ pub async fn storage_migration_cleanup(
         crate::cleanup_storage_migration(&config_directory, &data_directory)
     })
     .await
-    .map_err(|error| {
-        AppError::new(
-            "STORAGE_MIGRATION_CLEANUP_FAILED",
-            error.to_string(),
-            true,
-        )
-    })?
+    .map_err(|error| AppError::new("STORAGE_MIGRATION_CLEANUP_FAILED", error.to_string(), true))?
 }
 
 /// 清理迁移完成前的旧模型仓库（迁移已完成且切换生效后）。
@@ -4704,13 +4592,7 @@ pub async fn model_store_migration_cleanup(
         crate::cleanup_model_store_migration(&config_directory, &active_store)
     })
     .await
-    .map_err(|error| {
-        AppError::new(
-            "MODEL_STORE_CLEANUP_FAILED",
-            error.to_string(),
-            true,
-        )
-    })?
+    .map_err(|error| AppError::new("MODEL_STORE_CLEANUP_FAILED", error.to_string(), true))?
 }
 
 #[derive(Debug, Deserialize)]
@@ -4849,7 +4731,6 @@ fn storage_usage_snapshot(
         "vision",
         "reranker",
         "ocr",
-        "tts",
         "asr",
     ]
     .iter()
@@ -5403,7 +5284,10 @@ fn group_ask_trace_stages(records: &[NodeTraceRecord]) -> Vec<AskTraceStage> {
             })
         })
         .collect::<Vec<_>>();
-    let known = ASK_TRACE_STAGE_ORDER.iter().copied().collect::<HashSet<_>>();
+    let known = ASK_TRACE_STAGE_ORDER
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
     let mut extra = records
         .iter()
         .map(|record| record.node.as_str())
@@ -5457,7 +5341,10 @@ fn aggregate_ask_timing(stages: &[AskTraceStage]) -> AskTraceTiming {
         .find(|stage| stage.node == "retrieval")
         .and_then(|stage| stage.records.first())
     {
-        timing.embedding_ms = record.output_json.get("embedding_ms").and_then(Value::as_u64);
+        timing.embedding_ms = record
+            .output_json
+            .get("embedding_ms")
+            .and_then(Value::as_u64);
     }
     timing.total_ms = stages
         .iter()
@@ -5596,11 +5483,7 @@ fn build_diagnostic_summary(stages: &[AskTraceStage]) -> String {
         let supported = records
             .iter()
             .filter(|record| {
-                record
-                    .output_json
-                    .get("supported")
-                    .and_then(Value::as_bool)
-                    == Some(true)
+                record.output_json.get("supported").and_then(Value::as_bool) == Some(true)
             })
             .count();
         parts.push(format!("{supported}/{} supported", records.len()));
@@ -5626,11 +5509,12 @@ fn sanitize_ask_trace_for_export(stages: &mut [AskTraceStage], include_detailed_
             let mut output = record.output_json.clone();
             sanitize_trace_value(&mut input, include_detailed_text);
             sanitize_trace_value(&mut output, include_detailed_text);
-            if !include_detailed_text && stage.node == "generation" {
-                if let Some(Value::String(prompt)) = input.get("prompt") {
-                    let length = prompt.chars().count();
-                    input["prompt"] = json!(format!("[已隐藏] 共 {length} 字符"));
-                }
+            if !include_detailed_text
+                && stage.node == "generation"
+                && let Some(Value::String(prompt)) = input.get("prompt")
+            {
+                let length = prompt.chars().count();
+                input["prompt"] = json!(format!("[已隐藏] 共 {length} 字符"));
             }
             record.input_json = input;
             record.output_json = output;
@@ -5693,7 +5577,10 @@ fn sanitize_trace_paths(text: &str) -> String {
         // 路径终点：引号 / 空白 / 常见分隔符
         let mut end = text.len();
         for (offset, ch) in text[start..].char_indices() {
-            if matches!(ch, '"' | '\'' | ' ' | '\t' | '\n' | '\r' | ',' | '}' | ']' | ')') {
+            if matches!(
+                ch,
+                '"' | '\'' | ' ' | '\t' | '\n' | '\r' | ',' | '}' | ']' | ')'
+            ) {
                 end = start + offset;
                 break;
             }
@@ -5838,7 +5725,8 @@ pub async fn ask_evaluation_run(
         ));
     }
     let output = PathBuf::from(request.output_path.trim());
-    if !output.is_absolute() || output.extension().and_then(|value| value.to_str()) != Some("json") {
+    if !output.is_absolute() || output.extension().and_then(|value| value.to_str()) != Some("json")
+    {
         return Err(AppError::new(
             "EVALUATION_OUTPUT_INVALID",
             "评估结果必须写到绝对路径的JSON新文件",
@@ -5899,8 +5787,9 @@ pub async fn ask_evaluation_run(
             metrics,
             results,
         };
-        let bytes = serde_json::to_vec_pretty(&report)
-            .map_err(|error| AppError::new("EVALUATION_SERIALIZE_FAILED", error.to_string(), false))?;
+        let bytes = serde_json::to_vec_pretty(&report).map_err(|error| {
+            AppError::new("EVALUATION_SERIALIZE_FAILED", error.to_string(), false)
+        })?;
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -6059,69 +5948,76 @@ fn run_single_evaluation_case(
     };
 
     // answer 侧字段 + 错误分类
-    let (actual_file_ids, grounding_status, answer_mode, evidence_found, answer_grounded,
-         claim_count, supported_claim_count, clarification_used, error_message, error_category) =
-        match answer {
-            Some(result) => {
-                let grounding_status =
-                    serde_json::to_string(&result.grounding_status).unwrap_or_default();
-                let grounding_status =
-                    grounding_status.trim_matches('"').to_owned();
-                let supported_count = result
-                    .claims
+    let (
+        actual_file_ids,
+        grounding_status,
+        answer_mode,
+        evidence_found,
+        answer_grounded,
+        claim_count,
+        supported_claim_count,
+        clarification_used,
+        error_message,
+        error_category,
+    ) = match answer {
+        Some(result) => {
+            let grounding_status =
+                serde_json::to_string(&result.grounding_status).unwrap_or_default();
+            let grounding_status = grounding_status.trim_matches('"').to_owned();
+            let supported_count = result
+                .claims
+                .iter()
+                .filter(|claim| claim.support_status == SupportStatus::Supported)
+                .count();
+            let claims_have_unsupported = supported_count < result.claims.len();
+            let category = fanfan_core::evaluation::classify_error(
+                &failed_nodes,
+                None,
+                Some(result.answer_mode.as_str()),
+                result.insufficient_evidence,
+                case.expected_should_find_evidence,
+                claims_have_unsupported,
+            );
+            (
+                result
+                    .used_file_ids
                     .iter()
-                    .filter(|claim| claim.support_status == SupportStatus::Supported)
-                    .count();
-                let claims_have_unsupported = supported_count < result.claims.len();
-                let category = fanfan_core::evaluation::classify_error(
-                    &failed_nodes,
-                    None,
-                    Some(result.answer_mode.as_str()),
-                    result.insufficient_evidence,
-                    case.expected_should_find_evidence,
-                    claims_have_unsupported,
-                );
-                (
-                    result
-                        .used_file_ids
-                        .iter()
-                        .map(|file_id| file_id.to_string())
-                        .collect::<Vec<_>>(),
-                    Some(grounding_status),
-                    Some(result.answer_mode.as_str().to_owned()),
-                    !result.claims.is_empty() || !result.used_file_ids.is_empty(),
-                    result.grounding_status == GroundingStatus::Grounded && !claims_have_unsupported,
-                    result.claims.len() as u64,
-                    supported_count as u64,
-                    result.clarification.is_some()
-                        || result.answer_mode == AnswerMode::Clarification,
-                    None,
-                    category,
-                )
-            }
-            None => {
-                let category = fanfan_core::evaluation::classify_error(
-                    &failed_nodes,
-                    run_error.as_ref().map(|error| error.code.as_str()),
-                    None,
-                    false,
-                    case.expected_should_find_evidence,
-                    false,
-                );
-                (
-                    Vec::new(),
-                    None,
-                    None,
-                    false,
-                    false,
-                    0,
-                    0,
-                    false,
-                    run_error.map(|error| error.message),
-                    category,
-                )
-            }
-        };
+                    .map(|file_id| file_id.to_string())
+                    .collect::<Vec<_>>(),
+                Some(grounding_status),
+                Some(result.answer_mode.as_str().to_owned()),
+                !result.claims.is_empty() || !result.used_file_ids.is_empty(),
+                result.grounding_status == GroundingStatus::Grounded && !claims_have_unsupported,
+                result.claims.len() as u64,
+                supported_count as u64,
+                result.clarification.is_some() || result.answer_mode == AnswerMode::Clarification,
+                None,
+                category,
+            )
+        }
+        None => {
+            let category = fanfan_core::evaluation::classify_error(
+                &failed_nodes,
+                run_error.as_ref().map(|error| error.code.as_str()),
+                None,
+                false,
+                case.expected_should_find_evidence,
+                false,
+            );
+            (
+                Vec::new(),
+                None,
+                None,
+                false,
+                false,
+                0,
+                0,
+                false,
+                run_error.map(|error| error.message),
+                category,
+            )
+        }
+    };
 
     fanfan_core::evaluation::EvaluationRunResult {
         case_id: case.id.clone(),
@@ -6156,6 +6052,7 @@ fn run_single_evaluation_case(
 
 /// 批量运行的单例执行器：与 ask_start 同口径的运行时租约 + compute_answer，
 /// 不启动 Memory Candidate Writer，不写前台活动守卫。
+#[allow(clippy::too_many_arguments)]
 fn run_evaluation_ask(
     request: &AskRequest,
     catalog: &CatalogService,
@@ -6331,7 +6228,7 @@ pub fn memory_relation_set_status(
                 "MEMORY_STATUS_INVALID",
                 "只允许 confirmed 或 rejected",
                 false,
-            ))
+            ));
         }
     };
     catalog
@@ -6457,12 +6354,11 @@ pub fn index_rebuild(
 
 #[tauri::command(async)]
 pub fn search_start(
-    mut request: SearchRequest,
+    request: SearchRequest,
     catalog: State<'_, CatalogServiceState>,
     models: State<'_, ModelServiceState>,
     worker: State<'_, WorkerServiceState>,
     sidecars: State<'_, SidecarRegistryState>,
-    generation: State<'_, GenerationServiceState>,
     runtime_manager: State<'_, RuntimeManagerState>,
 ) -> Result<SearchSession, AppError> {
     let _foreground_guard = ForegroundActivityGuard::begin(&worker.foreground_activity);
@@ -6485,122 +6381,85 @@ pub fn search_start(
     );
     let catalog = catalog.get()?;
     let models = models.get()?;
-    let original_query = request.query.clone();
-    // 查询理解：将自然语言转换为结构化检索参数
-    let query_runtime_lease = if is_natural_language_query(&request.query) {
-        let mut runtime_request =
-            RuntimeTaskRequest::interactive(RuntimeTaskKind::Search, RuntimeBackendKind::LlamaCpp);
-        runtime_request.cpu_threads = background_inference_threads();
-        runtime_request.timeout = Duration::from_secs(3);
-        runtime_manager.0.acquire(runtime_request).ok()
-    } else {
-        None
-    };
-    let intent: Option<fanfan_core::QueryIntent> = if query_runtime_lease.is_some() {
-        models
-            .active_artifact(ModelRole::Generation)
-            .ok()
-            .flatten()
-            .and_then(|artifact| {
-                try_lock_generation_until(&generation.0, Duration::from_millis(500))
-                    .and_then(|mut runtime| {
-                    let threads = background_inference_threads();
-                    let _ = runtime
-                        .activate(&artifact.local_path, 4096, threads)
-                        .or_else(|_| runtime.activate(&artifact.local_path, 2048, threads));
-                    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-                    let (system, user) = query_understanding_prompt(&request.query, &today);
-                    let cancelled = std::sync::atomic::AtomicBool::new(false);
-                    let generated: String = runtime
-                        .complete_cancellable(&system, &user, 256, &cancelled)
-                        .ok()?;
-                    Some(parse_query_intent(&generated, &request.query))
-                })
-            })
-    } else {
-        None
-    };
-    if let Some(lease) = query_runtime_lease {
-        lease.complete();
-    }
-    let intent_used = intent.is_some();
-    let time_hint = intent.as_ref().and_then(|intent| {
-        intent
-            .time_hint
-            .as_ref()
-            .map(|hint| json!({ "from": hint.from, "to": hint.to }))
-    });
-    if let Some(intent) = intent {
-        request.query = intent.rewritten_query;
-        if let Some(hint) = intent.time_hint {
-            if request.scope.modified_from.is_none() {
-                request.scope.modified_from =
-                    chrono::NaiveDate::parse_from_str(&hint.from, "%Y-%m-%d")
-                        .ok()
-                        .and_then(|d| d.and_hms_opt(0, 0, 0))
-                        .map(|t| chrono::DateTime::<Utc>::from_naive_utc_and_offset(t, Utc));
-            }
-            if request.scope.modified_to.is_none() {
-                request.scope.modified_to = chrono::NaiveDate::parse_from_str(&hint.to, "%Y-%m-%d")
-                    .ok()
-                    .and_then(|d| d.and_hms_opt(23, 59, 59))
-                    .map(|t| chrono::DateTime::<Utc>::from_naive_utc_and_offset(t, Utc));
-            }
-        }
-        if !intent.extension_hints.is_empty() && request.scope.extensions.is_empty() {
-            request.scope.extensions = intent
-                .extension_hints
-                .into_iter()
-                .map(|e| e.trim_start_matches('.').to_lowercase())
-                .collect();
-        }
-    }
-    trace_node(
+    // 操作级追踪：SEARCH 链路入口（后续节点通过线程关联自动写入 operation_id）。
+    let operation_trace = ActiveOperationTrace::begin(
         &catalog,
-        "search",
-        "understanding",
         &correlation_id,
         None,
-        None,
-        &json!({ "query": original_query }),
+        TraceFeatureType::Search,
         &json!({
-            "rewritten_query": request.query.clone(),
-            "time_hint": time_hint,
-            "extensions": request.scope.extensions,
-            "used": intent_used,
+            "query": request.query,
+            "mode": format!("{:?}", request.mode),
+            "page_size": request.page_size,
+            "has_cursor": request.cursor.is_some(),
+            "scope": json!({
+                "roots": request.scope.root_ids.len(),
+                "collections": request.scope.collection_ids.len(),
+                "files": request.scope.file_ids.len(),
+                "extensions": request.scope.extensions,
+            }),
         }),
-        "ok",
         None,
     );
-    if matches!(request.mode, SearchMode::Semantic | SearchMode::Hybrid)
+    if matches!(request.mode, SearchMode::Hybrid)
         && let Some(artifact) = models.active_artifact(ModelRole::Embedding)?
     {
-        let mut runtime_request = RuntimeTaskRequest::interactive(
-            RuntimeTaskKind::Search,
-            RuntimeBackendKind::OnnxRuntime,
-        );
-        runtime_request.cpu_threads = 2;
-        runtime_request.timeout = Duration::from_secs(5);
-        let mut embedding_runtime_lease = runtime_manager.0.acquire(runtime_request).ok();
-        let tokenizer_path = PathBuf::from(&artifact.local_path)
-            .parent()
-            .map(|parent| parent.join("tokenizer.json"));
-        if embedding_runtime_lease.is_some()
-            && let Some(tokenizer_path) = tokenizer_path
-            && let Ok(response) = sidecars.0.onnx.encode_embeddings(&EmbeddingRequest {
-                model_path: artifact.local_path,
-                tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
-                texts: vec![request.query.clone()],
-                max_length: 512,
-                threads: 2,
-            })
-            && let Some(vector) = response.vectors.first()
-        {
+        let cache_key = SearchEmbeddingKey {
+            model_artifact_id: artifact.artifact_id.to_string(),
+            query: request.query.clone(),
+        };
+        // 命中缓存直接复用查询向量，跳过跨进程编码与资源租约；
+        // 未命中才 acquire + 编码，成功后写入缓存供重复搜索复用。
+        let query_vector = worker
+            .search_embedding_cache
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.get(&cache_key))
+            .or_else(|| {
+                let mut runtime_request = RuntimeTaskRequest::interactive(
+                    RuntimeTaskKind::Search,
+                    RuntimeBackendKind::OnnxRuntime,
+                );
+                runtime_request.cpu_threads = 2;
+                // 语义通道只是增强，失败应立即降级回 filename+fulltext；acquire 等 5
+                // 秒会让非语义搜索白白多等 5 秒（实测语义降级搜索 7s ≈ 5s acquire +
+                // 检索）。压到 300ms：资源就绪就编码，否则立刻走无语义路径。
+                runtime_request.timeout = Duration::from_millis(300);
+                let lease = runtime_manager.0.acquire(runtime_request).ok()?;
+                let tokenizer_path = PathBuf::from(&artifact.local_path)
+                    .parent()
+                    .map(|parent| parent.join("tokenizer.json"));
+                let Some(tokenizer_path) = tokenizer_path else {
+                    lease.complete();
+                    return None;
+                };
+                let Ok(response) = sidecars.0.onnx.encode_embeddings(&EmbeddingRequest {
+                    model_path: artifact.local_path,
+                    tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
+                    texts: vec![request.query.clone()],
+                    max_length: 512,
+                    threads: 2,
+                }) else {
+                    lease.complete();
+                    return None;
+                };
+                let Some(vector) = response.vectors.first() else {
+                    lease.complete();
+                    return None;
+                };
+                lease.complete();
+                let vector = vector.clone();
+                if let Ok(mut cache) = worker.search_embedding_cache.lock() {
+                    cache.put(cache_key.clone(), vector.clone());
+                }
+                Some(vector)
+            });
+        if let Some(vector) = query_vector {
             let result = catalog.search_with_semantic(
                 &request,
                 Some(SemanticQuery {
                     model_artifact_id: &artifact.artifact_id.to_string(),
-                    vector,
+                    vector: &vector,
                 }),
             )?;
             crate::runtime_log::event(
@@ -6645,13 +6504,8 @@ pub fn search_start(
                 "ok",
                 Some(started.elapsed().as_millis() as u64),
             );
-            if let Some(lease) = embedding_runtime_lease.take() {
-                lease.complete();
-            }
+            operation_trace.complete(&catalog, "ok");
             return Ok(result);
-        }
-        if let Some(lease) = embedding_runtime_lease {
-            lease.complete();
         }
     }
     let result = catalog.search(&request)?;
@@ -6697,6 +6551,7 @@ pub fn search_start(
         "ok",
         Some(started.elapsed().as_millis() as u64),
     );
+    operation_trace.complete(&catalog, "ok");
     Ok(result)
 }
 
@@ -6788,6 +6643,27 @@ pub fn ask_start(
         let _foreground_guard =
             ForegroundActivityGuard::begin(&foreground_worker.foreground_activity);
         let operation_started = Instant::now();
+        // 操作级追踪：ASK 链路入口（节点 trace 的 correlation_id 使用协调器
+        // operation_id，这里保持一致，完成态在下方各出口标记）。
+        let operation_trace = ActiveOperationTrace::begin(
+            &catalog,
+            &operation_id.to_string(),
+            request.session_id.map(|id| id.to_string()).as_deref(),
+            TraceFeatureType::Ask,
+            &json!({
+                "question": request.question,
+                "answer_style": request.answer_style,
+                "strict_evidence": request.strict_evidence,
+                "retrieval_limit": request.retrieval_limit,
+                "max_source_files": request.max_source_files,
+                "scope": json!({
+                    "roots": request.scope.root_ids.len(),
+                    "collections": request.scope.collection_ids.len(),
+                    "files": request.scope.file_ids.len(),
+                }),
+            }),
+            None,
+        );
         let generation_artifact_id = models
             .active_artifact(ModelRole::Generation)
             .ok()
@@ -6907,6 +6783,7 @@ pub fn ask_start(
                     "elapsed_ms": operation_started.elapsed().as_millis() as u64,
                 }),
             );
+            operation_trace.complete(&catalog, "cancelled");
             runtime_lease.fail("OPERATION_CANCELLED");
             return;
         }
@@ -6934,6 +6811,7 @@ pub fn ask_start(
                             "elapsed_ms": operation_started.elapsed().as_millis() as u64,
                         }),
                     );
+                    operation_trace.complete(&catalog, "cancelled");
                     runtime_lease.fail("OPERATION_CANCELLED");
                     return;
                 }
@@ -6988,6 +6866,7 @@ pub fn ask_start(
                         );
                     });
                 }
+                operation_trace.complete(&catalog, "ok");
                 runtime_lease.complete();
             }
             Err(error) => {
@@ -7016,6 +6895,7 @@ pub fn ask_start(
                         "elapsed_ms": operation_started.elapsed().as_millis() as u64,
                     }),
                 );
+                operation_trace.complete(&catalog, "error");
                 runtime_lease.fail(error.code.clone());
             }
         }
@@ -7023,7 +6903,56 @@ pub fn ask_start(
     Ok(handle)
 }
 
+/// OperationTrace 的 RAII 守卫：入口创建 operation_traces 记录并设置
+/// 线程关联，显式 `complete` 写完成态；Drop 时兜底清理线程关联。
+/// 记录失败静默，绝不影响主链路（与既有 Trace 纪律一致）。
+struct ActiveOperationTrace {
+    operation_id: Option<String>,
+}
+
+impl ActiveOperationTrace {
+    /// 新建一条 OperationTrace（status=running）并绑定当前线程。
+    fn begin(
+        catalog: &CatalogService,
+        correlation_id: &str,
+        session_id: Option<&str>,
+        feature_type: TraceFeatureType,
+        request: &Value,
+        preset_id: Option<&str>,
+    ) -> Self {
+        let input = OperationTraceInput {
+            correlation_id: correlation_id.to_string(),
+            session_id: session_id.map(str::to_string),
+            feature_type,
+            request: request.clone(),
+            preset_id: preset_id.map(str::to_string),
+        };
+        let operation_id = catalog.record_operation_trace(&input).ok();
+        if let Some(operation_id) = &operation_id {
+            fanfan_core::set_active_operation_trace(Some(operation_id.clone()));
+        }
+        ActiveOperationTrace { operation_id }
+    }
+
+    /// 标记完成态并解除线程关联（幂等；重复调用仅首次生效）。
+    fn complete(mut self, catalog: &CatalogService, status: &str) {
+        if let Some(operation_id) = self.operation_id.take() {
+            let _ = catalog.complete_operation_trace(&operation_id, status);
+        }
+        fanfan_core::set_active_operation_trace(None);
+    }
+}
+
+impl Drop for ActiveOperationTrace {
+    fn drop(&mut self) {
+        // 未显式 complete（错误/提前返回）时仅解除线程关联，避免污染后续请求。
+        fanfan_core::set_active_operation_trace(None);
+    }
+}
+
 /// 节点追踪：一条链路节点的输入输出快照，明文落库（失败静默，绝不影响主链路）。
+/// 若当前线程绑定了 OperationTrace，则自动把 operation_id 写入节点记录。
+#[allow(clippy::too_many_arguments)]
 fn trace_node(
     catalog: &CatalogService,
     flow: &str,
@@ -7036,17 +6965,25 @@ fn trace_node(
     status: &str,
     elapsed_ms: Option<u64>,
 ) {
-    let _ = catalog.record_node_trace(
-        flow,
-        node,
-        correlation_id,
-        session_id,
-        entity_id,
-        &truncate_for_trace(input_json),
-        &truncate_for_trace(output_json),
-        status,
+    let operation_id = fanfan_core::active_operation_trace();
+    let input = truncate_for_trace(input_json);
+    let output = truncate_for_trace(output_json);
+    let trace = TraceNodeInput {
+        flow: flow.to_owned(),
+        node: node.to_owned(),
+        correlation_id: correlation_id.to_owned(),
+        session_id: session_id.map(str::to_owned),
+        entity_id: entity_id.map(str::to_owned),
+        input_json: input,
+        output_json: output,
+        status: status.to_owned(),
         elapsed_ms,
-    );
+        meta: TraceNodeMeta {
+            operation_id,
+            ..TraceNodeMeta::default()
+        },
+    };
+    let _ = catalog.record_node_trace(&trace);
 }
 
 /// operation_execution 精简节点：记录「本轮问答实际走了哪条管线」
@@ -7083,9 +7020,7 @@ fn truncate_for_trace(value: &Value) -> Value {
                 *text = kept;
             }
             Value::Array(items) => items.iter_mut().for_each(|item| cap_strings(item, limit)),
-            Value::Object(map) => map
-                .values_mut()
-                .for_each(|item| cap_strings(item, limit)),
+            Value::Object(map) => map.values_mut().for_each(|item| cap_strings(item, limit)),
             _ => {}
         }
     }
@@ -7281,6 +7216,7 @@ fn memory_target_legality_valid(
         && valid_target(write.object_type, write.object_id)?)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_answer(
     request: &AskRequest,
     catalog: &CatalogService,
@@ -7347,85 +7283,40 @@ fn compute_answer(
         );
     }
 
-    // 0.5 寒暄/助手身份 fast-path（CASE 1：「你好」「你是谁？」等必须稳定
-    // GENERAL）。确定性命中即直接闲聊，不消耗一次 Router LLM 调用；只覆盖
-    // 最明确的寒暄与身份问题，含「我的/资料/文件」等自有资料表达的句子绝不
-    // 命中（fast_path_greeting 内部有 LOCAL_MARKERS 防护，误伤 LOCAL 是更
-    // 严重的错误）。
-    if fast_path_greeting(request.question.trim()) == Some(SourceIntent::General) {
-        trace_node(
-            &catalog,
-            "ask",
-            "source_routing",
-            &operation_id.to_string(),
-            session_id_ref,
-            None,
-            &json!({ "question": request.question }),
-            &json!({
-                "source": "general",
-                "confidence": 1.0,
-                "routing_ok": true,
-                "routing_raw": "deterministic fast_path_greeting",
-            }),
-            "ok",
-            None,
-        );
-        trace_operation_execution(
-            catalog,
-            &operation_id.to_string(),
-            session_id_ref,
-            "general",
-            "chat",
-        );
-        return run_chat_answer(
-            request,
-            catalog,
+    // 1. Source Router（LOCAL / GENERAL / AMBIGUOUS）
+    // AI 优先：来源判断完全交给 LLM 语义理解，不再用规则表抢先判定
+    // （personal_reference_hit / existence_query_hit 的 Router 前置分支已移除）。
+    // 生成模型已启用 enable_thinking=false，JSON 输出稳定；这里做一次重试兜底：
+    // 首次解析失败（JSON 截断/噪声）时重试一次，仍失败才走诚实澄清兜底
+    // （不猜意图、不进自由闲聊，避免幻觉）。
+    let routing_started = Instant::now();
+    let question = request.question.trim();
+    let mut routing: Option<SourceRouting> = None;
+    let mut routing_raw = String::new();
+    for attempt in 0..2 {
+        let (system, user) = source_router_prompt(question, &history);
+        match complete_json_with_model(
             generation,
             &generation_artifact,
-            &maintenance,
-            &history,
-            operation_id,
+            &system,
+            &user,
+            128,
+            &source_routing_schema(),
             cancelled,
-            phase,
-        );
-    }
-
-    // 1. Source Router（LOCAL / GENERAL / AMBIGUOUS）
-    // Phase 4.3 确定性前置检测（CASE 1/2/3）：自有资料表达（我的资料/
-    // 我的简历/毕业时候……）与存在性问句（有没有做过/是否提到……）在
-    // LLM Router **之前**强制 LOCAL。根因：推理模型（DeepSeek-R1/Qwen3.5）
-    // 48 token 截断后路由 JSON 解析必然失败，parse_failed 兜底曾直接进
-    // Chat 自由生成（RAG 定义幻觉 / 简历模板幻觉）。这两类问题的期望
-    // 答案只能是本地证据（有/没有 + 文件依据），规则命中即绕开小模型。
-    let routing_started = Instant::now();
-    let (routing, routing_raw) = {
-        let question = request.question.trim();
-        if let Some(marker) = personal_reference_hit(question) {
-            (
-                Some(SourceRouting { source: SourceIntent::Local, confidence: 1.0 }),
-                Some(format!("deterministic personal_reference_hit:{marker}")),
-            )
-        } else if existence_query_hit(question) {
-            (
-                Some(SourceRouting { source: SourceIntent::Local, confidence: 1.0 }),
-                Some("deterministic existence_query_hit".to_owned()),
-            )
-        } else {
-            let (system, user) = source_router_prompt(question, &history);
-            let raw = complete_json_with_model(
-                generation,
-                &generation_artifact,
-                &system,
-                &user,
-                48,
-                &source_routing_schema(),
-                cancelled,
-            )?;
-            (parse_source_routing(&raw), Some(raw))
+        ) {
+            Ok(raw) => {
+                routing_raw = raw.clone();
+                routing = parse_source_routing(&raw);
+                if routing.is_some() {
+                    break;
+                }
+            }
+            Err(error) if attempt == 1 => return Err(error),
+            Err(_) => {}
         }
-    };
+    }
     trace_node(
-        &catalog,
+        catalog,
         "ask",
         "source_routing",
         &operation_id.to_string(),
@@ -7442,25 +7333,16 @@ fn compute_answer(
         Some(routing_started.elapsed().as_millis() as u64),
     );
     let Some(routing) = routing else {
-        // 路由解析失败 → 保守闲聊（与旧行为一致：路由失败默认 chat，不猜检索）
+        // 路由重试后仍无法解析 → 诚实澄清兜底：不猜意图（不做宽检索猜答案、
+        // 不进自由闲聊产生幻觉），明确请用户澄清是查资料还是普通聊天。
         trace_operation_execution(
             catalog,
             &operation_id.to_string(),
             session_id_ref,
             "routing_parse_failed",
-            "chat",
+            "clarify",
         );
-        return run_chat_answer(
-            request,
-            catalog,
-            generation,
-            &generation_artifact,
-            &maintenance,
-            &history,
-            operation_id,
-            cancelled,
-            phase,
-        );
+        return run_clarification_refusal(request, catalog, operation_id, phase);
     };
     if routing.source == SourceIntent::General {
         trace_operation_execution(
@@ -7489,7 +7371,7 @@ fn compute_answer(
         let context_started = Instant::now();
         let context_resolution = resolve_ambiguous(&session_context);
         trace_node(
-            &catalog,
+            catalog,
             "ask",
             "context_resolution",
             &operation_id.to_string(),
@@ -7536,33 +7418,75 @@ fn compute_answer(
             && let Some(document_type) = context_resolution.resolved_document_type
         {
             let Some(mut plan) = parse_ask_plan(
-                request, catalog, generation, &generation_artifact, &history, operation_id,
-                session_id_ref, cancelled, phase,
+                request,
+                catalog,
+                generation,
+                &generation_artifact,
+                &history,
+                operation_id,
+                session_id_ref,
+                cancelled,
+                phase,
             )?
             else {
                 // 解析失败：按类型宽检索（不锁文件，退化为全库）
                 return run_retrieval_answer(
-                    request, request.question.trim(), catalog, models, worker, runtime_manager,
+                    request,
+                    request.question.trim(),
+                    catalog,
+                    models,
+                    worker,
+                    runtime_manager,
                     generation,
-                    generation_artifact, embedding_for_retrieval(&models)?, maintenance, &history,
-                    operation_id, cancelled, (phase, verified_claim), None, None, false, false,
+                    generation_artifact,
+                    embedding_for_retrieval(models)?,
+                    maintenance,
+                    &history,
+                    operation_id,
+                    cancelled,
+                    (phase, verified_claim),
+                    None,
+                    None,
+                    false,
+                    false,
                 );
             };
             plan.source = SourceIntent::Local;
             plan.requires_document_resolution = true;
             plan.target.document_type = plan.target.document_type.or(Some(document_type));
             return finish_retrieval_with_plan(
-                request, catalog, models, worker, runtime_manager, generation, generation_artifact,
-                embedding_for_retrieval(&models)?, maintenance, &history, &session_context,
-                plan, context_scope, operation_id, memory_enabled, cancelled, (phase, verified_claim),
+                request,
+                catalog,
+                models,
+                worker,
+                runtime_manager,
+                generation,
+                generation_artifact,
+                embedding_for_retrieval(models)?,
+                maintenance,
+                &history,
+                &session_context,
+                plan,
+                context_scope,
+                operation_id,
+                memory_enabled,
+                cancelled,
+                (phase, verified_claim),
             );
         }
     }
 
     // 3. Query Parser（LOCAL 或已恢复的 AMBIGUOUS 都要先结构化）
     let plan = parse_ask_plan(
-        request, catalog, generation, &generation_artifact, &history, operation_id,
-        session_id_ref, cancelled, phase,
+        request,
+        catalog,
+        generation,
+        &generation_artifact,
+        &history,
+        operation_id,
+        session_id_ref,
+        cancelled,
+        phase,
     )?;
     let Some(mut plan) = plan else {
         // 解析失败回退：原问题在（可能的）上下文 scope 内检索，不劣化现状
@@ -7571,17 +7495,34 @@ fn compute_answer(
             scoped.scope.file_ids = context_scope.clone();
         }
         return run_retrieval_answer(
-            &scoped, request.question.trim(), catalog, models, worker, runtime_manager,
-            generation, generation_artifact,
-            embedding_for_retrieval(&models)?, maintenance, &history, operation_id, cancelled,
-            (phase, verified_claim), None, None, false, false,
+            &scoped,
+            request.question.trim(),
+            catalog,
+            models,
+            worker,
+            runtime_manager,
+            generation,
+            generation_artifact,
+            embedding_for_retrieval(models)?,
+            maintenance,
+            &history,
+            operation_id,
+            cancelled,
+            (phase, verified_claim),
+            None,
+            None,
+            false,
+            false,
         );
     };
     if routing.source == SourceIntent::Ambiguous && !context_scope.is_empty() {
         plan.source = SourceIntent::Local;
         // 会话上下文已锁定文件：目标对象即上下文恢复出的文件，跳过 Document Resolver
         plan.requires_document_resolution = false;
-        plan.target.document_type = plan.target.document_type.or(session_context.active_document_type);
+        plan.target.document_type = plan
+            .target
+            .document_type
+            .or(session_context.active_document_type);
     }
     // 解析器兜底（CASE 1）：Router 判 local 但 Parser 输出 general_chat →
     // 尊重 Parser 的闲聊判定直接聊天（寒暄/身份问题已由 fast-path 拦截，
@@ -7607,9 +7548,23 @@ fn compute_answer(
         );
     }
     finish_retrieval_with_plan(
-        request, catalog, models, worker, runtime_manager, generation, generation_artifact,
-        embedding_for_retrieval(&models)?, maintenance, &history, &session_context, plan,
-        context_scope, operation_id, memory_enabled, cancelled, (phase, verified_claim),
+        request,
+        catalog,
+        models,
+        worker,
+        runtime_manager,
+        generation,
+        generation_artifact,
+        embedding_for_retrieval(models)?,
+        maintenance,
+        &history,
+        &session_context,
+        plan,
+        context_scope,
+        operation_id,
+        memory_enabled,
+        cancelled,
+        (phase, verified_claim),
     )
 }
 
@@ -7786,42 +7741,36 @@ fn parse_ask_plan(
     phase: &dyn Fn(&str, f64),
 ) -> Result<Option<QueryPlan>, AppError> {
     phase("query_parsing", 0.12);
-    // CASE 7 确定性 FIND 预检：在哪/在哪里/找一下/哪个文件/我放哪了 等定位
-    // 问句先于 LLM 提取目标引用（「我毕业时候那个材料在哪」→ reference =
-    // 「我毕业时候那个材料」）。0.6B 无法稳定解析这类问句（实测被历史回声
-    // 污染成上一条问题），确定性路径保证 DOCUMENT_FIND 不受模型波动影响；
-    // 无命中 → 走 LLM 解析（finalize 另有 FIND backstop）。
-    if let Some(reference) = extract_find_reference(request.question.trim()) {
-        let plan = find_query_plan(request.question.trim(), &reference);
-        trace_node(
-            catalog,
-            "ask",
-            "query_parsing",
-            &operation_id.to_string(),
-            session_id_ref,
-            None,
-            &json!({ "question": request.question }),
-            &json!({
-                "parsed": true,
-                "plan": plan,
-                "parsing_raw": "deterministic extract_find_reference",
-            }),
-            "ok",
-            None,
-        );
-        return Ok(Some(plan));
+    // AI 优先：意图/操作/目标分离全部交给 LLM Parser 语义理解（含
+    // DOCUMENT_FIND 的判定——Prompt 已教模型区分「找文件位置」与
+    // 「查文件内容」）。此处做一次重试兜底：首次解析失败（JSON 截断/
+    // 噪声/复读历史）时重试一次，仍失败返回 None（调用方按原问题宽检索，
+    // 不猜意图）。
+    let question = request.question.trim();
+    let mut plan: Option<QueryPlan> = None;
+    let mut raw = String::new();
+    for attempt in 0..2 {
+        let (system, user) = query_parser_prompt(question, history);
+        match complete_json_with_model(
+            generation,
+            generation_artifact,
+            &system,
+            &user,
+            320,
+            &query_parser_schema(),
+            cancelled,
+        ) {
+            Ok(text) => {
+                raw = text.clone();
+                plan = parse_query_plan(&text);
+                if plan.is_some() {
+                    break;
+                }
+            }
+            Err(error) if attempt == 1 => return Err(error),
+            Err(_) => {}
+        }
     }
-    let (system, user) = query_parser_prompt(request.question.trim(), history);
-    let raw = complete_json_with_model(
-        generation,
-        generation_artifact,
-        &system,
-        &user,
-        160,
-        &query_parser_schema(),
-        cancelled,
-    )?;
-    let plan = parse_query_plan(&raw);
     trace_node(
         catalog,
         "ask",
@@ -7886,6 +7835,53 @@ fn load_memory_hints(
     (alias_hints, relation_hints)
 }
 
+/// 路由（LLM 重试后）仍无法解析来源时的诚实兜底：明确告知未理解，请用户
+/// 澄清是查本地资料还是普通聊天。**不猜意图**——不做宽检索猜答案，也不进
+/// 自由闲聊产生幻觉（RAG 定义错误 / 通用模板）。answer_mode = RagRefusal。
+fn run_clarification_refusal(
+    request: &AskRequest,
+    catalog: &CatalogService,
+    operation_id: Uuid,
+    phase: &dyn Fn(&str, f64),
+) -> Result<AnswerResult, AppError> {
+    let started_at = Instant::now();
+    let message = "我暂时没能判断你的问题是想查本地资料还是普通聊天。请换个说法，或明确说明（例如「查我的资料」「随便聊聊」）。"
+        .to_owned();
+    let result = AnswerResult {
+        session_id: request.session_id.unwrap_or_else(Uuid::now_v7),
+        message_id: Uuid::now_v7(),
+        answer: message.clone(),
+        grounding_status: fanfan_core::GroundingStatus::Insufficient,
+        insufficient_evidence: true,
+        claims: Vec::new(),
+        source_files: Vec::new(),
+        used_file_ids: Vec::new(),
+        elapsed_ms: started_at.elapsed().as_millis() as u64,
+        answer_mode: AnswerMode::RagRefusal,
+        retrieval_channels: Vec::new(),
+        index_coverage: 0.0,
+        degradation_reason: None,
+        no_evidence_reason: Some(NoEvidenceReason::TrueNoEvidence),
+        clarification: None,
+    };
+    let session_id = request.session_id.map(|id| id.to_string());
+    trace_node(
+        catalog,
+        "ask",
+        "routing_clarify_refusal",
+        &operation_id.to_string(),
+        session_id.as_deref(),
+        None,
+        &json!({ "question": request.question }),
+        &json!({ "answer_mode": result.answer_mode, "answer": result.answer }),
+        "ok",
+        Some(result.elapsed_ms),
+    );
+    catalog.record_ask_exchange(request, &result)?;
+    phase("completed", 1.0);
+    Ok(result)
+}
+
 /// DOCUMENT_FIND（spec 十一.1）：只运行 Document Resolver 的结果，不跑普通
 /// chunk RAG。定位到文件 → 返回文件卡片式回答（answer_mode = find，无 claims
 /// ——「找到文件」本身是目标，不需要证据句）；未定位到任何候选 → LOCAL +
@@ -7914,15 +7910,15 @@ fn run_document_find_answer(
             file_names.entry(profile.file_id).or_insert(name);
         }
     }
-    let file_id = resolved_scope
-        .first()
-        .copied()
-        .or_else(|| resolution_candidates.first().map(|candidate| candidate.file_id));
+    let file_id = resolved_scope.first().copied().or_else(|| {
+        resolution_candidates
+            .first()
+            .map(|candidate| candidate.file_id)
+    });
     let Some(file_id) = file_id else {
         // spec 十：FIND 查的是文件不是「信息」——NOT_FOUND 明确指出没有
         // 匹配该指代的文件，绝不转 Chat Prompt。
-        let reference = extract_find_reference(request.question.trim())
-            .unwrap_or_else(|| compact_for_prompt(request.question.trim(), 40));
+        let reference = compact_for_prompt(request.question.trim(), 40);
         let message = format!(
             "没有找到能够匹配「{reference}」的文件。可以换一种说法（文件名、类型或内容关键词），或确认资料已完成索引。"
         );
@@ -8033,13 +8029,12 @@ fn finish_retrieval_with_plan(
         // 由 Resolver 的类型等价（TYPE_KEYWORDS）与词元信号自行定位。
         let profiles_with_names =
             catalog.list_document_profiles(plan.target.document_type, 2000)?;
-        let profiles_with_names = if profiles_with_names.is_empty()
-            && plan.target.document_type.is_some()
-        {
-            catalog.list_document_profiles(None, 2000)?
-        } else {
-            profiles_with_names
-        };
+        let profiles_with_names =
+            if profiles_with_names.is_empty() && plan.target.document_type.is_some() {
+                catalog.list_document_profiles(None, 2000)?
+            } else {
+                profiles_with_names
+            };
         let mut file_names = HashMap::with_capacity(profiles_with_names.len());
         let profiles = profiles_with_names
             .into_iter()
@@ -8242,7 +8237,11 @@ fn finish_retrieval_with_plan(
     // top-2/3 宽检索（用户明确指代时猜错比让用户选一次更伤）。
     // 注意：MultipleCandidates 的 resolved_file_ids 是 top-2/3（非空），
     // 触发条件只看「状态 + 有可选候选」，不能要求 scope 为空。
-    if should_ask_clarification(memory_resolution_ok, resolution_status, !resolution_candidates.is_empty()) {
+    if should_ask_clarification(
+        memory_resolution_ok,
+        resolution_status,
+        !resolution_candidates.is_empty(),
+    ) {
         let clarification_started = Instant::now();
         let reference = plan
             .target
@@ -8301,18 +8300,18 @@ fn finish_retrieval_with_plan(
             request.session_id.map(|id| id.to_string()).as_deref(),
             None,
             &json!({
-            "reference": reference,
-            "candidate_count": resolution_candidates.len(),
-        }),
-        &json!({
-            "answer_mode": result.answer_mode,
-            "clarification_reason": result
-                .clarification
-                .as_ref()
-                .map(|payload| payload.reason.clone()),
-            "options": result.clarification,
-            "question": request.question,
-        }),
+                "reference": reference,
+                "candidate_count": resolution_candidates.len(),
+            }),
+            &json!({
+                "answer_mode": result.answer_mode,
+                "clarification_reason": result
+                    .clarification
+                    .as_ref()
+                    .map(|payload| payload.reason.clone()),
+                "options": result.clarification,
+                "question": request.question,
+            }),
             "ok",
             Some(clarification_started.elapsed().as_millis() as u64),
         );
@@ -8422,8 +8421,9 @@ fn finish_retrieval_with_plan(
         operation_id,
         cancelled,
         progress,
-        // Step 11：EXTRACT operation 随主检索管线走，尾段重组为结构化列表
-        Some(plan.operation),
+        // Step 11：完整 QueryPlan 随主检索管线走（Gate 从 plan 读
+        // operation / question_shape / requires_project_context）
+        Some(&plan),
         resolution_reason,
         // 改写跳过仅用于 DOCUMENT_SUMMARY（已分流）；此处恒为 false
         false,
@@ -8467,8 +8467,7 @@ fn run_document_recall(
             reason = "no_metadata_match";
             return Ok(());
         }
-        let vector_ids: Vec<Uuid> =
-            preselected.iter().map(|(_, file_id, _)| *file_id).collect();
+        let vector_ids: Vec<Uuid> = preselected.iter().map(|(_, file_id, _)| *file_id).collect();
         let vectors = catalog.profile_vectors(&vector_ids)?;
         // 第 2 级：向量精排 + 融合。
         let ranked = rank_document_candidates(question, question_vector, &profiles, &vectors);
@@ -8653,11 +8652,8 @@ fn run_document_summary_answer(
     }
 
     // 3. 章节分组（heading 边界 + 超长拆分 + 尾部合并）
-    let mut sections = build_document_sections(
-        &section_chunks,
-        &node_heading_paths,
-        MAX_SECTION_CHARS,
-    );
+    let mut sections =
+        build_document_sections(&section_chunks, &node_heading_paths, MAX_SECTION_CHARS);
     merge_tail_sections(&mut sections, MAX_SECTIONS);
     let type_hint = document_type_hint.map(|value| value.as_str());
 
@@ -8674,7 +8670,9 @@ fn run_document_summary_answer(
         while index < sections.len() && (batch.is_empty() || batch_chars < SUMMARY_BATCH_CHARS) {
             let section = &sections[index];
             let compacted = compact_for_prompt(&section.text(), SUMMARY_SECTION_CAP_CHARS);
-            if !batch.is_empty() && batch_chars.saturating_add(compacted.len()) > SUMMARY_BATCH_CHARS {
+            if !batch.is_empty()
+                && batch_chars.saturating_add(compacted.len()) > SUMMARY_BATCH_CHARS
+            {
                 break;
             }
             batch_chars = batch_chars.saturating_add(compacted.len());
@@ -8685,10 +8683,12 @@ fn run_document_summary_answer(
         let batch_started = Instant::now();
         let payload = batch
             .iter()
-            .map(|(_, section, compacted)| json!({
-                "title": section.title,
-                "content": compacted,
-            }))
+            .map(|(_, section, compacted)| {
+                json!({
+                    "title": section.title,
+                    "content": compacted,
+                })
+            })
             .collect::<Value>();
         let (system, user) = document_summary_prompt(&file_name, type_hint, &payload.to_string());
         let parsed = match complete_json_with_model(
@@ -8711,7 +8711,8 @@ fn run_document_summary_answer(
         let mut batch_failed = false;
         for (_, section, _) in &batch {
             let key = section.title.trim().to_ascii_lowercase();
-            let base_key = key.trim_end_matches(|ch: char| ch.is_ascii_digit())
+            let base_key = key
+                .trim_end_matches(|ch: char| ch.is_ascii_digit())
                 .trim_end_matches("（续")
                 .trim();
             let digest = by_title
@@ -8800,7 +8801,7 @@ fn run_document_summary_answer(
         "document_summary",
         &correlation_id,
         session_id_ref,
-        Some("overview".into()),
+        Some("overview"),
         &json!({ "file_id": target_file.to_string(), "digest_count": digests.len() }),
         &json!({ "overview": overview, "fallback": batch_fallbacks }),
         "ok",
@@ -8875,8 +8876,9 @@ fn run_document_summary_answer(
         answer_mode: AnswerMode::Summary,
         retrieval_channels: vec!["document_structure".into()],
         index_coverage: 0.0,
-        degradation_reason: (batch_fallbacks > 0)
-            .then(|| format!("有{batch_fallbacks}个摘要批次回退为确定性节内摘录（模型输出未通过解析）")),
+        degradation_reason: (batch_fallbacks > 0).then(|| {
+            format!("有{batch_fallbacks}个摘要批次回退为确定性节内摘录（模型输出未通过解析）")
+        }),
         no_evidence_reason: None,
         clarification: None,
     };
@@ -9015,7 +9017,11 @@ fn run_compare_answer(
         }
     }
     let mut side_candidates = resolved_scope.clone();
-    side_candidates.extend(resolution_candidates.iter().map(|candidate| candidate.file_id));
+    side_candidates.extend(
+        resolution_candidates
+            .iter()
+            .map(|candidate| candidate.file_id),
+    );
     side_candidates.dedup();
     // 多候选（>2 侧）时 COMPARE 不清澄直接取 top-2：trace 如实标记自动选择（Phase 2 欠项）
     let compare_auto_selected = side_candidates.len() > 2;
@@ -9029,7 +9035,10 @@ fn run_compare_answer(
         let input = ResolverInput::new(
             &secondary_plan,
             session_context,
-            profiles.iter().map(|(profile, _)| profile.clone()).collect(),
+            profiles
+                .iter()
+                .map(|(profile, _)| profile.clone())
+                .collect(),
             file_names.clone(),
         );
         let resolution = resolve_documents(&input);
@@ -9037,7 +9046,12 @@ fn run_compare_answer(
             .resolved_file_ids
             .first()
             .copied()
-            .or_else(|| resolution.candidates.first().map(|candidate| candidate.file_id))
+            .or_else(|| {
+                resolution
+                    .candidates
+                    .first()
+                    .map(|candidate| candidate.file_id)
+            })
             .or(secondary_file);
     }
     if primary_file == secondary_file {
@@ -9080,7 +9094,7 @@ fn run_compare_answer(
             operation_id,
             cancelled,
             progress,
-            None,
+            Some(&plan),
             None,
             false,
             false,
@@ -9146,11 +9160,16 @@ fn run_compare_answer(
         let mut sub_request = request.clone();
         sub_request.question = question_text.clone();
         sub_request.scope.file_ids = vec![file_id];
-        sub_request.retrieval_limit = sub_request.retrieval_limit.min(COMPARE_MATERIAL_ITEMS as u32);
+        sub_request.retrieval_limit = sub_request
+            .retrieval_limit
+            .min(COMPARE_MATERIAL_ITEMS as u32);
         sub_request.max_source_files = sub_request.max_source_files.min(1);
         let result = catalog.answer_extractively(
             &sub_request,
-            Some(SemanticQuery { model_artifact_id: &artifact_id, vector: &response.vectors[0] }),
+            Some(SemanticQuery {
+                model_artifact_id: &artifact_id,
+                vector: &response.vectors[0],
+            }),
         )?;
         let name = file_names
             .get(&file_id)
@@ -9176,7 +9195,10 @@ fn run_compare_answer(
         // 不转闲聊（spec 十三）。
         let message = format!(
             "没能在两侧都找到可比较的内容（{} 命中 {} 条，{} 命中 {} 条）。可以换一种说法，或确认资料已完成索引。",
-            a_name, a_quotes.len(), b_name, b_quotes.len()
+            a_name,
+            a_quotes.len(),
+            b_name,
+            b_quotes.len()
         );
         return finish_summary_refusal(request, catalog, operation_id, &message, started_at, phase);
     }
@@ -9251,7 +9273,10 @@ fn run_compare_answer(
             text.push_str(&format!("\n左（{}）：{}", a_name, difference.left_evidence));
         }
         if !difference.right_evidence.is_empty() {
-            text.push_str(&format!("\n右（{}）：{}", b_name, difference.right_evidence));
+            text.push_str(&format!(
+                "\n右（{}）：{}",
+                b_name, difference.right_evidence
+            ));
         }
         claims.push(AnswerClaim {
             claim_id: Uuid::now_v7(),
@@ -9296,7 +9321,11 @@ fn run_compare_answer(
             .file_preview(&file_id, 1)
             .map(|preview| preview.file.canonical_path.clone())
             .unwrap_or_default();
-        source_files.push(AnswerSourceFile { file_id, display_name: name, canonical_path });
+        source_files.push(AnswerSourceFile {
+            file_id,
+            display_name: name,
+            canonical_path,
+        });
     }
 
     // 确定性回退：比较生成失败 → 两侧检索到的原文材料并排呈现。
@@ -9410,6 +9439,7 @@ fn run_compare_answer(
 }
 
 /// 闲聊分支：跳过检索/索引 gate，直接用生成模型对话（带会话历史）。
+#[allow(clippy::too_many_arguments)]
 fn run_chat_answer(
     request: &AskRequest,
     catalog: &CatalogService,
@@ -9593,7 +9623,10 @@ fn run_retrieval_answer(
     operation_id: Uuid,
     cancelled: &AtomicBool,
     progress: AskProgressCallbacks<'_>,
-    operation: Option<QueryOperation>,
+    // 完整 QueryPlan（LLM Parser 输出）：Answerability Gate 从 plan 读取
+    // operation / question_shape / requires_project_context，不再用关键词
+    // 猜测回答形态与证据要求。解析失败回退时为 None。
+    plan: Option<&QueryPlan>,
     // NO_EVIDENCE 根因预置（spec 十二）：Document Resolver 未解析出目标时
     // 由调用方传入 TARGET_NOT_RESOLVED，最终拒绝路径据此分类。
     resolution_reason: Option<NoEvidenceReason>,
@@ -9659,14 +9692,15 @@ fn run_retrieval_answer(
                 .iter()
                 .filter(|message| message.role != "user")
                 .any(|message| {
-                    message.content.split_whitespace().collect::<Vec<_>>().join(" ") == *query
+                    message
+                        .content
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        == *query
                 })
         });
-        if echoes_history {
-            Vec::new()
-        } else {
-            parsed
-        }
+        if echoes_history { Vec::new() } else { parsed }
     };
     let mut retrieval_questions = if rewritten_queries.is_empty() {
         vec![request.question.trim().to_owned()]
@@ -9814,7 +9848,10 @@ fn run_retrieval_answer(
     }
     // 检索计时：FTS + 语义 + RRF 在 answer_extractively 内部合并执行，
     // 该总耗时已覆盖 fts/semantic/rrf/mmr（core 内不可再拆，如实记录）。
-    let retrieval_elapsed_ms = sub_results.iter().map(|result| result.elapsed_ms).sum::<u64>();
+    let retrieval_elapsed_ms = sub_results
+        .iter()
+        .map(|result| result.elapsed_ms)
+        .sum::<u64>();
     let mut extractive = merge_extractive_results(sub_results);
     extractive.index_coverage = index_coverage;
     extractive.retrieval_channels = vec![
@@ -9854,8 +9891,7 @@ fn run_retrieval_answer(
             extractive.no_evidence_reason = Some(
                 resolution_reason
                     .or_else(|| {
-                        document_recall_empty
-                            .then_some(NoEvidenceReason::DocumentRecallEmpty)
+                        document_recall_empty.then_some(NoEvidenceReason::DocumentRecallEmpty)
                     })
                     .unwrap_or(NoEvidenceReason::TrueNoEvidence),
             );
@@ -10094,10 +10130,10 @@ fn run_retrieval_answer(
                 .and_then(|citation| citation.locator.heading_path.last().cloned()),
         })
         .collect::<Vec<_>>();
-    let gate_plan = QueryPlan {
-        operation: operation.unwrap_or(QueryOperation::Qa),
+    let gate_plan = plan.cloned().unwrap_or_else(|| QueryPlan {
+        operation: QueryOperation::Qa,
         ..QueryPlan::default()
-    };
+    });
     let gate_input = AnswerabilityInput {
         question: original_question,
         content_query: Some(request.question.trim()),
@@ -10140,14 +10176,17 @@ fn run_retrieval_answer(
     );
     if verdict.status == AnswerabilityStatus::NotAnswerable {
         // LOCAL 拒答：统一无证据文案（spec 十六），绝不转闲聊、绝不追加通用知识
-        let requires_project = existence_requires_project_context(original_question);
+        let requires_project = existence_requires_project_context(original_question, &gate_plan);
         extractive.claims.clear();
         extractive.source_files.clear();
         extractive.used_file_ids.clear();
         extractive.insufficient_evidence = true;
         extractive.grounding_status = fanfan_core::GroundingStatus::Insufficient;
-        extractive.answer =
-            local_no_evidence_answer(original_question, &verdict.missing_entities, requires_project);
+        extractive.answer = local_no_evidence_answer(
+            original_question,
+            &verdict.missing_entities,
+            requires_project,
+        );
         extractive.answer_mode = AnswerMode::RagRefusal;
         extractive.degradation_reason =
             Some(format!("Answerability Gate 拒绝：{}", verdict.reason));
@@ -10200,7 +10239,7 @@ fn run_retrieval_answer(
         ));
     }
     phase("generating", 0.62);
-    let mut prompt = fanfan_core::generation_prompt(request, &extractive, &history);
+    let mut prompt = fanfan_core::generation_prompt(request, &extractive, history);
     if !image_analysis_context.is_empty() {
         prompt.push_str(
             "\n\n以下是针对当前问题重新查看候选原图得到的辅助观察。它不能替代[S数字]原始引用；只有同时受到原始引用支持的事实才能写入答案：\n",
@@ -10220,18 +10259,19 @@ fn run_retrieval_answer(
     prompt.push_str("\n\n");
     prompt.push_str(&shape_directive);
     let answer_schema = fanfan_core::grounded_answer_json_schema();
-    let mut generated = runtime.complete_json_cancellable(
-        LOCAL_STRICT_SYSTEM_PROMPT,
-        &prompt,
-        768,
-        &answer_schema,
-        cancelled,
-    )
-    .inspect_err(|error| {
-        if error.code == "OPERATION_CANCELLED" {
-            runtime.stop();
-        }
-    })?;
+    let mut generated = runtime
+        .complete_json_cancellable(
+            LOCAL_STRICT_SYSTEM_PROMPT,
+            &prompt,
+            768,
+            &answer_schema,
+            cancelled,
+        )
+        .inspect_err(|error| {
+            if error.code == "OPERATION_CANCELLED" {
+                runtime.stop();
+            }
+        })?;
     drop(runtime);
     trace_node(
         catalog,
@@ -10361,11 +10401,9 @@ fn run_retrieval_answer(
         let mut unsupported_claim_reason: Option<String> = None;
         if !deterministically_supported {
             if let Some(entity) = claim_subject_mismatch(&claim.text, &quotes) {
-                unsupported_claim_reason =
-                    Some(format!("subject_entity_mismatch:{entity}"));
+                unsupported_claim_reason = Some(format!("subject_entity_mismatch:{entity}"));
             } else if let Some(marker) = find_external_knowledge_marker(&claim.text) {
-                unsupported_claim_reason =
-                    Some(format!("external_knowledge_blocked:{marker}"));
+                unsupported_claim_reason = Some(format!("external_knowledge_blocked:{marker}"));
                 local_external_knowledge_blocked = true;
             }
         }
@@ -10499,13 +10537,16 @@ fn run_retrieval_answer(
     // 回答重组为「条目 + 每项证据」结构化列表。重组失败/空条目 → 原样保留
     // 已验证回答（绝不 crash、不劣化）。重组后的 claims 逐条 verified_claim
     // 并重新过 validate_answer_evidence（引用证据都是已验证的真实 chunk）。
-    if operation == Some(QueryOperation::Extract)
+    if gate_plan.operation == QueryOperation::Extract
         && !grounded.claims.is_empty()
         && restructure_as_extract(
             catalog,
             generation,
             &generation_artifact,
             request,
+            // LLM Parser 语义判断：EXTRACT 清单条目是否必须是实体/名称形式
+            // （如项目名称），替代原 is_project_list_question 关键词表。
+            gate_plan.requires_entity_items,
             &mut grounded,
             &correlation_id,
             session_id_ref,
@@ -10558,11 +10599,15 @@ fn run_retrieval_answer(
 ///
 /// 返回 true 表示已完成重组（调用方负责逐条 verified_claim 与
 /// validate_answer_evidence）。
+#[allow(clippy::too_many_arguments)]
 fn restructure_as_extract(
     catalog: &CatalogService,
     generation: &Mutex<LocalGenerationRuntime>,
     generation_artifact: &ModelArtifact,
     request: &AskRequest,
+    // LLM Parser 语义判断：清单条目必须是实体/名称形式（如项目名称）时，
+    // prompt 追加实体规范，并对模型输出做 spec 十二实体形态校验。
+    requires_entity_items: bool,
     grounded: &mut AnswerResult,
     correlation_id: &str,
     session_id_ref: Option<&str>,
@@ -10588,7 +10633,7 @@ fn restructure_as_extract(
             )
         })
         .collect::<Vec<_>>();
-    let (system, user) = extract_prompt(request.question.trim(), &materials);
+    let (system, user) = extract_prompt(request.question.trim(), requires_entity_items, &materials);
     let raw = complete_json_with_model(
         generation,
         generation_artifact,
@@ -10616,13 +10661,12 @@ fn restructure_as_extract(
     // 每条目 → 确定性证据对齐（最长公共子串；不信任模型自报编号）。
     let mut new_claims = Vec::with_capacity(results.items.len());
     let mut matched_count = 0_usize;
-    // spec 十二类型验证：项目清单的条目必须是「实体/标题式文本」；
-    // 完整描述句（「大模型不仅负责生成文本，还会…」）即使与证据有公共
-    // 子串也当不了 project_name，直接丢弃（宁缺毋滥）。
-    let project_list = is_project_list_question(request.question.trim());
+    // spec 十二类型验证：LLM 判定为实体清单（如项目列表）时，条目必须是
+    // 「实体/标题式文本」；完整描述句（「大模型不仅负责生成文本，还会…」）
+    // 即使与证据有公共子串也当不了 project_name，直接丢弃（宁缺毋滥）。
     let mut rejected_entity_form = 0_usize;
     for item in results.items.iter().take(EXTRACT_MAX_ITEMS) {
-        if project_list && !extract_item_is_entity_like(item.item.trim()) {
+        if requires_entity_items && !extract_item_is_entity_like(item.item.trim()) {
             rejected_entity_form += 1;
             continue;
         }
@@ -10631,9 +10675,7 @@ fn restructure_as_extract(
             for citation in &claim.citations {
                 let overlap = longest_common_substr_len(&item.item, &citation.quote);
                 if overlap >= EXTRACT_MATCH_MIN_LEN
-                    && best
-                        .as_ref()
-                        .is_none_or(|(current, _)| overlap > *current)
+                    && best.as_ref().is_none_or(|(current, _)| overlap > *current)
                 {
                     best = Some((overlap, citation.clone()));
                 }
@@ -10693,7 +10735,9 @@ fn restructure_as_extract(
         .collect::<Vec<_>>()
         .join("\n");
     grounded.answer_mode = AnswerMode::Extract;
-    grounded.retrieval_channels.push("structured_extract".into());
+    grounded
+        .retrieval_channels
+        .push("structured_extract".into());
     trace_node(
         catalog,
         "ask",
@@ -11578,6 +11622,7 @@ pub(crate) fn spawn_parse_pending(app: AppHandle, catalog: Arc<CatalogService>) 
             }),
         );
         drop(_running_reset);
+        spawn_image_ocr_pending(app.clone(), Arc::clone(&catalog));
         spawn_image_understanding_pending(app.clone(), Arc::clone(&catalog));
         spawn_embed_pending(app, catalog);
     });
@@ -11715,6 +11760,253 @@ fn parse_vision_description(value: &str) -> Result<VisionDescriptionPayload, App
     Ok(parsed)
 }
 
+pub(crate) fn spawn_image_ocr_pending(app: AppHandle, catalog: Arc<CatalogService>) {
+    thread::spawn(move || {
+        struct RunningReset<'a>(&'a AtomicBool);
+        impl Drop for RunningReset<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+
+        if !background_storage_budget_allows(&app) {
+            return;
+        }
+        let worker = app.state::<WorkerServiceState>();
+        if worker.image_ocr_running.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _running_reset = RunningReset(&worker.image_ocr_running);
+        match catalog.backfill_ready_image_search_nodes(500) {
+            Ok(file_ids) if !file_ids.is_empty() => {
+                for file_id in &file_ids {
+                    let _ = catalog.promote_ocr_pending_file_when_assets_ready(file_id);
+                    let _ = app.emit("index:changed", file_id.to_string());
+                }
+                crate::runtime_log::event(
+                    "info",
+                    "index",
+                    "image_search.backfill_completed",
+                    None,
+                    &json!({ "file_count": file_ids.len() }),
+                );
+                spawn_embed_pending(app.clone(), Arc::clone(&catalog));
+            }
+            Ok(_) => {}
+            Err(error) => crate::runtime_log::event(
+                "warning",
+                "index",
+                "image_search.backfill_failed",
+                None,
+                &json!({ "error_code": error.code, "retryable": error.retryable }),
+            ),
+        }
+        let threads = background_inference_threads();
+        let models = app.state::<ModelServiceState>();
+        let models = match models.get() {
+            Ok(models) => models,
+            Err(_) => return,
+        };
+        let artifact = match models.active_artifact(ModelRole::Ocr) {
+            Ok(Some(artifact)) => artifact,
+            Ok(None) => return,
+            Err(error) => {
+                crate::runtime_log::event(
+                    "error",
+                    "ocr",
+                    "image_ocr.model_lookup_failed",
+                    None,
+                    &json!({ "error_code": error.code, "retryable": error.retryable }),
+                );
+                return;
+            }
+        };
+        let runtime = match active_ocr_runtime(&app, threads) {
+            Ok(Some(runtime)) => runtime,
+            Ok(None) => return,
+            Err(error) => {
+                crate::runtime_log::event(
+                    "error",
+                    "ocr",
+                    "image_ocr.runtime_resolution_failed",
+                    None,
+                    &json!({ "error_code": error.code, "retryable": error.retryable }),
+                );
+                return;
+            }
+        };
+        let artifact_id = artifact.artifact_id.to_string();
+        let cycle_id = Uuid::now_v7().to_string();
+        let cycle_started = Instant::now();
+        let mut ready = 0_u64;
+        let mut routed_to_vision = 0_u64;
+        let mut failed = 0_u64;
+        crate::runtime_log::event(
+            "info",
+            "ocr",
+            "image_ocr.cycle_started",
+            Some(&cycle_id),
+            &json!({ "model_artifact_id": artifact_id }),
+        );
+        loop {
+            if worker.foreground_activity.load(Ordering::Acquire) > 0 {
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+            let degradation = catalog
+                .maintenance_snapshot()
+                .map(|snapshot| snapshot.degradation_level)
+                .unwrap_or_else(|_| "balanced".to_owned());
+            if degradation == "core" {
+                break;
+            }
+            let runtime_manager = app.state::<RuntimeManagerState>();
+            let mut runtime_request = RuntimeTaskRequest::interactive(
+                RuntimeTaskKind::Ocr,
+                RuntimeBackendKind::PaddleOcr,
+            );
+            runtime_request.cpu_threads = threads;
+            runtime_request.memory_bytes = 512 * 1024 * 1024;
+            runtime_request.timeout = Duration::from_secs(2);
+            runtime_request.model_id = Some(artifact_id.clone());
+            let runtime_lease = match runtime_manager.0.acquire(runtime_request) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    crate::runtime_log::event(
+                        "info",
+                        "runtime",
+                        "runtime.background_deferred",
+                        Some(&cycle_id),
+                        &json!({ "task_kind": "image_ocr", "error_code": error.code }),
+                    );
+                    break;
+                }
+            };
+            let pending = match catalog.claim_pending_image_ocr(&artifact_id) {
+                Ok(Some(pending)) => pending,
+                Ok(None) => {
+                    runtime_lease.complete();
+                    break;
+                }
+                Err(error) => {
+                    runtime_lease.fail(error.code.clone());
+                    crate::runtime_log::event(
+                        "error",
+                        "ocr",
+                        "image_ocr.pending_claim_failed",
+                        Some(&cycle_id),
+                        &json!({ "error_code": error.code, "retryable": error.retryable }),
+                    );
+                    break;
+                }
+            };
+            let _ = app.emit(
+                "ocr:progress",
+                json!({
+                    "asset_id": pending.asset_id,
+                    "revision_id": pending.revision_id,
+                    "stage": "image_ocr",
+                    "attempt": pending.attempt_count,
+                }),
+            );
+            let page_no = pending.locator.page_no.unwrap_or(1);
+            let sidecars = app.state::<SidecarRegistryState>();
+            let operation = sidecars.0.ocr.route_image_ocr(&ImageOcrRoutingRequest {
+                model_path: runtime.model_path.clone(),
+                det_model_path: runtime.det_model_path.clone(),
+                cls_model_path: runtime.cls_model_path.clone(),
+                dictionary_path: runtime.dictionary_path.clone(),
+                image_path: pending.cache_path.clone(),
+                page_no,
+                threads: runtime.threads,
+                ocr_version: runtime.ocr_version.clone(),
+                confidence_threshold: 0.45,
+                asset_kind: pending.asset_kind.clone(),
+            });
+            match operation.and_then(|routed| {
+                let result = ImageOcrResult {
+                    asset_id: pending.asset_id,
+                    revision_id: pending.revision_id,
+                    model_artifact_id: artifact_id.clone(),
+                    ocr_text: routed.ocr_text,
+                    confidence: routed.confidence,
+                    engine: routed.engine,
+                    model_version: routed.model_version,
+                    vision_required: routed.vision_required,
+                    route_reason: routed.route_reason,
+                    attempts: routed.attempts,
+                    idempotency_key: pending.idempotency_key.clone(),
+                };
+                catalog.commit_image_ocr(&result)?;
+                Ok(result)
+            }) {
+                Ok(result) => {
+                    runtime_lease.complete();
+                    if result.vision_required {
+                        routed_to_vision = routed_to_vision.saturating_add(1);
+                    } else {
+                        ready = ready.saturating_add(1);
+                        if catalog
+                            .promote_ocr_pending_file_when_assets_ready(&pending.file_id)
+                            .unwrap_or(false)
+                        {
+                            let _ = app.emit("catalog:changed", pending.file_id.to_string());
+                        }
+                    }
+                    let _ = app.emit(
+                        "ocr:completed",
+                        json!({
+                            "asset_id": pending.asset_id,
+                            "revision_id": pending.revision_id,
+                            "vision_required": result.vision_required,
+                            "route_reason": result.route_reason,
+                        }),
+                    );
+                    let _ = app.emit("index:changed", pending.file_id.to_string());
+                }
+                Err(error) => {
+                    runtime_lease.fail(error.code.clone());
+                    failed = failed.saturating_add(1);
+                    let _ = catalog.fail_image_ocr(&pending.asset_id, &error);
+                    crate::runtime_log::event(
+                        "error",
+                        "ocr",
+                        "image_ocr.asset_failed",
+                        Some(&cycle_id),
+                        &json!({
+                            "asset_id": pending.asset_id,
+                            "revision_id": pending.revision_id,
+                            "attempt": pending.attempt_count,
+                            "error_code": error.code,
+                            "retryable": error.retryable,
+                        }),
+                    );
+                }
+            }
+            thread::yield_now();
+        }
+        crate::runtime_log::event(
+            if failed > 0 { "warning" } else { "info" },
+            "ocr",
+            "image_ocr.cycle_completed",
+            Some(&cycle_id),
+            &json!({
+                "ready_assets": ready,
+                "routed_to_vision": routed_to_vision,
+                "failed_assets": failed,
+                "elapsed_ms": cycle_started.elapsed().as_millis() as u64,
+            }),
+        );
+        drop(_running_reset);
+        if routed_to_vision > 0 || failed > 0 {
+            spawn_image_understanding_pending(app.clone(), Arc::clone(&catalog));
+        }
+        if ready > 0 {
+            spawn_embed_pending(app, catalog);
+        }
+    });
+}
+
 pub(crate) fn spawn_image_understanding_pending(app: AppHandle, catalog: Arc<CatalogService>) {
     thread::spawn(move || {
         struct RunningReset<'a>(&'a AtomicBool);
@@ -11846,23 +12138,21 @@ pub(crate) fn spawn_image_understanding_pending(app: AppHandle, catalog: Arc<Cat
             );
             // 推理锁带时限：VLM 推理可能被其他推理长时间占用，拿不到锁就跳过
             // 本张图（下个 cycle 重试），绝不无限期阻塞等锁的查询与 close。
-            let runtime_guard = match try_lock_generation_until(
-                &generation.0,
-                Duration::from_millis(2_000),
-            ) {
-                Some(guard) => guard,
-                None => {
-                    crate::runtime_log::event(
-                        "info",
-                        "vision",
-                        "vision.runtime_busy",
-                        Some(&cycle_id),
-                        &json!({ "reason": "generation_runtime_locked" }),
-                    );
-                    runtime_lease.complete();
-                    break;
-                }
-            };
+            let runtime_guard =
+                match try_lock_generation_until(&generation.0, Duration::from_millis(2_000)) {
+                    Some(guard) => guard,
+                    None => {
+                        crate::runtime_log::event(
+                            "info",
+                            "vision",
+                            "vision.runtime_busy",
+                            Some(&cycle_id),
+                            &json!({ "reason": "generation_runtime_locked" }),
+                        );
+                        runtime_lease.complete();
+                        break;
+                    }
+                };
             let operation = (|| {
                 let mut runtime = runtime_guard;
                 if runtime.active_model_path() != Some(artifact.local_path.as_str())
@@ -11913,6 +12203,30 @@ pub(crate) fn spawn_image_understanding_pending(app: AppHandle, catalog: Arc<Cat
                 Ok(()) => {
                     runtime_lease.complete();
                     committed = committed.saturating_add(1);
+                    match catalog.promote_ocr_pending_file_when_assets_ready(&pending.file_id) {
+                        Ok(true) => {
+                            crate::runtime_log::event(
+                                "info",
+                                "vision",
+                                "vision.file_promoted",
+                                Some(&cycle_id),
+                                &json!({ "file_id": pending.file_id }),
+                            );
+                            let _ = app.emit("catalog:changed", pending.file_id.to_string());
+                        }
+                        Ok(false) => {}
+                        Err(error) => crate::runtime_log::event(
+                            "warning",
+                            "vision",
+                            "vision.file_promote_failed",
+                            Some(&cycle_id),
+                            &json!({
+                                "file_id": pending.file_id,
+                                "error_code": error.code,
+                                "retryable": error.retryable,
+                            }),
+                        ),
+                    }
                     let _ = app.emit(
                         "vision:completed",
                         json!({"asset_id": pending.asset_id, "revision_id": pending.revision_id}),
@@ -12085,7 +12399,7 @@ fn run_profile_build_cycle(
                 );
             }
             // 画像就绪后立即尝试分类（Step 2）：纯计算 + 少量回写，失败只记日志
-            let attempted = run_classification_pass(app, catalog, worker, &artifact);
+            let attempted = run_classification_pass(app, catalog, &artifact);
             // 画像批次打满或分类还有待处理画像 → 继续下一轮
             result.profiled_files >= u64::from(PROFILE_BUILD_BATCH)
                 || attempted >= u64::from(CLASSIFY_BATCH)
@@ -12109,11 +12423,12 @@ fn run_profile_build_cycle(
 /// 分类原型向量缓存（进程级，按 Embedding 模型 artifact_id 缓存）。
 /// 原型 = TYPE_PROTOTYPE_TEXTS 逐类型取句向量均值并 L2 归一化；
 /// 模型不变则只计算一次，全进程复用（模型切换时自然重算）。
-static PROTOTYPE_VECTORS: OnceLock<Mutex<HashMap<String, Vec<(DocumentType, Vec<f32>)>>>> =
-    OnceLock::new();
+type PrototypeVector = (DocumentType, Vec<f32>);
+type PrototypeVectorCache = HashMap<String, Vec<PrototypeVector>>;
 
-fn prototype_cache(
-) -> MutexGuard<'static, HashMap<String, Vec<(DocumentType, Vec<f32>)>>> {
+static PROTOTYPE_VECTORS: OnceLock<Mutex<PrototypeVectorCache>> = OnceLock::new();
+
+fn prototype_cache() -> MutexGuard<'static, PrototypeVectorCache> {
     PROTOTYPE_VECTORS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -12141,7 +12456,11 @@ fn prototype_vectors_for(
         .parent()
         .map(|parent| parent.join("tokenizer.json"))
         .ok_or_else(|| {
-            AppError::new("EMBEDDING_TOKENIZER_MISSING", "Embedding 模型目录无效", false)
+            AppError::new(
+                "EMBEDDING_TOKENIZER_MISSING",
+                "Embedding 模型目录无效",
+                false,
+            )
         })?;
     if !tokenizer_path.is_file() {
         return Err(AppError::new(
@@ -12167,7 +12486,11 @@ fn prototype_vectors_for(
     })?;
     runtime_lease.complete();
     if response.dimension == 0
-        || response.vectors.len() != TYPE_PROTOTYPE_TEXTS.iter().map(|(_, texts)| texts.len()).sum::<usize>()
+        || response.vectors.len()
+            != TYPE_PROTOTYPE_TEXTS
+                .iter()
+                .map(|(_, texts)| texts.len())
+                .sum::<usize>()
     {
         return Err(AppError::new(
             "EMBEDDING_EMPTY",
@@ -12209,7 +12532,6 @@ fn prototype_vectors_for(
 fn run_classification_pass(
     app: &AppHandle,
     catalog: &CatalogService,
-    worker: &WorkerServiceState,
     artifact: &ModelArtifact,
 ) -> u64 {
     let pending = match catalog.list_profiles_needing_classification(CLASSIFY_BATCH) {
@@ -12229,7 +12551,10 @@ fn run_classification_pass(
         return 0; // 无待分类画像：不动原型缓存，不打扰 Embedding 运行时
     }
     let runtime_manager = app.state::<RuntimeManagerState>();
-    let prototypes = match prototype_vectors_for(&worker.client, &runtime_manager.0, artifact) {
+    // 分类原型向量必须由 onnx 角色 worker 编码（parse 角色不加载 embedding
+    // 运行时，直接调用会返回 OPERATION_UNSUPPORTED）；与嵌入循环同一取法。
+    let onnx_worker = app.state::<SidecarRegistryState>().0.onnx.clone();
+    let prototypes = match prototype_vectors_for(&onnx_worker, &runtime_manager.0, artifact) {
         Ok(prototypes) => prototypes,
         Err(error) => {
             crate::runtime_log::event(
@@ -12307,6 +12632,51 @@ fn run_classification_pass(
     attempted
 }
 
+/// 自愈恢复：下载完成后索引构建中断的 Embedding 模型会长期卡在
+/// `pending_self_test`，而 `active_artifact` 只认 `ready`，导致后台索引循环
+/// 永远拿不到可用模型、静默跳过。这里在「无待处理激活」时，若存在本地文件
+/// 完整（包校验通过）的 `pending_self_test` Embedding 模型，则重建激活任务，
+/// 使 `run_embedding_cycle` 恢复向量化与索引构建，模型随后由索引完成路径置为
+/// `ready`。纯聊天（未装 Embedding）场景不会命中，保持原有静默行为。
+fn recover_stuck_embedding_activation(
+    models: &ModelManager,
+) -> Result<Option<ModelArtifact>, AppError> {
+    let candidates = models.list_artifacts()?.into_iter().filter(|artifact| {
+        artifact.role == ModelRole::Embedding
+            && artifact.format == ModelFormat::Onnx
+            && artifact.status == "pending_self_test"
+            && Path::new(&artifact.local_path).is_file()
+            && artifact
+                .package_manifest
+                .as_ref()
+                .is_some_and(|manifest| manifest.integrity_status == "ready")
+    });
+    for artifact in candidates {
+        // 自检阶段已记录向量维度；缺失时退回默认 512 维
+        let dimension = artifact
+            .embedding_dimension
+            .filter(|dimension| *dimension > 0)
+            .unwrap_or(512);
+        if let Some(pending) =
+            models.begin_embedding_activation_with_job(&artifact.artifact_id, dimension, None)?
+        {
+            crate::runtime_log::event(
+                "warning",
+                "embedding",
+                "embedding.activation_recovered",
+                None,
+                &json!({
+                    "artifact_id": artifact.artifact_id.to_string(),
+                    "dimension": pending.dimension,
+                    "reason": "stuck_pending_self_test",
+                }),
+            );
+            return Ok(Some(models.artifact_by_id(&artifact.artifact_id)?));
+        }
+    }
+    Ok(None)
+}
+
 fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &WorkerServiceState) {
     if !background_storage_budget_allows(app) {
         return;
@@ -12319,7 +12689,7 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
             return;
         }
     };
-    let pending = match models.pending_embedding_activation() {
+    let mut pending = match models.pending_embedding_activation() {
         Ok(Some(pending)) if pending.status == "indexing" => Some(pending),
         Ok(_) => None,
         Err(error) => {
@@ -12327,6 +12697,21 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
             return;
         }
     };
+    // 自愈：无待处理激活时，尝试恢复「文件完整但卡在 pending_self_test」的
+    // Embedding 模型，重新进入索引构建流程（下载后中断的激活得以继续）。
+    if pending.is_none() {
+        match recover_stuck_embedding_activation(&models) {
+            Ok(Some(_)) => {
+                if let Ok(recovered) = models.pending_embedding_activation() {
+                    pending = recovered;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = app.emit("embedding:failed", error);
+            }
+        }
+    }
     let artifact = match pending.as_ref() {
         Some(pending) => models.artifact_by_id(&pending.artifact_id),
         None => models
@@ -12391,6 +12776,9 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
         .or(artifact.embedding_dimension);
     let mut committed_total = 0_u64;
     let mut completed_dimension = expected_dimension;
+    let mut execution_device: Option<String> = None;
+    let mut execution_provider: Option<String> = None;
+    let mut device_fallback_reason: Option<String> = None;
     let result = (|| -> Result<bool, AppError> {
         loop {
             if worker.foreground_activity.load(Ordering::Acquire) > 0 {
@@ -12455,6 +12843,9 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
                     return Err(error);
                 }
             };
+            execution_device = response.device.clone();
+            execution_provider = response.execution_provider.clone();
+            device_fallback_reason = response.fallback_reason.clone();
             if response.dimension == 0
                 || expected_dimension.is_some_and(|dimension| dimension != response.dimension)
                 || response.vectors.len() != chunks.len()
@@ -12635,6 +13026,9 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
                 &json!({
                     "committed_chunks": committed_total,
                     "dimension": completed_dimension,
+                    "device": execution_device,
+                    "execution_provider": execution_provider,
+                    "fallback_reason": device_fallback_reason,
                     "elapsed_ms": cycle_started.elapsed().as_millis() as u64,
                 }),
             );
@@ -12741,6 +13135,8 @@ fn finalize_embedding_download(
         if let Ok(job) = models.update_download_job(&job) {
             emit_download_state(app, &job);
             let _ = app.emit("model:download_completed", &job);
+            // embedding 激活完成后从下载列表移除。
+            let _ = models.remove_download_job(&job.job_id);
         }
     }
 }
@@ -12763,11 +13159,13 @@ mod tests {
 
     #[test]
     fn self_test_visible_text_strips_thinking_segments() {
-        // Phase 4.3 CASE F 配套（Qwen3.5 自检失败根因）：thinking 模型的
-        // <think> 思维链剥离后判定可见文本，防 32 token 截断误判回滚。
+        // Phase 4.3 CASE F 配套（Qwen3.5 自检失败根因）：剥离  thinking
+        // 思维链后以可见文本参与自检判定，避免思维链截断误判回滚。
         // 闭合思维链：只留可见回复
         assert_eq!(
-            self_test_visible_text("<think>用户让我确认，我应该简短回复。</think>翻翻本地模型可以工作。"),
+            self_test_visible_text(
+                "<think>用户让我确认，我应该简短回复。</think>翻翻本地模型可以工作。"
+            ),
             "翻翻本地模型可以工作。"
         );
         // 未闭合（token 截断）：思维链整段丢弃
@@ -12775,10 +13173,13 @@ mod tests {
             self_test_visible_text("翻翻已就绪。<think>我再检查一下输出格"),
             "翻翻已就绪。"
         );
-        // 纯思维链截断（无可见文本）→ 空串（自检按 <4 字符正确判失败）
+        // 纯思维链截断（无可见文本）得到空串；自检时原始输出非空仍判定通过
         assert_eq!(self_test_visible_text("<think>好的，我需要确认一下"), "");
         // 普通模型无 think 标记：原样返回
-        assert_eq!(self_test_visible_text("  翻翻本地模型可以工作。  "), "翻翻本地模型可以工作。");
+        assert_eq!(
+            self_test_visible_text("  翻翻本地模型可以工作。  "),
+            "翻翻本地模型可以工作。"
+        );
         // 多段思维链全部剥离
         assert_eq!(
             self_test_visible_text("<think>a</think>中段<think>b</think>尾段"),
@@ -12806,8 +13207,7 @@ mod tests {
         assert_eq!(memory, Some(6));
 
         // Vulkan：GB 后缀与多位小数
-        let vulkan =
-            vec!["Vulkan0: Intel(R) Arc(TM) A770: 16.0 GB".to_owned()];
+        let vulkan = vec!["Vulkan0: Intel(R) Arc(TM) A770: 16.0 GB".to_owned()];
         let (name, memory) = gpu_details_from_devices(Some(&vulkan)).expect("vulkan device found");
         assert_eq!(name.as_deref(), Some("Intel(R) Arc(TM) A770"));
         assert_eq!(memory, Some(16));
@@ -13112,16 +13512,36 @@ mod tests {
         // 核心场景：Memory 未消歧 + MultipleCandidates + 有候选 → 必须回问
         // （触发条件与 scope 是否非空无关——MultipleCandidates 的
         // resolved_file_ids 是 top-2/3，scope 非空不代表锁定）
-        assert!(should_ask_clarification(false, Some(ResolutionStatus::MultipleCandidates), true));
+        assert!(should_ask_clarification(
+            false,
+            Some(ResolutionStatus::MultipleCandidates),
+            true
+        ));
         // Memory 已消歧 → 不问（Memory 定位优先，锁定目标）
-        assert!(!should_ask_clarification(true, Some(ResolutionStatus::MultipleCandidates), true));
+        assert!(!should_ask_clarification(
+            true,
+            Some(ResolutionStatus::MultipleCandidates),
+            true
+        ));
         // 唯一候选 / 未解析 → 不问
         // 唯一候选（Resolved）→ 不问
-        assert!(!should_ask_clarification(false, Some(ResolutionStatus::Resolved), true));
-        assert!(!should_ask_clarification(false, Some(ResolutionStatus::Unresolved), true));
+        assert!(!should_ask_clarification(
+            false,
+            Some(ResolutionStatus::Resolved),
+            true
+        ));
+        assert!(!should_ask_clarification(
+            false,
+            Some(ResolutionStatus::Unresolved),
+            true
+        ));
         // 未运行 Resolver（scope 已被上下文/记忆锁定）→ 不问
         assert!(!should_ask_clarification(false, None, true));
         // 无候选（理论防御）→ 不问
-        assert!(!should_ask_clarification(false, Some(ResolutionStatus::MultipleCandidates), false));
+        assert!(!should_ask_clarification(
+            false,
+            Some(ResolutionStatus::MultipleCandidates),
+            false
+        ));
     }
 }

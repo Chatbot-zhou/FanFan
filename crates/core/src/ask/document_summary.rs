@@ -101,11 +101,7 @@ pub fn build_document_sections(
             .and_then(|path| path.iter().last())
             .filter(|text| !text.trim().is_empty())
             .map(|text| text.trim().to_owned());
-        let heading_key = heading
-            .as_deref()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
+        let heading_key = heading.as_deref().unwrap_or("").trim().to_ascii_lowercase();
         let split_oversize = sections
             .last()
             .is_some_and(|section| section.char_count() >= max_section_chars);
@@ -119,7 +115,9 @@ pub fn build_document_sections(
                 current_title = Some(base_title);
                 title_seen = 0;
             }
-            let mut title = current_title.clone().unwrap_or_else(|| "未命名内容".to_owned());
+            let mut title = current_title
+                .clone()
+                .unwrap_or_else(|| "未命名内容".to_owned());
             if split_oversize {
                 title_seen += 1;
                 title = format!("{title}（续 {title_seen}）");
@@ -141,10 +139,7 @@ pub fn build_document_sections(
 }
 
 /// 节数超过 `max_sections` 时，把尾部小节并入「其余内容」一节（保留分节边界）。
-pub fn merge_tail_sections(
-    sections: &mut Vec<DocumentSection>,
-    max_sections: usize,
-) -> usize {
+pub fn merge_tail_sections(sections: &mut Vec<DocumentSection>, max_sections: usize) -> usize {
     if sections.len() <= max_sections {
         return sections.len();
     }
@@ -593,7 +588,10 @@ mod tests {
         let parsed = parse_section_summaries(raw);
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].title, "第1章");
-        assert_eq!(parsed[1].key_points, vec!["要点二".to_owned(), "要点三".to_owned()]);
+        assert_eq!(
+            parsed[1].key_points,
+            vec!["要点二".to_owned(), "要点三".to_owned()]
+        );
     }
 
     #[test]
@@ -654,7 +652,8 @@ mod tests {
 
     #[test]
     fn tolerant_json_object_finds_object_in_noise() {
-        let raw = "前言\n{\"sections\":[{\"title\":\"T\",\"summary\":\"S\",\"key_points\":[]}]}\n后记";
+        let raw =
+            "前言\n{\"sections\":[{\"title\":\"T\",\"summary\":\"S\",\"key_points\":[]}]}\n后记";
         let parsed = parse_section_summaries(raw);
         assert_eq!(parsed.len(), 1);
     }

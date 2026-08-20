@@ -18,7 +18,6 @@ const IMPORTANT_ACTIONS = new Set<keyof FanFanBridge>([
   "model_download_switch_source",
   "model_download_remove",
   "model_store_migration_schedule",
-  "model_artifact_activate",
   "candidate_root_action",
   "search_start",
   "ask_start",
