@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use fanfan_core::{
-    AppError, MemorySettings, MemorySettingsService, MemoryStatus, MemorySummary,
-    MemoryTargetType, alias_summary_view, relation_summary_view,
+    AppError, MemorySettings, MemorySettingsService, MemoryStatus, MemorySummary, MemoryTargetType,
+    alias_summary_view, relation_summary_view,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -99,9 +99,7 @@ impl TargetNameIndex {
         target_id: Uuid,
     ) -> bool {
         match target_type {
-            MemoryTargetType::File => catalog
-                .memory_file_target_valid(target_id)
-                .unwrap_or(false),
+            MemoryTargetType::File => catalog.memory_file_target_valid(target_id).unwrap_or(false),
             MemoryTargetType::Collection => catalog
                 .memory_collection_target_valid(target_id)
                 .unwrap_or(false),
@@ -111,7 +109,9 @@ impl TargetNameIndex {
 }
 
 /// 组装全部记忆摘要（confirmed / candidate 分组；rejected 与 stale 不展示）。
-fn build_summary_list(catalog: &fanfan_core::CatalogService) -> Result<MemorySummaryList, AppError> {
+fn build_summary_list(
+    catalog: &fanfan_core::CatalogService,
+) -> Result<MemorySummaryList, AppError> {
     let index = TargetNameIndex::load(catalog);
     let mut confirmed = Vec::new();
     let mut candidates = Vec::new();
@@ -143,8 +143,8 @@ fn build_summary_list(catalog: &fanfan_core::CatalogService) -> Result<MemorySum
             _ => {}
         }
     }
-    confirmed.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
-    candidates.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    confirmed.sort_by_key(|item| std::cmp::Reverse(item.updated_at));
+    candidates.sort_by_key(|item| std::cmp::Reverse(item.updated_at));
     Ok(MemorySummaryList {
         confirmed,
         candidates,

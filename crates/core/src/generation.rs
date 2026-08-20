@@ -55,6 +55,10 @@ pub struct GenerationActivation {
     pub device: Option<String>,
     pub threads: u32,
     pub gpu_layers: Option<u32>,
+    /// 本次激活是否发生 GPU→CPU 降级及其原因；未降级时为 `None`。
+    pub fallback_reason: Option<String>,
+    /// 本次激活实测显存占用（字节）；无法可靠测得时为 `None`。
+    pub vram_usage_bytes: Option<u64>,
 }
 
 impl LocalGenerationRuntime {
@@ -173,7 +177,13 @@ impl LocalGenerationRuntime {
             self.stop();
             self.executable = fallback;
             self.last_capability = None;
-            return self.activate_internal_once(model_path, mmproj_path, context_size, threads);
+            // 保留 GPU 尝试失败的原因，标记本次激活发生 GPU→CPU 降级，
+            // 供启动日志 / 状态面板如实展示，避免把降级误报为正常 GPU 运行。
+            let mut activation =
+                self.activate_internal_once(model_path, mmproj_path, context_size, threads)?;
+            activation.fallback_reason =
+                Some("GPU 后端启动失败，已降级使用 CPU 备用运行时".to_owned());
+            return Ok(activation);
         }
         result
     }
@@ -225,39 +235,26 @@ impl LocalGenerationRuntime {
             && process.context_size == context_size
             && process.child.try_wait().ok().flatten().is_none()
         {
-            let backend = process.backend.clone();
-            let device = process.device.clone();
-            let gpu_layers = process.gpu_layers;
-            let self_test = if mmproj_path.is_some() {
-                self.complete_multimodal_data_url(
-                    "你是本地多模态运行状态检查器，不进行推理说明。",
-                    "只回复：就绪",
-                    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
-                    256,
-                    None,
-                )?
-            } else {
-                self.complete(
-                    "你是本地运行状态检查器，不进行推理说明。",
-                    "只回复：就绪",
-                    256,
-                )?
-            };
-            if self_test.trim().is_empty() {
-                // 进程僵死：放弃复用，走正常重载路径
-                self.stop();
-            } else {
+            // 复用已加载的同模型：进程存活且 HTTP /health 就绪即视为可用，
+            // 不再额外发起一次"就绪"LLM 自检，避免每次搜索/问答多一轮完整推理。
+            let healthy = http_request(process.port, "GET", "/health", None, None)
+                .map(|(status, _)| status == 200)
+                .unwrap_or(false);
+            if healthy {
                 return Ok(GenerationActivation {
-                    backend,
+                    backend: process.backend.clone(),
                     model_path: model_path.into(),
                     context_size,
-                    self_test,
+                    self_test: "ready (reused)".to_owned(),
                     multimodal: mmproj_path.is_some(),
-                    device,
+                    device: process.device.clone(),
                     threads: safe_threads,
-                    gpu_layers,
+                    gpu_layers: process.gpu_layers,
+                    fallback_reason: None,
+                    vram_usage_bytes: None,
                 });
             }
+            // 服务未就绪或进程僵死：放弃复用，走下方正常重载路径
         }
         self.stop();
         let capability = self.probe_capability();
@@ -415,6 +412,8 @@ impl LocalGenerationRuntime {
             device,
             threads: safe_threads,
             gpu_layers: (!capability.gpu_available).then_some(0),
+            fallback_reason: None,
+            vram_usage_bytes: None,
         })
     }
 

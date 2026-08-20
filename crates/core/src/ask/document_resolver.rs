@@ -16,12 +16,12 @@ use std::collections::HashMap;
 
 use uuid::Uuid;
 
+use crate::AskSessionContext;
 use crate::ask::query_normalize::meaningful_tokens;
 use crate::ask::query_plan::{DocumentCandidate, DocumentResolution, QueryPlan, ResolutionStatus};
 use crate::contracts::DocumentType;
 use crate::knowledge::DocumentProfile;
 use crate::profile_builder::type_keywords_for;
-use crate::AskSessionContext;
 
 /// 综合打分时使用的信号权重（可配置：改这里即可调参，编排层不感知细节）。
 /// 每个信号命中 +weight（0..=1 分数直接相加，分数上限≈1.05）。
@@ -51,8 +51,7 @@ pub const MAX_CANDIDATE_SCOPE: usize = 3;
 /// 「答辩PPT」）——目标含「毕业」时，这些等价词元参与标题/文件名匹配。
 /// 「设计」单独过宽（会命中「设计院合同」），只以「毕业设计」组合参与。
 const GRADUATION_REFERENCE_MARKER: &str = "毕业";
-const GRADUATION_EXPANSION_TERMS: &[&str] =
-    &["毕业", "论文", "答辩", "开题", "学位", "毕业设计"];
+const GRADUATION_EXPANSION_TERMS: &[&str] = &["毕业", "论文", "答辩", "开题", "学位", "毕业设计"];
 
 /// Document Resolver 的输入：QueryPlan + 会话上下文 + 候选画像 + 文件名。
 #[derive(Debug, Clone)]
@@ -82,10 +81,27 @@ impl<'a> ResolverInput<'a> {
 
 /// 目标对象是否完全为空（没有任何可定位依据）。
 fn target_is_empty(plan: &QueryPlan) -> bool {
-    plan.target.reference.as_deref().unwrap_or("").trim().is_empty()
-        && plan.target.document_name.as_deref().unwrap_or("").trim().is_empty()
+    plan.target
+        .reference
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+        && plan
+            .target
+            .document_name
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
         && plan.target.document_type.is_none()
-        && plan.target.entity_name.as_deref().unwrap_or("").trim().is_empty()
+        && plan
+            .target
+            .entity_name
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
 }
 
 /// 解析目标对象为文件白名单。返回的 `DocumentResolution` 供编排层：
@@ -199,8 +215,7 @@ fn score_candidate(input: &ResolverInput<'_>, profile: &DocumentProfile) -> Docu
         // 画像确实无类型时才生效，已有类型的画像不受影响。
         let filename = input.file_names.get(&profile.file_id).map(String::as_str);
         let type_keyword_hit = type_keywords_for(expected).iter().any(|keyword| {
-            profile.title.contains(keyword)
-                || filename.is_some_and(|name| name.contains(keyword))
+            profile.title.contains(keyword) || filename.is_some_and(|name| name.contains(keyword))
         });
         if type_keyword_hit {
             score += weight("document_type");
@@ -218,11 +233,14 @@ fn score_candidate(input: &ResolverInput<'_>, profile: &DocumentProfile) -> Docu
     //    分类器未运行时（document_type IS NULL）追加「有意义词元」命中：
     //    「我那个大模型的材料」→ 词元「大模型」⊂ 标题即命中（整串互含对
     //    指代式短语永远失败，token 化是唯一可行路径）。
-    let title_tokens = [input.plan.target.document_name.as_deref(), input.plan.target.reference.as_deref()]
-        .into_iter()
-        .flatten()
-        .filter(|token| !token.trim().is_empty())
-        .collect::<Vec<_>>();
+    let title_tokens = [
+        input.plan.target.document_name.as_deref(),
+        input.plan.target.reference.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|token| !token.trim().is_empty())
+    .collect::<Vec<_>>();
     let target_tokens = if profile.document_type.is_none() {
         title_tokens
             .iter()
@@ -238,9 +256,12 @@ fn score_candidate(input: &ResolverInput<'_>, profile: &DocumentProfile) -> Docu
         .iter()
         .any(|token| token.contains(GRADUATION_REFERENCE_MARKER));
     if !title_tokens.is_empty()
-        && (title_tokens.iter().any(|token| {
-            profile.title.contains(token) || token.contains(profile.title.trim())
-        }) || target_tokens.iter().any(|token| profile.title.contains(token)))
+        && (title_tokens
+            .iter()
+            .any(|token| profile.title.contains(token) || token.contains(profile.title.trim()))
+            || target_tokens
+                .iter()
+                .any(|token| profile.title.contains(token)))
     {
         score += weight("document_title");
         signals.push("document_title".to_owned());
@@ -254,7 +275,11 @@ fn score_candidate(input: &ResolverInput<'_>, profile: &DocumentProfile) -> Docu
     }
 
     // 4. 最近引用过的文件（recent usage，弱于 active）
-    if input.session.last_referenced_file_ids.contains(&profile.file_id) {
+    if input
+        .session
+        .last_referenced_file_ids
+        .contains(&profile.file_id)
+    {
         score += weight("session_referenced");
         signals.push("session_referenced".to_owned());
     }
@@ -263,9 +288,10 @@ fn score_candidate(input: &ResolverInput<'_>, profile: &DocumentProfile) -> Docu
     if let Some(entity_name) = input.plan.target.entity_name.as_deref() {
         let entity = entity_name.trim();
         if !entity.is_empty()
-            && profile.entities.iter().any(|candidate| {
-                candidate.contains(entity) || entity.contains(candidate.as_str())
-            })
+            && profile
+                .entities
+                .iter()
+                .any(|candidate| candidate.contains(entity) || entity.contains(candidate.as_str()))
         {
             score += weight("entity_match");
             signals.push("entity_match".to_owned());
@@ -363,15 +389,31 @@ mod tests {
         // CASE 1 的核心：正文类型信号优先于文件名。
         // 「如何写好简历.pdf」文件名含「简历」但类型不是简历；
         // 「大模型开发工程师-周晨.pdf」文件名不含「简历」但 document_type = resume。
-        let guide = profile(Uuid::now_v7(), Some(DocumentType::LearningMaterial), "如何写好简历");
-        let actual_resume = profile(Uuid::now_v7(), Some(DocumentType::Resume), "大模型开发工程师-周晨");
+        let guide = profile(
+            Uuid::now_v7(),
+            Some(DocumentType::LearningMaterial),
+            "如何写好简历",
+        );
+        let actual_resume = profile(
+            Uuid::now_v7(),
+            Some(DocumentType::Resume),
+            "大模型开发工程师-周晨",
+        );
         let mut file_names = HashMap::new();
         file_names.insert(guide.file_id, "如何写好简历.pdf".to_owned());
-        file_names.insert(actual_resume.file_id, "大模型开发工程师-周晨.pdf".to_owned());
+        file_names.insert(
+            actual_resume.file_id,
+            "大模型开发工程师-周晨.pdf".to_owned(),
+        );
 
         let plan = resume_plan();
         let session = AskSessionContext::default();
-        let input = ResolverInput::new(&plan, &session, vec![guide.clone(), actual_resume.clone()], file_names);
+        let input = ResolverInput::new(
+            &plan,
+            &session,
+            vec![guide.clone(), actual_resume.clone()],
+            file_names,
+        );
         let resolution = resolve_documents(&input);
         assert_eq!(resolution.status, ResolutionStatus::Resolved);
         assert_eq!(resolution.resolved_file_ids, vec![actual_resume.file_id]);
@@ -394,7 +436,12 @@ mod tests {
         plan.target.document_type = Some(DocumentType::Contract);
         plan.target.reference = Some("那份合同".to_owned());
 
-        let input = ResolverInput::new(&plan, &session, vec![other.clone(), active.clone()], HashMap::new());
+        let input = ResolverInput::new(
+            &plan,
+            &session,
+            vec![other.clone(), active.clone()],
+            HashMap::new(),
+        );
         let resolution = resolve_documents(&input);
         assert_eq!(resolution.status, ResolutionStatus::Resolved);
         assert_eq!(resolution.resolved_file_ids, vec![active.file_id]);
@@ -410,7 +457,12 @@ mod tests {
         let resume_b = profile(Uuid::now_v7(), Some(DocumentType::Resume), "简历 v2");
         let plan = resume_plan();
         let session = AskSessionContext::default();
-        let input = ResolverInput::new(&plan, &session, vec![resume_a.clone(), resume_b.clone()], HashMap::new());
+        let input = ResolverInput::new(
+            &plan,
+            &session,
+            vec![resume_a.clone(), resume_b.clone()],
+            HashMap::new(),
+        );
         let resolution = resolve_documents(&input);
         assert_eq!(resolution.status, ResolutionStatus::MultipleCandidates);
         assert_eq!(resolution.resolved_file_ids.len(), 2);
@@ -473,7 +525,11 @@ mod tests {
         // 命中画像无关——「简历里有没有身份证号」在画像层面没有任何身份证
         // 关键词，仍必须锁定简历文件；「没有依据」由检索阶段裁决（LOCAL +
         // NO_EVIDENCE 返回固定文案，绝不转闲聊）。
-        let resume = profile(Uuid::now_v7(), Some(DocumentType::Resume), "大模型开发工程师-周晨");
+        let resume = profile(
+            Uuid::now_v7(),
+            Some(DocumentType::Resume),
+            "大模型开发工程师-周晨",
+        );
         let mut plan = resume_plan();
         plan.content_query = Some("身份证号".to_owned());
         let session = AskSessionContext::default();
@@ -487,8 +543,11 @@ mod tests {
     fn langgraph_entity_resolves_to_file_scope() {
         // CASE 6 的后半：target 里的实体（LangGraph 项目）解析为 file_id
         // 白名单，后续检索只在这个 scope 内找「架构设计」。
-        let mut project =
-            profile(Uuid::now_v7(), Some(DocumentType::Other), "LangGraph 多智能体项目");
+        let mut project = profile(
+            Uuid::now_v7(),
+            Some(DocumentType::Other),
+            "LangGraph 多智能体项目",
+        );
         project.entities = vec!["LangGraph 项目".to_owned()];
         project.keywords = vec!["LangGraph".to_owned()];
         let mut plan = resume_plan();
@@ -533,7 +592,11 @@ mod tests {
     #[test]
     fn single_medium_candidate_locks_it() {
         // 唯一候选（type 命中）分数中等 → 明显唯一仍锁定
-        let only = profile(Uuid::now_v7(), Some(DocumentType::Resume), "大模型开发工程师-周晨");
+        let only = profile(
+            Uuid::now_v7(),
+            Some(DocumentType::Resume),
+            "大模型开发工程师-周晨",
+        );
         let plan = resume_plan();
         let session = AskSessionContext::default();
         let input = ResolverInput::new(&plan, &session, vec![only.clone()], HashMap::new());
@@ -597,7 +660,11 @@ mod tests {
     fn token_title_match_resolves_llm_material_target() {
         // CASE 8/9：目标「那个大模型的材料」（无类型信号）→ 词元「大模型」
         // 命中标题/文件名 → 候选生成（多候选由编排层澄清）
-        let profile_md = profile(Uuid::now_v7(), None, "周晨博-大模型开发技术点与项目逐字稿-优化版.md");
+        let profile_md = profile(
+            Uuid::now_v7(),
+            None,
+            "周晨博-大模型开发技术点与项目逐字稿-优化版.md",
+        );
         let profile_manual = profile(Uuid::now_v7(), None, "大模型应用开发手册.pdf");
         let unrelated = profile(Uuid::now_v7(), None, "乡村振兴项目文档.md");
         let mut plan = resume_plan();
@@ -617,12 +684,18 @@ mod tests {
         );
         let resolution = resolve_documents(&input);
         assert_eq!(resolution.status, ResolutionStatus::MultipleCandidates);
-        assert_eq!(resolution.resolved_file_ids.len(), 2, "两个大模型材料候选进 scope");
+        assert_eq!(
+            resolution.resolved_file_ids.len(),
+            2,
+            "两个大模型材料候选进 scope"
+        );
         // 无关的乡村振兴文档绝不进候选
-        assert!(resolution
-            .resolved_file_ids
-            .iter()
-            .all(|id| !id.to_string().contains("unrelated")));
+        assert!(
+            resolution
+                .resolved_file_ids
+                .iter()
+                .all(|id| !id.to_string().contains("unrelated"))
+        );
         let best = &resolution.candidates[0];
         assert!(best.signals.iter().any(|s| s == "document_title"));
     }
@@ -651,10 +724,12 @@ mod tests {
         let resolution = resolve_documents(&input);
         assert_eq!(resolution.status, ResolutionStatus::MultipleCandidates);
         assert_eq!(resolution.resolved_file_ids.len(), 2);
-        assert!(resolution
-            .resolved_file_ids
-            .iter()
-            .all(|id| !id.to_string().contains("unrelated")));
+        assert!(
+            resolution
+                .resolved_file_ids
+                .iter()
+                .all(|id| !id.to_string().contains("unrelated"))
+        );
     }
 
     #[test]
@@ -663,7 +738,11 @@ mod tests {
         // 不含「毕业」两字（开题报告/学位论文/答辩PPT）——「毕业」引用靠
         // 扩展词元命中标题；多候选 → clarification，绝不直接拒绝。
         let proposal = profile(Uuid::now_v7(), Some(DocumentType::Paper), "开题报告书");
-        let thesis = profile(Uuid::now_v7(), Some(DocumentType::Paper), "工学学位论文终稿");
+        let thesis = profile(
+            Uuid::now_v7(),
+            Some(DocumentType::Paper),
+            "工学学位论文终稿",
+        );
         let unrelated = profile(Uuid::now_v7(), None, "七月发票.pdf");
         let mut plan = resume_plan();
         plan.target.document_type = None;
@@ -693,17 +772,23 @@ mod tests {
             "扩展命中应记录 graduation_reference 信号: {signals:?}"
         );
         // 无关文件不进候选
-        assert!(resolution
-            .resolved_file_ids
-            .iter()
-            .all(|id| *id != unrelated_id));
+        assert!(
+            resolution
+                .resolved_file_ids
+                .iter()
+                .all(|id| *id != unrelated_id)
+        );
     }
 
     #[test]
     fn graduation_expansion_does_not_hit_design_documents() {
         // 「设计」单独过宽：设计院合同/课程设计不能被「毕业」引用误命中
         //（扩展表只有「毕业设计」组合，无裸「设计」）
-        let design_contract = profile(Uuid::now_v7(), Some(DocumentType::Contract), "设计院战略合作合同");
+        let design_contract = profile(
+            Uuid::now_v7(),
+            Some(DocumentType::Contract),
+            "设计院战略合作合同",
+        );
         let mut plan = resume_plan();
         plan.target.document_type = None;
         plan.target.reference = Some("我毕业时候那个材料".to_owned());
@@ -723,11 +808,22 @@ mod tests {
     fn classified_profiles_keep_strict_matching() {
         // 已有类型的画像不受 token 回退影响：「如何写好简历」（学习资料）靠
         // filename 撞「简历」词也打不过真正类型=resume 的画像
-        let guide = profile(Uuid::now_v7(), Some(DocumentType::LearningMaterial), "如何写好简历");
-        let actual_resume = profile(Uuid::now_v7(), Some(DocumentType::Resume), "大模型开发工程师-周晨");
+        let guide = profile(
+            Uuid::now_v7(),
+            Some(DocumentType::LearningMaterial),
+            "如何写好简历",
+        );
+        let actual_resume = profile(
+            Uuid::now_v7(),
+            Some(DocumentType::Resume),
+            "大模型开发工程师-周晨",
+        );
         let mut file_names = HashMap::new();
         file_names.insert(guide.file_id, "如何写好简历.pdf".to_owned());
-        file_names.insert(actual_resume.file_id, "大模型开发工程师-周晨.pdf".to_owned());
+        file_names.insert(
+            actual_resume.file_id,
+            "大模型开发工程师-周晨.pdf".to_owned(),
+        );
         let plan = resume_plan();
         let session = AskSessionContext::default();
         let input = ResolverInput::new(
@@ -748,7 +844,10 @@ mod tests {
     fn weights_are_configured_together() {
         // 可配置信号权重的健康检查：所有信号都在表里且为正权重
         let total: f32 = SIGNAL_WEIGHTS.iter().map(|(_, weight)| *weight).sum();
-        assert!(total > HIGH_CONFIDENCE_THRESHOLD, "权重总和应超过高置信度阈值");
+        assert!(
+            total > HIGH_CONFIDENCE_THRESHOLD,
+            "权重总和应超过高置信度阈值"
+        );
         assert!(SIGNAL_WEIGHTS.iter().all(|(_, weight)| *weight > 0.0));
     }
 }

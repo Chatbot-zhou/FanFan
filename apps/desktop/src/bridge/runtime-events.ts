@@ -21,7 +21,6 @@ export const RUNTIME_EVENTS = {
   askCancelled: "ask:cancelled",
   speechPartial: "speech:partial",
   speechFinal: "speech:final",
-  ttsChunk: "tts:chunk",
   collectionSuggestionPhase: "collection:suggestion_phase",
   visionProgress: "vision:progress",
   visionCompleted: "vision:completed",

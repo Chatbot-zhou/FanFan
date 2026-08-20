@@ -11,16 +11,16 @@ use uuid::Uuid;
 
 use crate::{
     AnswerResult, AppError, AppLogRecord, AskRequest, CatalogStore, ChunkEmbeddingInput,
-    CollectionRecord, CreateCollectionRequest, DegradationLevel, DegradationState, FilePreview,
-    FileRecord, FileRelation, FileSystemEvent, ImageUnderstandingResult, InboxPage, InboxQuery,
+    CollectionRecord, CreateCollectionRequest, DegradationLevel, DegradationState,
+    EvaluationCaseRecord, EvaluationResultRecord, EvaluationRunRecord, FilePreview, FileRecord,
+    FileRelation, FileSystemEvent, ImageOcrResult, ImageUnderstandingResult, InboxPage, InboxQuery,
     InboxUpdateRequest, IndexActivityStats, IndexRebuildResult, JobRecord, JobStatus,
     LogEventInput, LogPage, LogQuery, MaintenanceSnapshot, NodeTracePage, NodeTraceQuery,
-    NodeTraceRecord,
-    ParseResult, PendingEmbeddingChunk, PendingImageUnderstanding, ProcessingCoverageSnapshot,
+    NodeTraceRecord, OperationTraceInput, OperationTracePage, OperationTraceQuery, ParseResult,
+    PendingEmbeddingChunk, PendingImageOcr, PendingImageUnderstanding, ProcessingCoverageSnapshot,
     RelationGroupPage, RelationGroupQuery, RelationPage, RelationQuery, RelationRefreshResult,
-    RootRegistration, ScanControl, ScanPolicy,
-    SearchRequest, SearchSession, SemanticQuery, file_identity_for_path, path_key,
-    scan_root_with_control,
+    RootRegistration, ScanControl, ScanPolicy, SearchRequest, SearchSession, SemanticQuery,
+    TraceNodeInput, file_identity_for_path, path_key, scan_root_with_control,
 };
 
 #[cfg(windows)]
@@ -661,6 +661,27 @@ impl CatalogService {
         self.store.set_storage_quota_override(quota_bytes)
     }
 
+    /// 读取用户当前选定的官方模型预设 id（未选择时返回 `None`）。
+    pub fn selected_preset_id(&self) -> Result<Option<String>, AppError> {
+        self.store.selected_preset_id()
+    }
+
+    /// 持久化用户选定的官方模型预设 id。只保存 preset_id 而非展示名，
+    /// 便于未来升级 Qwen/Embedding 而不破坏迁移。
+    pub fn set_selected_preset_id(&self, preset_id: &str) -> Result<(), AppError> {
+        self.store.set_selected_preset_id(preset_id)
+    }
+
+    /// 读取官方模型预设 schema 版本（未写入时返回 0）。
+    pub fn model_preset_version(&self) -> Result<u32, AppError> {
+        self.store.model_preset_version()
+    }
+
+    /// 持久化官方模型预设 schema 版本。
+    pub fn set_model_preset_version(&self, version: u32) -> Result<(), AppError> {
+        self.store.set_model_preset_version(version)
+    }
+
     pub fn list_collections(&self) -> Result<Vec<CollectionRecord>, AppError> {
         self.store.list_collections()
     }
@@ -791,7 +812,10 @@ impl CatalogService {
             .upsert_memory_entity(entity_type, canonical_name, metadata_json)
     }
 
-    pub fn memory_entity_by_id(&self, entity_id: Uuid) -> Result<Option<crate::MemoryEntity>, AppError> {
+    pub fn memory_entity_by_id(
+        &self,
+        entity_id: Uuid,
+    ) -> Result<Option<crate::MemoryEntity>, AppError> {
         self.store.memory_entity_by_id(entity_id)
     }
 
@@ -800,7 +824,8 @@ impl CatalogService {
         entity_type: &str,
         canonical_name: &str,
     ) -> Result<Option<crate::MemoryEntity>, AppError> {
-        self.store.memory_entity_by_name(entity_type, canonical_name)
+        self.store
+            .memory_entity_by_name(entity_type, canonical_name)
     }
 
     pub fn list_memory_entities(&self, limit: u32) -> Result<Vec<crate::MemoryEntity>, AppError> {
@@ -840,7 +865,8 @@ impl CatalogService {
         relation_id: Uuid,
         status: crate::MemoryStatus,
     ) -> Result<bool, AppError> {
-        self.store.update_memory_relation_status(relation_id, status)
+        self.store
+            .update_memory_relation_status(relation_id, status)
     }
 
     pub fn list_memory_relations_by_subject(
@@ -878,7 +904,8 @@ impl CatalogService {
         status: Option<crate::MemoryStatus>,
         limit: u32,
     ) -> Result<Vec<crate::MemoryRelation>, AppError> {
-        self.store.list_memory_relations("1 = 1", Vec::new(), status, limit)
+        self.store
+            .list_memory_relations("1 = 1", Vec::new(), status, limit)
     }
 
     pub fn delete_memory_relation(&self, relation_id: Uuid) -> Result<bool, AppError> {
@@ -893,7 +920,10 @@ impl CatalogService {
         self.store.find_memory_aliases(alias)
     }
 
-    pub fn memory_alias_by_id(&self, alias_id: Uuid) -> Result<Option<crate::MemoryAlias>, AppError> {
+    pub fn memory_alias_by_id(
+        &self,
+        alias_id: Uuid,
+    ) -> Result<Option<crate::MemoryAlias>, AppError> {
         self.store.memory_alias_by_id(alias_id)
     }
 
@@ -1091,6 +1121,29 @@ impl CatalogService {
 
     pub fn recover_interrupted_image_understanding(&self) -> Result<u64, AppError> {
         self.store.recover_interrupted_image_understanding()
+    }
+
+    pub fn recover_interrupted_image_ocr(&self) -> Result<u64, AppError> {
+        self.store.recover_interrupted_image_ocr()
+    }
+
+    pub fn backfill_ready_image_search_nodes(&self, limit: usize) -> Result<Vec<Uuid>, AppError> {
+        self.store.backfill_ready_image_search_nodes(limit)
+    }
+
+    pub fn claim_pending_image_ocr(
+        &self,
+        model_artifact_id: &str,
+    ) -> Result<Option<PendingImageOcr>, AppError> {
+        self.store.claim_pending_image_ocr(model_artifact_id)
+    }
+
+    pub fn commit_image_ocr(&self, result: &ImageOcrResult) -> Result<(), AppError> {
+        self.store.commit_image_ocr(result)
+    }
+
+    pub fn fail_image_ocr(&self, asset_id: &Uuid, error: &AppError) -> Result<(), AppError> {
+        self.store.fail_image_ocr(asset_id, error)
     }
 
     pub fn claim_pending_image_understanding(
@@ -1294,6 +1347,12 @@ impl CatalogService {
         self.store.index_activity_stats()
     }
 
+    /// 当前已激活的向量索引代所采用的 embedding 模型 artifact id（无则 `None`）。
+    /// 供 `index_stale_check` 与索引重建提示使用。
+    pub fn active_index_model_artifact_id(&self) -> Result<Option<String>, AppError> {
+        self.store.active_index_model_artifact_id()
+    }
+
     pub fn list_logs(&self, limit: u32) -> Result<Vec<AppLogRecord>, AppError> {
         self.store.list_logs(limit)
     }
@@ -1306,29 +1365,86 @@ impl CatalogService {
         self.store.clear_logs()
     }
 
-    pub fn record_node_trace(
+    pub fn record_node_trace(&self, input: &TraceNodeInput) -> Result<(), AppError> {
+        self.store.record_node_trace_input(input)
+    }
+
+    pub fn record_operation_trace(&self, input: &OperationTraceInput) -> Result<String, AppError> {
+        self.store.record_operation_trace(input)
+    }
+
+    pub fn complete_operation_trace(
         &self,
-        flow: &str,
-        node: &str,
-        correlation_id: &str,
-        session_id: Option<&str>,
-        entity_id: Option<&str>,
-        input_json: &serde_json::Value,
-        output_json: &serde_json::Value,
+        operation_id: &str,
         status: &str,
-        elapsed_ms: Option<u64>,
     ) -> Result<(), AppError> {
-        self.store.record_node_trace(
-            flow,
-            node,
-            correlation_id,
-            session_id,
-            entity_id,
-            input_json,
-            output_json,
-            status,
-            elapsed_ms,
-        )
+        self.store.complete_operation_trace(operation_id, status)
+    }
+
+    pub fn query_operation_traces(
+        &self,
+        request: &OperationTraceQuery,
+    ) -> Result<OperationTracePage, AppError> {
+        self.store.query_operation_traces(request)
+    }
+
+    pub fn record_evaluation_case(&self, case: &EvaluationCaseRecord) -> Result<(), AppError> {
+        self.store.record_evaluation_case(case)
+    }
+
+    pub fn record_evaluation_cases(
+        &self,
+        cases: &[EvaluationCaseRecord],
+    ) -> Result<usize, AppError> {
+        self.store.record_evaluation_cases(cases)
+    }
+
+    pub fn record_evaluation_run(&self, run: &EvaluationRunRecord) -> Result<(), AppError> {
+        self.store.record_evaluation_run(run)
+    }
+
+    pub fn complete_evaluation_run(
+        &self,
+        run_id: &str,
+        metrics: &serde_json::Value,
+    ) -> Result<(), AppError> {
+        self.store.complete_evaluation_run(run_id, metrics)
+    }
+
+    pub fn record_evaluation_result(
+        &self,
+        result: &EvaluationResultRecord,
+    ) -> Result<(), AppError> {
+        self.store.record_evaluation_result(result)
+    }
+
+    pub fn record_evaluation_results(
+        &self,
+        results: &[EvaluationResultRecord],
+    ) -> Result<usize, AppError> {
+        self.store.record_evaluation_results(results)
+    }
+
+    pub fn query_evaluation_cases(
+        &self,
+        split: &str,
+        feature_type: Option<&str>,
+    ) -> Result<Vec<EvaluationCaseRecord>, AppError> {
+        self.store.query_evaluation_cases(split, feature_type)
+    }
+
+    pub fn query_evaluation_runs(
+        &self,
+        optimization_round: Option<u32>,
+    ) -> Result<Vec<EvaluationRunRecord>, AppError> {
+        self.store.query_evaluation_runs(optimization_round)
+    }
+
+    pub fn query_evaluation_results(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<EvaluationResultRecord>, AppError> {
+        self.store.query_evaluation_results(run_id)
     }
 
     pub fn query_node_traces(&self, request: &NodeTraceQuery) -> Result<NodeTracePage, AppError> {
@@ -1385,6 +1501,12 @@ impl CatalogService {
         model_artifact_id: &str,
     ) -> Result<Option<crate::IndexGeneration>, AppError> {
         self.store.active_vector_generation(model_artifact_id)
+    }
+
+    /// 是否存在任何已激活的向量索引代际（不限 Embedding 模型）。
+    /// 用于 Embedding 换代但尚未为新模型建索引的回落提示；只读不触碰索引数据。
+    pub fn any_active_vector_generation(&self) -> Result<bool, AppError> {
+        self.store.any_active_vector_generation()
     }
 
     pub fn file_preview(&self, file_id: &Uuid, node_limit: usize) -> Result<FilePreview, AppError> {

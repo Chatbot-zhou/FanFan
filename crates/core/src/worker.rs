@@ -30,7 +30,7 @@ pub fn strip_long_path_prefix(path: &str) -> String {
 
 /// Sidecar 角色：每个角色一个独立 worker 进程，只加载自己的依赖。
 /// parse 承载文档解析/导出（无模型）；onnx 承载 embedding/rerank；
-/// ocr 承载 RapidOCR；speech 承载 sherpa-onnx ASR/TTS。
+/// ocr 承载 RapidOCR；speech 承载 sherpa-onnx ASR。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WorkerRole {
     Parse,
@@ -50,12 +50,14 @@ impl WorkerRole {
     }
 
     /// 进程空闲多久后由 watchdog 主动终止（下次请求自动重启）。
-    /// parse 无模型缓存，与 llama.cpp 的 300 秒休眠一致；其余角色与
-    /// worker 内模型会话缓存 60 秒回收保持一致。
+    /// parse 无模型缓存，与 llama.cpp 的 300 秒休眠一致；onnx 承载
+    /// embedding/rerank，空闲回收会导致下一次搜索冷启动（实测数百秒），
+    /// 故与 parse 同取 300 秒驻留；ocr/speech 模型较大且低频，维持 60 秒。
     pub fn idle_timeout(self) -> Duration {
         match self {
             Self::Parse => Duration::from_secs(300),
-            Self::Onnx | Self::Ocr | Self::Speech => Duration::from_secs(60),
+            Self::Onnx => Duration::from_secs(300),
+            Self::Ocr | Self::Speech => Duration::from_secs(60),
         }
     }
 
@@ -175,6 +177,12 @@ pub struct EmbeddingResponse {
     pub dimension: u32,
     pub model_path: String,
     pub tokenizer_path: String,
+    #[serde(default)]
+    pub device: Option<String>,
+    #[serde(default)]
+    pub execution_provider: Option<String>,
+    #[serde(default)]
+    pub fallback_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +200,12 @@ pub struct RerankResponse {
     pub scores: Vec<f32>,
     pub model_path: String,
     pub tokenizer_path: String,
+    #[serde(default)]
+    pub device: Option<String>,
+    #[serde(default)]
+    pub execution_provider: Option<String>,
+    #[serde(default)]
+    pub fallback_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +216,14 @@ pub struct SpeechRecognitionRequest {
     pub samples: Vec<f32>,
     pub sample_rate: u32,
     pub threads: u32,
+    /// ASR 模型形态：`paraformer` / `sense_voice`；缺省按 paraformer 处理。
+    #[serde(default = "default_asr_arch")]
+    pub arch: String,
+}
+
+/// 语音识别请求的缺省 ASR 架构（兼容未携带该字段的旧调用方）。
+fn default_asr_arch() -> String {
+    "paraformer".to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,27 +232,6 @@ pub struct SpeechRecognitionResult {
     pub sample_rate: u32,
     pub duration_ms: u64,
     pub timestamps: Vec<f32>,
-    pub engine: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpeechSynthesisRequest {
-    pub model_path: String,
-    pub tokens_path: String,
-    pub lexicon_path: String,
-    pub text: String,
-    pub speaker_id: u32,
-    pub speed: f32,
-    pub threads: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpeechSynthesisResult {
-    pub audio_base64: String,
-    pub sample_rate: u32,
-    pub duration_ms: u64,
-    pub speaker_id: u32,
-    pub speed: f32,
     pub engine: String,
 }
 
@@ -251,6 +252,14 @@ pub struct OcrRecognitionRequest {
     pub image_path: String,
     pub page_no: u32,
     pub threads: u32,
+    /// OCR 版本形态：`PPOCRV5` / `PPOCRV6`；缺省按 PPOCRV5 处理。
+    #[serde(default = "default_ocr_version")]
+    pub ocr_version: String,
+}
+
+/// OCR 请求的缺省版本（兼容未携带该字段的旧调用方）。
+fn default_ocr_version() -> String {
+    "PPOCRV5".to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -274,6 +283,33 @@ pub struct OcrRecognitionResult {
     pub model_version: String,
     pub page_count: u32,
     pub lines: Vec<OcrLineResult>,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageOcrRoutingRequest {
+    pub model_path: String,
+    pub det_model_path: String,
+    pub cls_model_path: String,
+    pub dictionary_path: String,
+    pub image_path: String,
+    pub page_no: u32,
+    pub threads: u32,
+    pub ocr_version: String,
+    pub confidence_threshold: f32,
+    pub asset_kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageOcrRoutingResult {
+    pub ocr_text: Option<String>,
+    pub confidence: Option<f32>,
+    pub engine: String,
+    pub model_version: Option<String>,
+    pub vision_required: bool,
+    pub route_reason: String,
+    #[serde(default)]
+    pub attempts: Vec<crate::OcrAttempt>,
     pub elapsed_ms: u64,
 }
 
@@ -368,6 +404,13 @@ impl WorkerClient {
         self.request_operation("ocr.recognize", request)
     }
 
+    pub fn route_image_ocr(
+        &self,
+        request: &ImageOcrRoutingRequest,
+    ) -> Result<ImageOcrRoutingResult, AppError> {
+        self.request_operation("ocr.route_image", request)
+    }
+
     pub fn self_test_ocr(
         &self,
         model_path: String,
@@ -375,6 +418,7 @@ impl WorkerClient {
         cls_model_path: String,
         dictionary_path: String,
         threads: u32,
+        ocr_version: String,
     ) -> Result<RuntimeSelfTestResult, AppError> {
         self.request_operation(
             "ocr.self_test",
@@ -384,6 +428,7 @@ impl WorkerClient {
                 "cls_model_path": cls_model_path,
                 "dictionary_path": dictionary_path,
                 "threads": threads,
+                "ocr_version": ocr_version,
             }),
         )
     }
@@ -406,59 +451,27 @@ impl WorkerClient {
         self.request_operation("speech.recognize", request)
     }
 
-    pub fn synthesize_speech(
-        &self,
-        request: &SpeechSynthesisRequest,
-    ) -> Result<SpeechSynthesisResult, AppError> {
-        self.request_operation("speech.synthesize", request)
-    }
-
     pub fn self_test_asr(
         &self,
         model_path: String,
         tokens_path: String,
-        vad_model_path: String,
         threads: u32,
+        arch: String,
     ) -> Result<RuntimeSelfTestResult, AppError> {
         #[derive(Serialize)]
-        struct Request {
+        struct Request<'a> {
             model_path: String,
             tokens_path: String,
-            vad_model_path: String,
             threads: u32,
+            arch: &'a str,
         }
         self.request_operation(
             "speech.asr_self_test",
             &Request {
                 model_path,
                 tokens_path,
-                vad_model_path,
                 threads,
-            },
-        )
-    }
-
-    pub fn self_test_tts(
-        &self,
-        model_path: String,
-        tokens_path: String,
-        lexicon_path: String,
-        threads: u32,
-    ) -> Result<RuntimeSelfTestResult, AppError> {
-        #[derive(Serialize)]
-        struct Request {
-            model_path: String,
-            tokens_path: String,
-            lexicon_path: String,
-            threads: u32,
-        }
-        self.request_operation(
-            "speech.tts_self_test",
-            &Request {
-                model_path,
-                tokens_path,
-                lexicon_path,
-                threads,
+                arch: &arch,
             },
         )
     }
@@ -668,7 +681,7 @@ impl WorkerClient {
         self.active_pid.store(child.id(), Ordering::Release);
         // 启动竞态：worker 冷启动（PyInstaller 解包 + sherpa_onnx/onnxruntime 等
         // 重导入）可能超过 watchdog 首个观测点（spawn 后 2s）。此时心跳文件尚
-        // 未由 worker 侧创建，缺失即被判失联误杀（TTS 自检曾因此连续两次被杀）。
+        // 未由 worker 侧创建，缺失即被判失联误杀。
         // 由 Rust 侧在 spawn 成功后立即落一条新鲜心跳，把 8s 失联窗口从进程创建
         // 开始计时；worker 主循环就绪后每 2s 自行覆盖，语义不变。
         let _ = std::fs::write(&heartbeat_file, "spawned");
@@ -738,13 +751,12 @@ impl WorkerClient {
                     }
                     // 冷启动宽限：spawn 后 30s 内用 60s 阈值，避免高负载下
                     // 重导入未完成就被误杀；稳态后恢复 8s 严格判定。
-                    let stale_seconds = if now_ms.saturating_sub(spawned_at_ms) / 1000
-                        < STARTUP_GRACE_SECONDS
-                    {
-                        STARTUP_STALE_SECONDS
-                    } else {
-                        HEARTBEAT_STALE_SECONDS
-                    };
+                    let stale_seconds =
+                        if now_ms.saturating_sub(spawned_at_ms) / 1000 < STARTUP_GRACE_SECONDS {
+                            STARTUP_STALE_SECONDS
+                        } else {
+                            HEARTBEAT_STALE_SECONDS
+                        };
                     if heartbeat_stale(now_ms, heartbeat_ms, stale_seconds) {
                         eprintln!(
                             "[worker] sidecar {} (pid {}) 心跳丢失超过 {}s，判定失联并终止",
@@ -776,10 +788,10 @@ impl WorkerClient {
                     }
                 }
             });
-        if let Ok(handle) = handle {
-            if let Ok(mut supervisor) = self.supervisor.lock() {
-                *supervisor = Some(handle);
-            }
+        if let Ok(handle) = handle
+            && let Ok(mut supervisor) = self.supervisor.lock()
+        {
+            *supervisor = Some(handle);
         }
     }
 }
@@ -789,12 +801,10 @@ fn operation_timeout(operation: &str) -> Duration {
         // Must stay above the worker-side OCR budget (ocr.py caps at 270s)
         // so a long scan-heavy parse is never killed mid-OCR.
         "document.parse" => Duration::from_secs(360),
-        "embedding.encode" | "export.write" | "speech.synthesize" => Duration::from_secs(120),
-        "speech.recognize"
-        | "speech.asr_self_test"
-        | "speech.tts_self_test"
-        | "ocr.recognize"
-        | "ocr.self_test" => Duration::from_secs(90),
+        "embedding.encode" | "export.write" => Duration::from_secs(120),
+        "speech.recognize" | "speech.asr_self_test" | "ocr.recognize" | "ocr.self_test" => {
+            Duration::from_secs(90)
+        }
         _ => Duration::from_secs(60),
     }
 }
@@ -891,7 +901,9 @@ fn process_memory(pid: u32) -> Option<(u64, u64)> {
     use windows::Win32::{
         Foundation::CloseHandle,
         System::{
-            ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX},
+            ProcessStatus::{
+                GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+            },
             Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
         },
     };
@@ -927,10 +939,10 @@ fn assign_to_sidecar_job(pid: u32) -> Result<(), AppError> {
     use windows::Win32::{
         Foundation::{CloseHandle, HANDLE},
         System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-            JobObjectBasicLimitInformation, JobObjectExtendedLimitInformation,
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JobObjectBasicLimitInformation, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
         },
         System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE},
     };
@@ -984,7 +996,7 @@ fn assign_to_sidecar_job(pid: u32) -> Result<(), AppError> {
                 "JOB_OBJECT_OPEN_PROCESS_FAILED",
                 "无法打开sidecar进程句柄",
                 true,
-            ))
+            ));
         }
     };
     let result = unsafe { AssignProcessToJobObject(job, process) };
@@ -1125,21 +1137,39 @@ mod tests {
         assert_eq!(WorkerRole::Ocr.as_str(), "ocr");
         assert_eq!(WorkerRole::Speech.as_str(), "speech");
         assert_eq!(WorkerRole::Parse.idle_timeout(), Duration::from_secs(300));
-        assert_eq!(WorkerRole::Onnx.idle_timeout(), Duration::from_secs(60));
+        assert_eq!(WorkerRole::Onnx.idle_timeout(), Duration::from_secs(300));
         // 实例 UUID 跨调用稳定（RuntimeManager 覆盖注册依赖此性质）。
-        assert_eq!(WorkerRole::Onnx.instance_uuid(), WorkerRole::Onnx.instance_uuid());
-        assert_ne!(WorkerRole::Onnx.instance_uuid(), WorkerRole::Ocr.instance_uuid());
+        assert_eq!(
+            WorkerRole::Onnx.instance_uuid(),
+            WorkerRole::Onnx.instance_uuid()
+        );
+        assert_ne!(
+            WorkerRole::Onnx.instance_uuid(),
+            WorkerRole::Ocr.instance_uuid()
+        );
     }
 
     #[test]
     fn heartbeat_stale_requires_fresh_file() {
         let now = 1_000_000;
         assert!(heartbeat_stale(now, 0, 8), "缺失心跳文件视为失联");
-        assert!(heartbeat_stale(now, now - 9_000, 8), "超过 8 秒未更新视为失联");
-        assert!(!heartbeat_stale(now, now - 4_000, 8), "4 秒内的心跳视为存活");
+        assert!(
+            heartbeat_stale(now, now - 9_000, 8),
+            "超过 8 秒未更新视为失联"
+        );
+        assert!(
+            !heartbeat_stale(now, now - 4_000, 8),
+            "4 秒内的心跳视为存活"
+        );
         assert!(!heartbeat_stale(now, now, 8), "刚更新的心跳视为存活");
-        assert!(!heartbeat_stale(now, now - 30_000, 60), "宽限窗口内 30 秒未更新仍视为存活");
-        assert!(heartbeat_stale(now, now - 61_000, 60), "宽限窗口超过 60 秒仍未更新视为失联");
+        assert!(
+            !heartbeat_stale(now, now - 30_000, 60),
+            "宽限窗口内 30 秒未更新仍视为存活"
+        );
+        assert!(
+            heartbeat_stale(now, now - 61_000, 60),
+            "宽限窗口超过 60 秒仍未更新视为失联"
+        );
     }
 
     #[test]

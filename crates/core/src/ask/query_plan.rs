@@ -146,9 +146,62 @@ impl QueryOperation {
     }
 }
 
+/// 用户期望的回答形态（Query Parser 输出，由 LLM 语义判断）。
+///
+/// 与 [`AnswerShape`](crate::ask::answer_gate::AnswerShape) 一一对应，但判定
+/// 职责在 LLM Parser：模型根据问句语义判断「这是有/没有型、清单型还是
+/// 事实查询型」，不再由关键词表（有哪些/多少/在哪…）硬编码猜测。
+/// 生成侧据此追加 prompt 形态约束（只约束回答结构，不替模型生成内容）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionShape {
+    /// 有没有 / 是否…过：第一句必须先给 有/没有/资料不足 结论
+    BooleanExistence,
+    /// 清单型：逐条列出（有哪些项目/哪些技能…）
+    List,
+    /// 定位型：内容在哪个位置（在哪/第几页）
+    Location,
+    /// 概括型：总结内容（主要写了什么/总结一下）
+    Summary,
+    /// 精确事实型：数字/日期/名称等精确值（多少/几号/谁）
+    Fact,
+    /// 描述型（默认）：概念/内容描述（是什么/怎么介绍）
+    #[default]
+    Description,
+}
+
+impl QuestionShape {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QuestionShape::BooleanExistence => "boolean_existence",
+            QuestionShape::List => "list",
+            QuestionShape::Location => "location",
+            QuestionShape::Summary => "summary",
+            QuestionShape::Fact => "fact",
+            QuestionShape::Description => "description",
+        }
+    }
+
+    /// 宽容解析（大小写/噪声），失败返回 None。
+    pub fn parse_lenient(input: &str) -> Option<QuestionShape> {
+        let normalized = input.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "boolean_existence" | "booleanexistence" | "boolean" | "existence" => {
+                Some(QuestionShape::BooleanExistence)
+            }
+            "list" => Some(QuestionShape::List),
+            "location" => Some(QuestionShape::Location),
+            "summary" => Some(QuestionShape::Summary),
+            "fact" | "fact_lookup" | "factlookup" => Some(QuestionShape::Fact),
+            "description" => Some(QuestionShape::Description),
+            _ => None,
+        }
+    }
+}
+
 /// 用户所指的目标对象。与 content_query 严格分离：
 /// target 只用于定位文件，绝不拼回检索 Query。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct QueryTarget {
     /// 用户的原话指代（如「我的简历」「那份合同」「第二个」）
@@ -163,36 +216,13 @@ pub struct QueryTarget {
     pub entity_name: Option<String>,
 }
 
-impl Default for QueryTarget {
-    fn default() -> Self {
-        Self {
-            reference: None,
-            document_type: None,
-            document_name: None,
-            owner: None,
-            entity_type: None,
-            entity_name: None,
-        }
-    }
-}
-
 /// 检索过滤条件（第一版只建模时间与文件类型，P0 阶段多为空）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct QueryFilters {
     pub time: Option<String>,
     pub file_type: Option<String>,
     pub path: Option<String>,
-}
-
-impl Default for QueryFilters {
-    fn default() -> Self {
-        Self {
-            time: None,
-            file_type: None,
-            path: None,
-        }
-    }
 }
 
 /// 结构化查询计划：Source Router 与 Query Parser 的完整产物。
@@ -202,6 +232,20 @@ pub struct QueryPlan {
     pub source: SourceIntent,
     pub intent: QueryIntent,
     pub operation: QueryOperation,
+    /// 期望的回答形态（LLM Parser 语义判断，生成侧据此追加形态约束）。
+    #[serde(default)]
+    pub question_shape: QuestionShape,
+    /// LLM 判定：问题是否断言了「做过/参与过某类项目或经历」（如
+    /// 「我以前有没有做过 Agent 项目？」）。存在性断言需要项目语境证据，
+    /// 无 PROJECT 语境证据时门控拒绝（防止概念解释冒充经历）。
+    #[serde(default)]
+    pub requires_project_context: bool,
+    /// LLM 判定：EXTRACT 清单的条目必须是「实体/名称形式」（如项目名称），
+    /// 不能是整段技术描述（spec 十二类型验证）。由 Query Parser 语义判断，
+    /// 替代原 is_project_list_question 关键词表——问题是否「项目清单」不再
+    /// 靠「有哪些项目」等关键词硬编码猜测。
+    #[serde(default)]
+    pub requires_entity_items: bool,
     pub target: QueryTarget,
     /// 比较类请求（COMPARE_DOCUMENTS）的第二个目标对象（「比较我两个简历
     /// 版本」→ target = 简历，secondary_target = 版本指代）。为 None 时
@@ -225,6 +269,9 @@ impl Default for QueryPlan {
             source: SourceIntent::Ambiguous,
             intent: QueryIntent::DocumentQa,
             operation: QueryOperation::Qa,
+            question_shape: QuestionShape::Description,
+            requires_project_context: false,
+            requires_entity_items: false,
             target: QueryTarget::default(),
             secondary_target: None,
             content_query: None,

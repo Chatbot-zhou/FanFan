@@ -85,25 +85,6 @@ if (Test-Path -LiteralPath $nvidiaRoot) {
         Copy-Item -Destination $internalDir -Force
 }
 
-# cuDNN 9 on Windows requires zlibwapi.dll, which the nvidia pip packages do not
-# ship. Search common locations; the build fails loudly if it cannot be found.
-$zlibSource = $null
-$zlibCandidates = @(
-    (Join-Path $internalDir "zlibwapi.dll"),
-    (Join-Path $venvRoot "Scripts\zlibwapi.dll"),
-    "C:\Program Files\QuarkCloudDrive\6.5.1.711\zlibwapi.dll"
-)
-foreach ($candidate in $zlibCandidates) {
-    if (Test-Path -LiteralPath $candidate) {
-        $zlibSource = $candidate
-        break
-    }
-}
-if (-not $zlibSource) {
-    throw "zlibwapi.dll (required by cuDNN 9) was not found; install it next to the venv or edit scripts/build_worker.ps1"
-}
-Copy-Item -LiteralPath $zlibSource -Destination $internalDir -Force
-
 $workerSize = (Get-Item -LiteralPath $workerExecutable).Length
 $internalSize = (Get-ChildItem -Path $internalDir -Recurse -File | Measure-Object -Property Length -Sum).Sum
 Write-Output "Worker build checkpoint passed: $workerExecutable ($workerSize bytes, internal $([math]::Round($internalSize / 1MB)) MB)"

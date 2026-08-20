@@ -6,7 +6,7 @@ const job = (overrides: Partial<ModelDownloadJob> = {}): ModelDownloadJob => ({
   job_id: "job-a",
   edition_id: "edition-a",
   edition_name: "模型 A",
-  source: "huggingface",
+  source: "modelscope",
   status: "running",
   phase: "downloading",
   downloaded_bytes: 25,

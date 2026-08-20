@@ -15,6 +15,16 @@ pub struct VectorMatch {
     pub distance: f32,
 }
 
+/// HNSW 语义检索的 ef_search（beam 宽度）与候选数上限。
+///
+/// usearch 的 `search` 内部 beam 遍历深度 = `max(ef_search, wanted)`
+/// （index.hpp:3460）。原实现不设 ef（C++ 侧回退默认 64）且 wanted=1000，
+/// 导致每次检索遍历 1000 近邻（实测 3-4s）。统一设为 256 后 beam=256，
+/// 速度提升约 4 倍且召回接近全量；候选 256 对搜索/RAG 的 top-k 足够。
+pub const SEMANTIC_SEARCH_EXPANSION: usize = 256;
+/// 语义检索实际向调用方返回的候选数上限（与 ef_search 一致，避免 beam 被撑大）。
+pub const SEMANTIC_SEARCH_CANDIDATES: usize = 256;
+
 /// 已打开的视图索引缓存：restore_view 每次都会重建 HNSW 图结构（实测约 6 秒），
 /// 查询路径复用同一实例可省掉该固定开销。索引重建会替换文件（mtime 变化），
 /// 因此 build 前必须调用 `clear_index_cache` 释放旧句柄，否则 Windows 上
@@ -76,6 +86,11 @@ pub fn build_index_refs(
         dimensions: dimension,
         metric: MetricKind::Cos,
         quantization: ScalarKind::BF16,
+        // 显式设置构建期 ef_construction 与检索期 ef_search：默认 0 会被
+        // C++ 侧替换为内置默认（128/64），这里明确 128/256 保证图质量与
+        // 检索 beam 一致；restore_view 会重置为默认，查询路径另行覆盖。
+        expansion_add: 128,
+        expansion_search: SEMANTIC_SEARCH_EXPANSION,
         ..Default::default()
     };
     let index = Index::new(&options)
@@ -124,8 +139,9 @@ pub fn search_index(
     let index = match cache.as_ref() {
         Some(entry) if entry.path == index_path && entry.modified == modified => &entry.index,
         _ => {
-            let restored = Index::restore_view(path_text(index_path)?)
-                .map_err(|error| vector_error("VECTOR_INDEX_OPEN_FAILED", error.to_string(), true))?;
+            let restored = Index::restore_view(path_text(index_path)?).map_err(|error| {
+                vector_error("VECTOR_INDEX_OPEN_FAILED", error.to_string(), true)
+            })?;
             *cache = Some(CachedIndex {
                 path: index_path.to_path_buf(),
                 modified,
@@ -134,6 +150,9 @@ pub fn search_index(
             &cache.as_ref().expect("just inserted").index
         }
     };
+    // restore_view 会把 ef_search 重置为内置默认（64），这里统一覆盖为
+    // SEMANTIC_SEARCH_EXPANSION，保证 beam 深度 = max(ef, wanted) 由我们控制。
+    index.change_expansion_search(SEMANTIC_SEARCH_EXPANSION);
     if index.dimensions() != query.len() {
         return Err(vector_error(
             "VECTOR_INDEX_DIMENSION_MISMATCH",

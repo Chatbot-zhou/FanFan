@@ -310,7 +310,10 @@ pub fn relation_summary_view(
     MemorySummary {
         id: format!("relation:{}", relation.relation_id),
         title: subject.clone(),
-        summary: format!("《{subject}》与《{object}》存在关联（{}）", relation.predicate),
+        summary: format!(
+            "《{subject}》与《{object}》存在关联（{}）",
+            relation.predicate
+        ),
         kind: match (relation.subject_type, relation.object_type) {
             (MemoryTargetType::File, MemoryTargetType::File)
             | (MemoryTargetType::File, MemoryTargetType::Collection)
@@ -444,10 +447,7 @@ mod tests {
             MemoryStatus::Rejected,
             MemoryStatus::Stale,
         ] {
-            assert_eq!(
-                MemoryStatus::parse_storage(status.as_storage()),
-                status
-            );
+            assert_eq!(MemoryStatus::parse_storage(status.as_storage()), status);
         }
         for source in [
             MemorySource::UserExplicit,
@@ -464,10 +464,7 @@ mod tests {
             MemoryTargetType::File,
             MemoryTargetType::Collection,
         ] {
-            assert_eq!(
-                MemoryTargetType::parse_storage(target.as_storage()),
-                target
-            );
+            assert_eq!(MemoryTargetType::parse_storage(target.as_storage()), target);
         }
     }
 
@@ -482,7 +479,7 @@ mod tests {
 
         let service = MemorySettingsService::new(&directory);
         // 文件缺失 → 默认开启（既有行为不因升级改变）
-        assert_eq!(service.get().expect("default settings").enabled, true);
+        assert!(service.get().expect("default settings").enabled);
 
         // 关闭 → 持久化到 memory.json
         let updated = service.set_enabled(false).expect("disable memory");

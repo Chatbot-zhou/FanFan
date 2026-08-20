@@ -13,6 +13,15 @@ const locationLabel = (asset: ImageAsset) => {
   return asset.asset_kind === "standalone_image" ? "独立图片" : "文档内嵌图片";
 };
 
+const statusLabel = (asset: ImageAsset, queued: boolean) => {
+  if (queued) return "已重新加入本地图片理解队列";
+  if (asset.status === "pending_ocr") return "等待本地 OCR；识别不足时会自动进入图片理解";
+  if (asset.status === "ocr_processing") return "本地 OCR 正在识别图片";
+  if (asset.status === "processing") return "本地图片模型正在理解";
+  if (asset.status === "pending_understanding") return "OCR 信息不足，等待本地图片模型理解";
+  return asset.error?.message ?? "暂无图片说明";
+};
+
 export function ImageAssetGallery({ assets }: { assets: ImageAsset[] }) {
   const [retrying, setRetrying] = useState<string | null>(null);
   const [queued, setQueued] = useState<string[]>([]);
@@ -25,7 +34,9 @@ export function ImageAssetGallery({ assets }: { assets: ImageAsset[] }) {
         <img src={imageAssetUrl(asset.asset_id)} alt={asset.description ?? asset.ocr_text ?? locationLabel(asset)} loading="lazy" />
         <figcaption>
           <strong>{locationLabel(asset)}</strong>
-          <span>{asset.description ?? asset.ocr_text ?? (queued.includes(asset.asset_id) ? "已重新加入本地图片理解队列" : asset.status === "processing" ? "本地图片模型正在理解" : asset.status === "pending_understanding" ? "等待本地图片模型理解" : asset.error?.message ?? "暂无图片说明")}</span>
+          <span>{asset.description ?? asset.ocr_text ?? statusLabel(asset, queued.includes(asset.asset_id))}</span>
+          {asset.ocr_engine && <small>OCR：{asset.ocr_engine}{asset.ocr_confidence !== null ? ` · 置信度 ${Math.round(asset.ocr_confidence * 100)}%` : ""}</small>}
+          {asset.vision_route_reason && asset.status !== "ready" && <small>图片理解原因：{asset.vision_route_reason}</small>}
           {asset.status === "failed" && !queued.includes(asset.asset_id) && <button type="button" disabled={retrying === asset.asset_id} onClick={() => {
             setRetrying(asset.asset_id);
             setRetryError(null);

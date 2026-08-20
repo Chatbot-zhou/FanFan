@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{AppError, DownloadFile, locked_download_artifact};
+use crate::{
+    AppError, DownloadFile, RuntimeModelPlan, locked_download_artifact, resolve_runtime_model_plan,
+};
 
 const REGISTRY_VERSION: u32 = 4;
 const DOWNLOAD_REGISTRY_VERSION: u32 = 1;
@@ -25,20 +27,19 @@ pub enum ModelRole {
     Vision,
     Reranker,
     Ocr,
-    Tts,
     Asr,
     Router,
 }
 
 impl ModelRole {
-    fn directory_name(self) -> &'static str {
+    /// 角色在注册表中的目录键名（也用于 preset 报告里的人类可读角色标识）。
+    pub fn directory_name(self) -> &'static str {
         match self {
             Self::Generation => "generation",
             Self::Embedding => "embedding",
             Self::Vision => "vision",
             Self::Reranker => "reranker",
             Self::Ocr => "ocr",
-            Self::Tts => "tts",
             Self::Asr => "asr",
             Self::Router => "router",
         }
@@ -113,6 +114,11 @@ pub struct ModelArtifact {
     pub artifact_id: Uuid,
     pub role: ModelRole,
     pub format: ModelFormat,
+    /// 所属 Model Catalog 的 catalog_id（如 `qwen3-5-2b-q4`）。
+    /// `selected_preset_id` 运行时接通后，把它作为「该 artifact 归属哪个 Preset
+    /// 角色」的唯一依据；旧数据缺少该字段（`None`）时仅作迁移兼容处理。
+    #[serde(default)]
+    pub catalog_id: Option<String>,
     pub model_id: String,
     pub model_version: Option<String>,
     pub source: ModelSource,
@@ -176,13 +182,41 @@ pub struct ModelProfile {
     pub activated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ModelRoleConfig {
+/// 一次 `apply_runtime_plan` 的结果：每个角色就绪 / 缺失。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PresetPlanReport {
+    pub preset_id: String,
+    /// 已就绪并激活的角色（catalog_id 已就位）。
+    pub ready: Vec<RolePlanItem>,
+    /// 缺失、需要下载或本地导入的角色（catalog_id 未就绪）。
+    pub missing: Vec<RolePlanItem>,
+}
+
+/// plan 中单个角色的型号约束。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RolePlanItem {
+    #[serde(rename = "role")]
     pub role: ModelRole,
-    pub active_artifact_id: Option<Uuid>,
-    pub required_for: String,
-    pub optional: bool,
-    pub load_policy: String,
+    pub catalog_id: String,
+}
+
+/// 把一份 `RuntimeModelPlan` 展开为「（角色，catalog_id）」的有序元组，
+/// 供 `apply_runtime_plan` 逐角色对齐 active artifact；已去重、不包含 Router。
+fn plan_items(plan: &RuntimeModelPlan) -> Vec<(ModelRole, String)> {
+    let mut out: Vec<(ModelRole, String)> = Vec::with_capacity(7);
+    out.push((ModelRole::Generation, plan.generation.clone()));
+    out.push((ModelRole::Embedding, plan.embedding.clone()));
+    if let Some(value) = &plan.reranker {
+        out.push((ModelRole::Reranker, value.clone()));
+    }
+    out.push((ModelRole::Ocr, plan.ocr.clone()));
+    if let Some(value) = &plan.asr {
+        out.push((ModelRole::Asr, value.clone()));
+    }
+    if let Some(value) = &plan.vision {
+        out.push((ModelRole::Vision, value.clone()));
+    }
+    out
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -369,17 +403,13 @@ impl ModelManager {
                 // 快速路径同一原则；否则每次启动都会对全部配套文件（本机约
                 // 3.9GB，含 2.5GB 视觉主模型）做全量 SHA-256，实测卡住启动 21s。
                 // 文件被同大小替换的情况由模型加载失败与自检兜底。
-                let manifest_matches = artifact
-                    .package_manifest
-                    .as_ref()
-                    .is_some_and(|manifest| {
-                        manifest.files.iter().any(|file| {
-                            file.file_name == expected.file_name
-                                && fs::metadata(&target).is_ok_and(|meta| {
-                                    meta.is_file() && meta.len() == file.size_bytes
-                                })
-                        })
-                    });
+                let manifest_matches = artifact.package_manifest.as_ref().is_some_and(|manifest| {
+                    manifest.files.iter().any(|file| {
+                        file.file_name == expected.file_name
+                            && fs::metadata(&target)
+                                .is_ok_and(|meta| meta.is_file() && meta.len() == file.size_bytes)
+                    })
+                });
                 if manifest_matches {
                     continue;
                 }
@@ -448,24 +478,18 @@ impl ModelManager {
             // 快速路径：manifest 已 ready 且所有文件大小仍匹配 → 复用，跳过全量
             // SHA-256（5GB 模型每次启动哈希约 55s）。SHA 在导入/下载/自检时强制
             // 校验；文件被替换但大小相同的情况由模型加载失败与自检兜底。
-            let already_ready = artifact
-                .package_manifest
-                .as_ref()
-                .is_some_and(|manifest| {
-                    manifest.integrity_status == "ready"
-                        && manifest.files.iter().all(|file| {
-                            Path::new(&artifact.local_path)
-                                .parent()
-                                .is_some_and(|parent| {
-                                    fs::metadata(parent.join(&file.file_name)).is_ok_and(
-                                        |metadata| {
-                                            metadata.is_file()
-                                                && metadata.len() == file.size_bytes
-                                        },
-                                    )
+            let already_ready = artifact.package_manifest.as_ref().is_some_and(|manifest| {
+                manifest.integrity_status == "ready"
+                    && manifest.files.iter().all(|file| {
+                        Path::new(&artifact.local_path)
+                            .parent()
+                            .is_some_and(|parent| {
+                                fs::metadata(parent.join(&file.file_name)).is_ok_and(|metadata| {
+                                    metadata.is_file() && metadata.len() == file.size_bytes
                                 })
-                        })
-                });
+                            })
+                    })
+            });
             let mut manifest = if already_ready {
                 artifact.package_manifest.clone().expect("checked above")
             } else {
@@ -670,7 +694,7 @@ impl ModelManager {
                 .join(artifact_id.to_string());
             fs::create_dir_all(&temporary_directory)
                 .map_err(|error| AppError::new("MODEL_INSTALL_FAILED", error.to_string(), true))?;
-            let mut installation_guard = InstallationGuard::new(temporary_directory.clone());
+            let installation_guard = InstallationGuard::new(temporary_directory.clone());
             let source_parent = source.parent().ok_or_else(|| {
                 AppError::new("MODEL_SOURCE_UNAVAILABLE", "模型文件缺少父目录", false)
             })?;
@@ -713,7 +737,16 @@ impl ModelManager {
             }
             fs::rename(&temporary_directory, &target_directory)
                 .map_err(|error| AppError::new("MODEL_INSTALL_FAILED", error.to_string(), true))?;
-            installation_guard.track(target_directory.clone());
+            // 先把 guard 放进 Vec，再 track 到 target_directory。
+            // 否则若后续 build_package_manifest 失败，guard 仍停留在局部作用域，
+            // Drop 时会按 track 后的 target_directory 删除已成功安装的文件，
+            // 而已 push 到 Vec 的前序 guard 又会因未 commit 在函数返回时
+            // 一并删除各自 target_directory，造成大面积已安装文件丢失。
+            installation_guards.push(installation_guard);
+            installation_guards
+                .last_mut()
+                .expect("just pushed guard")
+                .track(target_directory.clone());
             let installed_main = target_directory.join(
                 source
                     .file_name()
@@ -722,6 +755,7 @@ impl ModelManager {
             let mut artifact = ModelArtifact {
                 artifact_id,
                 role: selection.role,
+                catalog_id: None,
                 format: candidate.format,
                 model_id: metadata
                     .and_then(|value| value.model_id.clone())
@@ -753,7 +787,6 @@ impl ModelManager {
             artifact.package_manifest = Some(build_package_manifest(&artifact)?);
             registry.artifacts.push(artifact.clone());
             imported.push(artifact);
-            installation_guards.push(installation_guard);
         }
         registry.updated_at = Utc::now();
         self.save_registry(&registry)?;
@@ -799,75 +832,6 @@ impl ModelManager {
             .profiles
             .into_iter()
             .find(|profile| profile.profile_id == profile_id))
-    }
-
-    pub fn role_configs(&self) -> Result<Vec<ModelRoleConfig>, AppError> {
-        let registry = self.load_registry()?;
-        let active = |role: ModelRole| {
-            registry
-                .active_artifacts
-                .get(role.directory_name())
-                .copied()
-        };
-        Ok(vec![
-            ModelRoleConfig {
-                role: ModelRole::Generation,
-                active_artifact_id: active(ModelRole::Generation),
-                required_for: "严格证据问答与回答组织".into(),
-                optional: false,
-                load_policy: "on_demand".into(),
-            },
-            ModelRoleConfig {
-                role: ModelRole::Embedding,
-                active_artifact_id: active(ModelRole::Embedding),
-                required_for: "语义检索与文档关系".into(),
-                optional: false,
-                load_policy: "background_index".into(),
-            },
-            ModelRoleConfig {
-                role: ModelRole::Router,
-                // 意图路由是合成角色：直接复用 Generation 模型做 LLM 直路由，无独立模型
-                active_artifact_id: active(ModelRole::Generation),
-                required_for: "提问意图路由（闲聊走对话、检索走RAG）".into(),
-                optional: true,
-                load_policy: "on_demand".into(),
-            },
-            ModelRoleConfig {
-                role: ModelRole::Vision,
-                active_artifact_id: active(ModelRole::Vision),
-                required_for: "图片、图表与扫描页理解".into(),
-                optional: false,
-                load_policy: "serial_on_demand".into(),
-            },
-            ModelRoleConfig {
-                role: ModelRole::Reranker,
-                active_artifact_id: active(ModelRole::Reranker),
-                required_for: "候选证据精排".into(),
-                optional: true,
-                load_policy: "on_demand".into(),
-            },
-            ModelRoleConfig {
-                role: ModelRole::Ocr,
-                active_artifact_id: active(ModelRole::Ocr),
-                required_for: "扫描件与图片文字识别".into(),
-                optional: true,
-                load_policy: "on_demand".into(),
-            },
-            ModelRoleConfig {
-                role: ModelRole::Tts,
-                active_artifact_id: active(ModelRole::Tts),
-                required_for: "语音合成（TTS）模型".into(),
-                optional: true,
-                load_policy: "on_demand".into(),
-            },
-            ModelRoleConfig {
-                role: ModelRole::Asr,
-                active_artifact_id: active(ModelRole::Asr),
-                required_for: "语音识别（ASR）模型".into(),
-                optional: true,
-                load_policy: "on_demand".into(),
-            },
-        ])
     }
 
     pub fn activate_profile(
@@ -1049,7 +1013,11 @@ impl ModelManager {
         let already_active = registry
             .active_artifacts
             .get(ModelRole::Embedding.directory_name())
-            .is_some_and(|active| *active == *artifact_id);
+            .is_some_and(|active| *active == *artifact_id)
+            // 只有当组件确实处于 ready 时才视为“已激活”；若 active 指向的
+            // 组件仍停在 pending_self_test（下载后索引构建中断的残留状态），
+            // 应重新建立激活任务让索引流程恢复。
+            && artifact.status == "ready";
         supersede_pending_profile(&mut registry);
         let pending = if already_active {
             registry.pending_embedding_activation = None;
@@ -1115,6 +1083,14 @@ impl ModelManager {
             ));
         }
         artifact.embedding_dimension = Some(dimension);
+        // 索引构建成功即视为自检通过：与 activate_artifact 保持同一状态口径，
+        // 否则 artifact 会一直停留在 pending_self_test，与已激活状态不一致
+        // （表现为“模型已启用但详情仍显示待自检”）。
+        if let Some(manifest) = artifact.package_manifest.as_mut() {
+            manifest.self_test_status = "ready".into();
+            manifest.verified_at = Utc::now();
+        }
+        artifact.status = "ready".into();
         registry
             .active_artifacts
             .insert(ModelRole::Embedding.directory_name().into(), *artifact_id);
@@ -1313,6 +1289,106 @@ impl ModelManager {
         }
         registry.updated_at = Utc::now();
         self.save_registry(&registry)
+    }
+
+    /// 让 `selected_preset_id` 真正驱动运行时：把 plan 里每个角色的 active
+    /// 指向「已就绪且 catalog_id 与预设一致」的本地 artifact；找不到就上报为
+    /// 缺失（由下载编排处理）。运行时加载必须经此计划取模型，禁止直接读旧
+    /// `model_role_config` 覆盖 preset 的选择。
+    ///
+    /// 匹配策略：优先用 `ModelArtifact.catalog_id` 精确匹配；旧数据没有该字段
+    /// 时不强行猜，仅把该角色按当前 active 保留并记为缺失（迁移兼容、不静默替换）。
+    pub fn apply_runtime_plan(&self, preset_id: &str) -> Result<PresetPlanReport, AppError> {
+        let plan = resolve_runtime_model_plan(preset_id).ok_or_else(|| {
+            AppError::new("PRESET_UNKNOWN", "未知模型预设，拒绝接通运行时", false)
+        })?;
+        let _registry_guard = self.lock_registry()?;
+        let mut registry = self.load_registry()?;
+        let report = self.collect_plan_report(&registry, preset_id, &plan);
+        // 仅对已就绪的角色把 active 指向匹配 artifact；缺失角色保持原样（由下载编排处理）。
+        for item in &report.ready {
+            if let Some(artifact_id) = registry
+                .artifacts
+                .iter()
+                .find(|artifact| {
+                    artifact.role == item.role
+                        && artifact.status == "ready"
+                        && artifact.catalog_id.as_deref() == Some(item.catalog_id.as_str())
+                })
+                .map(|artifact| artifact.artifact_id)
+            {
+                registry
+                    .active_artifacts
+                    .insert(item.role.directory_name().to_owned(), artifact_id);
+            }
+        }
+        registry.updated_at = Utc::now();
+        self.save_registry(&registry)?;
+        Ok(report)
+    }
+
+    /// 只读地评估「选中某档位后各角色就绪 / 缺失情况」：不持久化 `selected_preset_id`、
+    /// 不修改 active artifact、不写库。供前端在选择档位前先弹「下载缺失模型」确认框，
+    /// 用户确认后才真正调用 `apply_runtime_plan` 完成切换（先确认下载、再切换）。
+    pub fn plan_preset(&self, preset_id: &str) -> Result<PresetPlanReport, AppError> {
+        let plan = resolve_runtime_model_plan(preset_id)
+            .ok_or_else(|| AppError::new("PRESET_UNKNOWN", "未知模型预设", false))?;
+        let _registry_guard = self.lock_registry()?;
+        let registry = self.load_registry()?;
+        Ok(self.collect_plan_report(&registry, preset_id, &plan))
+    }
+
+    /// 依据 registry 中「已就绪且本地文件存在」的 artifact，比对 plan 各角色的
+    /// catalog_id，返回就绪 / 缺失清单。纯只读比对，不写 active_artifacts、不保存。
+    fn collect_plan_report(
+        &self,
+        registry: &ModelRegistryState,
+        preset_id: &str,
+        plan: &RuntimeModelPlan,
+    ) -> PresetPlanReport {
+        let mut ready = Vec::new();
+        let mut missing = Vec::new();
+        for (role, catalog_id) in plan_items(plan) {
+            let matched = registry.artifacts.iter().any(|artifact| {
+                artifact.role == role
+                    && artifact.status == "ready"
+                    && Path::new(&artifact.local_path).is_file()
+                    && artifact.catalog_id.as_deref() == Some(catalog_id.as_str())
+            });
+            if matched {
+                ready.push(RolePlanItem { role, catalog_id });
+            } else {
+                missing.push(RolePlanItem { role, catalog_id });
+            }
+        }
+        PresetPlanReport {
+            preset_id: preset_id.to_owned(),
+            ready,
+            missing,
+        }
+    }
+
+    /// 把已安装 artifact 绑定到其归属 catalog_id，让 Preset 的白名单匹配与孤立清理
+    /// 能可靠区分「当前档位模型」与「旧版遗留模型」。下载/导入完成后的 artifact 缺省
+    /// 无 catalog_id，若不回填，`apply_runtime_plan` 永远匹配不到、孤立清理也失效。
+    pub fn bind_artifact_catalog_id(
+        &self,
+        artifact_id: &Uuid,
+        catalog_id: &str,
+    ) -> Result<(), AppError> {
+        let _registry_guard = self.lock_registry()?;
+        let mut registry = self.load_registry()?;
+        if let Some(artifact) = registry
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.artifact_id == *artifact_id)
+            && artifact.catalog_id.as_deref() != Some(catalog_id)
+        {
+            artifact.catalog_id = Some(catalog_id.to_owned());
+            registry.updated_at = Utc::now();
+            self.save_registry(&registry)?;
+        }
+        Ok(())
     }
 
     pub fn vision_projector_path(&self, artifact: &ModelArtifact) -> Result<PathBuf, AppError> {
@@ -2121,12 +2197,6 @@ fn infer_role(path: &Path, format: ModelFormat) -> Option<ModelRole> {
         Some(ModelRole::Reranker)
     } else if value.contains("embed") || value.contains("bge-") || value.contains("gte-") {
         Some(ModelRole::Embedding)
-    } else if value.contains("tts")
-        || value.contains("vits")
-        || value.contains("cosyvoice")
-        || value.contains("melotts")
-    {
-        Some(ModelRole::Tts)
     } else if value.contains("asr")
         || value.contains("whisper")
         || value.contains("paraformer")
@@ -2153,6 +2223,8 @@ fn discover_companion_files(path: &Path) -> Result<Vec<String>, AppError> {
         "yaml",
         "yml",
         "onnx_data",
+        // OCR 等多文件 ONNX 模型：同目录下的 det/cls 等配套 ONNX 文件也需安装。
+        "onnx",
     ];
     let mut files = Vec::new();
     for entry in fs::read_dir(parent)

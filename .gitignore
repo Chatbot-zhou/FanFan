@@ -60,6 +60,7 @@ Desktop.ini
 .claude/
 .codex/
 .collab/
+.trae/
 
 # Local verification artifacts
 .artifacts/
@@ -73,12 +74,18 @@ push-to-rag.sh
 eval/
 qa-fixtures/
 results*.json
+scripts/run_ragas.ps1
 
 # Evaluation harness (depends on removed eval fixtures)
 evaluate_qa_fixtures.rs
 
 # Debug probes (diagnostic-only binaries, not part of the product)
 _dbg_*.rs
+
+# Performance/evaluation probes (diagnostic-only, not part of the product)
+crates/core/examples/perf_probe.rs
+crates/core/examples/perf_fusion_probe.rs
+crates/core/examples/evaluation_optimize.rs
 
 # Installers and packaging
 *.exe
@@ -88,3 +95,6 @@ build/
 
 # Runtime vector indexes (app data lives in %APPDATA%, local copies only)
 vector-indexes/
+
+# Local docs artifacts (project docs stay local, not uploaded to GitHub)
+docs/

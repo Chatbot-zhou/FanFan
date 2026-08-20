@@ -786,8 +786,6 @@ pub(crate) struct RelationEdge {
     pub right_file_id: Uuid,
     pub relation_type: RelationType,
     pub confidence: f64,
-    /// 方向（contains_or_summarizes 才有意义：左 → 右 表示左是右的摘要）
-    pub directed: bool,
 }
 
 /// 把边按连通分量聚成组。
@@ -853,9 +851,7 @@ pub(crate) fn cluster_relation_edges(
             match edge.relation_type {
                 RelationType::ExactDuplicate => has_duplicate = true,
                 RelationType::VersionCandidate => has_version = true,
-                RelationType::ContainsOrSummarizes | RelationType::Related => {
-                    has_summary = true
-                }
+                RelationType::ContainsOrSummarizes | RelationType::Related => has_summary = true,
                 RelationType::SemanticRelated => has_semantic = true,
             }
         }
@@ -883,11 +879,7 @@ pub(crate) fn cluster_relation_edges(
                     edge.relation_type,
                     RelationType::ContainsOrSummarizes | RelationType::Related
                 ) {
-                    let (summary_id, source_id) = if edge.directed {
-                        (edge.left_file_id, edge.right_file_id)
-                    } else {
-                        (edge.left_file_id, edge.right_file_id)
-                    };
+                    let (summary_id, source_id) = (edge.left_file_id, edge.right_file_id);
                     member_roles
                         .entry(summary_id)
                         .or_insert(RelationGroupRole::Summary);
@@ -897,7 +889,10 @@ pub(crate) fn cluster_relation_edges(
                 }
             }
         }
-        let confidence = component_edges.iter().map(|edge| edge.confidence).sum::<f64>()
+        let confidence = component_edges
+            .iter()
+            .map(|edge| edge.confidence)
+            .sum::<f64>()
             / component_edges.len() as f64;
         let title = title_for(&member_ids, group_type);
         let members = member_ids
@@ -1180,7 +1175,6 @@ mod tests {
             right_file_id: Uuid::from_u128(u128::from(right)),
             relation_type,
             confidence,
-            directed: false,
         }
     }
 
@@ -1210,7 +1204,12 @@ mod tests {
         let group = &groups[0];
         assert_eq!(group.group_type, RelationGroupType::Duplicate);
         assert_eq!(group.members.len(), 3);
-        assert!(group.members.iter().any(|m| m.file_id == a && m.role == RelationGroupRole::Member));
+        assert!(
+            group
+                .members
+                .iter()
+                .any(|m| m.file_id == a && m.role == RelationGroupRole::Member)
+        );
         assert!(group.members.iter().any(|m| m.file_id == b));
         assert!(group.members.iter().any(|m| m.file_id == c));
         assert_eq!(group.confidence, 1.0);
@@ -1242,7 +1241,10 @@ mod tests {
         assert_eq!(groups.len(), 2);
         let mut types = groups.iter().map(|g| g.group_type).collect::<Vec<_>>();
         types.sort_by_key(|t| t.as_storage());
-        assert_eq!(types, vec![RelationGroupType::Duplicate, RelationGroupType::TopicGroup]);
+        assert_eq!(
+            types,
+            vec![RelationGroupType::Duplicate, RelationGroupType::TopicGroup]
+        );
     }
 
     #[test]
@@ -1267,7 +1269,6 @@ mod tests {
                 right_file_id: Uuid::from_u128(2),
                 relation_type: RelationType::ContainsOrSummarizes,
                 confidence: 0.90,
-                directed: true,
             }],
             &title_hook,
         );
@@ -1326,11 +1327,11 @@ mod tests {
         //   → s2 组先于 b（b 的候选邻居全被先组消费，最终无组）
         // - x 与 s2 的 top-1 相同（0.954），x 的邻居均值更高 → x 先组
         let profiles = vec![
-            seed_profile(1, 1.0, 0.0, "b"),     // s1
-            seed_profile(2, 0.99, 0.141, "b"),  // a（0.99 与 s1，桶中心）
-            seed_profile(3, 0.8, -0.6, "b"),    // b（0.80 与 s1，与 a 仅 0.7074）
-            seed_profile(4, 0.0, 1.0, "b"),     // s2
-            seed_profile(5, 0.3, 0.954, "b"),   // x（0.954 与 s2，与 s1 仅 0.3）
+            seed_profile(1, 1.0, 0.0, "b"),    // s1
+            seed_profile(2, 0.99, 0.141, "b"), // a（0.99 与 s1，桶中心）
+            seed_profile(3, 0.8, -0.6, "b"),   // b（0.80 与 s1，与 a 仅 0.7074）
+            seed_profile(4, 0.0, 1.0, "b"),    // s2
+            seed_profile(5, 0.3, 0.954, "b"),  // x（0.954 与 s2，与 s1 仅 0.3）
         ];
         let groups = seed_expand_semantic_groups(&profiles, &HashSet::new(), 0.78, 12, 96);
         assert_eq!(groups.len(), 2);

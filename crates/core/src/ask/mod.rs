@@ -27,10 +27,10 @@ pub mod answer_gate;
 pub mod builtin_knowledge;
 pub mod compare;
 pub mod context_resolver;
-pub mod extract;
 pub mod document_resolver;
 pub mod document_retrieval;
 pub mod document_summary;
+pub mod extract;
 pub mod memory_resolver;
 pub mod memory_writer;
 pub mod no_evidence;
@@ -45,8 +45,8 @@ pub mod source_router;
 
 pub use answer_gate::{
     AnswerShape, AnswerabilityInput, AnswerabilityStatus, AnswerabilityVerdict, EvidenceRole,
-    GateEvidence, LOCAL_STRICT_SYSTEM_PROMPT, answer_shape_directive, classify_answer_shape,
-    classify_evidence_role, claim_subject_mismatch, evaluate_answerability,
+    GateEvidence, LOCAL_STRICT_SYSTEM_PROMPT, answer_shape_directive, claim_subject_mismatch,
+    classify_answer_shape, classify_evidence_role, evaluate_answerability,
     existence_requires_project_context, extract_query_entities, find_external_knowledge_marker,
     local_no_evidence_answer,
 };
@@ -55,13 +55,6 @@ pub use compare::{
     ComparePoint, CompareResults, compare_prompt, compare_schema, parse_compare_results,
 };
 pub use context_resolver::{ContextResolution, ContextSignal, resolve_ambiguous};
-pub use memory_resolver::{MemoryHint, match_alias_hints, match_relation_hints};
-pub use no_evidence::NoEvidenceReason;
-pub use memory_writer::{
-    MemoryProposal, MemoryTargetRegistry, MemoryWriterContext, MemoryWriterOutput,
-    memory_writer_prompt, memory_writer_schema, parse_writer_output, prewrite_validate,
-    resolve_proposal_targets,
-};
 pub use document_resolver::{
     HIGH_CONFIDENCE_THRESHOLD, HIGH_MARGIN, MAX_CANDIDATE_SCOPE, MEDIUM_CONFIDENCE_THRESHOLD,
     ResolverInput, SIGNAL_WEIGHTS, resolve_documents,
@@ -81,20 +74,21 @@ pub use document_summary::{
 };
 pub use extract::{
     EXTRACT_MATCH_MIN_LEN, EXTRACT_MATERIAL_CHARS, EXTRACT_MAX_ITEMS, ExtractItem, ExtractResults,
-    extract_prompt, extract_schema, is_project_list_question, longest_common_substr_len,
-    parse_extract_results,
+    extract_prompt, extract_schema, longest_common_substr_len, parse_extract_results,
 };
-pub use query_normalize::{
-    extract_find_reference, is_existence_question, normalize_query_variants,
+pub use memory_resolver::{MemoryHint, match_alias_hints, match_relation_hints};
+pub use memory_writer::{
+    MemoryProposal, MemoryTargetRegistry, MemoryWriterContext, MemoryWriterOutput,
+    memory_writer_prompt, memory_writer_schema, parse_writer_output, prewrite_validate,
+    resolve_proposal_targets,
 };
-pub use query_parser::{
-    find_query_plan, parse_query_plan, query_parser_prompt, query_parser_schema,
-};
+pub use no_evidence::NoEvidenceReason;
+pub use query_normalize::normalize_query_variants;
+pub use query_parser::{parse_query_plan, query_parser_prompt, query_parser_schema};
 pub use query_plan::{
     DocumentCandidate, DocumentResolution, EvidenceStatus, QueryFilters, QueryIntent,
-    QueryOperation, QueryPlan, QueryTarget, ResolutionStatus, SourceIntent,
+    QueryOperation, QueryPlan, QueryTarget, QuestionShape, ResolutionStatus, SourceIntent,
 };
 pub use source_router::{
-    fast_path_greeting, parse_source_routing, source_router_prompt, source_routing_schema,
-    SourceRouting,
+    SourceRouting, parse_source_routing, source_router_prompt, source_routing_schema,
 };

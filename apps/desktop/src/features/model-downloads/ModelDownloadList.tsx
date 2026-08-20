@@ -1,12 +1,13 @@
 import type { ModelDownloadJob } from "../../bridge";
 import {
+  cleanModelDisplayName,
   formatModelDownloadBytes,
   formatModelDownloadEta,
   MODEL_DOWNLOAD_PHASE_LABELS,
   modelDownloadNeedsAttention,
 } from "./model-downloads";
 
-export type ModelDownloadAction = "pause" | "cancel" | "resume" | "retry" | "switch_source" | "remove";
+export type ModelDownloadAction = "pause" | "cancel" | "resume" | "retry" | "remove";
 
 interface ModelDownloadListProps {
   jobs: ModelDownloadJob[];
@@ -44,7 +45,7 @@ export function ModelDownloadList({
           >
             <div className="model-download-row__primary">
               <div className="model-download-row__identity">
-                <strong>{job.edition_name}</strong>
+                <strong>{cleanModelDisplayName(job.edition_name)}</strong>
                 <small>{failed && job.activation_status === "failed" ? "模型已下载，启用失败" : MODEL_DOWNLOAD_PHASE_LABELS[job.phase]} · <b>{sourceLabel(job)}</b></small>
               </div>
               <span title={errorText ?? undefined} role={errorText ? "alert" : undefined} className="model-download-row__error">{errorText ?? ""}</span>
@@ -61,13 +62,12 @@ export function ModelDownloadList({
                 </>}
                 {!compact && on_action && failed && <>
                   <button type="button" className="primary-button" disabled={Boolean(pendingAction)} onClick={() => on_action(job, "retry")}>{pendingAction === "retry" ? "重试中" : "重试"}</button>
-                  <button type="button" disabled={Boolean(pendingAction)} onClick={() => on_action(job, "switch_source")}>{pendingAction === "switch_source" ? "切换中" : "切换来源"}</button>
                   <button type="button" disabled={Boolean(pendingAction)} onClick={() => on_action(job, "remove")}>{pendingAction === "remove" ? "移除中" : "移除任务"}</button>
                 </>}
               </div>
             </div>
             <div className="model-download-row__progress">
-              <progress aria-label={`${job.edition_name}下载进度`} value={job.progress} max={1} />
+              <progress aria-label={`${cleanModelDisplayName(job.edition_name)}下载进度`} value={job.progress} max={1} />
               <span>{formatModelDownloadBytes(job.downloaded_bytes)} / {formatModelDownloadBytes(job.total_bytes)}</span>
               {job.bytes_per_second > 0 && <span>{formatModelDownloadBytes(job.bytes_per_second)}/s</span>}
               {eta && <span>{eta}</span>}

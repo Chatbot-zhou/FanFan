@@ -152,3 +152,16 @@ docs               产品规划、逐条审查、视觉和开发记录
 本项目基于 [MIT License](LICENSE) 发布，版权所有 © FanFan Contributors。
 
 MIT 许可证授予你自由使用、复制、修改、合并、发布、分发、再许可及/或销售本软件的副本的权利，前提是保留上述版权声明与许可声明；软件按「现状」提供，不附带任何明示或暗示的担保，作者不对因使用本软件产生的任何损失承担责任。
+
+## 关注我们
+
+- GitHub 仓库：`https://github.com/Chatbot-zhou/FanFan`
+- Gitee 仓库：`https://gitee.com/chatbotzhou/fan-fan`
+- 翻翻官网：[landing/index.html](landing/index.html)
+- 翻翻官网（上码平台）：`https://merit-wfgr.upma.site/`
+- 魔搭社区：`https://www.modelscope.cn/organization/FanFanZhiDao`
+- 微信公众号：
+
+  ![翻翻微信公众号](docs/4a2da725755f533551cd31f49063978e.jpg)
+
+感谢以上平台的免费使用；同时还有 Coze 平台作为我们微信公众号的智能客服。

@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 import time
 import zipfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID
@@ -22,6 +22,7 @@ from xml.etree import ElementTree
 from .protocol import WorkerError, is_uuid_v7
 from .ocr import recognize_with_windows
 from .paddle_ocr import recognize_image
+from .image_ocr import complex_visual_reason
 
 
 PARSER_VERSION = "0.1.0"
@@ -78,6 +79,7 @@ class OcrRuntimeConfig:
     dictionary_path: str
     threads: int = 1
     confidence_threshold: float = 0.45
+    ocr_version: str = "PPOCRV5"
 
     @classmethod
     def from_dict(cls, value: Any) -> "OcrRuntimeConfig | None":
@@ -94,7 +96,10 @@ class OcrRuntimeConfig:
         confidence_threshold = value.get("confidence_threshold", 0.45)
         if not isinstance(confidence_threshold, (int, float)) or isinstance(confidence_threshold, bool) or not 0.0 <= float(confidence_threshold) <= 1.0:
             raise ValueError("ocr_runtime confidence_threshold must be between 0 and 1")
-        return cls(paths[0], paths[1], paths[2], paths[3], threads, float(confidence_threshold))
+        ocr_version = value.get("ocr_version", "PPOCRV5")
+        if not isinstance(ocr_version, str) or ocr_version not in ("PPOCRV4", "PPOCRV5", "PPOCRV6"):
+            raise ValueError("ocr_runtime ocr_version must be PPOCRV4/PPOCRV5/PPOCRV6")
+        return cls(paths[0], paths[1], paths[2], paths[3], threads, float(confidence_threshold), ocr_version)
 
     def payload(self, image_path: Path, page_no: int) -> dict[str, Any]:
         return {
@@ -103,6 +108,7 @@ class OcrRuntimeConfig:
             "cls_model_path": self.cls_model_path,
             "dictionary_path": self.dictionary_path,
             "threads": self.threads,
+            "ocr_version": self.ocr_version,
             "image_path": str(image_path),
             "page_no": page_no,
         }
@@ -202,9 +208,12 @@ class ImageAsset:
     sha256: str
     locator: dict[str, Any]
     ocr_text: str | None = None
+    ocr_confidence: float | None = None
+    ocr_engine: str | None = None
     description: str | None = None
     vision_model_id: str | None = None
-    status: str = "pending_understanding"
+    vision_route_reason: str | None = None
+    status: str = "pending_ocr"
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,6 +258,10 @@ def _cache_image_asset(
     asset_kind: str,
     source_locator: dict[str, Any],
     ocr_text: str | None = None,
+    ocr_confidence: float | None = None,
+    ocr_engine: str | None = None,
+    vision_route_reason: str | None = None,
+    status: str = "pending_ocr",
 ) -> ImageAsset | None:
     if not request.asset_cache_dir or not content:
         return None
@@ -273,6 +286,10 @@ def _cache_image_asset(
         sha256=hashlib.sha256(content).hexdigest(),
         locator=source_locator,
         ocr_text=ocr_text,
+        ocr_confidence=ocr_confidence,
+        ocr_engine=ocr_engine,
+        vision_route_reason=vision_route_reason,
+        status=status,
     )
 
 
@@ -778,7 +795,15 @@ def _pdf_result(request: ParseRequest, path: Path, started_at: float) -> ParseRe
                         ocr_page_count = len(recognized_pages)
                         parser_name = f"pypdf+{ocr_engine}"
                     ocr_text_by_page: dict[int, str] = {}
+                    ocr_route_by_page: dict[int, tuple[float | None, str | None]] = {}
                     for page_number in ocr_pages:
+                        page_result = {
+                            "lines": [
+                                line
+                                for line in ocr_result.get("lines", [])
+                                if isinstance(line, dict) and line.get("page_no") == page_number
+                            ]
+                        }
                         page_text = "\n".join(
                             node.text or ""
                             for node in recognized
@@ -786,6 +811,22 @@ def _pdf_result(request: ParseRequest, path: Path, started_at: float) -> ParseRe
                         ).strip()
                         if page_text:
                             ocr_text_by_page[page_number] = page_text
+                            confidence_values = [
+                                float(line["confidence"])
+                                for line in page_result["lines"]
+                                if isinstance(line.get("confidence"), (int, float))
+                                and not isinstance(line.get("confidence"), bool)
+                            ]
+                            confidence = (
+                                sum(confidence_values) / len(confidence_values)
+                                if confidence_values
+                                else None
+                            )
+                            threshold = request.ocr_runtime.confidence_threshold if request.ocr_runtime else 0.45
+                            route_reason = _ocr_fallback_reason(page_result, None, threshold)
+                            if route_reason is None:
+                                route_reason = complex_visual_reason("pdf_scanned_page", page_result, page_text)
+                            ocr_route_by_page[page_number] = (confidence, route_reason)
                         if page_number not in recognized_pages:
                             warnings.append(ParseWarning("OCR_NO_TEXT", "该页OCR后没有识别到文字", locator("pdf", page_no=page_number)))
                             warnings.append(ParseWarning("OCR_REQUIRED", "该页尚未获得可索引文字", locator("pdf", page_no=page_number)))
@@ -800,6 +841,12 @@ def _pdf_result(request: ParseRequest, path: Path, started_at: float) -> ParseRe
                                 "pdf_scanned_page",
                                 locator("pdf", page_no=page_number),
                                 ocr_text_by_page.get(page_number),
+                                ocr_route_by_page.get(page_number, (None, None))[0],
+                                ocr_engine,
+                                ocr_route_by_page.get(page_number, (None, "ocr_no_text"))[1],
+                                "pending_understanding"
+                                if ocr_route_by_page.get(page_number, (None, "ocr_no_text"))[1]
+                                else "ready",
                             )
                             if asset is not None:
                                 image_assets.append(asset)
@@ -963,6 +1010,7 @@ def parse_document(request: ParseRequest) -> ParseResult:
             ocr_warnings: list[ParseWarning] = []
             ocr_attempts: list[OcrAttempt] = []
             ocr_engine = "rapidocr-ppocrv5"
+            fallback_reason: str | None = None
             if request.ocr_runtime is not None:
                 ocr_started_at = time.monotonic()
                 ocr_result, ocr_error = recognize_image(request.ocr_runtime.payload(path, 1))
@@ -983,20 +1031,35 @@ def parse_document(request: ParseRequest) -> ParseResult:
                 ocr_attempts.append(_ocr_attempt("windows-ocr", "Windows.Media.Ocr", ocr_result, ocr_error, None, ocr_started_at))
                 ocr_engine = "windows-ocr"
             if ocr_error:
+                if standalone_asset is not None:
+                    image_assets = [replace(
+                        standalone_asset,
+                        ocr_engine=ocr_engine,
+                        vision_route_reason=ocr_error.code.lower(),
+                        status="pending_understanding",
+                    )]
                 return _result(request, "partial", "image-metadata", [], ocr_warnings + [ParseWarning(ocr_error.code, ocr_error.message), ParseWarning("OCR_REQUIRED", "图片尚未完成OCR")], 1, started_at, image_assets=image_assets, ocr_attempts=ocr_attempts)
             nodes = _ocr_nodes(ocr_result or {}, "image")
             ocr_text = "\n".join(node.text or "" for node in nodes).strip() or None
             if standalone_asset is not None:
-                image_assets = [ImageAsset(
-                    standalone_asset.asset_id,
-                    standalone_asset.revision_id,
-                    standalone_asset.asset_kind,
-                    standalone_asset.cache_path,
-                    standalone_asset.mime_type,
-                    standalone_asset.size_bytes,
-                    standalone_asset.sha256,
-                    standalone_asset.locator,
-                    ocr_text,
+                threshold = request.ocr_runtime.confidence_threshold if request.ocr_runtime else 0.45
+                route_reason = fallback_reason or _ocr_fallback_reason(ocr_result, None, threshold)
+                if route_reason is None and ocr_text is not None:
+                    route_reason = complex_visual_reason("standalone_image", ocr_result or {}, ocr_text)
+                confidence_values = [
+                    float(line["confidence"])
+                    for line in (ocr_result or {}).get("lines", [])
+                    if isinstance(line, dict)
+                    and isinstance(line.get("confidence"), (int, float))
+                    and not isinstance(line.get("confidence"), bool)
+                ]
+                image_assets = [replace(
+                    standalone_asset,
+                    ocr_text=ocr_text,
+                    ocr_confidence=(sum(confidence_values) / len(confidence_values)) if confidence_values else None,
+                    ocr_engine=ocr_engine,
+                    vision_route_reason=route_reason,
+                    status="pending_understanding" if route_reason else "ready",
                 )]
             if not nodes:
                 return _result(request, "partial", ocr_engine, [], ocr_warnings + [ParseWarning("OCR_NO_TEXT", "图片OCR后没有识别到文字"), ParseWarning("OCR_REQUIRED", "图片尚未获得可索引文字")], 1, started_at, image_assets=image_assets, ocr_attempts=ocr_attempts)

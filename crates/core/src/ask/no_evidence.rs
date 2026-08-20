@@ -54,11 +54,20 @@ mod tests {
     fn all_reasons_have_stable_names() {
         for (reason, expected) in [
             (NoEvidenceReason::TargetNotResolved, "TARGET_NOT_RESOLVED"),
-            (NoEvidenceReason::DocumentRecallEmpty, "DOCUMENT_RECALL_EMPTY"),
-            (NoEvidenceReason::ChunkRetrievalEmpty, "CHUNK_RETRIEVAL_EMPTY"),
+            (
+                NoEvidenceReason::DocumentRecallEmpty,
+                "DOCUMENT_RECALL_EMPTY",
+            ),
+            (
+                NoEvidenceReason::ChunkRetrievalEmpty,
+                "CHUNK_RETRIEVAL_EMPTY",
+            ),
             (NoEvidenceReason::QueryGateRejected, "QUERY_GATE_REJECTED"),
             (NoEvidenceReason::RerankRejected, "RERANK_REJECTED"),
-            (NoEvidenceReason::AnswerabilityRejected, "ANSWERABILITY_REJECTED"),
+            (
+                NoEvidenceReason::AnswerabilityRejected,
+                "ANSWERABILITY_REJECTED",
+            ),
             (NoEvidenceReason::TrueNoEvidence, "TRUE_NO_EVIDENCE"),
         ] {
             assert_eq!(reason.as_str(), expected);
@@ -69,8 +78,7 @@ mod tests {
     fn serde_round_trips_uppercase_snake() {
         let json = serde_json::to_string(&NoEvidenceReason::QueryGateRejected).unwrap();
         assert_eq!(json, "\"QUERY_GATE_REJECTED\"");
-        let parsed: NoEvidenceReason =
-            serde_json::from_str("\"RERANK_REJECTED\"").expect("parses");
+        let parsed: NoEvidenceReason = serde_json::from_str("\"RERANK_REJECTED\"").expect("parses");
         assert_eq!(parsed, NoEvidenceReason::RerankRejected);
     }
 }

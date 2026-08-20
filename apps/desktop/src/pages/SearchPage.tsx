@@ -2,7 +2,7 @@ import { CloseOutlined, FileExcelOutlined, FilePdfOutlined, FileWordOutlined, Se
 import { useEffect, useMemo, useRef, useState } from "react";
 import { bridge, type CollectionRecord, type FilePreview, type SearchRequest } from "../bridge";
 import { PdfVisualPreview } from "../components/PdfVisualPreview";
-import { ImageAssetGallery } from "../components/ImageAssetGallery";
+import { ImageAssetGallery, imageAssetUrl } from "../components/ImageAssetGallery";
 import { OcrAttemptChain } from "../components/OcrAttemptChain";
 import { AppSelect } from "../components/AppSelect";
 import { errorMessage } from "../utils/app-error";
@@ -19,23 +19,28 @@ const emptyScope = {
   availability: "present" as const,
 };
 
+// 搜索序号放模块级：组件卸载（切页）后旧搜索完成仍能正确判断是否覆盖结果，
+// 不会因为组件重新挂载导致 ref 重置而误判。
+let searchSerial = 0;
+
 export function SearchPage() {
-  // 搜索会话（查询词、结果、筛选偏好）放在全局 store，切换页面后回来仍保留
+  // 搜索会话（查询词、结果、筛选偏好、加载状态）放在全局 store，切换页面后回来仍保留
   const query = useAppStore((state) => state.search_query);
   const setQuery = useAppStore((state) => state.set_search_query);
+  const loading = useAppStore((state) => state.search_loading);
+  const setLoading = useAppStore((state) => state.set_search_loading);
+  const loadingMore = useAppStore((state) => state.search_loading_more);
+  const setLoadingMore = useAppStore((state) => state.set_search_loading_more);
   const session = useAppStore((state) => state.search_session);
   const sessionQuery = useAppStore((state) => state.search_session_query);
   const setSession = useAppStore((state) => state.set_search_session);
   const prefs = useAppStore((state) => state.search_prefs);
   const setPrefs = useAppStore((state) => state.set_search_prefs);
   const { mode, sort, extension, modified_window: modifiedWindow, scope_collection_ids: scopeCollectionIds } = prefs;
-  const [loading, setLoading] = useState(false);
-  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<FilePreview | null>(null);
   const [previewLoadingId, setPreviewLoadingId] = useState<string | null>(null);
   const [collections, setCollections] = useState<CollectionRecord[]>([]);
-  const searchSerial = useRef(0);
   const initialQuery = useRef(query);
 
   useEffect(() => {
@@ -97,18 +102,18 @@ export function SearchPage() {
     setLoading(true);
     setError(null);
     setPreview(null);
-    const serial = ++searchSerial.current;
+    const serial = ++searchSerial;
     const baseRequest: Omit<SearchRequest, "cursor"> = { query: trimmed, scope, mode, sort, page_size: 30 };
     try {
       setSession(null);
       const result = await bridge.search_start({ ...baseRequest, cursor: null });
-      if (serial === searchSerial.current) setSession(result, trimmed);
+      if (serial === searchSerial) setSession(result, trimmed);
     } catch (searchError) {
-      if (serial !== searchSerial.current) return;
+      if (serial !== searchSerial) return;
       setSession(null);
       setError(errorMessage(searchError));
     } finally {
-      if (serial === searchSerial.current) setLoading(false);
+      if (serial === searchSerial) setLoading(false);
     }
   };
 
@@ -131,6 +136,8 @@ export function SearchPage() {
   useEffect(() => {
     const initialValue = initialQuery.current;
     if (!initialValue || sessionQuery === initialValue) return;
+    // 同查询词的搜索仍在后台运行（切页又切回），直接等待其结果，不重复发起
+    if (loading && query === initialValue) return;
     void search(initialValue);
     // 只在挂载时发起一次；之后的搜索由表单提交驱动
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -140,13 +147,13 @@ export function SearchPage() {
     <section className="page page--search">
       <form className="search-page__form" onSubmit={(event) => { event.preventDefault(); void search(query); }}>
         <SearchOutlined />
-        <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="例如：去年那个关于RAG召回率优化的文档" autoFocus />
+        <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="输入关键词" autoFocus />
         <button type="submit" disabled={loading} aria-label="搜索"><SearchOutlined /></button>
       </form>
       {loading && <div className="search-progress" role="progressbar"><div className="search-progress__bar" /></div>}
       <div className="search-filters">
         <label>方式
-          <AppSelect ariaLabel="搜索方式" value={mode} onChange={(value) => setPrefs({ mode: value as SearchRequest["mode"] })} options={[{ value: "hybrid", label: "混合搜索" }, { value: "filename", label: "文件名" }, { value: "fulltext", label: "全文" }, { value: "semantic", label: "语义" }]} />
+          <AppSelect ariaLabel="搜索方式" value={mode} onChange={(value) => setPrefs({ mode: value as SearchRequest["mode"] })} options={[{ value: "hybrid", label: "混合搜索" }, { value: "filename", label: "文件名" }, { value: "fulltext", label: "全文" }]} />
         </label>
         <label>范围
           <AppSelect ariaLabel="选择检索范围" value="" showSearch onChange={addScopeCollection} labelRender={() => (
@@ -198,6 +205,12 @@ export function SearchPage() {
               <div><h2>{highlightPlainTerms(result.name, query)}</h2><time>{new Date(result.modified_at).toLocaleDateString("zh-CN")}</time></div>
                     <small>{result.display_path}</small>
               <p>{highlightPlainTerms(result.snippet, query)}</p>
+              {result.image_asset_id && (
+                <figure className="search-result__image-match">
+                  <img src={imageAssetUrl(result.image_asset_id)} alt={`搜索命中的图片：${result.name}`} loading="lazy" />
+                  <figcaption>图片内容命中</figcaption>
+                </figure>
+              )}
               {result.locator && (
                 <small className="source-locator">
                   {result.locator.page_no ? `第 ${result.locator.page_no} 页` :

@@ -7,9 +7,9 @@
 //!
 //! 纯函数，无 IO；会话上下文由编排层从存储读取后传入。
 
+use crate::AskSessionContext;
 use crate::ask::query_plan::{QueryIntent, ResolutionStatus, SourceIntent};
 use crate::contracts::DocumentType;
-use crate::AskSessionContext;
 
 /// 恢复依据的会话上下文信号（用于 tracing）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -139,7 +139,10 @@ mod tests {
         assert!(resolution.is_resolved());
         assert_eq!(resolution.source, SourceIntent::Local);
         assert_eq!(resolution.intent, QueryIntent::DocumentQa);
-        assert_eq!(resolution.resolved_file_ids, vec![context.active_file_id.unwrap()]);
+        assert_eq!(
+            resolution.resolved_file_ids,
+            vec![context.active_file_id.unwrap()]
+        );
         assert_eq!(resolution.signal, Some(ContextSignal::ActiveFile));
         assert!((resolution.confidence - 0.95).abs() < 1e-6);
     }
@@ -195,7 +198,10 @@ mod tests {
         let resolution = resolve_ambiguous(&context);
         assert!(resolution.is_resolved());
         assert_eq!(resolution.resolved_file_ids, Vec::<uuid::Uuid>::new());
-        assert_eq!(resolution.resolved_document_type, Some(DocumentType::Resume));
+        assert_eq!(
+            resolution.resolved_document_type,
+            Some(DocumentType::Resume)
+        );
         assert_eq!(resolution.signal, Some(ContextSignal::ActiveDocumentType));
     }
 

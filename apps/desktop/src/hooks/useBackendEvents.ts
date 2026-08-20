@@ -65,7 +65,6 @@ export function useBackendEvents() {
         }),
         listen(RUNTIME_EVENTS.modelState, () => {
           void queryClient.invalidateQueries({ queryKey: ["model-runtime"] });
-          void queryClient.invalidateQueries({ queryKey: ["model-role-configs"] });
           // 后台 GPU 探测完成时环境检测结果也随之刷新（GPU 名称/显存/后端）
           void queryClient.invalidateQueries({ queryKey: ["environment"] });
         }),

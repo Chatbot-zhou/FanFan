@@ -28,6 +28,9 @@ interface SearchPrefs {
 interface AppState {
   route: AppRoute;
   search_query: string;
+  /** 搜索加载状态放全局 store：切页不卸载，进度条与结果不丢失。 */
+  search_loading: boolean;
+  search_loading_more: boolean;
   search_session: SearchSession | null;
   search_session_query: string;
   search_prefs: SearchPrefs;
@@ -49,6 +52,8 @@ interface AppState {
   navigate: (route: AppRoute) => void;
   start_search: (query: string) => void;
   set_search_query: (query: string) => void;
+  set_search_loading: (loading: boolean) => void;
+  set_search_loading_more: (loading: boolean) => void;
   set_search_session: (session: SearchSession | null, query?: string) => void;
   set_search_prefs: (prefs: Partial<SearchPrefs>) => void;
   set_ask_turns: (turns: AskTurn[]) => void;
@@ -70,6 +75,8 @@ interface AppState {
 export const useAppStore = create<AppState>((set) => ({
   route: "home",
   search_query: "",
+  search_loading: false,
+  search_loading_more: false,
   search_session: null,
   search_session_query: "",
   search_prefs: {
@@ -104,8 +111,17 @@ export const useAppStore = create<AppState>((set) => ({
     : route === "collections"
       ? { route, selected_collection_id: null }
       : { route })),
-  start_search: (search_query) => set({ route: "search", search_query, search_session: null, search_session_query: "" }),
+  start_search: (search_query) => set({
+    route: "search",
+    search_query,
+    search_session: null,
+    search_session_query: "",
+    search_loading: false,
+    search_loading_more: false,
+  }),
   set_search_query: (search_query) => set({ search_query }),
+  set_search_loading: (search_loading) => set({ search_loading }),
+  set_search_loading_more: (search_loading_more) => set({ search_loading_more }),
   set_search_session: (search_session, query) => set(search_session
     ? { search_session, search_session_query: query ?? "" }
     : { search_session: null }),

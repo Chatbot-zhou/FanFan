@@ -63,6 +63,7 @@ fn run() -> Result<(), AppError> {
                     required_companion(&parent, "ch_ppocr_mobile_v2.0_cls_infer.onnx")?,
                     required_companion(&parent, "ppocrv5_dict.txt")?,
                     1,
+                    "PPOCRV5".to_owned(),
                 )
                 .and_then(|_| manager.activate_artifact(&artifact.artifact_id, None))
                 .map(|_| "ocr"),
@@ -70,20 +71,11 @@ fn run() -> Result<(), AppError> {
                 .self_test_asr(
                     artifact.local_path.clone(),
                     required_companion(&parent, "tokens.txt")?,
-                    required_companion(&parent, "silero_vad.onnx")?,
                     1,
+                    "paraformer".to_owned(),
                 )
                 .and_then(|_| manager.activate_artifact(&artifact.artifact_id, None))
                 .map(|_| "asr"),
-            ModelRole::Tts => worker
-                .self_test_tts(
-                    artifact.local_path.clone(),
-                    required_companion(&parent, "tokens.txt")?,
-                    required_companion(&parent, "lexicon.txt")?,
-                    1,
-                )
-                .and_then(|_| manager.activate_artifact(&artifact.artifact_id, None))
-                .map(|_| "tts"),
             _ => continue,
         };
         match result {
@@ -124,7 +116,6 @@ impl ModelRoleLabel for ModelRole {
             ModelRole::Vision => "vision",
             ModelRole::Reranker => "reranker",
             ModelRole::Ocr => "ocr",
-            ModelRole::Tts => "tts",
             ModelRole::Asr => "asr",
             ModelRole::Router => "router",
         }

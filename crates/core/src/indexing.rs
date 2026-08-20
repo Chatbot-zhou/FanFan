@@ -18,6 +18,14 @@ pub struct OcrRuntimeConfig {
     pub cls_model_path: String,
     pub dictionary_path: String,
     pub threads: u32,
+    /// OCR 版本形态：`PPOCRV5` / `PPOCRV6`；缺省按 PPOCRV5 处理。
+    #[serde(default = "default_ocr_version")]
+    pub ocr_version: String,
+}
+
+/// OCR 运行时配置的缺省版本（兼容未携带该字段的旧数据）。
+fn default_ocr_version() -> String {
+    "PPOCRV5".to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -99,11 +107,52 @@ pub struct ImageAsset {
     pub sha256: String,
     pub locator: SourceLocator,
     pub ocr_text: Option<String>,
+    #[serde(default)]
+    pub ocr_confidence: Option<f32>,
+    #[serde(default)]
+    pub ocr_engine: Option<String>,
     pub description: Option<String>,
     pub vision_model_id: Option<String>,
+    #[serde(default)]
+    pub vision_route_reason: Option<String>,
     pub status: String,
     #[serde(default)]
     pub error: Option<AppError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PendingImageOcr {
+    pub asset_id: Uuid,
+    pub file_id: Uuid,
+    pub revision_id: Uuid,
+    #[serde(skip_serializing)]
+    pub cache_path: String,
+    pub mime_type: String,
+    pub asset_kind: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub locator: SourceLocator,
+    pub attempt_count: u32,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ImageOcrResult {
+    pub asset_id: Uuid,
+    pub revision_id: Uuid,
+    pub model_artifact_id: String,
+    #[serde(default)]
+    pub ocr_text: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f32>,
+    pub engine: String,
+    #[serde(default)]
+    pub model_version: Option<String>,
+    pub vision_required: bool,
+    pub route_reason: String,
+    #[serde(default)]
+    pub attempts: Vec<OcrAttempt>,
+    pub idempotency_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -178,7 +227,6 @@ pub type ContentChunk = ChunkRecord;
 pub enum SearchMode {
     Filename,
     Fulltext,
-    Semantic,
     Hybrid,
 }
 
@@ -285,6 +333,8 @@ pub struct SearchResult {
     pub match_reasons: Vec<String>,
     pub locator: Option<SourceLocator>,
     pub revision_id: Option<Uuid>,
+    #[serde(default)]
+    pub image_asset_id: Option<Uuid>,
     pub scores: SearchScore,
 }
 
@@ -293,6 +343,8 @@ pub struct RetrievalCandidate {
     pub file_id: Uuid,
     pub chunk_id: Option<Uuid>,
     pub revision_id: Option<Uuid>,
+    #[serde(default)]
+    pub image_asset_id: Option<Uuid>,
     pub name: String,
     pub extension: String,
     #[serde(
@@ -336,6 +388,13 @@ const MAX_FUSED_CHUNKS_PER_FILE: usize = 3;
 /// 文件名/路径命中（「找文件」类查询的最强信号）在文件级排序时的保底加分，
 /// 保证语义噪声堆叠的大文档不会把真正目标文件挤出前列。
 const FILENAME_MATCH_BOOST: f32 = 2.0;
+/// MMR 去重参与候选中按融合分截断到 limit 的倍数：原实现对全部候选做
+/// O(N^2) 的 token 冗余比较，长文本语料下单次搜索可达数十秒（实测 41s），
+/// 截断只排除低分候选，不影响高分去重结果。
+const MMR_CANDIDATE_FACTOR: usize = 3;
+/// token_jaccard 每次比较参与计算的 token 上限：MMR 冗余度只关心内容
+/// 是否重复，截断超长 chunk 的尾部 token 可把单次比较成本降为常数。
+const MMR_TOKEN_JACCARD_MAX_TOKENS: usize = 256;
 pub(crate) const RAG_MIN_SEMANTIC_SUPPORT: f32 = 0.60;
 pub(crate) const RAG_MIN_FULLTEXT_SCORE: f32 = 0.05;
 
@@ -348,6 +407,7 @@ pub(crate) const RAG_MIN_FULLTEXT_SCORE: f32 = 0.05;
 ///   也弱，无法救），拒绝 12/13 负例（唯一误放的「你好」0.803 在路由层
 ///   被 LLM 直路由判为闲聊，到不了检索）；
 /// - 0.87（含 margin 分支）在此标定集上误杀 34/38 正例，已废弃。
+///
 /// fulltext 通道单独不设低门槛放行——部分 token 命中（bm25 中等负数）在
 /// 乱码查询上也会出现（实测 0.09-0.22），只有罕见词全部命中的极强全文
 /// 证据（>=0.30）才可作为查询相关的唯一依据（正例实测最高 0.171，正常
@@ -368,8 +428,7 @@ pub(crate) fn query_has_relevant_evidence(candidates: &[RetrievalCandidate]) -> 
             top_fulltext = top_fulltext.max(score);
         }
     }
-    top_semantic >= RAG_QUERY_RELEVANT_SEMANTIC
-        || top_fulltext >= RAG_QUERY_RELEVANT_FULLTEXT
+    top_semantic >= RAG_QUERY_RELEVANT_SEMANTIC || top_fulltext >= RAG_QUERY_RELEVANT_FULLTEXT
 }
 
 /// Whether this candidate may serve as RAG evidence, given whether the
@@ -465,6 +524,7 @@ pub(crate) struct RankedHit {
     pub file: FileRecord,
     pub chunk_id: Option<Uuid>,
     pub revision_id: Option<Uuid>,
+    pub image_asset_id: Option<Uuid>,
     pub snippet: String,
     pub locator: Option<SourceLocator>,
     pub reason: &'static str,
@@ -493,6 +553,7 @@ pub(crate) fn fuse_ranked_hits(
                 match_reasons: candidate.match_reasons,
                 locator: candidate.locator,
                 revision_id: candidate.revision_id,
+                image_asset_id: candidate.image_asset_id,
                 scores: candidate.scores,
             });
     }
@@ -562,25 +623,28 @@ pub(crate) fn fuse_retrieval_candidates(
                     *count += 1;
                 }
             }
-            let entry = fused.entry(fused_key).or_insert_with(|| RetrievalCandidate {
-                file_id: hit.file.file_id,
-                chunk_id: hit.chunk_id,
-                revision_id: hit.revision_id,
-                name: hit.file.display_name.clone(),
-                extension: hit.file.extension.clone(),
-                path: hit.file.canonical_path.clone(),
-                modified_at: hit.file.fs_modified_at,
-                snippet: hit.snippet.clone(),
-                match_reasons: Vec::new(),
-                locator: hit.locator.clone(),
-                scores: SearchScore {
-                    filename: None,
-                    fulltext: None,
-                    semantic: None,
-                    fused: 0.0,
-                },
-                rank: 0,
-            });
+            let entry = fused
+                .entry(fused_key)
+                .or_insert_with(|| RetrievalCandidate {
+                    file_id: hit.file.file_id,
+                    chunk_id: hit.chunk_id,
+                    revision_id: hit.revision_id,
+                    image_asset_id: hit.image_asset_id,
+                    name: hit.file.display_name.clone(),
+                    extension: hit.file.extension.clone(),
+                    path: hit.file.canonical_path.clone(),
+                    modified_at: hit.file.fs_modified_at,
+                    snippet: hit.snippet.clone(),
+                    match_reasons: Vec::new(),
+                    locator: hit.locator.clone(),
+                    scores: SearchScore {
+                        filename: None,
+                        fulltext: None,
+                        semantic: None,
+                        fused: 0.0,
+                    },
+                    rank: 0,
+                });
             if accumulate_rank {
                 entry.scores.fused += reciprocal_rank;
             }
@@ -611,6 +675,7 @@ pub(crate) fn fuse_retrieval_candidates(
                     );
                     if entry.locator.is_none() || entry.chunk_id.is_none() {
                         entry.chunk_id = hit.chunk_id;
+                        entry.image_asset_id = hit.image_asset_id;
                         entry.locator = hit.locator.clone();
                         entry.snippet.clone_from(&hit.snippet);
                     }
@@ -625,6 +690,7 @@ pub(crate) fn fuse_retrieval_candidates(
                     );
                     if entry.locator.is_none() || entry.chunk_id.is_none() {
                         entry.chunk_id = hit.chunk_id;
+                        entry.image_asset_id = hit.image_asset_id;
                         entry.locator = hit.locator.clone();
                         entry.snippet.clone_from(&hit.snippet);
                     }
@@ -635,55 +701,85 @@ pub(crate) fn fuse_retrieval_candidates(
     }
     let mut remaining = fused.into_values().collect::<Vec<_>>();
     remaining.sort_by(|left, right| right.scores.fused.total_cmp(&left.scores.fused));
+    // MMR 去重对每个未选候选 × 每个已选候选做 token 冗余比较（O(N^2)）。
+    // 只保留融合分最高的 limit × MMR_CANDIDATE_FACTOR 个候选参与去重：
+    // 低分候选对最终 Top-limit 结果影响可忽略，却占去重比较的主体。
+    remaining.truncate(
+        remaining
+            .len()
+            .min(limit.saturating_mul(MMR_CANDIDATE_FACTOR)),
+    );
     let max_relevance = remaining
         .first()
         .map(|candidate| candidate.scores.fused)
         .unwrap_or(1.0)
         .max(f32::EPSILON);
+    // 预计算每个候选的 token 集合：原实现对同一 snippet 在每轮比较中反复
+    // 重新 token 化，长文本场景成为单次搜索的主要耗时（实测 41s）。
+    let mut token_sets = remaining
+        .iter()
+        .map(|candidate| snippet_token_set(&candidate.snippet))
+        .collect::<Vec<_>>();
     let mut selected = Vec::new();
+    // 每个候选相对「已选集合」的当前最大冗余度（增量维护）。原实现对每轮
+    // 全部候选 × 全部已选重新做 token Jaccard（O(R×S²)，372×124² ≈ 286 万次），
+    // 实测单次搜索的 fusion 阶段耗时 7~13 秒。这里缓存每个候选已累计的最大
+    // 冗余度，每加入一个已选结果只对剩余候选各算一次 jaccard 并取 max
+    // （结果与全量重算完全等价），总比较次数降为 O(R×S) ≈ 4.6 万次。
+    let mut redundancy_cache = vec![0.0_f32; remaining.len()];
     while !remaining.is_empty() && selected.len() < limit {
         let (best_index, _) = remaining
             .iter()
             .enumerate()
             .map(|(index, candidate)| {
                 let relevance = candidate.scores.fused / max_relevance;
-                let redundancy = selected
-                    .iter()
-                    .map(|chosen: &RetrievalCandidate| {
-                        let lexical = token_jaccard(&candidate.snippet, &chosen.snippet);
-                        if candidate.file_id == chosen.file_id {
-                            lexical.max(0.2)
-                        } else {
-                            lexical
-                        }
-                    })
-                    .fold(0.0_f32, f32::max);
-                (index, relevance * 0.78 - redundancy * 0.22)
+                (index, relevance * 0.78 - redundancy_cache[index] * 0.22)
             })
             .max_by(|left, right| left.1.total_cmp(&right.1))
             .expect("remaining candidates are not empty");
         let mut candidate = remaining.swap_remove(best_index);
+        let candidate_tokens = token_sets.swap_remove(best_index);
+        redundancy_cache.swap_remove(best_index);
+        // 增量更新：新选中的候选对每个剩余候选的冗余度，只与新加入的已选
+        // 结果比较一次，累积取最大值（同文件候选保底 0.2 与全量重算一致）。
+        for (index, remaining_candidate) in remaining.iter().enumerate() {
+            let lexical = token_set_jaccard(&token_sets[index], &candidate_tokens);
+            let redundancy = if remaining_candidate.file_id == candidate.file_id {
+                lexical.max(0.2)
+            } else {
+                lexical
+            };
+            if redundancy > redundancy_cache[index] {
+                redundancy_cache[index] = redundancy;
+            }
+        }
         candidate.rank = selected.len() as u32 + 1;
         selected.push(candidate);
     }
     selected
 }
 
-fn token_jaccard(left: &str, right: &str) -> f32 {
-    let tokens = |value: &str| {
-        value
-            .split(|character: char| !character.is_alphanumeric())
-            .filter(|token| !token.is_empty())
-            .map(str::to_ascii_lowercase)
-            .collect::<std::collections::HashSet<_>>()
-    };
-    let left = tokens(left);
-    let right = tokens(right);
+/// 把 snippet 切成小写 token 集合，最多取 MMR_TOKEN_JACCARD_MAX_TOKENS 个：
+/// 冗余度比较只关心「内容是否重复」，截断尾部可避免超长 chunk 拖慢比较。
+fn snippet_token_set(snippet: &str) -> std::collections::HashSet<String> {
+    snippet
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .take(MMR_TOKEN_JACCARD_MAX_TOKENS)
+        .collect()
+}
+
+/// 基于预计算 token 集合的 Jaccard 相似度（MMR 冗余度信号）。
+fn token_set_jaccard(
+    left: &std::collections::HashSet<String>,
+    right: &std::collections::HashSet<String>,
+) -> f32 {
     if left.is_empty() || right.is_empty() {
         return 0.0;
     }
-    let intersection = left.intersection(&right).count() as f32;
-    let union = left.union(&right).count() as f32;
+    let intersection = left.intersection(right).count() as f32;
+    let union = left.union(right).count() as f32;
     intersection / union
 }
 
@@ -916,6 +1012,7 @@ mod tests {
             },
             chunk_id: Some(chunk_id),
             revision_id: Some(Uuid::now_v7()),
+            image_asset_id: None,
             snippet: snippet.into(),
             locator: Some(SourceLocator::default()),
             reason,
@@ -989,7 +1086,13 @@ mod tests {
         let chunk_id = Uuid::now_v7();
         let supported = fuse_retrieval_candidates(
             &[
-                vec![ranked_hit(file_id, chunk_id, "semantic", 0.65, "shared chunk")],
+                vec![ranked_hit(
+                    file_id,
+                    chunk_id,
+                    "semantic",
+                    0.65,
+                    "shared chunk",
+                )],
                 vec![ranked_hit(
                     file_id,
                     chunk_id,
@@ -1011,7 +1114,13 @@ mod tests {
         // stand on its own.
         let unsupported = fuse_retrieval_candidates(
             &[
-                vec![ranked_hit(file_id, chunk_id, "semantic", 0.55, "shared chunk")],
+                vec![ranked_hit(
+                    file_id,
+                    chunk_id,
+                    "semantic",
+                    0.55,
+                    "shared chunk",
+                )],
                 vec![ranked_hit(
                     file_id,
                     chunk_id,
@@ -1045,24 +1154,22 @@ mod tests {
     fn query_level_relevance_gate_rejects_gibberish() {
         // 真实查询的语义 top-1 明显领先（实测 0.90+）：强语义命中放行。
         let strong = fuse_retrieval_candidates(
-            &[
-                vec![
-                    ranked_hit(
-                        Uuid::now_v7(),
-                        Uuid::now_v7(),
-                        "semantic",
-                        0.9018,
-                        "产品定位",
-                    ),
-                    ranked_hit(
-                        Uuid::now_v7(),
-                        Uuid::now_v7(),
-                        "semantic",
-                        0.8889,
-                        "产品规划",
-                    ),
-                ],
-            ],
+            &[vec![
+                ranked_hit(
+                    Uuid::now_v7(),
+                    Uuid::now_v7(),
+                    "semantic",
+                    0.9018,
+                    "产品定位",
+                ),
+                ranked_hit(
+                    Uuid::now_v7(),
+                    Uuid::now_v7(),
+                    "semantic",
+                    0.8889,
+                    "产品规划",
+                ),
+            ]],
             10,
         );
         assert!(query_has_relevant_evidence(&strong));
@@ -1085,13 +1192,7 @@ mod tests {
                     0.7713,
                     "查看属性.png",
                 ),
-                ranked_hit(
-                    Uuid::now_v7(),
-                    Uuid::now_v7(),
-                    "semantic",
-                    0.7690,
-                    "逐字稿",
-                ),
+                ranked_hit(Uuid::now_v7(), Uuid::now_v7(), "semantic", 0.7690, "逐字稿"),
             ]],
             10,
         );
@@ -1099,24 +1200,10 @@ mod tests {
 
         // 中语义 0.80 整（真实正例最低档）：视为相关。
         let leading = fuse_retrieval_candidates(
-            &[
-                vec![
-                    ranked_hit(
-                        Uuid::now_v7(),
-                        Uuid::now_v7(),
-                        "semantic",
-                        0.80,
-                        "报销流程",
-                    ),
-                    ranked_hit(
-                        Uuid::now_v7(),
-                        Uuid::now_v7(),
-                        "semantic",
-                        0.60,
-                        "其他文档",
-                    ),
-                ],
-            ],
+            &[vec![
+                ranked_hit(Uuid::now_v7(), Uuid::now_v7(), "semantic", 0.80, "报销流程"),
+                ranked_hit(Uuid::now_v7(), Uuid::now_v7(), "semantic", 0.60, "其他文档"),
+            ]],
             10,
         );
         assert!(query_has_relevant_evidence(&leading));
@@ -1136,24 +1223,22 @@ mod tests {
 
         // 弱语义（0.79 < 门槛）+ 部分 token 弱全文（0.22 < 0.30）：拒绝。
         let weak_lexical = fuse_retrieval_candidates(
-            &[
-                vec![
-                    ranked_hit(
-                        Uuid::now_v7(),
-                        Uuid::now_v7(),
-                        "semantic",
-                        0.79,
-                        "共享 chunk",
-                    ),
-                    ranked_hit(
-                        Uuid::now_v7(),
-                        Uuid::now_v7(),
-                        "fulltext",
-                        0.221,
-                        "movies.csv 部分 token",
-                    ),
-                ],
-            ],
+            &[vec![
+                ranked_hit(
+                    Uuid::now_v7(),
+                    Uuid::now_v7(),
+                    "semantic",
+                    0.79,
+                    "共享 chunk",
+                ),
+                ranked_hit(
+                    Uuid::now_v7(),
+                    Uuid::now_v7(),
+                    "fulltext",
+                    0.221,
+                    "movies.csv 部分 token",
+                ),
+            ]],
             10,
         );
         assert!(!query_has_relevant_evidence(&weak_lexical));

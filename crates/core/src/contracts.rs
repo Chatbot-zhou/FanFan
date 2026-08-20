@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
@@ -701,6 +703,254 @@ pub struct NodeTracePage {
     pub items: Vec<NodeTraceRecord>,
     pub next_cursor: Option<String>,
     pub total: u64,
+}
+
+/// 链路类型（四条核心链路），operation_traces.feature_type 的取值。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TraceFeatureType {
+    Search,
+    Ask,
+    SmartCollection,
+    FileRelation,
+}
+
+impl TraceFeatureType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Search => "SEARCH",
+            Self::Ask => "ASK",
+            Self::SmartCollection => "SMART_COLLECTION",
+            Self::FileRelation => "FILE_RELATION",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "SEARCH" => Some(Self::Search),
+            "ASK" => Some(Self::Ask),
+            "SMART_COLLECTION" => Some(Self::SmartCollection),
+            "FILE_RELATION" => Some(Self::FileRelation),
+            _ => None,
+        }
+    }
+}
+
+/// 一次链路操作的操作级追踪（OperationTrace）：一条用户操作一条，关联多条
+/// 节点级 TraceNode（node_traces.correlation_id = operation_traces.correlation_id）。
+/// 字段与 docs/fanfan_trace_evaluation_optimization_agent_prompt.txt 的
+/// OperationTrace 契约保持一致。写入失败静默，绝不影响主链路。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OperationTraceRecord {
+    pub operation_id: String,
+    /// 与 node_traces.correlation_id 关联，一个操作的所有节点共用
+    pub correlation_id: String,
+    pub session_id: Option<String>,
+    pub feature_type: String,
+    /// 精简后的请求快照（query/参数摘要，不存大文本）
+    pub request: Value,
+    pub preset_id: Option<String>,
+    /// queued | running | ok | error | skipped
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub total_duration_ms: Option<u64>,
+    pub schema_version: u32,
+}
+
+/// 创建 OperationTrace 的入参（新建时 status 固定为 running）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OperationTraceInput {
+    pub correlation_id: String,
+    pub session_id: Option<String>,
+    pub feature_type: TraceFeatureType,
+    pub request: Value,
+    pub preset_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperationTraceQuery {
+    pub feature_type: Option<String>,
+    pub cursor: Option<String>,
+    pub page_size: u32,
+}
+
+impl OperationTraceQuery {
+    pub fn validate(&self) -> Result<(), AppError> {
+        if !(1..=500).contains(&self.page_size) {
+            return Err(AppError::new(
+                "OPERATION_TRACE_LIMIT_INVALID",
+                "操作追踪读取数量需要在1到500之间",
+                false,
+            ));
+        }
+        self.offset().map(|_| ())
+    }
+
+    pub fn offset(&self) -> Result<u64, AppError> {
+        self.cursor
+            .as_deref()
+            .unwrap_or("0")
+            .parse::<u64>()
+            .map_err(|_| {
+                AppError::new(
+                    "OPERATION_TRACE_CURSOR_INVALID",
+                    "操作追踪分页游标无效",
+                    false,
+                )
+            })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OperationTracePage {
+    pub items: Vec<OperationTraceRecord>,
+    pub next_cursor: Option<String>,
+    pub total: u64,
+}
+
+/// 节点级 TraceNode 的评测/优化扩展元数据（写入 node_traces 新增列）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TraceNodeMeta {
+    pub operation_id: Option<String>,
+    pub evaluation_case_id: Option<String>,
+    pub optimization_round: Option<u32>,
+    pub model_id: Option<String>,
+    pub requested_device: Option<String>,
+    pub actual_device: Option<String>,
+}
+
+/// 节点追踪的结构化写入参数，避免跨 Catalog/Storage 层传递易错的位置参数。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TraceNodeInput {
+    pub flow: String,
+    pub node: String,
+    pub correlation_id: String,
+    pub session_id: Option<String>,
+    pub entity_id: Option<String>,
+    pub input_json: Value,
+    pub output_json: Value,
+    pub status: String,
+    pub elapsed_ms: Option<u64>,
+    #[serde(default)]
+    pub meta: TraceNodeMeta,
+}
+
+/// 评测用例记录（evaluation_cases 表）。
+/// 字段与 docs/fanfan_trace_evaluation_optimization_agent_prompt.txt 第十二节
+/// EvaluationCase 契约一致；多值字段（file/chunk/evidence/member）落库时以
+/// JSON 数组字符串存储。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EvaluationCaseRecord {
+    pub case_id: String,
+    /// SEARCH / ASK / SMART_COLLECTION / FILE_RELATION
+    pub feature_type: String,
+    pub question_or_request: String,
+    pub expected_source: Option<String>,
+    pub expected_intent: Option<String>,
+    pub expected_operation: Option<String>,
+    pub expected_file_ids: Option<Vec<String>>,
+    pub expected_chunk_ids: Option<Vec<String>>,
+    pub expected_evidence_ids: Option<Vec<String>>,
+    pub expected_answer_shape: Option<String>,
+    pub expected_relation_type: Option<String>,
+    pub expected_collection_members: Option<Vec<String>>,
+    pub gold_reason: Option<String>,
+    /// DEV / HOLDOUT
+    pub split: String,
+    pub dataset_version: String,
+    #[serde(default)]
+    pub metadata: Value,
+    pub created_at: DateTime<Utc>,
+}
+
+/// RAGAS 0.4.x 的版本化单轮样本契约。正文仅允许写入受保护的评测目录；
+/// 普通报告只保留匿名 case_id、分数、错误类别、耗时、成本与指纹。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RagasEvaluationSampleV1 {
+    pub schema_version: u32,
+    pub case_id: String,
+    pub dataset_version: String,
+    /// PUBLIC / DEV / HOLDOUT
+    pub split: String,
+    pub feature_type: String,
+    pub user_input: String,
+    pub response: String,
+    #[serde(default)]
+    pub retrieved_contexts: Vec<String>,
+    #[serde(default)]
+    pub reference_contexts: Vec<String>,
+    #[serde(default)]
+    pub retrieved_context_ids: Vec<String>,
+    #[serde(default)]
+    pub reference_context_ids: Vec<String>,
+    pub reference: Option<String>,
+    pub trace_id: Option<String>,
+    pub retrieval_latency_ms: Option<u64>,
+    pub generation_latency_ms: Option<u64>,
+    pub total_latency_ms: u64,
+    pub model_fingerprint: Option<String>,
+    pub index_fingerprint: Option<String>,
+    pub code_fingerprint: Option<String>,
+    #[serde(default)]
+    pub deterministic_judgements: Value,
+}
+
+/// 冻结的50题评测批次。仅保存匿名稳定标识与指纹，不保存问题、答案或原文。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvaluationBatchManifestV1 {
+    pub schema_version: u32,
+    pub batch_id: String,
+    pub dataset_version: String,
+    /// DEV / HOLDOUT
+    pub split: String,
+    pub batch_index: u32,
+    pub batch_size: u32,
+    pub selection_algorithm: String,
+    pub case_ids: Vec<String>,
+    pub source_file_ids: Vec<String>,
+    pub intent_distribution: BTreeMap<String, u32>,
+    pub manifest_sha256: String,
+    pub code_fingerprint: Option<String>,
+    pub index_fingerprint: Option<String>,
+    pub model_fingerprint: Option<String>,
+    pub source_manifest_fingerprint: Option<String>,
+}
+
+/// 评测执行记录（evaluation_runs 表）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EvaluationRunRecord {
+    pub run_id: String,
+    pub dataset_version: String,
+    pub code_revision: Option<String>,
+    pub preset_id: Option<String>,
+    pub model_ids: Option<Vec<String>>,
+    pub optimization_round: u32,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub metrics: Value,
+}
+
+/// 评测逐例结果记录（evaluation_results 表）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EvaluationResultRecord {
+    pub result_id: String,
+    pub case_id: String,
+    pub run_id: String,
+    pub operation_id: Option<String>,
+    pub pass_fail: bool,
+    pub error_category: Option<String>,
+    pub diagnosis_reason: Option<String>,
+    pub actual_source: Option<String>,
+    pub actual_intent: Option<String>,
+    pub actual_operation: Option<String>,
+    pub actual_files: Option<Vec<String>>,
+    pub actual_evidence: Option<Vec<String>>,
+    #[serde(default)]
+    pub metrics: Value,
+    pub latency_ms: Option<u64>,
+    pub created_at: DateTime<Utc>,
 }
 
 /// 一次 Ask 的逐阶段耗时（阶段未出现则为 null）。
