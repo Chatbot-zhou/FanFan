@@ -79,15 +79,10 @@ scripts/run_ragas.ps1
 # Local evaluation workspace (database snapshots, model registry copies)
 .evaluation-tmp/
 
-# Evaluation harness (depends on removed eval fixtures)
-evaluate_qa_fixtures.rs
-
 # Debug probes (diagnostic-only binaries, not part of the product)
 _dbg_*.rs
 
-# Performance/evaluation probes (diagnostic-only, not part of the product)
-crates/core/examples/perf_probe.rs
-crates/core/examples/perf_fusion_probe.rs
+# Evaluation probes (diagnostic-only, not part of the product)
 crates/core/examples/evaluation_optimize.rs
 
 # Installers and packaging
