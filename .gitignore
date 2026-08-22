@@ -94,8 +94,5 @@ build/
 # Runtime vector indexes (app data lives in %APPDATA%, local copies only)
 vector-indexes/
 
-# Local docs artifacts stay local by default. The two product baselines below
-# are versioned because they define the implementation and review contract.
-docs/*
-!docs/翻翻-产品与开发规划书.md
-!docs/方案逐条审查清单.md
+# Project docs stay local by default and are not uploaded
+docs/
