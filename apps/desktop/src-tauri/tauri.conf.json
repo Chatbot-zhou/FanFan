@@ -34,6 +34,7 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "useLocalToolsDir": true,
     "category": "Productivity",
     "shortDescription": "完全本地化的 AI 信息管理助手",
     "longDescription": "想不起来？翻翻就知道。完全本地地理解、整理和找回电脑中散落的资料。",

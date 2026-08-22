@@ -85,6 +85,18 @@ if (Test-Path -LiteralPath $nvidiaRoot) {
         Copy-Item -Destination $internalDir -Force
 }
 
+# 移除与 System32 冲突的旧版 VC 运行时 DLL。PyInstaller 会从依赖包收集到
+# 旧版 msvcp140/vcruntime140（如 14.29 "cloudtest"），与系统新版（14.51）混用
+# 会导致 onnxruntime 加载失败（"DLL load failed while importing
+# onnxruntime_pybind11_state: 动态链接库(DLL)初始化例程失败"）。
+# Windows 10/11 自带 VC 2015-2022 运行时，删除后由系统提供新版本。
+foreach ($vcRuntime in @("msvcp140.dll", "MSVCP140_1.dll", "vcruntime140.dll", "vcruntime140_1.dll")) {
+    $vcPath = Join-Path $internalDir $vcRuntime
+    if (Test-Path -LiteralPath $vcPath) {
+        Remove-Item -LiteralPath $vcPath -Force
+    }
+}
+
 $workerSize = (Get-Item -LiteralPath $workerExecutable).Length
 $internalSize = (Get-ChildItem -Path $internalDir -Recurse -File | Measure-Object -Property Length -Sum).Sum
 Write-Output "Worker build checkpoint passed: $workerExecutable ($workerSize bytes, internal $([math]::Round($internalSize / 1MB)) MB)"
