@@ -80,7 +80,7 @@ fn run() -> Result<(), fanfan_core::AppError> {
     // ensure_ollama_registry_synced 逻辑一致），否则 active_artifact 判为 None。
     sync_ollama_registry(&manager)?;
     // 临时调试：打印注册表加载状态
-    if std::env::var("ASK_DEBUG").is_ok() {
+    if std::env::var("FANFAN_ASK_DEBUG").is_ok() {
         // 通过公开 API 无法直接读注册表，仅打印 active_artifact 判定结果
         for role in [ModelRole::Embedding, ModelRole::Generation, ModelRole::Reranker] {
             println!(
@@ -472,7 +472,7 @@ fn run_retrieval_branch(
         "[generate] {:.1}s",
         generation_started.elapsed().as_secs_f64()
     );
-    if std::env::var("ASK_DEBUG").is_ok() {
+    if std::env::var("FANFAN_ASK_DEBUG").is_ok() {
         println!(
             "[debug] generated raw (前2000字符):\n{}",
             compact_for_prompt(&generated, 2000)
