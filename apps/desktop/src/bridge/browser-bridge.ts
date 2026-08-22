@@ -30,6 +30,7 @@ import type {
   MemoryRelationStatusRequest,
   MemoryClearRequest,
   IndexStaleStatus,
+  IndexRebuildProgress,
   ModelRole,
   PresetPlanItem,
   PresetPlanReport,
@@ -105,6 +106,7 @@ const makeSummary = (localDate: string): HomeSummary => ({
     ocr_pages: 42,
     progress: 0.84,
   },
+  index_initialized: true,
   recent_files: recentFiles,
   favorite_files: [
     { ...recentFiles[0]!, name: "重要项目资料", extension: "folder", subtitle: "12 项" },
@@ -136,6 +138,7 @@ const defaultEnvironment: EnvironmentCheck = {
 const defaultInferenceRuntime: InferenceRuntimeState = {
   backend: "cpu",
   device_names: [],
+  running_models: [],
   gpu_available: false,
   gpu_offload_layers: 0,
   gpu_offload_mode: "disabled",
@@ -210,7 +213,7 @@ const demoModelPresets: ModelPreset[] = [
     display_name: "轻量模式",
     description: "最低资源占用，8GB 内存、无独立显卡也能完成基础搜索与 RAG。",
     generation: "qwen3-5-0-8b-q4",
-    embedding: "bge-small-zh-int8",
+    embedding: "qwen3-embedding-0-6b",
     reranker: null,
     asr: null,
     ocr: "ppocr-v6-small",
@@ -229,7 +232,7 @@ const demoModelPresets: ModelPreset[] = [
     display_name: "标准模式",
     description: "适合大多数配备独显的电脑，完整问答、智能检索、语音输入、增强 OCR。",
     generation: "qwen3-5-2b-q4",
-    embedding: "bge-small-zh-int8",
+    embedding: "qwen3-embedding-0-6b",
     reranker: "bge-reranker-base-int8",
     asr: "sensevoice-small",
     ocr: "ppocr-v6-small",
@@ -248,7 +251,7 @@ const demoModelPresets: ModelPreset[] = [
     display_name: "增强模式",
     description: "更高的问答质量与更稳定的 Query Understanding、跨文档检索与综合。",
     generation: "qwen3-5-4b-q4",
-    embedding: "bge-m3",
+    embedding: "qwen3-embedding-0-6b",
     reranker: "bge-reranker-base-int8",
     asr: "sensevoice-small",
     ocr: "ppocr-v6-medium",
@@ -267,7 +270,7 @@ const demoModelPresets: ModelPreset[] = [
     display_name: "旗舰模式",
     description: "翻翻最高质量本地配置，适合 32GB+ 内存与 12GB+ 显存的工作站。",
     generation: "qwen3-5-9b-q4",
-    embedding: "bge-m3",
+    embedding: "qwen3-embedding-0-6b",
     reranker: "bge-reranker-base-int8",
     asr: "sensevoice-small",
     ocr: "ppocr-v6-medium",
@@ -283,7 +286,7 @@ const demoModelPresets: ModelPreset[] = [
   },
 ];
 const demoRoleCatalog: ModelCatalogEntry[] = [
-  ["bge-small-zh-int8", "embedding", "BGE", "BGE-small-zh-v1.5 · 默认", "bge-small-zh-v1.5-onnx-int8", "中文资料检索的轻量向量模型。", 24_304_813, 1, null, "快", true, "所有受支持设备均推荐", "embedding_bge_small", ["modelscope"]],
+  ["qwen3-embedding-0-6b", "embedding", "Qwen3-Embedding", "Qwen3-Embedding 0.6B · 多语言", "qwen3-embedding:0.6b", "经本机 Ollama 提供的中文多语言向量模型（1024 维），四档预设统一使用。", 639_000_000, 1, null, "快", true, "所有受支持设备均推荐；经 Ollama 拉取，切换后需要新建索引代际", "embedding_qwen3_embedding", ["ollama"]],
   ["bge-reranker-base-int8", "reranker", "BGE Reranker", "BGE Reranker Base · 可选", "bge-reranker-base-onnx-int8", "对少量混合召回候选做相关性复核。", 296_335_457, 2, null, "中等", false, "更重视速度时可不配置", "reranker_bge_base_int8", ["modelscope"]],
 ].map(([catalog_id, role, family, name, model_id, description, download_size_bytes, estimated_memory_gb, estimated_vram_gb, cpu_speed, recommended, device_guidance, install_edition_id, supported_sources]) => ({
   catalog_id: catalog_id as string,
@@ -298,7 +301,7 @@ const demoRoleCatalog: ModelCatalogEntry[] = [
   estimated_memory_gb: estimated_memory_gb as number,
   estimated_vram_gb: estimated_vram_gb as number | null,
   cpu_speed: cpu_speed as string,
-  license_name: role === "embedding" || role === "reranker" ? "MIT" : "Apache-2.0",
+  license_name: role === "reranker" ? "MIT" : "Apache-2.0",
   recommended: recommended as boolean,
   device_guidance: device_guidance as string,
   verification_status: install_edition_id ? "verified" : "local_import_only",
@@ -410,19 +413,21 @@ export const browserBridge: FanFanBridge = {
   async inference_runtime_refresh() {
     return undefined;
   },
+  async ollama_status_get() {
+    // 浏览器预览不连本机 Ollama：报告为已就绪，避免界面显示「未安装引导」干扰交互测试。
+    return { status: "ready", version: "preview", starting: false, error_code: null };
+  },
+  async ollama_start() {
+    return { status: "ready", version: "preview", starting: false, error_code: null };
+  },
+  async ollama_stop() {
+    return { status: "installed_not_running", version: "", starting: false, error_code: null };
+  },
   async model_state_get() {
     const stored = window.localStorage.getItem(MODEL_KEY);
     if (stored) return JSON.parse(stored) as ModelRuntimeState;
     const embedding = demoActiveRoles.has("embedding");
     return embedding ? { ...defaultModelState, status: "ready", runtime_backend: "cpu", capabilities: { ...defaultModelState.capabilities, embedding: true } } : defaultModelState;
-  },
-  async model_import_scan(paths) {
-    return paths.map((path, index) => ({ candidate_id: crypto.randomUUID(), source_path: path, display_name: path.split(/[\\/]/).pop() || `model-${index + 1}`, format: path.toLowerCase().endsWith(".gguf") ? "gguf" as const : "onnx" as const, suggested_role: path.toLowerCase().endsWith(".gguf") ? "generation" as const : "embedding" as const, size_bytes: 1024 * 1024 * (index + 1), sha256: "0".repeat(64), companion_files: [], warnings: [] }));
-  },
-  async model_import_confirm(selections) {
-    const installed = selections.map((selection) => ({ artifact_id: crypto.randomUUID(), role: selection.role, format: selection.source_path.toLowerCase().endsWith(".gguf") ? "gguf" as const : "onnx" as const, model_id: selection.source_path.split(/[\\/]/).pop() || "local-model", model_version: null, source: "local_import" as const, repository_id: null, revision: null, sha256: "0".repeat(64), size_bytes: 1024 * 1024, local_path: selection.source_path, quantization: null, context_length: null, embedding_dimension: null, query_prefix: null, max_length: null, license_name: null, status: "ready", imported_at: now() }));
-    demoArtifacts = [...demoArtifacts, ...installed];
-    return installed;
   },
   async model_role_catalog_list() {
     return structuredClone(demoRoleCatalog);
@@ -481,10 +486,11 @@ export const browserBridge: FanFanBridge = {
   async model_download_start(edition_id, source) {
     const entry = demoRoleCatalog.find((item) => item.install_edition_id === edition_id);
     if (!entry) throw new Error("模型版本不存在");
+    const isOllamaEntry = entry.role === "generation" || entry.role === "embedding";
     const artifact: ModelArtifact = {
       artifact_id: crypto.randomUUID(),
       role: entry.role,
-      format: entry.role === "generation" ? "gguf" : "onnx",
+      format: isOllamaEntry ? "ollama" : "onnx",
       model_id: entry.model_id,
       model_version: null,
       source,
@@ -492,10 +498,10 @@ export const browserBridge: FanFanBridge = {
       revision: null,
       sha256: "0".repeat(64),
       size_bytes: entry.download_size_bytes ?? 0,
-      local_path: `C:\\Users\\你\\AppData\\Roaming\\com.fanfan.desktop\\models\\${entry.model_id}`,
-      quantization: entry.role === "generation" ? "Q4_K_M" : null,
+      local_path: isOllamaEntry ? entry.model_id : `C:\\Users\\你\\AppData\\Roaming\\com.fanfan.desktop\\models\\${entry.model_id}`,
+      quantization: null,
       context_length: null,
-      embedding_dimension: entry.role === "embedding" ? 512 : null,
+      embedding_dimension: entry.role === "embedding" ? 1024 : null,
       query_prefix: entry.role === "embedding" ? "为这个句子生成表示以用于检索相关文章：" : null,
       max_length: entry.role === "embedding" ? 512 : null,
       license_name: entry.license_name,
@@ -665,6 +671,7 @@ export const browserBridge: FanFanBridge = {
         retrieval_channels: ["filename", "fts", "embedding", "rrf"],
         index_coverage: 1,
         degradation_reason: null,
+        thinking: null,
       };
     } else {
       const source_files = matches.map((match) => ({
@@ -705,6 +712,7 @@ export const browserBridge: FanFanBridge = {
         retrieval_channels: ["filename", "fts", "embedding", "rrf"],
         index_coverage: 1,
         degradation_reason: null,
+        thinking: null,
       };
     }
     const operation_id = crypto.randomUUID();
@@ -894,9 +902,9 @@ export const browserBridge: FanFanBridge = {
   async collection_suggestion_refresh() {
     if (demoSuggestions.length === 0) {
       const members = demoFileRecords().slice(0, 2).map((file, index) => ({ file, revision_id: file.current_revision_id!, confidence: index === 0 ? 1 : 0.86, rationale: index === 0 ? "该文档是本组语义质心候选" : "与组内核心文档的语义相似度为 86%", state: "suggested" }));
-      demoSuggestions = [{ suggestion_id: crypto.randomUUID(), suggested_name: "RAG 检索优化资料", description: "这些资料的语义画像都在讨论混合召回与检索效果。确认后只在翻翻中形成虚拟分类。", confidence: 0.86, status: "suggested", model_version: "demo-bge-small-zh-v1.5", algorithm_version: "semantic_cluster_v3", members, created_at: now(), updated_at: now() }];
+      demoSuggestions = [{ suggestion_id: crypto.randomUUID(), suggested_name: "RAG 检索优化资料", description: "这些资料的语义画像都在讨论混合召回与检索效果。确认后只在翻翻中形成虚拟分类。", confidence: 0.86, status: "suggested", model_version: "demo-qwen3-embedding-0-6b", algorithm_version: "semantic_cluster_v3", members, created_at: now(), updated_at: now() }];
     }
-    return { profiled_files: 2, candidate_edges: 1, created_suggestions: demoSuggestions.length, suggestion_ids: demoSuggestions.map((item) => item.suggestion_id), algorithm_version: "semantic_cluster_v3", model_version: "demo-bge-small-zh-v1.5", topic_groups: 1, remaining_topic_groups: 0 };
+    return { profiled_files: 2, candidate_edges: 1, created_suggestions: demoSuggestions.length, suggestion_ids: demoSuggestions.map((item) => item.suggestion_id), algorithm_version: "semantic_cluster_v3", model_version: "demo-qwen3-embedding-0-6b", topic_groups: 1, remaining_topic_groups: 0 };
   },
   async collection_suggestion_query(cursor, page_size, status = "suggested") {
     const filtered = demoSuggestions.filter((item) => item.status === status);
@@ -977,12 +985,12 @@ export const browserBridge: FanFanBridge = {
   },
   async exclusion_rule_delete(rule_id) { demoExclusionRules = demoExclusionRules.filter((item) => item.rule_id !== rule_id); },
   async app_status_get() {
-    const maintenance = { schema_version: 19, database_size_bytes: 12_582_912, indexed_files: 3, searchable_chunks: 18, embedded_chunks: 0, pending_files: 0, failed_files: 0, active_jobs: 0, log_events: 3, background_notice: null, checks: [{ key: "database", label: "本地数据库", status: "passed" as const, detail: "ok" }, { key: "schema", label: "数据结构", status: "passed" as const, detail: "版本 19" }, { key: "source_readonly", label: "源文件保护", status: "passed" as const, detail: "维护操作只作用于翻翻索引与日志" }], checked_at: now() };
+    const maintenance = { schema_version: 19, database_size_bytes: 12_582_912, indexed_files: 0, indexable_files: 3, parsed_files: 3, embedded_files: 0, active_index_files: 0, searchable_chunks: 18, embedded_chunks: 0, active_vector_keys: 0, pending_files: 0, failed_files: 0, active_jobs: 0, log_events: 3, background_notice: null, checks: [{ key: "database", label: "本地数据库", status: "passed" as const, detail: "ok" }, { key: "schema", label: "数据结构", status: "passed" as const, detail: "版本 19" }, { key: "source_readonly", label: "源文件保护", status: "passed" as const, detail: "维护操作只作用于翻翻索引与日志" }], checked_at: now() };
     return { local_only: true as const, source_files_readonly: true as const, roots: [...roots], scan_progress: null, maintenance, inference_runtime: defaultInferenceRuntime, ai_runtime: defaultAiRuntime, recovery_actions: ["view_models" as const], checked_at: now() };
   },
   async runtime_state_get() { return structuredClone(defaultAiRuntime); },
   async maintenance_get() {
-    return { schema_version: 19, database_size_bytes: 12_582_912, indexed_files: 3, searchable_chunks: 18, embedded_chunks: 0, pending_files: 0, failed_files: 0, active_jobs: 0, log_events: 3, background_notice: null, checks: [{ key: "database", label: "本地数据库", status: "passed" as const, detail: "ok" }, { key: "schema", label: "数据结构", status: "passed" as const, detail: "版本 19" }, { key: "source_readonly", label: "源文件保护", status: "passed" as const, detail: "维护操作只作用于翻翻索引与日志" }], checked_at: now() };
+    return { schema_version: 19, database_size_bytes: 12_582_912, indexed_files: 0, indexable_files: 3, parsed_files: 3, embedded_files: 0, active_index_files: 0, searchable_chunks: 18, embedded_chunks: 0, active_vector_keys: 0, pending_files: 0, failed_files: 0, active_jobs: 0, log_events: 3, background_notice: null, checks: [{ key: "database", label: "本地数据库", status: "passed" as const, detail: "ok" }, { key: "schema", label: "数据结构", status: "passed" as const, detail: "版本 19" }, { key: "source_readonly", label: "源文件保护", status: "passed" as const, detail: "维护操作只作用于翻翻索引与日志" }], checked_at: now() };
   },
   async maintenance_check(level) {
     return { level, database_result: "ok", elapsed_ms: 1, source_files_modified: false };
@@ -1174,11 +1182,14 @@ export const browserBridge: FanFanBridge = {
   async index_rebuild() {
     return { operation_id: crypto.randomUUID(), kind: "index_rebuild" as const, status: "queued" as const, created_at: now() };
   },
+  async index_rebuild_progress(): Promise<IndexRebuildProgress> {
+    return { running: false, phase: "idle", done: 0, total: 0, percent: 100 };
+  },
   async root_list() {
     return [...roots];
   },
   async root_add(request) {
-    const root: RootRecord = { root_id: "018f0000-0000-7000-8000-000000000405", path: request.path, canonical_path: request.path, path_key: request.path.toLocaleLowerCase("zh-CN"), root_file_id: null, volume_id: "vol-demo", volume_type: "fixed", authorization_source: request.authorization_source, root_kind: request.full_volume_confirmed ? "volume_root" : "folder", label: request.label || request.path, enabled: true, status: "ready", watch_mode: request.watch_mode, coverage_parent_root_id: null, file_count: 0, permission_error_count: 0, last_scan_at: null };
+    const root: RootRecord = { root_id: "018f0000-0000-7000-8000-000000000405", path: request.path, canonical_path: request.path, path_key: request.path.toLocaleLowerCase("zh-CN"), root_file_id: null, volume_id: "vol-demo", volume_type: "fixed", authorization_source: request.authorization_source, root_kind: request.full_volume_confirmed ? "volume_root" : "folder", label: request.label || request.path, enabled: true, status: "ready", watch_mode: request.watch_mode, coverage_parent_root_id: null, file_count: 0, permission_error_count: 0, last_scan_at: null, indexed_file_count: 0, indexable_file_count: 0, parsed_file_count: 0, embedded_file_count: 0, active_index_file_count: 0 };
     roots.push(root);
     return root;
   },

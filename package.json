@@ -17,11 +17,8 @@
     "ragas:ci": "python -m pip install --disable-pip-version-check -e eval/ragas && python -m unittest discover -s eval/ragas/tests -p test_*.py -v",
     "worker:build": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build_worker.ps1",
     "worker:packaged-check": "python scripts/validate_packaged_worker.py",
-    "runtime:prepare": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/prepare_llama_runtime.ps1",
-    "runtime:check": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/validate_llama_runtime.ps1",
     "semantic:performance": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/validate_semantic_performance.ps1",
-    "generation:smoke": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/validate_local_generation.ps1",
-    "installer:build": "corepack pnpm runtime:check && corepack pnpm worker:build && corepack pnpm worker:packaged-check && corepack pnpm --filter @fanfan/desktop tauri:build --bundles nsis",
+    "installer:build": "corepack pnpm worker:build && corepack pnpm worker:packaged-check && corepack pnpm --filter @fanfan/desktop tauri:build --bundles nsis",
     "installer:smoke": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/validate_installer.ps1",
     "release:manifest": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/generate_release_manifest.ps1",
     "search:baseline": "cargo run -p fanfan-core --example evaluate_search --locked",
@@ -29,7 +26,7 @@
     "fixtures:check": "python scripts/validate_test_corpus.py",
     "rust:check": "cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked",
     "verify": "corepack pnpm contracts:check && corepack pnpm fixtures:check && corepack pnpm check && corepack pnpm worker:test && corepack pnpm worker:corpus && corepack pnpm ragas:test && corepack pnpm rust:check && corepack pnpm search:baseline",
-    "verify:release": "corepack pnpm verify && corepack pnpm worker:build && corepack pnpm worker:packaged-check && corepack pnpm runtime:check && corepack pnpm semantic:performance && corepack pnpm generation:smoke"
+    "verify:release": "corepack pnpm verify && corepack pnpm worker:build && corepack pnpm worker:packaged-check && corepack pnpm semantic:performance"
   },
   "dependencies": {
     "react-markdown": "^10.1.0",

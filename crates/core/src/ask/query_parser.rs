@@ -37,13 +37,14 @@ pub fn query_parser_schema() -> serde_json::Value {
         "type": "object",
         "additionalProperties": false,
         "required": [
-            "reference", "document_type", "document_name",
+            "reference", "document_type", "document_name", "precise_named_document",
             "owner", "entity_type", "entity_name"
         ],
         "properties": {
             "reference": {"type": ["string", "null"], "maxLength": 200},
             "document_type": {"type": ["string", "null"]},
             "document_name": {"type": ["string", "null"], "maxLength": 200},
+            "precise_named_document": {"type": "boolean"},
             "owner": {"type": ["string", "null"], "maxLength": 50},
             "entity_type": {"type": ["string", "null"], "maxLength": 100},
             "entity_name": {"type": ["string", "null"], "maxLength": 200}
@@ -86,13 +87,14 @@ pub fn query_parser_schema() -> serde_json::Value {
                 "type": ["object", "null"],
                 "additionalProperties": false,
                 "required": [
-                    "reference", "document_type", "document_name",
+                    "reference", "document_type", "document_name", "precise_named_document",
                     "owner", "entity_type", "entity_name"
                 ],
                 "properties": {
                     "reference": {"type": ["string", "null"], "maxLength": 200},
                     "document_type": {"type": ["string", "null"]},
                     "document_name": {"type": ["string", "null"], "maxLength": 200},
+                    "precise_named_document": {"type": "boolean"},
                     "owner": {"type": ["string", "null"], "maxLength": 50},
                     "entity_type": {"type": ["string", "null"], "maxLength": 100},
                     "entity_name": {"type": ["string", "null"], "maxLength": 200}
@@ -140,6 +142,7 @@ pub fn query_parser_prompt(question: &str, history: &[AskMessage]) -> (String, S
 - 「我的简历里有没有写 X」「我的简历里有没有提到 X」是存在性问句 → operation = "qa"（回答「有/没有」），绝不是 extract。
 - 「我以前有没有做过 Agent 项目？」是存在性问句 → operation = "qa"；只有明确要清单（「把项目名称提取出来」「列出所有项目」）才是 extract。
 - 「我的资料里是怎么介绍 RAG 的？」「我的文件里有没有提到 Transformer？」→ LIBRARY_QA；content_query 只填真正的内容词（RAG / Transformer），「我的资料里是怎么介绍的」是 scope 引导语，不算内容。
+- 明确限定在某个文档对象内部查询（我的**简历**里找 X / 那份**合同**里有没有 Y）→ DOCUMENT_QA（单文档/单类型内检索），target 必须填该对象、requires_document_resolution = true；**禁止**把「我的简历」这种目标限定整句丢进 content_query 或误判为全库 LIBRARY_QA。
 - 「我的简历有什么内容」「我的简历主要写了什么」→ DOCUMENT_SUMMARY（整文摘要），不是普通关键词检索；content_query 为 null，requires_full_document = true。
 - 「我的简历在哪里」→ DOCUMENT_FIND；content_query 为 null。
 - 「所有文件里哪些提到了 RAG」「我的资料里有没有 LangGraph」→ LIBRARY_QA；target 为空对象，content_query = 实际检索词。
@@ -153,6 +156,7 @@ pub fn query_parser_prompt(question: &str, history: &[AskMessage]) -> (String, S
 - requires_project_context：只有「是否做过/参与过某类项目或经历」这类存在性断言才填 true（如「我以前有没有做过 Agent 项目？」→ true），其余一律 false。
 - requires_entity_items：只有 EXTRACT 清单的条目必须是「实体/名称形式」（如「有哪些项目」→ 条目是项目名称，不是整段技术描述）时才填 true；条目可以是事实片段/描述（如日期、条款、联系方式）时填 false；非 extract 一律 false。
 - 明确说「我的」时 owner 填 "self"，否则 null。
+- 用户**精确点名**某份文档时（给出完整标题或文件名，如「周晨博20212P2002《专业实习》课程实习总结报告.docx」）：target.document_name 必须填该完整标题、precise_named_document = true、requires_document_resolution = true；凭指代/类型定位（「我的简历」「那份合同」）时 precise_named_document = false。precise_named_document 只表达「用户精确点名」这一语义判定，不得把它当关键词收集。
 - 不确定的字段填 null，不要编造。
 
 【示例】
@@ -169,7 +173,10 @@ pub fn query_parser_prompt(question: &str, history: &[AskMessage]) -> (String, S
 输出：{{"source":"local","intent":"document_qa","operation":"qa","target":{{"reference":"我的经历","document_type":null,"document_name":null,"owner":"self","entity_type":null,"entity_name":null}},"content_query":"Agent 项目","filters":{{"time":null,"file_type":null,"path":null}},"question_shape":"boolean_existence","requires_project_context":true,"requires_document_resolution":false,"requires_full_document":false,"confidence":0.88}}
 
 用户：比较我两个简历版本有什么不同？
-输出：{{"source":"local","intent":"compare_documents","operation":"compare","target":{{"reference":"我的简历","document_type":"resume","document_name":null,"owner":"self","entity_type":null,"entity_name":null}},"secondary_target":{{"reference":"第二个版本","document_type":null,"document_name":null,"owner":null,"entity_type":null,"entity_name":null}},"content_query":"有什么不同","filters":{{"time":null,"file_type":null,"path":null}},"question_shape":"description","requires_project_context":false,"requires_document_resolution":true,"requires_full_document":false,"confidence":0.92}}
+输出：{{"source":"local","intent":"compare_documents","operation":"compare","target":{{"reference":"我的简历","document_type":"resume","document_name":null,"precise_named_document":false,"owner":"self","entity_type":null,"entity_name":null}},"secondary_target":{{"reference":"第二个版本","document_type":null,"document_name":null,"precise_named_document":false,"owner":null,"entity_type":null,"entity_name":null}},"content_query":"有什么不同","filters":{{"time":null,"file_type":null,"path":null}},"question_shape":"description","requires_project_context":false,"requires_entity_items":false,"requires_document_resolution":true,"requires_full_document":false,"confidence":0.92}}
+
+用户：概括一下周晨博20212P2002《专业实习》课程实习总结报告.docx都在讲什么？
+输出：{{"source":"local","intent":"document_summary","operation":"summary","target":{{"reference":null,"document_type":null,"document_name":"周晨博20212P2002《专业实习》课程实习总结报告.docx","precise_named_document":true,"owner":null,"entity_type":null,"entity_name":null}},"content_query":null,"filters":{{"time":null,"file_type":null,"path":null}},"question_shape":"summary","requires_project_context":false,"requires_entity_items":false,"requires_document_resolution":true,"requires_full_document":true,"confidence":0.98}}
 
 只输出符合 JSON Schema 的对象，不要输出 Markdown、代码块或解释。"#,
         question = question.trim()
@@ -301,7 +308,13 @@ pub fn finalize_query_plan(
     _question: &str,
     history: &[AskMessage],
 ) -> Option<QueryPlan> {
-    // 1. target 非空且需要定位 → 强制走 Document Resolver
+    // 1. target 非空 → 强制走 Document Resolver。诊断报告 P0-1：白名单式判定
+    //    （resolver_intents）会让「intent=library_qa 但 target 明确指到简历」时
+    //    丢失目标对象——target 里显式的文档信息必须永远被尊重，不依赖模型把
+    //    intent 恰好判成白名单内的类型。目标对象明确时：
+    //    - requires_document_resolution 一律置真；
+    //    - LibraryQa（全库泛指）若同时带 target 限定 → 归一化为 DocumentQa
+    //      （单文档/单类型内检索），避免「在简历里找 RAG 项目」走全库检索。
     let target_non_empty = plan
         .target
         .reference
@@ -318,15 +331,11 @@ pub fn finalize_query_plan(
             .entity_name
             .as_deref()
             .is_some_and(|v| !v.trim().is_empty());
-    let resolver_intents = [
-        QueryIntent::DocumentQa,
-        QueryIntent::DocumentSummary,
-        QueryIntent::MultiDocumentQa,
-        QueryIntent::CompareDocuments,
-        QueryIntent::DocumentFind,
-    ];
-    if target_non_empty && resolver_intents.contains(&plan.intent) {
+    if target_non_empty {
         plan.requires_document_resolution = true;
+        if plan.intent == QueryIntent::LibraryQa {
+            plan.intent = QueryIntent::DocumentQa;
+        }
     }
     // 2. 回声防护（在 scope 剥离**之前**）：解析结果等于历史任一用户问题
     // → 解析失败。必须先判——剥离会把复读句拆成残片（「我的资料里有没有
@@ -410,6 +419,10 @@ fn parse_query_plan_lenient(value: &serde_json::Value) -> Option<QueryPlan> {
             .get("document_name")
             .and_then(|value| value.as_str())
             .map(str::to_owned);
+        plan.target.precise_named_document = target
+            .get("precise_named_document")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
         plan.target.owner = target
             .get("owner")
             .and_then(|value| value.as_str())
@@ -442,6 +455,10 @@ fn parse_query_plan_lenient(value: &serde_json::Value) -> Option<QueryPlan> {
                 .get("document_name")
                 .and_then(|value| value.as_str())
                 .map(str::to_owned),
+            precise_named_document: target
+                .get("precise_named_document")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
             owner: target
                 .get("owner")
                 .and_then(|value| value.as_str())
@@ -458,6 +475,7 @@ fn parse_query_plan_lenient(value: &serde_json::Value) -> Option<QueryPlan> {
         let is_empty = secondary.reference.is_none()
             && secondary.document_type.is_none()
             && secondary.document_name.is_none()
+            && !secondary.precise_named_document
             && secondary.owner.is_none()
             && secondary.entity_type.is_none()
             && secondary.entity_name.is_none();
@@ -702,6 +720,30 @@ mod tests {
         let empty = raw.replace("\"secondary_target\":null", r#""secondary_target":{"reference":null,"document_type":null,"document_name":null,"owner":null,"entity_type":null,"entity_name":null}"#);
         let plan = parse_query_plan(&empty).expect("parses");
         assert!(plan.secondary_target.is_none());
+    }
+
+    #[test]
+    fn parses_precise_named_document_flag() {
+        // 模型驱动精确定位：解析器把「完整标题+精确点名」读入 document_name 与
+        // precise_named_document。
+        let raw = r#"{"source":"local","intent":"document_summary","operation":"summary",
+            "target":{"reference":null,"document_type":null,
+                      "document_name":"周晨博20212P2002《专业实习》课程实习总结报告.docx",
+                      "precise_named_document":true,"owner":null,"entity_type":null,"entity_name":null},
+            "content_query":null,"filters":{"time":null,"file_type":null,"path":null},
+            "question_shape":"summary","requires_project_context":false,"requires_entity_items":false,
+            "requires_document_resolution":true,"requires_full_document":true,"confidence":0.98}"#;
+        let plan = parse_query_plan(raw).expect("parses");
+        assert_eq!(
+            plan.target.document_name.as_deref(),
+            Some("周晨博20212P2002《专业实习》课程实习总结报告.docx")
+        );
+        assert!(plan.target.precise_named_document);
+        assert!(plan.requires_document_resolution);
+        // 缺省（model 未给该字段）→ 默认 false，兼容旧主体输出
+        let without = raw.replace("\"precise_named_document\":true,", "");
+        let plan = parse_query_plan(&without).expect("parses without flag");
+        assert!(!plan.target.precise_named_document);
     }
 
     #[test]

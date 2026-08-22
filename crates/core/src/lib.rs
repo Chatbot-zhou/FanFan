@@ -10,6 +10,7 @@ pub mod maintenance;
 pub mod memory;
 pub mod model_catalog;
 pub mod models;
+pub mod ollama;
 pub mod organizing;
 pub mod preset_resolver;
 pub mod profile_builder;
@@ -42,8 +43,10 @@ pub use ask::document_retrieval::{
     DOCUMENT_RECALL_METADATA_ONLY_WEIGHT, DOCUMENT_RECALL_METADATA_WEIGHT,
     DOCUMENT_RECALL_MIN_SCORE, DOCUMENT_RECALL_MIN_SIGNAL_LEN, DOCUMENT_RECALL_TOP_N,
     DOCUMENT_RECALL_VECTOR_CANDIDATES, DOCUMENT_RECALL_VECTOR_WEIGHT, DocumentCandidateMatch,
-    cosine_similarity, preselect_document_profiles, rank_document_candidates,
-    score_document_metadata,
+    PARALLEL_RECALL_TOP_N, ParallelDocumentRecall, RRF_K, SEMANTIC_RECALL_MAX_CANDIDATES,
+    SEMANTIC_RECALL_MIN_SIMILARITY, cosine_similarity, metadata_ranked_candidates,
+    metadata_ranked_ids, parallel_document_recall, preselect_document_profiles,
+    rank_document_candidates, rrf_fuse, score_document_metadata, semantic_document_recall,
 };
 pub use ask::document_summary::{
     DocumentOverview, DocumentSection, MAX_SECTION_CHARS, MAX_SECTIONS, SectionChunk,
@@ -67,6 +70,7 @@ pub use ask::query_plan::{
     DocumentCandidate, DocumentResolution, EvidenceStatus, QueryFilters, QueryOperation, QueryPlan,
     QueryTarget, SourceIntent,
 };
+pub use ask::query_planner::{FAST_PATH_CONFIDENCE_THRESHOLD, FastPathPlan, fast_path_plan};
 pub use ask::source_router::{
     SourceRouting, parse_source_routing, source_router_prompt, source_routing_schema,
 };
@@ -81,6 +85,7 @@ pub use maintenance::*;
 pub use memory::*;
 pub use model_catalog::*;
 pub use models::*;
+pub use ollama::*;
 pub use organizing::*;
 pub use preset_resolver::*;
 pub use router::*;

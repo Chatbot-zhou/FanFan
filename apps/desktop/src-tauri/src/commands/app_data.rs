@@ -17,6 +17,7 @@ use fanfan_core::ask::builtin_knowledge::lookup_builtin_knowledge;
 use fanfan_core::ask::query_normalize::normalize_query_variants;
 use fanfan_core::ask::query_plan::{QueryIntent, QueryOperation, ResolutionStatus};
 use fanfan_core::ask::source_router::{SourceRouting, personal_reference_hit};
+use fanfan_core::ollama::{OLLAMA_START_TIMEOUT, OllamaClient, OllamaPullProgress, ensure_running};
 use fanfan_core::profile_builder::{TYPE_PROTOTYPE_TEXTS, TypePrototype, classify_document_type};
 use fanfan_core::{
     AddRootRequest, AiRuntimeSnapshot, AnswerClaim, AnswerMode, AnswerResult, AnswerSourceFile,
@@ -27,26 +28,26 @@ use fanfan_core::{
     CatalogService, ChunkEmbeddingInput, ClarificationOption, ClarificationPayload,
     CollectionModelReview, CollectionRecord, CollectionRule, CollectionSuggestion,
     CollectionSuggestionPage, CollectionSuggestionQuery, CollectionSuggestionRefreshResult,
-    CollectionSuggestionUpdateRequest, CompareResults, CreateCollectionRequest,
-    DOCUMENT_RECALL_TOP_N, DOCUMENT_RECALL_VECTOR_CANDIDATES, DegradationLevel, DocumentCandidate,
-    DocumentOverview, DocumentProfile, DocumentProfileInspect, DocumentProfileRebuildRequest,
-    DocumentType, DownloadFile, DownloadedModelMetadata, EXTRACT_MATCH_MIN_LEN, EXTRACT_MAX_ITEMS,
-    EmbeddingRequest, EvidenceRef, ExclusionRule, ExclusionRuleInput, ExportResult, FilePage,
-    FilePreview, FileQuery, FileRecord, GateEvidence, GenerationActivation, GroundingStatus,
-    ImageOcrResult, ImageOcrRoutingRequest, ImageUnderstandingResult, ImportCandidate, InboxItem,
-    InboxPage, InboxQuery, InboxUpdateRequest, IncrementalWatchManager, IndexActivityStats,
-    JobRecord, LOCAL_STRICT_SYSTEM_PROMPT, LocalGenerationRuntime, LogPage, LogQuery,
-    MAX_CANDIDATE_SCOPE, MAX_SECTION_CHARS, MAX_SECTIONS, MaintenanceSnapshot, MemoryClearRequest,
-    MemoryHint, MemoryInspectorView, MemoryKind, MemoryRelationStatusRequest, MemorySource,
-    MemoryStatus, MemoryTargetRegistry, MemoryTargetType, MemoryWriteInput, MemoryWriterContext,
-    ModelArtifact, ModelCatalogEntry, ModelDownloadFileProgress, ModelDownloadJob,
-    ModelDownloadRemoval, ModelEdition, ModelFormat, ModelImportSelection, ModelManager,
-    ModelPreset, ModelRole, ModelSource, ModelStoreStatus, NoEvidenceReason, NodeTracePage,
-    NodeTraceQuery, NodeTraceRecord, OcrRuntimeConfig, OperationTraceInput, ParseMetrics,
-    ParseOutcome, ParseRequest, ParseResult, PendingEmbeddingActivation, ProfileRefreshResult,
-    QueryPlan, RagReadiness, RelationGroupPage, RelationGroupQuery, RelationPage, RelationQuery,
-    RelationRefreshResult, RerankRequest, ResolverInput, RootRecord, RuntimeBackendKind,
-    RuntimeCapability, RuntimeInstanceState, RuntimeManager, RuntimeResourceBudget,
+    CollectionSuggestionUpdateRequest, CompareResults, CreateCollectionRequest, DegradationLevel,
+    DocumentCandidate, DocumentOverview, DocumentProfile, DocumentProfileInspect,
+    DocumentProfileRebuildRequest, DocumentType, DownloadFile, DownloadedModelMetadata,
+    EXTRACT_MATCH_MIN_LEN, EXTRACT_MAX_ITEMS, EmbeddingResponse, EvidenceRef, ExclusionRule,
+    ExclusionRuleInput, ExportResult, FastPathPlan, FilePage, FilePreview, FileQuery, FileRecord,
+    GateEvidence, GenerationActivation, GroundingStatus, ImageOcrResult, ImageOcrRoutingRequest,
+    ImageUnderstandingResult, InboxItem, InboxPage, InboxQuery, InboxUpdateRequest,
+    IncrementalWatchManager, IndexActivityStats, JobRecord, LOCAL_STRICT_SYSTEM_PROMPT,
+    LocalGenerationRuntime, LogPage, LogQuery, MAX_CANDIDATE_SCOPE, MAX_SECTION_CHARS,
+    MAX_SECTIONS, MaintenanceSnapshot, MemoryClearRequest, MemoryHint, MemoryInspectorView,
+    MemoryKind, MemoryRelationStatusRequest, MemorySource, MemoryStatus, MemoryTargetRegistry,
+    MemoryTargetType, MemoryWriteInput, MemoryWriterContext, ModelArtifact, ModelCatalogEntry,
+    ModelDownloadFileProgress, ModelDownloadJob, ModelDownloadRemoval, ModelEdition, ModelFormat,
+    ModelImportSelection, ModelManager, ModelPreset, ModelRole, ModelSource, ModelStoreStatus,
+    NoEvidenceReason, NodeTracePage, NodeTraceQuery, NodeTraceRecord, OcrRuntimeConfig,
+    OperationTraceInput, PARALLEL_RECALL_TOP_N, ParseMetrics, ParseOutcome, ParseRequest,
+    ParseResult, PendingEmbeddingActivation, ProfileRefreshResult, QueryPlan, RagReadiness,
+    RelationGroupPage, RelationGroupQuery, RelationPage, RelationQuery, RelationRefreshResult,
+    RerankRequest, ResolverInput, RootRecord, RuntimeBackendKind, RuntimeCapability,
+    RuntimeInstanceState, RuntimeManager, RuntimeModelPlacement, RuntimeResourceBudget,
     RuntimeTaskKind, RuntimeTaskRequest, ScopeFilter, SearchMode, SearchRequest, SearchSession,
     SectionChunk, SectionSummary, SemanticQuery, SourceIntent, SpeechRecognitionRequest,
     SpeechRecognitionResult, StructureEntry, SupportStatus, TraceFeatureType, TraceNodeInput,
@@ -54,15 +55,14 @@ use fanfan_core::{
     build_document_sections, chat_prompt, claim_subject_mismatch, compare_prompt, compare_schema,
     digests_json, document_overview_prompt, document_summary_prompt, evaluate_answerability,
     existence_requires_project_context, extract_item_is_entity_like, extract_prompt,
-    extract_schema, find_external_knowledge_marker, local_no_evidence_answer,
+    extract_schema, fast_path_plan, find_external_knowledge_marker, local_no_evidence_answer,
     longest_common_substr_len, match_alias_hints, match_relation_hints, memory_writer_prompt,
-    memory_writer_schema, merge_tail_sections, overview_schema, parse_compare_results,
-    parse_extract_results, parse_overview, parse_query_plan, parse_rewritten_queries,
-    parse_section_summaries, parse_source_routing, parse_writer_output,
-    preselect_document_profiles, prewrite_validate, query_parser_prompt, query_parser_schema,
-    query_rewrite_prompt, rank_document_candidates, resolve_ambiguous, resolve_documents,
-    resolve_proposal_targets, section_summary_schema, source_router_prompt, source_routing_schema,
-    strip_long_path_prefix,
+    memory_writer_schema, merge_tail_sections, overview_schema, parallel_document_recall,
+    parse_compare_results, parse_extract_results, parse_overview, parse_query_plan,
+    parse_rewritten_queries, parse_section_summaries, parse_source_routing, parse_writer_output,
+    prewrite_validate, query_parser_prompt, query_parser_schema, query_rewrite_prompt,
+    resolve_ambiguous, resolve_documents, resolve_proposal_targets, section_summary_schema,
+    source_router_prompt, source_routing_schema, strip_long_path_prefix,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -149,6 +149,13 @@ pub struct WorkerServiceState {
     pub image_ocr_running: AtomicBool,
     pub vision_running: AtomicBool,
     pub foreground_activity: AtomicU32,
+    /// 用户主动发起的语义索引重建是否进行中。换模型后重建耗时主要在重新嵌入
+    /// 全部分块与重建向量索引，前端据此轮询 `index_rebuild_progress` 展示进度。
+    pub rebuild_active: AtomicBool,
+    /// 最近一次语义索引重建是否失败（未收敛即退出）。成功收敛会复位为 false，
+    /// 失败（嵌入停滞/索引代切换超时）时置 true，供 `index_rebuild_progress`
+    /// 返回 `phase="failed"`，前端据此提示用户重试。
+    pub rebuild_failed: AtomicBool,
     pub search_embedding_cache: Mutex<SearchEmbeddingCache>,
 }
 
@@ -420,7 +427,11 @@ pub struct AskOperationSnapshot {
     error: Option<AppError>,
 }
 
-type AskProgressCallbacks<'a> = (&'a dyn Fn(&str, f64), &'a dyn Fn(&AnswerClaim));
+type AskProgressCallbacks<'a> = (
+    &'a dyn Fn(&str, f64),
+    &'a dyn Fn(&AnswerClaim),
+    &'a dyn Fn(&str),
+);
 
 #[derive(Debug)]
 struct AskOperationEntry {
@@ -494,6 +505,8 @@ pub struct ModelRuntimeState {
 pub struct InferenceRuntimeState {
     backend: String,
     device_names: Vec<String>,
+    /// 当前驻留内存的各模型硬件占用（来自 Ollama `/api/ps`），供状态面板逐模型展示 CPU/GPU。
+    running_models: Vec<RuntimeModelPlacement>,
     gpu_available: bool,
     gpu_offload_layers: Option<u32>,
     gpu_offload_mode: String,
@@ -752,25 +765,6 @@ fn write_environment_cache(data_directory: &Path, check: &EnvironmentCheck) {
     }
 }
 
-/// 后台 GPU 探测完成后刷新环境状态并落盘：环境页与模型推荐立即拿到探测
-/// 结果（探测完成前 model_state/environment 如实显示 CPU 状态，前后端一致）。
-pub(crate) fn refresh_environment_after_probe(
-    app: &AppHandle,
-    runtime_capability: &RuntimeCapability,
-) {
-    let environment = app.state::<EnvironmentServiceState>();
-    let cached_gpu = read_environment_cache(&environment.data_directory);
-    let check = detect_environment(
-        &environment.data_directory,
-        Some(runtime_capability),
-        cached_gpu,
-    );
-    if let Ok(mut latest) = environment.latest.lock() {
-        *latest = Some(check.clone());
-    }
-    write_environment_cache(&environment.data_directory, &check);
-}
-
 #[tauri::command(async)]
 pub fn environment_get_latest(
     environment: State<'_, EnvironmentServiceState>,
@@ -938,32 +932,6 @@ pub fn rag_readiness_get(
     })
 }
 
-#[derive(Debug, Deserialize)]
-pub struct ModelImportScanRequest {
-    paths: Vec<String>,
-}
-
-#[tauri::command(async)]
-pub fn model_import_scan(
-    request: ModelImportScanRequest,
-    models: State<'_, ModelServiceState>,
-) -> Result<Vec<ImportCandidate>, AppError> {
-    models.get()?.scan_import_paths(&request.paths)
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ModelImportConfirmRequest {
-    selections: Vec<ModelImportSelection>,
-}
-
-#[tauri::command(async)]
-pub fn model_import_confirm(
-    request: ModelImportConfirmRequest,
-    models: State<'_, ModelServiceState>,
-) -> Result<Vec<ModelArtifact>, AppError> {
-    models.get()?.import_artifacts(&request.selections)
-}
-
 #[tauri::command(async)]
 pub fn model_role_catalog_list(
     environment: State<'_, EnvironmentServiceState>,
@@ -1015,6 +983,63 @@ pub struct ModelPresetSelectRequest {
     preset_id: String,
 }
 
+/// 启动/选档时自动探测本机 Ollama 已驻留模型并登记就绪。若 Ollama 不可用
+/// （未装/未运行），静默跳过，不阻塞检索主链。
+/// - 对 plan.generation：若本机已有对应 tag 且注册表无 ready Ollama artifact
+///   → `ollama_generation_ready(tag, catalog_id)`，同时把旧 GGUF 置 inactive。
+/// - 对 plan.embedding：同理走 `ollama_embedding_ready(tag)`。
+/// 随后调 `apply_runtime_plan` 收敛 active_artifacts。
+pub(crate) fn ensure_ollama_registry_synced(
+    models: &ModelManager,
+    preset_id: &str,
+) -> Result<(), AppError> {
+    let Some(plan) = fanfan_core::resolve_runtime_model_plan(preset_id) else {
+        return Ok(());
+    };
+    // Ollama 不可用时静默跳过——保持 degraded，不阻塞检索主链。
+    let probe = match ensure_running(OLLAMA_START_TIMEOUT) {
+        Ok(probe) if probe.running => probe,
+        _ => return Ok(()),
+    };
+    let _ = probe;
+    let client = OllamaClient::local();
+    let local_tags = match client.list_models() {
+        Ok(tags) => tags,
+        Err(_) => return Ok(()),
+    };
+    let local_tag_set: std::collections::HashSet<&str> =
+        local_tags.iter().map(|m| m.name.as_str()).collect();
+    // 先用 plan_preset 只读检查就绪状态，避免直接访问私有 registry。
+    let report = models.plan_preset(preset_id)?;
+    let gen_ready = report
+        .ready
+        .iter()
+        .any(|item| item.role == ModelRole::Generation);
+    let emb_ready = report
+        .ready
+        .iter()
+        .any(|item| item.role == ModelRole::Embedding);
+    // generation：若未就绪且 tag 在本机已驻留 → 登记。
+    if !gen_ready {
+        if let Some(tag) = fanfan_core::ollama_tag_for_catalog(&plan.generation) {
+            if local_tag_set.contains(tag.as_str()) {
+                let _ = models.ollama_generation_ready(&tag, &plan.generation);
+            }
+        }
+    }
+    // embedding：若未就绪且 tag 在本机已驻留 → 登记。
+    if !emb_ready {
+        if let Some(tag) = fanfan_core::ollama_tag_for_catalog(&plan.embedding) {
+            if local_tag_set.contains(tag.as_str()) {
+                let _ = models.ollama_embedding_ready(&tag);
+            }
+        }
+    }
+    // 收敛 active_artifacts，让 collect_plan_report 判 ready。
+    let _ = models.apply_runtime_plan(preset_id);
+    Ok(())
+}
+
 /// 只读地评估「选中某档位后的就绪 / 缺失清单」：不持久化 preset_id、不切换运行时、
 /// 不写库。供前端在选择档位前先弹「下载缺失模型」确认框，用户确认后才真正切换。
 #[tauri::command(async)]
@@ -1022,7 +1047,10 @@ pub fn model_preset_plan(
     request: ModelPresetSelectRequest,
     models: State<'_, ModelServiceState>,
 ) -> Result<fanfan_core::PresetPlanReport, AppError> {
-    models.get()?.plan_preset(&request.preset_id)
+    let models = models.get()?;
+    // 选档查询前先同步本机已驻留模型，避免已装模型仍被判缺失。
+    let _ = ensure_ollama_registry_synced(&models, &request.preset_id);
+    models.plan_preset(&request.preset_id)
 }
 
 /// 选中官方档位：持久化 preset_id，并把各角色 active 对齐到「已就绪且 catalog_id
@@ -1035,8 +1063,11 @@ pub fn model_preset_select(
     models: State<'_, ModelServiceState>,
 ) -> Result<fanfan_core::PresetPlanReport, AppError> {
     let catalog = catalog.get()?;
+    let models = models.get()?;
+    // 切换前先同步本机已驻留模型，避免已装模型仍被判缺失/触发重复下载。
+    let _ = ensure_ollama_registry_synced(&models, &request.preset_id);
     catalog.set_selected_preset_id(&request.preset_id)?;
-    let report = models.get()?.apply_runtime_plan(&request.preset_id)?;
+    let report = models.apply_runtime_plan(&request.preset_id)?;
     let _ = app.emit(
         "model:preset-selected",
         &json!({ "preset_id": request.preset_id, "ready_count": report.ready.len(), "missing_count": report.missing.len() }),
@@ -1253,6 +1284,14 @@ pub fn model_download_pause(
 ) -> Result<ModelDownloadJob, AppError> {
     let manager = models.get()?;
     let mut job = manager.download_job(&request.job_id)?;
+    // Ollama 模型不支持断点续传（每次 /api/pull 从头开始），暂停语义不适用。
+    if job.source == fanfan_core::ModelSource::Ollama {
+        return Err(AppError::new(
+            "MODEL_DOWNLOAD_PAUSE_UNSUPPORTED",
+            "Ollama 模型不支持暂停，请改用取消",
+            false,
+        ));
+    }
     if matches!(job.status.as_str(), "completed" | "failed" | "cancelled") {
         return Err(AppError::new(
             "MODEL_DOWNLOAD_CONTROL_INVALID",
@@ -1531,6 +1570,7 @@ fn restart_existing_download(
     let source_name = match selected_source {
         ModelSource::Huggingface => "huggingface",
         ModelSource::Modelscope => "modelscope",
+        ModelSource::Ollama => "ollama",
         ModelSource::LocalImport => {
             return Err(AppError::new(
                 "MODEL_DOWNLOAD_SOURCE_UNAVAILABLE",
@@ -1579,6 +1619,7 @@ fn parse_download_source(source: &str) -> Result<ModelSource, AppError> {
     match source {
         "huggingface" => Ok(ModelSource::Huggingface),
         "modelscope" => Ok(ModelSource::Modelscope),
+        "ollama" => Ok(ModelSource::Ollama),
         _ => Err(AppError::new(
             "MODEL_DOWNLOAD_SOURCE_UNAVAILABLE",
             "不支持的模型下载来源",
@@ -1636,6 +1677,219 @@ fn spawn_model_download(
     Ok(())
 }
 
+/// 处理「Ollama pull」语义的模型版本下载：先确保本机 Ollama 已就绪（已装未运行则
+/// 后台启动），随后逐个按 `tag` 调 `/api/pull` 拉取模型，把流式进度写入
+/// `ModelDownloadJob.files` 并沿用既有事件上报。Ollama 模型不落 FanFan 的
+/// ModelStore，因此不进入文件下载 / sha256 校验 / 导入流程。
+fn download_ollama_edition(
+    app: &AppHandle,
+    catalog: &Arc<CatalogService>,
+    models: &ModelManager,
+    job: &mut ModelDownloadJob,
+    edition: &ModelEdition,
+    control: &AtomicU8,
+) -> Result<(), AppError> {
+    let probe = ensure_running(OLLAMA_START_TIMEOUT)?;
+    if !probe.running {
+        return Err(AppError::new(
+            "OLLAMA_INSTALLED_NOT_RUNNING",
+            "Ollama 已安装但服务未能就绪，无法拉取模型",
+            true,
+        ));
+    }
+    let client = OllamaClient::local();
+    // 大模型（如 qwen3.5:9b 数个 GB）拉取可能持续数分钟，网络读超时由
+    // ollama.pull 内按行处理；这里只设一个总体的乐观上限兜底。
+    let pull_timeout = Duration::from_secs(90 * 60);
+    for artifact in &edition.artifacts {
+        check_download_control(control)?;
+        let tag = artifact.model_id.clone();
+        let role = artifact.role;
+        // current_file 显示「Ollama · <tag>」，与魔搭下载的「xxx.gguf」风格区分。
+        job.current_file = Some(format!("Ollama · {}", tag));
+        job.phase = "downloading".into();
+
+        // 多层进度累计：Ollama 一个 tag 会输出多个 layer（不同 digest）的 pulling 行，
+        // 用 HashMap 按 digest 累计 (total, completed)，避免后到 layer 覆盖前面 layer。
+        let mut layer_stats: std::collections::HashMap<String, (u64, u64)> =
+            std::collections::HashMap::new();
+        // 速度 / ETA 平滑：基于 0.5s 间隔的快照差，EMA 平滑系数 0.5。
+        let mut last_snapshot_bytes: u64 = 0;
+        let mut last_snapshot_time = Instant::now();
+        let mut ema_bps: f64 = 0.0;
+        // 节流：首字节立即上报（避免「0 B / 0 B」停留过久），之后 200ms 一次。
+        let mut last_emit = Instant::now() - Duration::from_secs(1);
+        let mut first_total_seen = false;
+        let mut on_progress = |progress: OllamaPullProgress| {
+            // 1) 按 digest 累计当前 layer 的 (total, completed)。
+            if let Some(digest) = progress.digest.as_deref() {
+                if progress.total > 0 {
+                    layer_stats.insert(digest.to_owned(), (progress.total, progress.completed));
+                }
+            }
+            // 2) 回填对应 file 字段：用所有 layer 的累计总和。
+            if let Some(file) = job
+                .files
+                .iter_mut()
+                .find(|file| file.role == role && file.file_name == tag)
+            {
+                let layer_total: u64 = layer_stats.values().map(|(total, _)| *total).sum();
+                let layer_completed: u64 =
+                    layer_stats.values().map(|(_, completed)| *completed).sum();
+                // 用 .max 避免 Ollama 偶发 total 回退导致 file.total_bytes 缩水。
+                if layer_total > 0 {
+                    file.total_bytes = file.total_bytes.max(layer_total);
+                }
+                file.downloaded_bytes = layer_completed.min(file.total_bytes);
+                file.status = if progress.status == "success" {
+                    "completed".into()
+                } else if progress.error.is_some() {
+                    "failed".into()
+                } else {
+                    "downloading".into()
+                };
+            }
+            // 3) 同步 job 级字段（核心修复：前端只读 job 级字段，否则进度恒为 0）。
+            job.downloaded_bytes = job.files.iter().map(|file| file.downloaded_bytes).sum();
+            job.total_bytes = job.files.iter().map(|file| file.total_bytes).sum();
+            job.progress = if job.total_bytes > 0 {
+                (job.downloaded_bytes as f64 / job.total_bytes as f64).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            // 4) BPS / ETA 计算（EMA 平滑，0.5s 采样一次）。
+            let now = Instant::now();
+            let elapsed = now.duration_since(last_snapshot_time).as_secs_f64();
+            if elapsed >= 0.5 {
+                let delta_bytes = job.downloaded_bytes.saturating_sub(last_snapshot_bytes);
+                if delta_bytes > 0 {
+                    let instant_bps = delta_bytes as f64 / elapsed;
+                    ema_bps = if ema_bps == 0.0 {
+                        instant_bps
+                    } else {
+                        0.5 * ema_bps + 0.5 * instant_bps
+                    };
+                }
+                last_snapshot_bytes = job.downloaded_bytes;
+                last_snapshot_time = now;
+            }
+            job.bytes_per_second = ema_bps as u64;
+            if job.bytes_per_second > 0 && job.downloaded_bytes < job.total_bytes {
+                let remaining = job.total_bytes - job.downloaded_bytes;
+                job.eta_seconds = Some((remaining as f64 / job.bytes_per_second as f64) as u64);
+            } else {
+                job.eta_seconds = None;
+            }
+            // 5) 节流上报：首字节立即发，之后 200ms 一次。必须用持久化上报
+            //    （写回下载注册表 + emit），因为前端靠轮询 model_download_list
+            //    读取进度，仅 emit 事件不足以让 Ollama 进度条移动。
+            if !first_total_seen && job.total_bytes > 0 {
+                first_total_seen = true;
+                let _ = persist_download_job(app, models, job);
+                last_emit = Instant::now();
+            } else if last_emit.elapsed() >= Duration::from_millis(200) {
+                last_emit = Instant::now();
+                let _ = persist_download_job(app, models, job);
+            }
+        };
+        // 取消判定：control 置为 DOWNLOAD_ACTION_CANCEL 时，pull 内部主动返回 OPERATION_CANCELLED。
+        let should_cancel =
+            || control.load(std::sync::atomic::Ordering::Acquire) == DOWNLOAD_ACTION_CANCEL;
+        client.pull(
+            &tag,
+            pull_timeout,
+            Some(&mut on_progress),
+            Some(&should_cancel),
+        )?;
+        check_download_control(control)?;
+        // 拉取完成收口本行状态。
+        if let Some(file) = job
+            .files
+            .iter_mut()
+            .find(|file| file.role == role && file.file_name == tag)
+        {
+            file.status = "completed".into();
+            file.downloaded_bytes = file.total_bytes;
+        }
+        job.current_file = None;
+    }
+
+    // 阶段3：Ollama 拉取完成后，注册「合成 ready artifact」使既有的
+    // 就绪门控与索引覆盖逻辑识别「Ollama 模型已就绪」。
+    // - embedding 就绪 → 随后转入后台索引循环按新维度（1024）重建向量索引。
+    // - generation 就绪 → collect_plan_report / apply_runtime_plan 可识别。
+    if edition
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.role == ModelRole::Embedding)
+    {
+        if let Some(artifact) = edition
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.role == ModelRole::Embedding)
+        {
+            let _ = models.ollama_embedding_ready(&artifact.model_id)?;
+        }
+        spawn_embed_pending(app.clone(), Arc::clone(catalog));
+    }
+    if edition
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.role == ModelRole::Generation)
+    {
+        if let Some(artifact) = edition
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.role == ModelRole::Generation)
+        {
+            // 从 catalog 反查 catalog_id，保证与 preset.generation 精确匹配。
+            let catalog_id = fanfan_core::model_catalog::built_in_model_catalog()
+                .into_iter()
+                .find(|entry| {
+                    entry.role == ModelRole::Generation
+                        && entry.install_edition_id.as_deref() == Some(&edition.edition_id)
+                })
+                .map(|entry| entry.catalog_id);
+            if let Some(cid) = catalog_id {
+                let _ = models.ollama_generation_ready(&artifact.model_id, &cid)?;
+            }
+        }
+    }
+
+    job.phase = "verifying".into();
+    persist_download_job(app, models, job)?;
+    for file in &mut job.files {
+        file.status = "completed".into();
+        file.downloaded_bytes = file.total_bytes;
+    }
+    job.phase = "completed".into();
+    job.status = "completed".into();
+    job.error = None;
+    persist_download_job(app, models, job)?;
+    let _ = app.emit("model:download_completed", &*job);
+    let _ = models.remove_download_job(&job.job_id);
+    Ok(())
+}
+
+/// 阶段3：embedding 统一入口。经本机 Ollama `/api/embed` 把文本批量编码为
+/// 向量，返回与既有 `EmbeddingResponse` 兼容的结构，供语义检索 / 向量索引 /
+/// 文档类型分类 / 自检链路沿用，无需各调用点感知后端差异。
+/// 模型 tag 由四档预设统一固定为 `qwen3-embedding:0.6b`（见 model_catalog）。
+fn run_embedding(texts: Vec<String>) -> Result<EmbeddingResponse, AppError> {
+    let tag = fanfan_core::model_catalog::OLLAMA_EMBEDDING_TAG;
+    let client = OllamaClient::local();
+    let (vectors, dimension) = client.embed(tag, &texts)?;
+    Ok(EmbeddingResponse {
+        vectors,
+        dimension,
+        model_path: tag.to_owned(),
+        tokenizer_path: String::new(),
+        device: Some("ollama".to_owned()),
+        execution_provider: None,
+        fallback_reason: None,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_model_download(
     app: &AppHandle,
@@ -1654,6 +1908,17 @@ fn run_model_download(
         job.error = None;
         persist_download_job(app, models, &mut job)?;
         let _ = app.emit("model:download_started", &job);
+
+        // —— Ollama 迁移：生成 / embedding 版本为「Ollama pull」语义（无本地文件）。
+        // 若版本全部组件都指向本机 Ollama，则整段走 pull 通道并直接完成，
+        // 不进入文件下载 / 校验 / ModelStore 导入流程（Ollama 模型由 /api/pull 托管）。
+        let all_ollama = edition
+            .artifacts
+            .iter()
+            .all(|a| a.format == ModelFormat::Ollama);
+        if all_ollama {
+            return download_ollama_edition(app, catalog, models, &mut job, edition, control);
+        }
 
         for artifact in &edition.artifacts {
             let staging = models.download_artifact_staging_directory(
@@ -1794,19 +2059,10 @@ fn run_model_download(
         }
         let embedding = embedding.expect("checked embedding");
         let generation_artifact = generation_artifact.expect("checked generation");
-        let tokenizer = PathBuf::from(&embedding.local_path)
-            .parent()
-            .map(|parent| parent.join("tokenizer.json"))
-            .ok_or_else(|| {
-                AppError::new("EMBEDDING_TOKENIZER_UNAVAILABLE", "语义模型目录无效", false)
-            })?;
-        let embedding_test = sidecars.onnx.encode_embeddings(&EmbeddingRequest {
-            model_path: embedding.local_path.clone(),
-            tokenizer_path: Some(tokenizer.to_string_lossy().into_owned()),
-            texts: vec!["拾起散落的信息，连接过去的自己".into()],
-            max_length: embedding.max_length.unwrap_or(512),
-            threads: 2,
-        })?;
+        // Ollama 迁移：embedding 由本机 Ollama 统一托管，直接经 /api/embed 自检，
+        // 不再读取本地 onnx / tokenizer 文件；下来 `embedding` 仅在推导两者皆在时生效。
+        let _ = embedding;
+        let embedding_test = run_embedding(vec!["拾起散落的信息，连接过去的自己".into()])?;
         let embedding_valid = embedding_test.dimension > 0
             && embedding_test.vectors.len() == 1
             && embedding_test.vectors[0].len() == embedding_test.dimension as usize
@@ -1963,6 +2219,30 @@ fn self_test_visible_text(raw: &str) -> String {
     visible.trim().to_owned()
 }
 
+/// 清洗 qwen3.5 思考模型的正文标记：`<Thinking>…</Thinking><Answer>…</Answer>`。
+/// 该模型在 think=true 时正文本身会携带这两段标签（与 message.thinking 字段
+/// 不同，这里出现的是**正文内嵌**的标记），直接展示给用户不友好，需剥除。
+/// 剥离规则：去掉 `<Thinking>` / `</Thinking>` / `<Answer>` / `</Answer>`，
+/// 并 trim 空白；剥离失败或全空时原样返回。
+fn clean_qwen_thinking_tags(raw: &str) -> String {
+    let cleaned = raw
+        .replace("<Thinking>", "")
+        .replace("</Thinking>", "")
+        .replace("<Answer>", "")
+        .replace("</Answer>", "")
+        .replace("\\<Thinking>", "")
+        .replace("\\</Thinking>", "")
+        .replace("\\<Answer>", "")
+        .replace("\\</Answer>", "")
+        .trim()
+        .to_owned();
+    if cleaned.is_empty() {
+        raw.trim().to_owned()
+    } else {
+        cleaned
+    }
+}
+
 /// 模型激活后的 GPU 状态日志（Phase 4.3 第四部分）：device / backend /
 /// gpu_layers / 模型文件一次打全，落 runtime 日志供「GPU 到底有没有用上」
 /// 的启动期排查（与 llama.cpp 的 --list-devices 探测结果一致）。
@@ -2051,19 +2331,9 @@ fn self_test_and_activate_downloaded_roles(
                 models.activate_artifact(&artifact.artifact_id, None)?;
             }
             (ModelRole::Embedding, ModelFormat::Onnx) => {
-                let tokenizer = PathBuf::from(&artifact.local_path)
-                    .parent()
-                    .map(|parent| parent.join("tokenizer.json"))
-                    .ok_or_else(|| {
-                        AppError::new("EMBEDDING_TOKENIZER_UNAVAILABLE", "语义模型目录无效", false)
-                    })?;
-                let response = onnx.encode_embeddings(&EmbeddingRequest {
-                    model_path: artifact.local_path.clone(),
-                    tokenizer_path: Some(tokenizer.to_string_lossy().into_owned()),
-                    texts: vec!["拾起散落的信息，连接过去的自己".into()],
-                    max_length: artifact.max_length.unwrap_or(512),
-                    threads: background_inference_threads(),
-                })?;
+                // Ollama 迁移：embedding 由本机 Ollama 统一托管，这里直接经 /api/embed 自检，
+                // 不再读取本地 onnx / tokenizer 文件。
+                let response = run_embedding(vec!["拾起散落的信息，连接过去的自己".into()])?;
                 if response.dimension == 0
                     || response.vectors.len() != 1
                     || response.vectors[0].len() != response.dimension as usize
@@ -2464,6 +2734,7 @@ fn default_inference_runtime_state() -> InferenceRuntimeState {
     InferenceRuntimeState {
         backend: "unavailable".into(),
         device_names: Vec::new(),
+        running_models: Vec::new(),
         gpu_available: false,
         gpu_offload_layers: Some(0),
         gpu_offload_mode: "disabled".into(),
@@ -2489,7 +2760,7 @@ pub(crate) fn inference_runtime_state(
     // 纯读状态：VLM/LLM 推理持锁期间可达数十秒，状态轮询绝不能排队等锁
     //（app_status_get/model_state_get 曾因此被拖 43s）。拿不到锁就按
     // 「探测未完成 / CPU 生效中」回退，model:state 事件会驱动前端刷新。
-    let mut runtime = match try_lock_generation_until(&generation.0, Duration::from_millis(500)) {
+    let runtime = match try_lock_generation_until(&generation.0, Duration::from_millis(500)) {
         Some(runtime) => runtime,
         None => {
             let hardware = current_hardware_profile(&[]);
@@ -2497,6 +2768,7 @@ pub(crate) fn inference_runtime_state(
             return Ok(InferenceRuntimeState {
                 backend: "cpu".into(),
                 device_names: Vec::new(),
+                running_models: Vec::new(),
                 gpu_available: false,
                 gpu_offload_layers: None,
                 gpu_offload_mode: "disabled".into(),
@@ -2542,10 +2814,16 @@ pub(crate) fn inference_runtime_state(
         .unwrap_or_else(|| capability.backend.clone());
     let hardware = current_hardware_profile(&device_names);
     let budget = current_inference_budget(hardware.memory_total_bytes);
+    // 实时查询 Ollama `/api/ps`：逐模型上报 CPU/GPU 占用（尽力而为，读取失败为空）。
+    // 生成模型之外运行着的 embedding 等也据此如实展示，不再停留在「未识别 GPU」。
+    let running_models = runtime.running_model_placements();
+    let gpu_available =
+        capability.gpu_available || running_models.iter().any(|entry| entry.vram_bytes > 0);
     Ok(InferenceRuntimeState {
         backend: backend.clone(),
         device_names: device_names.clone(),
-        gpu_available: capability.gpu_available,
+        running_models,
+        gpu_available,
         gpu_offload_layers: runtime.active_gpu_layers(),
         gpu_offload_mode: if capability.gpu_available {
             "automatic".into()
@@ -2678,7 +2956,7 @@ pub(crate) fn model_state_from_manager(
 
 fn privacy_safe_display_path(path: &str) -> String {
     let normalized = path.replace('/', "\\");
-    let absolute = normalized.as_bytes().get(1) == Some(&b':') || normalized.starts_with("\\\\");
+    let absolute = normalized.as_bytes().get(1) == Some(&b':') || normalized.starts_with("\\");
     if !absolute {
         return normalized;
     }
@@ -2786,6 +3064,7 @@ pub fn home_get_summary(
             { "key": "processing_failed", "label": "处理失败", "value": failed }
         ],
         "scan_progress": scan_progress,
+        "index_initialized": index_stats.searchable_files > 0,
         "recent_files": recent_files,
         "favorite_files": [],
         "collections": collections.into_iter().take(6).enumerate().map(|(index, collection)| {
@@ -5846,6 +6125,7 @@ fn run_single_evaluation_case(
         max_source_files: 4,
         strict_evidence: true,
         clarification_selection: None,
+        think_mode: false,
     };
     let started = Instant::now();
     let (answer, run_error) = run_evaluation_ask(
@@ -6080,6 +6360,7 @@ fn run_evaluation_ask(
     };
     let phase = |_name: &str, _progress: f64| {};
     let verified_claim = |_claim: &AnswerClaim| {};
+    let on_thinking = |_thinking: &str| {};
     match compute_answer(
         request,
         catalog,
@@ -6092,7 +6373,7 @@ fn run_evaluation_ask(
         // 不读取用户设置，保证评估口径与历史结果可比。
         true,
         cancelled,
-        (&phase, &verified_claim),
+        (&phase, &verified_claim, &on_thinking),
     ) {
         Ok(answer) => {
             runtime_lease.complete();
@@ -6326,6 +6607,10 @@ pub fn index_rebuild(
         &json!({ "operation_id": operation_id }),
     );
     let _ = app.emit("index:rebuild_started", &handle);
+    let worker = app.state::<WorkerServiceState>();
+    worker.rebuild_active.store(true, Ordering::Release);
+    // 新一轮重建开始，先复位失败标记；后续由重建线程在收敛/放弃时更新。
+    worker.rebuild_failed.store(false, Ordering::Release);
     thread::spawn(move || match catalog.rebuild_index("REBUILD_INDEX") {
         Ok(result) => {
             crate::runtime_log::event(
@@ -6336,7 +6621,11 @@ pub fn index_rebuild(
                 &json!({ "operation_id": operation_id, "reset_files": result.reset_files, "source_files_modified": false }),
             );
             let _ = app.emit("index:changed", json!({ "operation": { "operation_id": completion_handle.operation_id, "kind": completion_handle.kind, "status": "completed", "created_at": completion_handle.created_at }, "result": result }));
-            spawn_parse_pending(app, catalog);
+            spawn_parse_pending(app.clone(), catalog.clone());
+            spawn_embed_pending(app.clone(), catalog.clone());
+            // 重建由解析/嵌入 worker 异步推进，本线程持续等待 active 索引代切换
+            // 到当前 Embedding 模型，期间前端轮询 index_rebuild_progress 展示进度。
+            wait_for_rebuild_completion(&app, &catalog);
         }
         Err(error) => {
             crate::runtime_log::event(
@@ -6346,10 +6635,155 @@ pub fn index_rebuild(
                 Some(&operation_id.to_string()),
                 &json!({ "operation_id": operation_id, "error_code": error.code, "retryable": error.retryable }),
             );
+            let worker = app.state::<WorkerServiceState>();
+            worker.rebuild_active.store(false, Ordering::Release);
+            worker.rebuild_failed.store(true, Ordering::Release);
             let _ = app.emit("index:failed", &error);
         }
     });
     Ok(handle)
+}
+
+/// 语义索引重建中途「嵌入推进无变化」的最大轮数（约对应 30 秒），防止失败无限挂起。
+const REBUILD_EMBED_STALL_CYCLES: u32 = 30;
+/// 嵌入已收敛但 active 索引代仍未切换时的最长等待轮数（约对应 90 秒）。
+const REBUILD_SETTLE_CYCLES: u32 = 90;
+
+/// 等待语义索引重建收敛。
+///
+/// 重建换模型后主要由嵌入 worker 异步推进，本函数轮询直到满足任一退出条件：
+/// 1. active 向量索引代已切换到当前 Embedding 模型（重建完成）；
+/// 2. 嵌入进度长时间停滞（嵌入失败等场景）；
+/// 3. 嵌入已收敛但索引代迟迟未切换（索引构建长时间失败）。
+/// 无论何种退出，都会复位 `rebuild_active` 标记，避免前端进度长期悬挂。
+fn wait_for_rebuild_completion(app: &AppHandle, catalog: &CatalogService) {
+    let worker = app.state::<WorkerServiceState>();
+    let models_state = app.state::<ModelServiceState>();
+    let mut last_done: Option<u64> = None;
+    let mut embed_stall_cycles: u32 = 0;
+    let mut settle_cycles: u32 = 0;
+    loop {
+        if worker.foreground_activity.load(Ordering::Acquire) > 0 {
+            thread::sleep(Duration::from_millis(500));
+            continue;
+        }
+        let models = match models_state.get() {
+            Ok(models) => models,
+            Err(_) => {
+                worker.rebuild_active.store(false, Ordering::Release);
+                worker.rebuild_failed.store(true, Ordering::Release);
+                return;
+            }
+        };
+        let active_id = models
+            .active_artifact(ModelRole::Embedding)
+            .ok()
+            .flatten()
+            .map(|artifact| artifact.artifact_id.to_string());
+        let index_id = catalog.active_index_model_artifact_id().ok().flatten();
+        let converged = match (&active_id, &index_id) {
+            (Some(active), Some(index)) => active == index,
+            // 当前有 Embedding 但尚无 active 索引代：重建产物仍未落地。
+            (Some(_), None) => false,
+            // 无 active Embedding 时不存在待重建目标，视为完成。
+            _ => true,
+        };
+        if converged {
+            worker.rebuild_active.store(false, Ordering::Release);
+            worker.rebuild_failed.store(false, Ordering::Release);
+            let _ = app.emit(
+                "index:rebuild_progress",
+                json!({ "running": false, "phase": "done", "percent": 100 }),
+            );
+            return;
+        }
+        let Some(active) = active_id else {
+            // 无 active Embedding 目标却未收敛，视为异常并放弃。
+            worker.rebuild_active.store(false, Ordering::Release);
+            worker.rebuild_failed.store(true, Ordering::Release);
+            return;
+        };
+        let (done, total) = catalog
+            .embedding_rebuild_progress(&active)
+            .unwrap_or((0, 0));
+        if total > 0 && done >= total {
+            // 嵌入已收敛，处于向量索引构建/校验阶段，等待 active 切换并设超时兜底。
+            settle_cycles += 1;
+            if settle_cycles > REBUILD_SETTLE_CYCLES {
+                worker.rebuild_active.store(false, Ordering::Release);
+                worker.rebuild_failed.store(true, Ordering::Release);
+                return;
+            }
+        } else {
+            settle_cycles = 0;
+            if last_done.is_some_and(|previous| previous == done) {
+                embed_stall_cycles += 1;
+            } else {
+                embed_stall_cycles = 0;
+            }
+            last_done = Some(done);
+            if embed_stall_cycles > REBUILD_EMBED_STALL_CYCLES {
+                worker.rebuild_active.store(false, Ordering::Release);
+                worker.rebuild_failed.store(true, Ordering::Release);
+                return;
+            }
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// 语义索引重建进度快照，前端轮询展示。
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexRebuildProgress {
+    running: bool,
+    phase: String,
+    done: u64,
+    total: u64,
+    percent: u8,
+}
+
+/// 查询语义索引重建进度：目标模型已嵌入分块数 / 可搜索分块总数。
+/// 换模型重建时旧模型向量不计入 `done`，因此百分比可真实反映重建进度。
+#[tauri::command]
+pub fn index_rebuild_progress(
+    catalog: State<'_, CatalogServiceState>,
+    models: State<'_, ModelServiceState>,
+    worker: State<'_, WorkerServiceState>,
+) -> Result<IndexRebuildProgress, AppError> {
+    let running = worker.rebuild_active.load(Ordering::Acquire);
+    let rebuild_failed = worker.rebuild_failed.load(Ordering::Acquire);
+    let models = models.get()?;
+    let active_id = models
+        .active_artifact(ModelRole::Embedding)?
+        .map(|artifact| artifact.artifact_id.to_string());
+    let (done, total) = match &active_id {
+        Some(active) => catalog.get()?.embedding_rebuild_progress(active)?,
+        None => (0, 0),
+    };
+    let percent = if total > 0 {
+        ((done as f64 / total as f64) * 100.0).round() as u8
+    } else {
+        100
+    };
+    let phase = if !running {
+        if rebuild_failed {
+            "failed".to_owned()
+        } else {
+            "idle".to_owned()
+        }
+    } else if total > 0 && done >= total {
+        "indexing".to_owned()
+    } else {
+        "embedding".to_owned()
+    };
+    Ok(IndexRebuildProgress {
+        running,
+        phase,
+        done,
+        total,
+        percent,
+    })
 }
 
 #[tauri::command(async)]
@@ -6358,8 +6792,6 @@ pub fn search_start(
     catalog: State<'_, CatalogServiceState>,
     models: State<'_, ModelServiceState>,
     worker: State<'_, WorkerServiceState>,
-    sidecars: State<'_, SidecarRegistryState>,
-    runtime_manager: State<'_, RuntimeManagerState>,
 ) -> Result<SearchSession, AppError> {
     let _foreground_guard = ForegroundActivityGuard::begin(&worker.foreground_activity);
     let correlation_id = Uuid::now_v7().to_string();
@@ -6416,39 +6848,12 @@ pub fn search_start(
             .ok()
             .and_then(|mut cache| cache.get(&cache_key))
             .or_else(|| {
-                let mut runtime_request = RuntimeTaskRequest::interactive(
-                    RuntimeTaskKind::Search,
-                    RuntimeBackendKind::OnnxRuntime,
-                );
-                runtime_request.cpu_threads = 2;
-                // 语义通道只是增强，失败应立即降级回 filename+fulltext；acquire 等 5
-                // 秒会让非语义搜索白白多等 5 秒（实测语义降级搜索 7s ≈ 5s acquire +
-                // 检索）。压到 300ms：资源就绪就编码，否则立刻走无语义路径。
-                runtime_request.timeout = Duration::from_millis(300);
-                let lease = runtime_manager.0.acquire(runtime_request).ok()?;
-                let tokenizer_path = PathBuf::from(&artifact.local_path)
-                    .parent()
-                    .map(|parent| parent.join("tokenizer.json"));
-                let Some(tokenizer_path) = tokenizer_path else {
-                    lease.complete();
+                // Ollama 迁移：embedding 由本机 Ollama 统一托管，直接经 /api/embed
+                // 编码查询向量并写缓存；失败即降级回 filename+fulltext。
+                let Ok(response) = run_embedding(vec![request.query.clone()]) else {
                     return None;
                 };
-                let Ok(response) = sidecars.0.onnx.encode_embeddings(&EmbeddingRequest {
-                    model_path: artifact.local_path,
-                    tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
-                    texts: vec![request.query.clone()],
-                    max_length: 512,
-                    threads: 2,
-                }) else {
-                    lease.complete();
-                    return None;
-                };
-                let Some(vector) = response.vectors.first() else {
-                    lease.complete();
-                    return None;
-                };
-                lease.complete();
-                let vector = vector.clone();
+                let vector = response.vectors.into_iter().next()?;
                 if let Ok(mut cache) = worker.search_embedding_cache.lock() {
                     cache.put(cache_key.clone(), vector.clone());
                 }
@@ -6643,6 +7048,8 @@ pub fn ask_start(
         let _foreground_guard =
             ForegroundActivityGuard::begin(&foreground_worker.foreground_activity);
         let operation_started = Instant::now();
+        let reporter = AskExecutionReporter::new(app.clone(), operation_id);
+        reporter.ask_started();
         // 操作级追踪：ASK 链路入口（节点 trace 的 correlation_id 使用协调器
         // operation_id，这里保持一致，完成态在下方各出口标记）。
         let operation_trace = ActiveOperationTrace::begin(
@@ -6684,6 +7091,10 @@ pub fn ask_start(
                     entry.handle.status = "failed";
                     entry.error = Some(error.clone());
                 }
+                reporter.fail_active(&error.message);
+                reporter.ask_completed("failed");
+                reporter.fail_active("运行资源暂不可用");
+                reporter.ask_completed("failed");
                 let _ = app.emit(
                     "ask:failed",
                     json!({"operation_id": operation_id, "error": error}),
@@ -6705,7 +7116,9 @@ pub fn ask_start(
         }
         let phase_app = app.clone();
         let claim_app = app.clone();
-        let phase = |name: &str, progress: f64| {
+        let phase_reporter = reporter.clone();
+        let claim_reporter = reporter.clone();
+        let phase = move |name: &str, progress: f64| {
             crate::runtime_log::event(
                 "info",
                 "rag",
@@ -6717,11 +7130,13 @@ pub fn ask_start(
                     "progress": progress,
                 }),
             );
+            phase_reporter.phase(name, progress);
             let _ = phase_app.emit(
                 "ask:phase",
                 json!({"operation_id": operation_id, "phase": name, "progress": progress}),
             );
         };
+        let on_thinking = |_thinking: &str| {};
         let verified_claim = |claim: &AnswerClaim| {
             crate::runtime_log::event(
                 "info",
@@ -6744,10 +7159,7 @@ pub fn ask_start(
                 "ask:claim",
                 json!({"operation_id": operation_id, "claim": claim}),
             );
-            let _ = claim_app.emit(
-                "ask:token",
-                json!({"operation_id": operation_id, "token": format!("{}\n", claim.text), "verified": true}),
-            );
+            claim_reporter.answer_delta(claim);
         };
         let result = compute_answer(
             &request,
@@ -6759,7 +7171,7 @@ pub fn ask_start(
             operation_id,
             memory_feature_enabled(&app),
             &cancelled,
-            (&phase, &verified_claim),
+            (&phase, &verified_claim, &on_thinking),
         );
         if cancelled.load(Ordering::Acquire) {
             let error = AppError::new("OPERATION_CANCELLED", "问答已取消", false);
@@ -6769,6 +7181,8 @@ pub fn ask_start(
                 entry.handle.status = "cancelled";
                 entry.error = Some(error.clone());
             }
+            reporter.fail_active("问答已取消");
+            reporter.ask_completed("cancelled");
             let _ = app.emit(
                 "ask:cancelled",
                 json!({"operation_id": operation_id, "error": error}),
@@ -6797,6 +7211,8 @@ pub fn ask_start(
                         entry.handle.status = "cancelled";
                         entry.error = Some(error.clone());
                     }
+                    reporter.fail_active("问答已取消");
+                    reporter.ask_completed("cancelled");
                     let _ = app.emit(
                         "ask:cancelled",
                         json!({"operation_id": operation_id, "error": error}),
@@ -6821,6 +7237,12 @@ pub fn ask_start(
                     entry.handle.status = "completed";
                     entry.result = Some(answer.clone());
                 }
+                if answer.answer_mode == AnswerMode::Chat
+                    && !reporter.answer_started.load(Ordering::Acquire)
+                {
+                    reporter.answer_text(&answer.answer);
+                }
+                reporter.ask_completed("completed");
                 let _ = app.emit(
                     "ask:completed",
                     json!({"operation_id": operation_id, "result": answer}),
@@ -6879,6 +7301,8 @@ pub fn ask_start(
                     entry.handle.status = "failed";
                     entry.error = Some(error.clone());
                 }
+                reporter.fail_active(&error.message);
+                reporter.ask_completed("failed");
                 let _ = app.emit(
                     "ask:failed",
                     json!({"operation_id": operation_id, "error": error}),
@@ -6903,6 +7327,459 @@ pub fn ask_start(
     Ok(handle)
 }
 
+#[derive(Clone)]
+struct AskExecutionReporter {
+    app: AppHandle,
+    operation_id: Uuid,
+    sequence: Arc<AtomicU32>,
+    active: Arc<Mutex<Option<ActiveAskUiNode>>>,
+    started_at: Instant,
+    answer_started: Arc<AtomicBool>,
+    step_count: Arc<AtomicU32>,
+    verified_count: Arc<AtomicU32>,
+    streamed_claims: Arc<Mutex<HashSet<Uuid>>>,
+}
+
+struct ActiveAskUiNode {
+    node_id: &'static str,
+    node_name: String,
+    public_label: &'static str,
+    started_at: Instant,
+    progress_lines: Vec<String>,
+    last_progress_at: Instant,
+}
+
+struct AskUiNodeSpec {
+    node_id: &'static str,
+    public_label: &'static str,
+    progress_lines: &'static [&'static str],
+}
+
+impl AskExecutionReporter {
+    fn new(app: AppHandle, operation_id: Uuid) -> Self {
+        Self {
+            app,
+            operation_id,
+            sequence: Arc::new(AtomicU32::new(0)),
+            active: Arc::new(Mutex::new(None)),
+            started_at: Instant::now(),
+            answer_started: Arc::new(AtomicBool::new(false)),
+            step_count: Arc::new(AtomicU32::new(0)),
+            verified_count: Arc::new(AtomicU32::new(0)),
+            streamed_claims: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    fn ask_started(&self) {
+        self.emit(
+            "ask_started",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
+    fn phase(&self, node_name: &str, _progress: f64) {
+        if node_name == "completed" {
+            self.complete_active(None);
+            return;
+        }
+        let Some(spec) = public_node_spec(node_name) else {
+            return;
+        };
+        let now = Instant::now();
+        let mut active = match self.active.lock() {
+            Ok(active) => active,
+            Err(_) => return,
+        };
+        let should_start = active
+            .as_ref()
+            .map(|node| node.node_id != spec.node_id)
+            .unwrap_or(true);
+        if should_start {
+            if let Some(previous) = active.take() {
+                self.emit_node_terminal(&previous, "node_completed", "completed", None);
+            }
+            let progress_lines = spec
+                .progress_lines
+                .iter()
+                .take(3)
+                .map(|line| (*line).to_owned())
+                .collect::<Vec<_>>();
+            *active = Some(ActiveAskUiNode {
+                node_id: spec.node_id,
+                node_name: node_name.to_owned(),
+                public_label: spec.public_label,
+                started_at: now,
+                progress_lines: progress_lines.clone(),
+                last_progress_at: now,
+            });
+            self.emit(
+                "node_started",
+                Some(spec.node_id),
+                Some(node_name),
+                Some(spec.public_label),
+                Some("running"),
+                None,
+                Some(progress_lines),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            return;
+        }
+        if let Some(current) = active.as_mut() {
+            current.node_name = node_name.to_owned();
+            if current.last_progress_at.elapsed() >= Duration::from_millis(100) {
+                current.progress_lines = spec
+                    .progress_lines
+                    .iter()
+                    .take(3)
+                    .map(|line| (*line).to_owned())
+                    .collect();
+                current.last_progress_at = now;
+                self.emit(
+                    "node_progress",
+                    Some(current.node_id),
+                    Some(&current.node_name),
+                    Some(current.public_label),
+                    Some("running"),
+                    None,
+                    Some(current.progress_lines.clone()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+            }
+        }
+    }
+
+    fn answer_delta(&self, claim: &AnswerClaim) {
+        if let Ok(mut streamed) = self.streamed_claims.lock() {
+            if !streamed.insert(claim.claim_id) {
+                return;
+            }
+        }
+        let verified = self.verified_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if !self.answer_started.swap(true, Ordering::AcqRel) {
+            self.emit(
+                "answer_started",
+                None,
+                None,
+                None,
+                Some("running"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        if let Ok(mut active) = self.active.lock() {
+            if let Some(node) = active.as_mut() {
+                if node.node_id == "verification" {
+                    node.progress_lines = vec![
+                        format!("已核对 {verified} 条事实"),
+                        "只展示通过来源校验的回答内容".to_owned(),
+                    ];
+                    self.emit(
+                        "node_progress",
+                        Some(node.node_id),
+                        Some(&node.node_name),
+                        Some(node.public_label),
+                        Some("running"),
+                        None,
+                        Some(node.progress_lines.clone()),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
+                }
+            }
+        }
+        self.emit(
+            "answer_delta",
+            None,
+            None,
+            None,
+            Some("running"),
+            None,
+            None,
+            None,
+            Some(format!("{}\n\n", claim.text)),
+            None,
+            None,
+            None,
+        );
+    }
+
+    fn answer_text(&self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        if !self.answer_started.swap(true, Ordering::AcqRel) {
+            self.emit(
+                "answer_started",
+                None,
+                None,
+                None,
+                Some("running"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        self.emit(
+            "answer_delta",
+            None,
+            None,
+            None,
+            Some("running"),
+            None,
+            None,
+            None,
+            Some(text.to_owned()),
+            None,
+            None,
+            None,
+        );
+    }
+
+    fn complete_answer(&self) {
+        if self.answer_started.load(Ordering::Acquire) {
+            self.emit(
+                "answer_completed",
+                None,
+                None,
+                None,
+                Some("completed"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+    }
+
+    fn fail_active(&self, summary: &str) {
+        let mut active = match self.active.lock() {
+            Ok(active) => active,
+            Err(_) => return,
+        };
+        if let Some(node) = active.take() {
+            self.emit_node_terminal(&node, "node_failed", "failed", Some(summary));
+        }
+    }
+
+    fn complete_active(&self, summary: Option<&str>) {
+        let mut active = match self.active.lock() {
+            Ok(active) => active,
+            Err(_) => return,
+        };
+        if let Some(node) = active.take() {
+            self.emit_node_terminal(&node, "node_completed", "completed", summary);
+        }
+    }
+
+    fn ask_completed(&self, status: &str) {
+        self.complete_active(None);
+        if status == "completed" {
+            self.complete_answer();
+        }
+        self.emit(
+            "ask_completed",
+            None,
+            None,
+            None,
+            Some(status),
+            None,
+            None,
+            None,
+            None,
+            Some(self.step_count.load(Ordering::Relaxed)),
+            Some(self.started_at.elapsed().as_millis() as u64),
+            None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit(
+        &self,
+        event_type: &str,
+        node_id: Option<&str>,
+        node_name: Option<&str>,
+        public_label: Option<&str>,
+        status: Option<&str>,
+        public_summary: Option<String>,
+        progress_lines: Option<Vec<String>>,
+        duration_ms: Option<u64>,
+        delta: Option<String>,
+        step_count: Option<u32>,
+        total_duration_ms: Option<u64>,
+        _reserved: Option<()>,
+    ) {
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = self.app.emit(
+            "ask:stream",
+            json!({
+                "event_type": event_type,
+                "operation_id": self.operation_id,
+                "sequence": sequence,
+                "node_id": node_id,
+                "node_name": node_name,
+                "public_label": public_label,
+                "status": status,
+                "public_summary": public_summary,
+                "progress_lines": progress_lines,
+                "duration_ms": duration_ms,
+                "delta": delta,
+                "step_count": step_count,
+                "total_duration_ms": total_duration_ms,
+            }),
+        );
+    }
+
+    fn emit_node_terminal(
+        &self,
+        node: &ActiveAskUiNode,
+        event_type: &str,
+        status: &str,
+        summary: Option<&str>,
+    ) {
+        if status != "skipped" {
+            self.step_count.fetch_add(1, Ordering::Relaxed);
+        }
+        self.emit(
+            event_type,
+            Some(node.node_id),
+            Some(&node.node_name),
+            Some(node.public_label),
+            Some(status),
+            Some(
+                summary
+                    .unwrap_or_else(|| public_node_summary(node.node_id))
+                    .to_owned(),
+            ),
+            Some(node.progress_lines.clone()),
+            Some(node.started_at.elapsed().as_millis() as u64),
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+}
+
+fn public_node_spec(node_name: &str) -> Option<AskUiNodeSpec> {
+    let spec = match node_name {
+        "intent_routing" | "source_routing" => AskUiNodeSpec {
+            node_id: "source_routing",
+            public_label: "理解问题",
+            progress_lines: &[
+                "正在判断问题属于资料问答还是普通回复",
+                "正在读取当前会话上下文",
+            ],
+        },
+        "understanding" | "query_parsing" | "query_planning" => AskUiNodeSpec {
+            node_id: "query_planning",
+            public_label: "规划检索",
+            progress_lines: &["正在拆解问题和目标资料", "正在确定检索方式"],
+        },
+        "context_resolution" | "memory_resolution" | "document_resolution" | "scope_planning" => {
+            AskUiNodeSpec {
+                node_id: "document_resolution",
+                public_label: "查找目标资料",
+                progress_lines: &["正在识别你指向的文件", "正在确定资料范围"],
+            }
+        }
+        "document_recall" | "evidence_retrieval" | "hybrid_retrieval" | "retrieval" => {
+            AskUiNodeSpec {
+                node_id: "retrieval",
+                public_label: "检索相关内容",
+                progress_lines: &[
+                    "正在搜索相关文件",
+                    "正在融合关键词和语义结果",
+                    "正在召回候选片段",
+                ],
+            }
+        }
+        "reranking" | "evidence_selection" | "answerability_gate" | "image_reanalysis" => {
+            AskUiNodeSpec {
+                node_id: "evidence",
+                public_label: "整理证据",
+                progress_lines: &["正在筛选更相关的证据", "正在判断证据是否足够回答"],
+            }
+        }
+        "document_summary" => AskUiNodeSpec {
+            node_id: "document_summary",
+            public_label: "汇总文档",
+            progress_lines: &["正在读取文档结构", "正在汇总主要内容"],
+        },
+        "document_compare" => AskUiNodeSpec {
+            node_id: "document_compare",
+            public_label: "对比资料",
+            progress_lines: &["正在读取对比资料", "正在整理差异与共同点"],
+        },
+        "document_find" => AskUiNodeSpec {
+            node_id: "document_find",
+            public_label: "定位文件",
+            progress_lines: &["正在匹配可能的文件", "正在整理最相关结果"],
+        },
+        "generating" | "generation" | "chat_generating" => AskUiNodeSpec {
+            node_id: "generation",
+            public_label: "生成回答",
+            progress_lines: &["正在根据可用信息组织回答", "资料问答只会输出通过校验的内容"],
+        },
+        "citation_validation" | "citation_structure_repair" | "verification" | "repair" => {
+            AskUiNodeSpec {
+                node_id: "verification",
+                public_label: "核对引用",
+                progress_lines: &["正在逐句核对来源", "只展示通过来源校验的回答内容"],
+            }
+        }
+        _ => return None,
+    };
+    Some(spec)
+}
+
+fn public_node_summary(node_id: &str) -> &'static str {
+    match node_id {
+        "source_routing" => "已完成理解",
+        "query_planning" => "已完成检索规划",
+        "document_resolution" => "已确定资料范围",
+        "retrieval" => "已完成内容检索",
+        "evidence" => "已整理候选证据",
+        "document_summary" => "已完成文档汇总",
+        "document_compare" => "已完成资料对比",
+        "document_find" => "已完成文件定位",
+        "generation" => "已生成候选回答",
+        "verification" => "已完成引用核对",
+        _ => "已完成",
+    }
+}
 /// OperationTrace 的 RAII 守卫：入口创建 operation_traces 记录并设置
 /// 线程关联，显式 `complete` 写完成态；Drop 时兜底清理线程关联。
 /// 记录失败静默，绝不影响主链路（与既有 Trace 纪律一致）。
@@ -7229,7 +8106,7 @@ fn compute_answer(
     cancelled: &AtomicBool,
     progress: AskProgressCallbacks<'_>,
 ) -> Result<AnswerResult, AppError> {
-    let (phase, verified_claim) = progress;
+    let (phase, verified_claim, on_thinking) = progress;
     if cancelled.load(Ordering::Acquire) {
         return Err(AppError::new("OPERATION_CANCELLED", "问答已取消", false));
     }
@@ -7362,6 +8239,7 @@ fn compute_answer(
             operation_id,
             cancelled,
             phase,
+            on_thinking,
         );
     }
 
@@ -7410,6 +8288,7 @@ fn compute_answer(
                 operation_id,
                 cancelled,
                 phase,
+                on_thinking,
             );
         }
         context_scope = context_resolution.resolved_file_ids.clone();
@@ -7419,6 +8298,7 @@ fn compute_answer(
         {
             let Some(mut plan) = parse_ask_plan(
                 request,
+                &session_context,
                 catalog,
                 generation,
                 &generation_artifact,
@@ -7444,7 +8324,7 @@ fn compute_answer(
                     &history,
                     operation_id,
                     cancelled,
-                    (phase, verified_claim),
+                    (phase, verified_claim, on_thinking),
                     None,
                     None,
                     false,
@@ -7471,7 +8351,7 @@ fn compute_answer(
                 operation_id,
                 memory_enabled,
                 cancelled,
-                (phase, verified_claim),
+                (phase, verified_claim, on_thinking),
             );
         }
     }
@@ -7479,6 +8359,7 @@ fn compute_answer(
     // 3. Query Parser（LOCAL 或已恢复的 AMBIGUOUS 都要先结构化）
     let plan = parse_ask_plan(
         request,
+        &session_context,
         catalog,
         generation,
         &generation_artifact,
@@ -7508,7 +8389,7 @@ fn compute_answer(
             &history,
             operation_id,
             cancelled,
-            (phase, verified_claim),
+            (phase, verified_claim, on_thinking),
             None,
             None,
             false,
@@ -7545,6 +8426,7 @@ fn compute_answer(
             operation_id,
             cancelled,
             phase,
+            on_thinking,
         );
     }
     finish_retrieval_with_plan(
@@ -7564,7 +8446,7 @@ fn compute_answer(
         operation_id,
         memory_enabled,
         cancelled,
-        (phase, verified_claim),
+        (phase, verified_claim, on_thinking),
     )
 }
 
@@ -7590,7 +8472,7 @@ fn run_clarified_answer(
     cancelled: &AtomicBool,
     progress: AskProgressCallbacks<'_>,
 ) -> Result<AnswerResult, AppError> {
-    let (phase, verified_claim) = progress;
+    let (phase, verified_claim, on_thinking) = progress;
     if !catalog.memory_file_target_valid(selection)? {
         return Err(AppError::new(
             "CLARIFICATION_SELECTION_INVALID",
@@ -7659,6 +8541,7 @@ fn run_clarified_answer(
     // 重新解析 content_query（目标已锁定，跳过 Document Resolver 与路由）
     let parsed = parse_ask_plan(
         request,
+        &updated_context,
         catalog,
         generation,
         generation_artifact,
@@ -7688,7 +8571,7 @@ fn run_clarified_answer(
         operation_id,
         memory_enabled,
         cancelled,
-        (phase, verified_claim),
+        (phase, verified_claim, on_thinking),
     )
 }
 
@@ -7731,6 +8614,7 @@ fn embedding_for_retrieval(models: &ModelManager) -> Result<Option<ModelArtifact
 #[allow(clippy::too_many_arguments)]
 fn parse_ask_plan(
     request: &AskRequest,
+    session_context: &AskSessionContext,
     catalog: &CatalogService,
     generation: &Mutex<LocalGenerationRuntime>,
     generation_artifact: &ModelArtifact,
@@ -7741,12 +8625,43 @@ fn parse_ask_plan(
     phase: &dyn Fn(&str, f64),
 ) -> Result<Option<QueryPlan>, AppError> {
     phase("query_parsing", 0.12);
+    let question = request.question.trim();
+
+    // Fast Path First：高置信的目标理解直接短路，不调用 Generation Model。
+    // 覆盖「我的简历里写了哪些项目」→ document_type=RESUME / content_query=项目
+    // 这类复用会话上下文 + 文档类型原型即可判定的场景。仅在低置信或不适用
+    // （精确点名、歧义较大）时返回 None，让位 LLM Parser（Model Escalation Last）。
+    if let Some(FastPathPlan {
+        plan,
+        confidence,
+        signals,
+    }) = fast_path_plan(question, session_context)
+    {
+        trace_node(
+            catalog,
+            "ask",
+            "query_planning",
+            &operation_id.to_string(),
+            session_id_ref,
+            None,
+            &json!({
+                "question": request.question,
+                "mode": "fast_path",
+                "confidence": confidence,
+                "signals": signals,
+            }),
+            &json!({ "plan": &plan }),
+            "ok",
+            None,
+        );
+        return Ok(Some(plan));
+    }
+
     // AI 优先：意图/操作/目标分离全部交给 LLM Parser 语义理解（含
     // DOCUMENT_FIND 的判定——Prompt 已教模型区分「找文件位置」与
     // 「查文件内容」）。此处做一次重试兜底：首次解析失败（JSON 截断/
     // 噪声/复读历史）时重试一次，仍失败返回 None（调用方按原问题宽检索，
     // 不猜意图）。
-    let question = request.question.trim();
     let mut plan: Option<QueryPlan> = None;
     let mut raw = String::new();
     for attempt in 0..2 {
@@ -7863,6 +8778,7 @@ fn run_clarification_refusal(
         degradation_reason: None,
         no_evidence_reason: Some(NoEvidenceReason::TrueNoEvidence),
         clarification: None,
+        thinking: None,
     };
     let session_id = request.session_id.map(|id| id.to_string());
     trace_node(
@@ -7897,7 +8813,8 @@ fn run_document_find_answer(
     cancelled: &AtomicBool,
     progress: AskProgressCallbacks<'_>,
 ) -> Result<AnswerResult, AppError> {
-    let (phase, _verified_claim) = progress;
+    let (phase, _verified_claim, _on_thinking) = progress;
+    phase("document_find", 0.72);
     let _ = cancelled;
     let correlation_id = operation_id.to_string();
     let session_id = request.session_id.map(|id| id.to_string());
@@ -7952,6 +8869,7 @@ fn run_document_find_answer(
         degradation_reason: None,
         no_evidence_reason: None,
         clarification: None,
+        thinking: None,
     };
     trace_node(
         catalog,
@@ -8043,7 +8961,30 @@ fn finish_retrieval_with_plan(
                 profile
             })
             .collect::<Vec<DocumentProfile>>();
-        let input = ResolverInput::new(&plan, session_context, profiles, file_names);
+        // Resolver 语义补召回通道（C）：用目标指代短语嵌入问题，与全量画像向量
+        // 做余弦（并行召回，不预筛 metadata）。embedding 缺失/失败 → None，
+        // 语义通道自动跳过（Fast Path First，嵌入不可用不阻断定位）；向量只作
+        // 补召回信号，不替代精确/Metadata 排序。
+        let resolver_reference = plan
+            .target
+            .reference
+            .clone()
+            .or_else(|| plan.target.document_name.clone())
+            .unwrap_or_else(|| request.question.trim().to_owned());
+        let resolver_question_vector = run_embedding(vec![resolver_reference.clone()])
+            .ok()
+            .and_then(|responses| responses.vectors.into_iter().next());
+        let resolver_profile_ids: Vec<Uuid> =
+            profiles.iter().map(|profile| profile.file_id).collect();
+        // 向量加载失败 → 空映射，退化为 metadata-only（语义补召回是增益层，失败
+        // 绝不阻断目标对象解析，与 run_document_recall 的吞错语义一致）。
+        let resolver_profile_vectors = catalog
+            .profile_vectors(&resolver_profile_ids)
+            .unwrap_or_default();
+        let semantic_enabled =
+            resolver_question_vector.is_some() && !resolver_profile_vectors.is_empty();
+        let input = ResolverInput::new(&plan, session_context, profiles, file_names.clone())
+            .with_vectors(resolver_question_vector, resolver_profile_vectors);
         let resolution = resolve_documents(&input);
         resolved_scope = resolution.resolved_file_ids.clone();
         resolution_status = Some(resolution.status);
@@ -8064,6 +9005,8 @@ fn finish_retrieval_with_plan(
                     "owner": plan.target.owner,
                     "entity_name": plan.target.entity_name,
                 },
+                "resolver_reference": resolver_reference,
+                "semantic_enabled": semantic_enabled,
                 "candidate_count": resolution.candidates.len(),
             }),
             &json!({
@@ -8237,11 +9180,16 @@ fn finish_retrieval_with_plan(
     // top-2/3 宽检索（用户明确指代时猜错比让用户选一次更伤）。
     // 注意：MultipleCandidates 的 resolved_file_ids 是 top-2/3（非空），
     // 触发条件只看「状态 + 有可选候选」，不能要求 scope 为空。
-    if should_ask_clarification(
-        memory_resolution_ok,
-        resolution_status,
-        !resolution_candidates.is_empty(),
-    ) {
+    // 精确点名（precise_named_document=true）命中多份同名副本时不澄清：
+    // 模型已凭语义判定用户点名的文件，同名副本是同一内容族，直接进 scope
+    // 检索，而不是让用户在看似不同的副本里选。判定由 LLM 给出，非硬规则。
+    if !plan.target.precise_named_document
+        && should_ask_clarification(
+            memory_resolution_ok,
+            resolution_status,
+            !resolution_candidates.is_empty(),
+        )
+    {
         let clarification_started = Instant::now();
         let reference = plan
             .target
@@ -8291,6 +9239,7 @@ fn finish_retrieval_with_plan(
             degradation_reason: None,
             no_evidence_reason: None,
             clarification: Some(payload),
+            thinking: None,
         };
         trace_node(
             catalog,
@@ -8433,13 +9382,21 @@ fn finish_retrieval_with_plan(
     )
 }
 
-/// 文档级召回（Step 9，spec 十一.5 / 十二）：全库画像 metadata 信号粗筛 →
-/// 粗筛集批量取向量精排 → 融合排序取前 `DOCUMENT_RECALL_TOP_N`。
+/// 文档级召回（Step 9，spec 十一.5 / 十二）：全库画像**并行召回**。
 ///
-/// 只在 scope 为空的全库资料请求时调用；任何失败（画像读取 / 向量缺失 /
-/// 数据源未就绪）都在内部吞掉并如实 trace，返回空集让调用方回落到 wider
-/// chunk retrieval——召回是增益层，绝不中断问答。trace 节点 `document_recall`
-/// 记录问题、候选分数与信号（前端可展示「按哪些依据找到这些文档」）。
+/// 三条通道各自产出有序候选后再 RRF 融合，取前 `PARALLEL_RECALL_TOP_N`：
+///   A. 精确/标题通道 + B. 元数据通道（document_type / entity / context / 关键词）
+///      —— 由 `parallel_document_recall` 内部的 metadata 排序承载；
+///   C. 纯语义通道（profile_vector 余弦），**不设 metadata 预筛门槛**，
+///      文件名/标题表达不了真实用途、但正文向量与问题相近的正确文件
+///      （如「我的简历 → final_v3.pdf」）靠本通道补召回。
+///
+/// 关键：A/B 与 C 并行召回后再融合，**禁止先 metadata 过滤、再在剩余文件里
+/// 做 embedding**——那会永久丢掉 filename/metadata 无法识别的正确文件。
+/// 任何失败（画像读取 / 向量缺失 / 数据源未就绪）都在内部吞掉并如实 trace，
+/// 返回空集让调用方回落到 wider chunk retrieval——召回是增益层，绝不中断问答。
+/// trace 节点 `document_recall` 记录三通道候选与融合排序（据此能明确归因
+/// Planner / Resolver / Semantic Recall / Scope 各自的成败）。
 fn run_document_recall(
     catalog: &CatalogService,
     question: &str,
@@ -8451,7 +9408,7 @@ fn run_document_recall(
     let mut trace_status = "ok";
     let mut reason = "recalled";
     let mut recalled: Vec<Uuid> = Vec::new();
-    let mut recall_signals: Vec<serde_json::Value> = Vec::new();
+    let mut channel_trace: serde_json::Value = json!({});
     let outcome: Result<(), AppError> = (|| {
         let profiles = catalog.list_document_profiles(None, 10_000)?;
         if profiles.is_empty() {
@@ -8459,28 +9416,34 @@ fn run_document_recall(
             reason = "no_profiles";
             return Ok(());
         }
-        // 第 1 级：metadata 粗筛（分数降序、截断到向量候选上限），
-        // 只对这批取向量——避免对全库逐文件查一次库。
-        let preselected = preselect_document_profiles(question, &profiles);
-        if preselected.is_empty() {
-            trace_status = "empty";
-            reason = "no_metadata_match";
-            return Ok(());
-        }
-        let vector_ids: Vec<Uuid> = preselected.iter().map(|(_, file_id, _)| *file_id).collect();
-        let vectors = catalog.profile_vectors(&vector_ids)?;
-        // 第 2 级：向量精排 + 融合。
-        let ranked = rank_document_candidates(question, question_vector, &profiles, &vectors);
-        recalled = ranked.iter().map(|candidate| candidate.file_id).collect();
-        recall_signals = ranked
+        // 全库画像向量一次性批量加载（单条 IN 查询），供语义通道在**不预筛**的
+        // 前提下与 metadata 通道并行参与召回；向量量级与「chunk 数 < 5000 时
+        // 整点积扫描」一致，属本项目可接受的批量扫描成本。
+        let all_ids: Vec<Uuid> = profiles
             .iter()
-            .map(|candidate| {
-                json!({
-                    "file_id": candidate.file_id.to_string(),
-                    "score": candidate.score,
-                    "signals": candidate.signals,
-                })
-            })
+            .map(|(profile, _)| profile.file_id)
+            .collect();
+        let all_vectors = catalog.profile_vectors(&all_ids)?;
+        let recall = parallel_document_recall(question, question_vector, &profiles, &all_vectors);
+
+        // Trace：分开记录 A/B(metadata) 与 C(semantic) 通道各自召回，再记录融合
+        // 结果，便于定位是 Resolver(metadata) 漏召回、Semantic 漏召回还是融合排序偏。
+        channel_trace = json!({
+            "metadata_candidates": recall.metadata_candidates.iter().map(|c| json!({
+                "file_id": c.file_id.to_string(),
+                "score": c.score,
+                "signals": c.signals,
+            })).collect::<Vec<_>>(),
+            "semantic_candidates": recall.semantic_candidates.iter().map(|(fid, cosine)| json!({
+                "file_id": fid.to_string(),
+                "cosine": cosine,
+            })).collect::<Vec<_>>(),
+            "semantic_enabled": recall.semantic_enabled,
+        });
+        recalled = recall
+            .fused
+            .iter()
+            .map(|candidate| candidate.file_id)
             .collect();
         if recalled.is_empty() {
             trace_status = "empty";
@@ -8517,14 +9480,14 @@ fn run_document_recall(
         &json!({
             "question": question,
             "has_vector": question_vector.is_some(),
-            "preselect_cap": DOCUMENT_RECALL_VECTOR_CANDIDATES,
         }),
         &json!({
             "status": trace_status,
             "reason": reason,
             "candidate_count": recalled.len(),
-            "candidates": recall_signals,
-            "top_n_cap": DOCUMENT_RECALL_TOP_N,
+            "recalled": recalled.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+            "channels": channel_trace,
+            "top_n_cap": PARALLEL_RECALL_TOP_N,
         }),
         trace_status,
         Some(started.elapsed().as_millis() as u64),
@@ -8565,7 +9528,8 @@ fn run_document_summary_answer(
     resolution_candidates: &[DocumentCandidate],
     document_type_hint: Option<DocumentType>,
 ) -> Result<AnswerResult, AppError> {
-    let (phase, verified_claim) = progress;
+    let (phase, verified_claim, _on_thinking) = progress;
+    phase("document_summary", 0.55);
     let correlation_id = operation_id.to_string();
     let session_id = request.session_id.map(|id| id.to_string());
     let session_id_ref = session_id.as_deref();
@@ -8881,6 +9845,7 @@ fn run_document_summary_answer(
         }),
         no_evidence_reason: None,
         clarification: None,
+        thinking: None,
     };
     for claim in &result.claims {
         verified_claim(claim);
@@ -8944,6 +9909,7 @@ fn finish_summary_refusal(
         degradation_reason: None,
         no_evidence_reason: None,
         clarification: None,
+        thinking: None,
     };
     let session_id = request.session_id.map(|id| id.to_string());
     trace_node(
@@ -9001,7 +9967,8 @@ fn run_compare_answer(
     cancelled: &AtomicBool,
     progress: AskProgressCallbacks<'_>,
 ) -> Result<AnswerResult, AppError> {
-    let (phase, verified_claim) = progress;
+    let (phase, verified_claim, _on_thinking) = progress;
+    phase("document_compare", 0.55);
     let correlation_id = operation_id.to_string();
     let session_id = request.session_id.map(|id| id.to_string());
     let session_id_ref = session_id.as_deref();
@@ -9114,37 +10081,13 @@ fn run_compare_answer(
         .content_query
         .clone()
         .unwrap_or_else(|| request.question.trim().to_owned());
-    let tokenizer_path = PathBuf::from(&embedding.local_path)
-        .parent()
-        .map(|parent| parent.join("tokenizer.json"))
-        .filter(|path| path.is_file())
-        .ok_or_else(|| {
-            AppError::new(
-                "EMBEDDING_TOKENIZER_MISSING",
-                "Embedding tokenizer 不存在，完整 RAG 已停止",
-                true,
-            )
-        })?;
-    let mut embedding_runtime_request = RuntimeTaskRequest::interactive(
-        RuntimeTaskKind::Embedding,
-        RuntimeBackendKind::OnnxRuntime,
+    let text = format!(
+        "{}{}",
+        embedding.query_prefix.as_deref().unwrap_or(""),
+        question_text
     );
-    embedding_runtime_request.cpu_threads = 2;
-    embedding_runtime_request.timeout = Duration::from_secs(10);
-    embedding_runtime_request.model_id = Some(artifact_id.clone());
-    let embedding_runtime_lease = runtime_manager.acquire(embedding_runtime_request)?;
-    let response = worker.encode_embeddings(&EmbeddingRequest {
-        model_path: embedding.local_path.clone(),
-        tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
-        texts: vec![format!(
-            "{}{}",
-            embedding.query_prefix.as_deref().unwrap_or(""),
-            question_text
-        )],
-        max_length: embedding.max_length.unwrap_or(512),
-        threads: 2,
-    })?;
-    embedding_runtime_lease.complete();
+    // Ollama 迁移：embedding 由本机 Ollama 统一托管，直接经 /api/embed 编码对比问题向量。
+    let response = run_embedding(vec![text])?;
     if response.vectors.is_empty() {
         return Err(AppError::new(
             "EMBEDDING_EMPTY",
@@ -9382,6 +10325,7 @@ fn run_compare_answer(
             .then(|| "对比生成未通过解析，回退为两侧原文材料并排呈现".to_owned()),
         no_evidence_reason: None,
         clarification: None,
+        thinking: None,
     };
     for claim in &result.claims {
         verified_claim(claim);
@@ -9450,6 +10394,7 @@ fn run_chat_answer(
     operation_id: Uuid,
     cancelled: &AtomicBool,
     phase: &dyn Fn(&str, f64),
+    on_thinking: &dyn Fn(&str),
 ) -> Result<AnswerResult, AppError> {
     if maintenance.degradation_level == "core" {
         return Err(AppError::new(
@@ -9482,6 +10427,7 @@ fn run_chat_answer(
             degradation_reason: None,
             no_evidence_reason: Some(NoEvidenceReason::TrueNoEvidence),
             clarification: None,
+            thinking: None,
         };
         let session_id = request.session_id.map(|id| id.to_string());
         trace_node(
@@ -9528,6 +10474,7 @@ fn run_chat_answer(
             degradation_reason: None,
             no_evidence_reason: None,
             clarification: None,
+            thinking: None,
         };
         let session_id = request.session_id.map(|id| id.to_string());
         trace_node(
@@ -9554,14 +10501,68 @@ fn run_chat_answer(
     phase("chat_generating", 0.7);
     let (system, user) = chat_prompt(request, history);
     let started_at = Instant::now();
-    let answer = complete_with_model(
-        generation,
-        generation_artifact,
-        &system,
-        &user,
-        512,
-        cancelled,
-    )?;
+    // 深度思考模式：开启思考并流式输出推理轨迹（message.thinking 增量经
+    // on_thinking 推给前端），正文增量仍走完整的问答 token 事件。非思考
+    // 模式沿用原有同步调用，保证 RAG 内部 JSON 链路的稳定输出。
+    // 深度思考模式返回 (正文, 思考轨迹)；非思考模式思考为 None。
+    let (answer, thinking) = if request.think_mode {
+        let mut text = String::new();
+        let mut thinking_text = String::new();
+        {
+            let mut runtime = generation.lock().map_err(|_| {
+                AppError::new(
+                    "GENERATION_RUNTIME_LOCK_FAILED",
+                    "生成运行时状态已损坏",
+                    true,
+                )
+            })?;
+            let threads = interactive_inference_threads();
+            if runtime.active_model_path() != Some(generation_artifact.local_path.as_str())
+                || !runtime.is_active()
+            {
+                runtime.activate(&generation_artifact.local_path, 4096, threads)?;
+            }
+            let mut delta = |thinking: Option<&str>, content: Option<&str>| {
+                if let Some(thinking) = thinking {
+                    thinking_text.push_str(thinking);
+                    on_thinking(thinking);
+                }
+                if let Some(content) = content {
+                    text.push_str(content);
+                }
+            };
+            runtime
+                .complete_stream_cancellable(&system, &user, 4096, true, cancelled, &mut delta)?;
+        }
+        // 思考模式可能因思考轨迹过长耗尽 token 预算（F4）：content 为空但
+        // 有思考文本时，不报 OLLAMA_RESPONSE_INVALID，改为友好提示并把思考
+        // 文本作为回退正文，保证用户看到「模型确实思考过」而非错误。
+        let text = if text.trim().is_empty() && !thinking_text.trim().is_empty() {
+            "（模型已完成深度思考，但思考过程消耗了全部输出预算，未生成最终正文。你可以关闭深度思考后重试，或换一种更简洁的问法。）".to_owned()
+        } else {
+            if text.trim().is_empty() {
+                return Err(AppError::new(
+                    "OLLAMA_RESPONSE_INVALID",
+                    "Ollama 对话响应缺少回答文本",
+                    false,
+                ));
+            }
+            // qwen3.5 思考模型正文会内嵌 <Thinking>/<Answer> 标记，展示前剥除
+            clean_qwen_thinking_tags(&text)
+        };
+        let thinking = (!thinking_text.trim().is_empty()).then_some(thinking_text);
+        (text, thinking)
+    } else {
+        let answer = complete_with_model(
+            generation,
+            generation_artifact,
+            &system,
+            &user,
+            512,
+            cancelled,
+        )?;
+        (answer, None)
+    };
     let result = AnswerResult {
         session_id: request.session_id.unwrap_or_else(Uuid::now_v7),
         message_id: Uuid::now_v7(),
@@ -9578,6 +10579,7 @@ fn run_chat_answer(
         degradation_reason: None,
         no_evidence_reason: None,
         clarification: None,
+        thinking,
     };
     let session_id = request.session_id.map(|id| id.to_string());
     trace_node(
@@ -9633,7 +10635,7 @@ fn run_retrieval_answer(
     skip_query_rewrite: bool,
     document_recall: bool,
 ) -> Result<AnswerResult, AppError> {
-    let (phase, verified_claim) = progress;
+    let (phase, verified_claim, _on_thinking) = progress;
     let correlation_id = operation_id.to_string();
     let session_id = request.session_id.map(|id| id.to_string());
     let session_id_ref = session_id.as_deref();
@@ -9754,23 +10756,6 @@ fn run_retrieval_answer(
         return Err(AppError::new("OPERATION_CANCELLED", "问答已取消", false));
     }
     phase("hybrid_retrieval", 0.25);
-    let tokenizer_path = PathBuf::from(&embedding.local_path)
-        .parent()
-        .map(|parent| parent.join("tokenizer.json"))
-        .ok_or_else(|| {
-            AppError::new(
-                "EMBEDDING_TOKENIZER_MISSING",
-                "Embedding 模型目录无效",
-                false,
-            )
-        })?;
-    if !tokenizer_path.is_file() {
-        return Err(AppError::new(
-            "EMBEDDING_TOKENIZER_MISSING",
-            "Embedding tokenizer 不存在，完整 RAG 已停止",
-            true,
-        ));
-    }
     // 路由改为 LLM 直路由后不再产生问题向量，恒按检索问题（改写拆分后的
     // 多个问题批量编码一次，分别检索后合并）自行编码。
     let embedding_texts = retrieval_questions
@@ -9784,22 +10769,9 @@ fn run_retrieval_answer(
         })
         .collect::<Vec<_>>();
     let embedding_started = Instant::now();
-    let mut embedding_runtime_request = RuntimeTaskRequest::interactive(
-        RuntimeTaskKind::Embedding,
-        RuntimeBackendKind::OnnxRuntime,
-    );
-    embedding_runtime_request.cpu_threads = 2;
-    embedding_runtime_request.timeout = Duration::from_secs(10);
-    embedding_runtime_request.model_id = Some(embedding.artifact_id.to_string());
-    let embedding_runtime_lease = runtime_manager.acquire(embedding_runtime_request)?;
-    let response = worker.encode_embeddings(&EmbeddingRequest {
-        model_path: embedding.local_path.clone(),
-        tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
-        texts: embedding_texts,
-        max_length: embedding.max_length.unwrap_or(512),
-        threads: 2,
-    })?;
-    embedding_runtime_lease.complete();
+    // Ollama 迁移：embedding 由本机 Ollama 统一托管，直接经 /api/embed 批量编码，
+    // 无需 tokenizer 与 onnx 运行时租约。
+    let response = run_embedding(embedding_texts)?;
     let embedding_ms = embedding_started.elapsed().as_millis() as u64;
     if response.vectors.len() != retrieval_questions.len() {
         return Err(AppError::new(
@@ -9886,15 +10858,33 @@ fn run_retrieval_answer(
     if extractive.insufficient_evidence {
         // NO_EVIDENCE 六分类（spec 十二）：子查询根因已在 storage 层写入；
         // 无子查询根因时按阶段优先级取 TARGET_NOT_RESOLVED（调用方预置）>
-        // DOCUMENT_RECALL_EMPTY > TRUE_NO_EVIDENCE。
+        // DOCUMENT_RECALL_EMPTY > CHUNK_RETRIEVAL_EMPTY > TRUE_NO_EVIDENCE。
+        // 文档级召回命中候选、但候选集合内 chunk 检索为空（诊断报告 P0-3）：
+        // 这是「有资料却拒绝」的高频根因——明确记为 CHUNK_RETRIEVAL_EMPTY，
+        // 区别于真无证据，便于诊断与后续放宽阈值。
         if extractive.no_evidence_reason.is_none() {
             extractive.no_evidence_reason = Some(
                 resolution_reason
                     .or_else(|| {
                         document_recall_empty.then_some(NoEvidenceReason::DocumentRecallEmpty)
                     })
+                    .or_else(|| {
+                        // 文档级召回确实启用并命中了候选文件（此时 file_ids 已
+                        // 被约束到候选集合），但候选集合内 chunk 检索为空 →
+                        // 记 CHUNK_RETRIEVAL_EMPTY，区别于「从未召回」与「真无证据」。
+                        (document_recall && !document_recall_empty)
+                            .then_some(NoEvidenceReason::ChunkRetrievalEmpty)
+                    })
                     .unwrap_or(NoEvidenceReason::TrueNoEvidence),
             );
+        }
+        // D2（索引覆盖提示）：index_coverage 不足时在拒答文案中附加提示，
+        // 降低「部分资料未完成索引 → 有资料却拒绝」的误判。
+        if extractive.index_coverage > 0.0 && extractive.index_coverage < 0.9 {
+            let suffix = "（注意：当前仍有部分资料未完成索引，扩大覆盖后可能找到更多依据）";
+            if !extractive.answer.contains("未完成索引") {
+                extractive.answer.push_str(suffix);
+            }
         }
         extractive.answer_mode = AnswerMode::RagRefusal;
         trace_node(
@@ -10210,6 +11200,31 @@ fn run_retrieval_answer(
                 "answerability_status": verdict.status.as_str(),
                 "answerability_reason": verdict.reason,
                 "answer_shape": verdict.answer_shape.as_str(),
+            }),
+            "ok",
+            Some(extractive.elapsed_ms),
+        );
+        catalog.record_ask_exchange(request, &extractive)?;
+        phase("completed", 1.0);
+        return Ok(extractive);
+    }
+    if !fanfan_core::should_synthesize_grounded_answer(&extractive) {
+        trace_node(
+            catalog,
+            "ask",
+            "generation_skipped",
+            &correlation_id,
+            session_id_ref,
+            None,
+            &json!({
+                "reason": "extractive_answer_preferred",
+                "claim_count": extractive.claims.len(),
+                "source_file_count": extractive.source_files.len(),
+            }),
+            &json!({
+                "answer_mode": extractive.answer_mode.as_str(),
+                "grounding_status": format!("{:?}", extractive.grounding_status),
+                "insufficient_evidence": extractive.insufficient_evidence,
             }),
             "ok",
             Some(extractive.elapsed_ms),
@@ -12399,7 +13414,7 @@ fn run_profile_build_cycle(
                 );
             }
             // 画像就绪后立即尝试分类（Step 2）：纯计算 + 少量回写，失败只记日志
-            let attempted = run_classification_pass(app, catalog, &artifact);
+            let attempted = run_classification_pass(catalog, &artifact);
             // 画像批次打满或分类还有待处理画像 → 继续下一轮
             result.profiled_files >= u64::from(PROFILE_BUILD_BATCH)
                 || attempted >= u64::from(CLASSIFY_BATCH)
@@ -12435,12 +13450,10 @@ fn prototype_cache() -> MutexGuard<'static, PrototypeVectorCache> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// 取当前 Embedding 模型的分类原型向量：缓存命中直接返回，否则用 onnx
+/// 取当前 Embedding 模型的分类原型向量：缓存命中直接返回，否则用本机 Ollama
 /// 对 TYPE_PROTOTYPE_TEXTS 编码一次、按类型聚合。失败返回 Err——分类是
 /// best-effort，调用方记日志后跳过本轮即可。
 fn prototype_vectors_for(
-    worker: &WorkerClient,
-    runtime_manager: &RuntimeManager,
     artifact: &ModelArtifact,
 ) -> Result<Vec<(DocumentType, Vec<f32>)>, AppError> {
     let key = artifact.artifact_id.to_string();
@@ -12452,39 +13465,8 @@ fn prototype_vectors_for(
         .flat_map(|(_, prototype_texts)| prototype_texts.iter().copied())
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let tokenizer_path = PathBuf::from(&artifact.local_path)
-        .parent()
-        .map(|parent| parent.join("tokenizer.json"))
-        .ok_or_else(|| {
-            AppError::new(
-                "EMBEDDING_TOKENIZER_MISSING",
-                "Embedding 模型目录无效",
-                false,
-            )
-        })?;
-    if !tokenizer_path.is_file() {
-        return Err(AppError::new(
-            "EMBEDDING_TOKENIZER_MISSING",
-            "Embedding tokenizer 不存在，文档类型分类已跳过",
-            false,
-        ));
-    }
-    let mut runtime_request = RuntimeTaskRequest::interactive(
-        RuntimeTaskKind::Embedding,
-        RuntimeBackendKind::OnnxRuntime,
-    );
-    runtime_request.cpu_threads = 2;
-    runtime_request.timeout = Duration::from_secs(30);
-    runtime_request.model_id = Some(key.clone());
-    let runtime_lease = runtime_manager.acquire(runtime_request)?;
-    let response = worker.encode_embeddings(&EmbeddingRequest {
-        model_path: artifact.local_path.clone(),
-        tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
-        texts,
-        max_length: artifact.max_length.unwrap_or(512),
-        threads: 2,
-    })?;
-    runtime_lease.complete();
+    // Ollama 迁移：embedding 由本机 Ollama 统一托管，直接经 /api/embed 编码原型文本。
+    let response = run_embedding(texts)?;
     if response.dimension == 0
         || response.vectors.len()
             != TYPE_PROTOTYPE_TEXTS
@@ -12529,11 +13511,7 @@ fn prototype_vectors_for(
 /// 表示，绝不猜类型；下次有内容变化（新 revision 触发重建）时自然重判。
 /// 分类失败只记日志：类型只影响 Document Resolver 的信号权重与类型化检索，
 /// 绝不阻塞索引或问答主链。
-fn run_classification_pass(
-    app: &AppHandle,
-    catalog: &CatalogService,
-    artifact: &ModelArtifact,
-) -> u64 {
+fn run_classification_pass(catalog: &CatalogService, artifact: &ModelArtifact) -> u64 {
     let pending = match catalog.list_profiles_needing_classification(CLASSIFY_BATCH) {
         Ok(pending) => pending,
         Err(error) => {
@@ -12550,11 +13528,7 @@ fn run_classification_pass(
     if pending.is_empty() {
         return 0; // 无待分类画像：不动原型缓存，不打扰 Embedding 运行时
     }
-    let runtime_manager = app.state::<RuntimeManagerState>();
-    // 分类原型向量必须由 onnx 角色 worker 编码（parse 角色不加载 embedding
-    // 运行时，直接调用会返回 OPERATION_UNSUPPORTED）；与嵌入循环同一取法。
-    let onnx_worker = app.state::<SidecarRegistryState>().0.onnx.clone();
-    let prototypes = match prototype_vectors_for(&onnx_worker, &runtime_manager.0, artifact) {
+    let prototypes = match prototype_vectors_for(artifact) {
         Ok(prototypes) => prototypes,
         Err(error) => {
             crate::runtime_log::event(
@@ -12741,22 +13715,6 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
             return;
         }
     };
-    let tokenizer_path = match PathBuf::from(&artifact.local_path)
-        .parent()
-        .map(|parent| parent.join("tokenizer.json"))
-        .filter(|path| path.is_file())
-    {
-        Some(path) => path,
-        None => {
-            let error = AppError::new(
-                "EMBEDDING_TOKENIZER_UNAVAILABLE",
-                "Embedding 模型缺少受管理的 tokenizer.json",
-                false,
-            );
-            record_embedding_activation_failure(app, catalog, &models, pending.as_ref(), &error);
-            return;
-        }
-    };
     let model_artifact_id = artifact.artifact_id.to_string();
     let cycle_id = Uuid::now_v7().to_string();
     let cycle_started = Instant::now();
@@ -12808,41 +13766,8 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
             if chunks.is_empty() {
                 break;
             }
-            let runtime_manager = app.state::<RuntimeManagerState>();
-            let mut runtime_request = RuntimeTaskRequest::interactive(
-                RuntimeTaskKind::IncrementalIndex,
-                RuntimeBackendKind::OnnxRuntime,
-            );
-            runtime_request.cpu_threads = background_inference_threads();
-            runtime_request.timeout = Duration::from_secs(2);
-            runtime_request.model_id = Some(model_artifact_id.clone());
-            let runtime_lease = match runtime_manager.0.acquire(runtime_request) {
-                Ok(lease) => lease,
-                Err(error) => {
-                    crate::runtime_log::event(
-                        "info",
-                        "runtime",
-                        "runtime.background_deferred",
-                        Some(&cycle_id),
-                        &json!({"task_kind": "incremental_index", "error_code": error.code}),
-                    );
-                    return Ok(false);
-                }
-            };
-            let onnx_worker = app.state::<SidecarRegistryState>().0.onnx.clone();
-            let response = match onnx_worker.encode_embeddings(&EmbeddingRequest {
-                model_path: artifact.local_path.clone(),
-                tokenizer_path: Some(tokenizer_path.to_string_lossy().into_owned()),
-                texts: chunks.iter().map(|chunk| chunk.text.clone()).collect(),
-                max_length: artifact.max_length.unwrap_or(512),
-                threads: 4,
-            }) {
-                Ok(response) => response,
-                Err(error) => {
-                    runtime_lease.fail(error.code.clone());
-                    return Err(error);
-                }
-            };
+            // Ollama 迁移：索引编码经本机 Ollama /api/embed 承载，无需 onnx 租约与 tokenizer。
+            let response = run_embedding(chunks.iter().map(|chunk| chunk.text.clone()).collect())?;
             execution_device = response.device.clone();
             execution_provider = response.execution_provider.clone();
             device_fallback_reason = response.fallback_reason.clone();
@@ -12859,7 +13784,6 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
                     "向量数量或维度与模型自检结果不一致",
                     false,
                 );
-                runtime_lease.fail(error.code.clone());
                 return Err(error);
             }
             let inputs = chunks
@@ -12877,11 +13801,9 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
             ) {
                 Ok(committed) => committed,
                 Err(error) => {
-                    runtime_lease.fail(error.code.clone());
                     return Err(error);
                 }
             };
-            runtime_lease.complete();
             if committed == 0 {
                 break;
             }
@@ -13360,6 +14282,7 @@ mod tests {
             degradation_reason: None,
             no_evidence_reason: None,
             clarification: None,
+            thinking: None,
         };
 
         apply_rerank_scores(&mut result, &[0.1, 0.9]).expect("apply valid rerank scores");
@@ -13418,6 +14341,7 @@ mod tests {
             degradation_reason: None,
             no_evidence_reason: None,
             clarification: None,
+            thinking: None,
         };
 
         apply_rerank_scores(&mut result, &[0.1, 0.5, 0.9, 0.3, 0.7]).expect("apply rerank scores");
@@ -13477,6 +14401,7 @@ mod tests {
             degradation_reason: None,
             no_evidence_reason: None,
             clarification: None,
+            thinking: None,
         };
 
         let markdown = render_answer_export(&answer, "md").expect("render export");

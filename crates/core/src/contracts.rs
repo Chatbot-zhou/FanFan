@@ -241,7 +241,20 @@ pub struct FileRecord {
 }
 
 pub fn privacy_safe_display_path(path: &str) -> String {
-    let normalized = path.replace('/', "\\");
+    // 先去掉 Windows 长路径接口产生的前缀 `\\?\`（含 UNC 变体 `\\?\UNC\`），
+    // 否则截断成 `…\?\…` 后在前端无法再剥离，会展示成“两条斜杠一个问号”。
+    // UNC 前缀去掉后还原为 `\\server\share\…` 保持绝对路径语义。
+    let cleaned = if let Some(rest) = path
+        .strip_prefix("\\\\?\\UNC\\")
+        .or_else(|| path.strip_prefix("\\\\?\\unc\\"))
+    {
+        format!("\\\\{rest}")
+    } else if let Some(rest) = path.strip_prefix("\\\\?\\") {
+        rest.to_string()
+    } else {
+        path.to_string()
+    };
+    let normalized = cleaned.replace('/', "\\");
     let absolute = normalized.as_bytes().get(1) == Some(&b':') || normalized.starts_with("\\\\");
     if !absolute {
         return normalized;

@@ -232,6 +232,17 @@ pub struct RootRecord {
     pub file_count: u64,
     pub permission_error_count: u64,
     pub last_scan_at: Option<DateTime<Utc>>,
+    /// 该资料位置已进入活动 USearch 索引的可授权文件数。
+    #[serde(default)]
+    pub indexed_file_count: u64,
+    #[serde(default)]
+    pub indexable_file_count: u64,
+    #[serde(default)]
+    pub parsed_file_count: u64,
+    #[serde(default)]
+    pub embedded_file_count: u64,
+    #[serde(default)]
+    pub active_index_file_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,6 +262,7 @@ pub struct RootDiscoveryResult {
 #[serde(rename_all = "snake_case")]
 pub enum CandidateRootType {
     Onedrive,
+    Documents,
     Wechat,
     Qq,
 }
@@ -259,6 +271,7 @@ impl CandidateRootType {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Onedrive => "onedrive",
+            Self::Documents => "documents",
             Self::Wechat => "wechat",
             Self::Qq => "qq",
         }
@@ -266,6 +279,7 @@ impl CandidateRootType {
 
     pub fn from_storage(value: &str) -> Self {
         match value {
+            "documents" => Self::Documents,
             "wechat" => Self::Wechat,
             "qq" => Self::Qq,
             _ => Self::Onedrive,
@@ -275,6 +289,7 @@ impl CandidateRootType {
     pub fn label(self) -> &'static str {
         match self {
             Self::Onedrive => "OneDrive",
+            Self::Documents => "文档",
             Self::Wechat => "微信接收文件",
             Self::Qq => "QQ接收文件",
         }
@@ -394,9 +409,19 @@ impl CatalogService {
             .find(|(label, _)| *label == "文档")
             .and_then(|(_, path)| path.ok())
         {
+            candidates.push((CandidateRootType::Documents, documents.clone()));
             candidates.push((CandidateRootType::Wechat, documents.join("WeChat Files")));
             candidates.push((CandidateRootType::Qq, documents.join("Tencent Files")));
         }
+        // 收集已授权资料位置的规范化路径键，避免对已授权目录或已被其覆盖的
+        // 子目录重复推荐（如已授权“文档”，文档本身与文档下的微信/QQ 都不再推荐）。
+        let authorized_keys: Vec<String> = self
+            .store
+            .list_roots()?
+            .into_iter()
+            .filter(|root| root.enabled)
+            .map(|root| path_key(&PathBuf::from(&root.canonical_path)))
+            .collect();
         let mut seen = std::collections::HashSet::new();
         for (candidate_type, path) in candidates {
             if !path.is_dir() {
@@ -404,7 +429,7 @@ impl CatalogService {
             }
             let canonical = std::fs::canonicalize(&path).unwrap_or(path);
             let key = path_key(&canonical);
-            if seen.insert(key.clone()) {
+            if seen.insert(key.clone()) && !Self::overlaps_authorized(&key, &authorized_keys) {
                 self.store.upsert_candidate_root(
                     candidate_type,
                     &canonical.to_string_lossy(),
@@ -413,6 +438,16 @@ impl CatalogService {
             }
         }
         self.store.list_candidate_roots()
+    }
+
+    /// 判断候选路径键是否与某个已授权资料位置存在覆盖关系（相等、候选是已授权目录的
+    /// 子目录、或已授权目录是候选的子目录）。被覆盖的候选不再推荐，避免重复加入。
+    fn overlaps_authorized(candidate_key: &str, authorized_keys: &[String]) -> bool {
+        authorized_keys.iter().any(|root_key| {
+            candidate_key == root_key
+                || candidate_key.starts_with(&format!("{root_key}\\"))
+                || root_key.starts_with(&format!("{candidate_key}\\"))
+        })
     }
 
     pub fn list_candidate_roots(&self) -> Result<Vec<CandidateRoot>, AppError> {
@@ -1351,6 +1386,15 @@ impl CatalogService {
     /// 供 `index_stale_check` 与索引重建提示使用。
     pub fn active_index_model_artifact_id(&self) -> Result<Option<String>, AppError> {
         self.store.active_index_model_artifact_id()
+    }
+
+    /// 语义索引重建进度：返回 (目标模型已嵌入分块数, 可搜索分块总数)。
+    /// 供前端在「换模型→重建索引」期间轮询展示进度。
+    pub fn embedding_rebuild_progress(
+        &self,
+        model_artifact_id: &str,
+    ) -> Result<(u64, u64), AppError> {
+        self.store.embedding_rebuild_progress(model_artifact_id)
     }
 
     pub fn list_logs(&self, limit: u32) -> Result<Vec<AppLogRecord>, AppError> {

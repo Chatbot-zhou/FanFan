@@ -53,13 +53,13 @@ export function ModelPresetPanel() {
   const recommendation = useQuery({ queryKey: ["model-preset-recommendation"], queryFn: () => bridge.model_preset_recommendation() });
   const roleCatalog = useQuery({ queryKey: ["model-role-catalog"], queryFn: () => bridge.model_role_catalog_list() });
   const environment = useQuery({ queryKey: ["environment"], queryFn: () => bridge.environment_get_latest() });
+  // 仍保留 index_stale_check 用于“切换后是否需自动重建”的判定（仅内部使用，不再渲染提示框）。
   const indexStale = useQuery({ queryKey: ["index-stale-check"], queryFn: () => bridge.index_stale_check() });
 
   const names = useMemo(() => catalogNameMap(roleCatalog.data ?? []), [roleCatalog.data]);
   const recommendedId = recommendation.data ?? "";
-  const deviceLabel = environment.data?.gpu_name ? `GPU · ${environment.data.gpu_name}` : "CPU";
 
-  // 缺失模型统一从 ModelScope（魔搭社区）下载；确认后再入队，避免静默联网下载。
+  // 缺失的问答/语义检索模型经本机 Ollama pull，其余角色（OCR/精排/语音）走 ModelScope；确认后再入队，避免静默联网下载。
   const [sourceChoice, setSourceChoice] = useState<PresetPlanReport | null>(null);
   // 临时激活的卡片 id：点击某卡片时高亮并显示资源/速度提示，点击空白处取消，不代表持久生效配置。
   const [activeCard, setActiveCard] = useState<string | null>(null);
@@ -98,9 +98,17 @@ export function ModelPresetPanel() {
     onSuccess: async (report) => {
       setLastPlan(report);
       await queryClient.invalidateQueries({ queryKey: ["model-preset-selected"] });
+      setRebuildFailed(false);
       // 预设切换只持久化 preset_id，不主动删除旧模型；同步刷新模型状态与角色配置。
       await queryClient.invalidateQueries({ queryKey: ["model-runtime"] });
       await queryClient.invalidateQueries({ queryKey: ["index-stale-check"] });
+      // 全部模型已就绪（含 embedding 已激活）后自动重建语义索引，无需用户手动点击；
+      // 重建失败仍沿用旧索引（后端不切换 active 索引代），仅提示用户重试。
+      if (report.missing.length === 0 && indexStale.data?.stale) {
+        bridge.index_rebuild("REBUILD_INDEX").catch(() => {
+          setRebuildFailed(true);
+        });
+      }
       // 弹下载确认框改由 previewPreset 控制（先确认、再切换），这里不再自动弹，避免确认后重复弹。
     },
   });
@@ -161,7 +169,8 @@ export function ModelPresetPanel() {
   }, [selectedPresetId, lastPlan, downloads.data]);
 
   /**
-   * 为当前档位缺失的每个角色模型，统一从 ModelScope（魔搭社区）入队下载。
+   * 为当前档位缺失的每个角色模型入队下载：问答/语义检索（generation/embedding）
+   * 走本机 Ollama，其余角色（OCR/精排/语音）走 ModelScope（魔搭社区）。
    * 单个模型入队失败不影响其余模型；失败统一显示在下载任务区。
    */
   const enqueueMissingDownloads = async (report: PresetPlanReport) => {
@@ -169,8 +178,9 @@ export function ModelPresetPanel() {
     for (const item of report.missing) {
       const entry = entries.find((e) => e.catalog_id === item.catalog_id && e.role === item.role);
       if (!entry?.install_edition_id) continue;
+      const downloadSource = entry.role === "generation" || entry.role === "embedding" ? "ollama" : "modelscope";
       try {
-        await bridge.model_download_start(entry.install_edition_id, "modelscope", true);
+        await bridge.model_download_start(entry.install_edition_id, downloadSource, true);
       } catch (cause) {
         // 单个缺失模型入队失败不影响其余模型；错误统一显示在下载任务区。
         console.error(`preset download failed: ${item.role} ${item.catalog_id}`, cause);
@@ -179,9 +189,27 @@ export function ModelPresetPanel() {
     await queryClient.invalidateQueries({ queryKey: ["model-downloads"] });
   };
 
-  const rebuildIndex = useMutation({
+  // 语义索引重建失败标记：切换模型后自动重建，失败时提示用户重试（活跃索引代保持旧模型）。
+  const [rebuildFailed, setRebuildFailed] = useState(false);
+  // 重建进度查询：用于失败检测；重建进行中的进度由状态栏「检索覆盖」栏展示。
+  const indexRebuildProgress = useQuery({
+    queryKey: ["index-rebuild-progress"],
+    queryFn: () => bridge.index_rebuild_progress(),
+    refetchInterval: (query) => (query.state.data?.running ? 1000 : false),
+  });
+  // 后端将未收敛的重建标记为 phase="failed"，据此展示失败提示；重新开始时复位。
+  useEffect(() => {
+    const data = indexRebuildProgress.data;
+    if (!data) return;
+    if (data.phase === "failed") setRebuildFailed(true);
+    else if (data.running) setRebuildFailed(false);
+  }, [indexRebuildProgress.data]);
+
+  // 重建失败后的「重试」入口：重新触发同一套自动重建流程。
+  const retryRebuild = useMutation({
     mutationFn: () => bridge.index_rebuild("REBUILD_INDEX"),
     onSuccess: async () => {
+      setRebuildFailed(false);
       await queryClient.invalidateQueries({ queryKey: ["index-stale-check"] });
     },
   });
@@ -190,28 +218,22 @@ export function ModelPresetPanel() {
     <section className="model-preset">
       <h2>模型配置</h2>
 
-      <div className="model-preset__status">
-        <span>运行设备：<strong>{environment.data ? deviceLabel : "正在检测…"}</strong></span>
-        {environment.data?.gpu_memory_gb != null && <span>显存 {environment.data.gpu_memory_gb} GB</span>}
-        {environment.data?.memory_total_gb != null && <span>内存 {environment.data.memory_total_gb} GB</span>}
-      </div>
-
       {currentPreset
         ? <p className="model-preset__current">当前配置：<strong>{currentPreset.display_name}</strong>{hasEffectiveCurrent ? "" : "（模型未全部就绪，等待下载完成）"}</p>
         : <p className="model-preset__current">尚未选择配置，可选择下方任一档位。</p>}
 
-      {indexStale.data?.stale && (
-        <div role="alert" className="model-preset__stale">
+      {rebuildFailed && (
+        <div role="alert" className="model-preset__rebuild-failed">
           <div>
-            <strong>语义检索模型已更换，需要重建索引</strong>
-            <p>更换/升级了语义检索模型，旧索引代仍然沿用旧模型。重建后新的问答检索会应用到最新模型，建议立即执行。</p>
+            <strong>语义索引重建失败</strong>
+            <p>重建未能在限时内收敛，当前仍沿用上一版索引。可稍后重试。</p>
           </div>
-          <button type="button" className="primary-button" disabled={rebuildIndex.isPending} onClick={() => rebuildIndex.mutate()}>
-            {rebuildIndex.isPending ? "正在重建" : "重建索引"}
+          <button type="button" className="primary-button" disabled={retryRebuild.isPending} onClick={() => retryRebuild.mutate()}>
+            {retryRebuild.isPending ? "正在重试" : "重试"}
           </button>
         </div>
       )}
-      {rebuildIndex.isError && <p role="alert" className="inline-error">{errorMessage(rebuildIndex.error)}</p>}
+      {retryRebuild.isError && <p role="alert" className="inline-error">{errorMessage(retryRebuild.error)}</p>}
 
       {selectPreset.isError && <p role="alert" className="inline-error">{errorMessage(selectPreset.error)}</p>}
 
@@ -290,7 +312,8 @@ export function ModelPresetPanel() {
         ))}
       </div>
 
-      {/* 缺失模型确认弹窗：统一从 ModelScope（魔搭社区）下载，不再提供海外源选项。 */}
+      {/* 缺失模型确认弹窗：问答/语义检索模型经本机 Ollama pull 拉取，
+          其余角色（OCR/精排/语音）仍走 ModelScope。 */}
       <Modal
         open={sourceChoice !== null}
         title="下载缺失模型"
@@ -309,7 +332,7 @@ export function ModelPresetPanel() {
         }}
       >
         <p className="model-preset__src-desc">
-          当前配置需要从魔搭社区（ModelScope）下载 {sourceChoice?.missing.length ?? 0} 个模型：
+          需要准备 {sourceChoice?.missing.length ?? 0} 个本地模型组件（缺失模型来源见下方告示）：
         </p>
         {sourceChoice && (
           <ul className="model-preset__src-models">
@@ -320,6 +343,9 @@ export function ModelPresetPanel() {
             ))}
           </ul>
         )}
+        <p className="model-preset__src-desc">
+          <small>问答与语义检索模型由本机 Ollama 服务拉取并运行；OCR、语义精排与语音识别模型仍从魔搭社区（ModelScope）下载。Ollama 未安装时会先在模型管理引导你安装。</small>
+        </p>
       </Modal>
     </section>
   );

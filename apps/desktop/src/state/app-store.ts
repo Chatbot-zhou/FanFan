@@ -1,10 +1,11 @@
 import { create } from "zustand";
-import type { AnswerResult, AppRoute, InboxQuery, SearchRequest, SearchSession } from "../bridge";
+import type { AnswerResult, AppRoute, AskStreamEvent, InboxQuery, SearchRequest, SearchSession } from "../bridge";
+import { applyAskStreamEvent as reduceAskStreamEvent, finalizeAskExecutionState, toggleAskExecutionNode, type AskExecutionState } from "../features/ask/ask-execution-state";
 
 type InboxStatus = InboxQuery["status"];
 export type SettingsTab = "roots" | "models" | "index" | "appearance" | "memory" | "logs";
 export type SearchModifiedWindow = "all" | "7" | "30" | "365";
-export type AskTurn = { question: string; answer: AnswerResult };
+export type AskTurn = { question: string; answer: AnswerResult; execution?: AskExecutionState | null };
 /** 后台分析任务种类：资料关系分析、AI 集合建议分析 */
 export type AnalysisTaskKind = "relation" | "collection";
 /** 分析任务跨页面保留的运行状态：切页不中断也不丢失，页面重挂载后仍显示「正在分析」。 */
@@ -40,6 +41,11 @@ interface AppState {
   ask_active_session_id: string | null;
   ask_operation_id: string | null;
   ask_streamed_answer: string;
+  ask_execution: AskExecutionState | null;
+  /** 兼容旧字段；普通 UI 不展示模型 thinking。 */
+  ask_streamed_thinking: string;
+  /** 兼容旧字段；新请求固定关闭，不展示模型 thinking。 */
+  ask_think_mode: boolean;
   ask_active_phase: string;
   ask_scope_collection_ids: string[];
   inbox_initial_status: InboxStatus;
@@ -56,12 +62,17 @@ interface AppState {
   set_search_loading_more: (loading: boolean) => void;
   set_search_session: (session: SearchSession | null, query?: string) => void;
   set_search_prefs: (prefs: Partial<SearchPrefs>) => void;
-  set_ask_turns: (turns: AskTurn[]) => void;
+  set_ask_turns: (turns: AskTurn[] | ((prev: AskTurn[]) => AskTurn[])) => void;
   set_ask_pending_question: (question: string | null) => void;
   set_ask_loading: (loading: boolean) => void;
   set_ask_active_session_id: (sessionId: string | null) => void;
   set_ask_operation_id: (operationId: string | null) => void;
   set_ask_streamed_answer: (answer: string) => void;
+  apply_ask_stream_event: (event: AskStreamEvent) => void;
+  toggle_ask_execution_node: (nodeId: string) => void;
+  finalize_ask_execution: (totalDurationMs: number | null) => void;
+  set_ask_streamed_thinking: (thinking: string) => void;
+  set_ask_think_mode: (thinkMode: boolean) => void;
   set_ask_active_phase: (phase: string) => void;
   set_ask_scope_collection_ids: (ids: string[]) => void;
   reset_ask_state: () => void;
@@ -92,6 +103,9 @@ export const useAppStore = create<AppState>((set) => ({
   ask_active_session_id: null,
   ask_operation_id: null,
   ask_streamed_answer: "",
+  ask_execution: null,
+  ask_streamed_thinking: "",
+  ask_think_mode: false,
   ask_active_phase: "queued",
   ask_scope_collection_ids: [],
   inbox_initial_status: "new",
@@ -126,12 +140,32 @@ export const useAppStore = create<AppState>((set) => ({
     ? { search_session, search_session_query: query ?? "" }
     : { search_session: null }),
   set_search_prefs: (prefs) => set((state) => ({ search_prefs: { ...state.search_prefs, ...prefs } })),
-  set_ask_turns: (ask_turns) => set({ ask_turns }),
+  set_ask_turns: (ask_turns) => set((state) => ({
+    ask_turns: typeof ask_turns === "function" ? ask_turns(state.ask_turns) : ask_turns,
+  })),
   set_ask_pending_question: (ask_pending_question) => set({ ask_pending_question }),
   set_ask_loading: (ask_loading) => set({ ask_loading }),
   set_ask_active_session_id: (ask_active_session_id) => set({ ask_active_session_id }),
   set_ask_operation_id: (ask_operation_id) => set({ ask_operation_id }),
   set_ask_streamed_answer: (ask_streamed_answer) => set({ ask_streamed_answer }),
+  apply_ask_stream_event: (event) => set((state) => {
+    const ask_execution = reduceAskStreamEvent(state.ask_execution, event);
+    return {
+      ask_execution,
+      ask_operation_id: ask_execution?.operation_id ?? state.ask_operation_id,
+      ask_streamed_answer: ask_execution?.streamed_answer ?? state.ask_streamed_answer,
+    };
+  }),
+  toggle_ask_execution_node: (nodeId) => set((state) => ({ ask_execution: toggleAskExecutionNode(state.ask_execution, nodeId) })),
+  finalize_ask_execution: (totalDurationMs) => set((state) => {
+    const ask_execution = finalizeAskExecutionState(state.ask_execution, totalDurationMs);
+    return {
+      ask_execution,
+      ask_streamed_answer: ask_execution?.streamed_answer ?? state.ask_streamed_answer,
+    };
+  }),
+  set_ask_streamed_thinking: (ask_streamed_thinking) => set({ ask_streamed_thinking }),
+  set_ask_think_mode: (ask_think_mode) => set({ ask_think_mode }),
   set_ask_active_phase: (ask_active_phase) => set({ ask_active_phase }),
   set_ask_scope_collection_ids: (ask_scope_collection_ids) => set({ ask_scope_collection_ids }),
   reset_ask_state: () => set({
@@ -141,6 +175,9 @@ export const useAppStore = create<AppState>((set) => ({
     ask_active_session_id: null,
     ask_operation_id: null,
     ask_streamed_answer: "",
+    ask_execution: null,
+    ask_streamed_thinking: "",
+    ask_think_mode: false,
     ask_active_phase: "queued",
   }),
   open_inbox: (inbox_initial_status, inbox_today_only = false) => set({

@@ -2,6 +2,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AppError, ModelFormat, ModelRole, ModelSource};
 
+/// Ollama 统一 embedding 模型的 catalog_id（四档预设全部引用它）。
+pub const OLLAMA_EMBEDDING_CATALOG_ID: &str = "qwen3-embedding-0-6b";
+/// Ollama 统一 embedding 模型的本机 tag。
+pub const OLLAMA_EMBEDDING_TAG: &str = "qwen3-embedding:0.6b";
+/// Ollama 统一 embedding 模型的原生向量维度（native 1024 维）。
+pub const OLLAMA_EMBEDDING_DIMENSION: u32 = 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelEdition {
     pub edition_id: String,
@@ -231,7 +238,7 @@ pub fn built_in_model_presets() -> Vec<ModelPreset> {
             display_name: "轻量模式".into(),
             description: "最低资源占用，8GB 内存、无独立显卡也能完成基础搜索与 RAG。".into(),
             generation: "qwen3-5-0-8b-q4".into(),
-            embedding: "bge-small-zh-int8".into(),
+            embedding: "qwen3-embedding-0-6b".into(),
             reranker: None,
             asr: None,
             ocr: "ppocr-v6-small".into(),
@@ -256,7 +263,7 @@ pub fn built_in_model_presets() -> Vec<ModelPreset> {
             description: "适合大多数配备独显的电脑，完整问答、智能检索、语音输入、增强 OCR。"
                 .into(),
             generation: "qwen3-5-2b-q4".into(),
-            embedding: "bge-small-zh-int8".into(),
+            embedding: "qwen3-embedding-0-6b".into(),
             reranker: Some("bge-reranker-base-int8".into()),
             asr: Some("sensevoice-small".into()),
             ocr: "ppocr-v6-small".into(),
@@ -280,7 +287,7 @@ pub fn built_in_model_presets() -> Vec<ModelPreset> {
             display_name: "增强模式".into(),
             description: "更高的问答质量与更稳定的 Query Understanding、跨文档检索与综合。".into(),
             generation: "qwen3-5-4b-q4".into(),
-            embedding: "bge-m3".into(),
+            embedding: "qwen3-embedding-0-6b".into(),
             reranker: Some("bge-reranker-base-int8".into()),
             asr: Some("sensevoice-small".into()),
             ocr: "ppocr-v6-medium".into(),
@@ -304,7 +311,7 @@ pub fn built_in_model_presets() -> Vec<ModelPreset> {
             display_name: "旗舰模式".into(),
             description: "翻翻最高质量本地配置，适合 32GB+ 内存与 12GB+ 显存的工作站。".into(),
             generation: "qwen3-5-9b-q4".into(),
-            embedding: "bge-m3".into(),
+            embedding: "qwen3-embedding-0-6b".into(),
             reranker: Some("bge-reranker-base-int8".into()),
             asr: Some("sensevoice-small".into()),
             ocr: "ppocr-v6-medium".into(),
@@ -452,26 +459,36 @@ fn recommend_for_role(
 // The `recommended` flags in this catalog are intentionally all false: the
 // desktop layer recomputes them from the user's actual hardware before the
 // catalog reaches the UI.
+/// 按 `catalog_id` 查找内置 catalog 条目，返回其 `model_id`（对 Ollama 模型
+/// 即为本机 tag，如 `qwen3.5:2b`）。用于启动/选档自动探测时把 plan 的
+/// generation/embedding catalog_id 映射到 Ollama tag。
+pub fn ollama_tag_for_catalog(catalog_id: &str) -> Option<String> {
+    built_in_model_catalog()
+        .into_iter()
+        .find(|entry| entry.catalog_id == catalog_id)
+        .map(|entry| entry.model_id)
+}
+
 pub fn built_in_model_catalog() -> Vec<ModelCatalogEntry> {
     vec![
         catalog_entry(
-            "bge-small-zh-int8",
+            "qwen3-embedding-0-6b",
             ModelRole::Embedding,
-            "BGE",
-            "BGE-small-zh-v1.5 · 默认",
-            "bge-small-zh-v1.5-onnx-int8",
-            "面向中文资料检索的轻量向量模型。",
-            &["中文检索稳定", "索引速度快", "内存占用低"],
-            &["细粒度语义区分弱于更大的向量模型"],
-            Some(24_304_813),
+            "Qwen3-Embedding",
+            "Qwen3-Embedding 0.6B · 多语言",
+            "qwen3-embedding:0.6b",
+            "经本机 Ollama 提供的中文多语言向量模型（1024 维），四档预设统一使用。",
+            &["中文多语言检索", "四档统一", "由 Ollama 托管无需本地文件"],
+            &["需要本机安装并启动 Ollama", "切换后需重建向量索引"],
+            Some(639_000_000),
             1.0,
             None,
             "快",
-            "MIT",
-            false,
-            "所有受支持设备均推荐；更换后需要新建索引代际",
-            Some("embedding_bge_small"),
-            &["modelscope"],
+            "Apache-2.0",
+            true,
+            "所有受支持设备均推荐；经 Ollama 拉取，切换后需要新建索引代际",
+            Some("embedding_qwen3_embedding"),
+            &["ollama"],
         ),
         catalog_entry(
             "bge-reranker-base-int8",
@@ -497,8 +514,8 @@ pub fn built_in_model_catalog() -> Vec<ModelCatalogEntry> {
             ModelRole::Generation,
             "Qwen3.5",
             "Qwen3.5 0.8B",
-            "Qwen3.5-0.8B-Q4_K_M",
-            "新一代 Qwen3.5 入门档，原生多模态架构，低配置设备也能流畅问答。",
+            "qwen3.5:0.8b",
+            "经本机 Ollama 拉取 Qwen3.5 0.8B（qwen3.5:0.8b）入门档问答模型，文本+图像。",
             &[
                 "比 Qwen3 同档质量更高",
                 "原生多模态可转作视觉模型",
@@ -513,15 +530,15 @@ pub fn built_in_model_catalog() -> Vec<ModelCatalogEntry> {
             false,
             "8GB 内存即可流畅运行；低配设备作为 Qwen3 的升级起点",
             Some("generation_qwen3_5_0_8b_q4"),
-            // 官方 Preset 统一只从 ModelScope 下载（source_provider = modelscope）。
-            &["modelscope"],
+            // 生成/嵌入改由本机 Ollama pull，不再下载 GGUF 文件。
+            &["ollama"],
         ),
         catalog_entry(
             "qwen3-5-2b-q4",
             ModelRole::Generation,
             "Qwen3.5",
             "Qwen3.5 2B",
-            "Qwen3.5-2B-Q4_K_M",
+            "qwen3.5:2b",
             "新一代 Qwen3.5 轻量主流档，综合能力比 0.8B 明显更强，低配设备也能流畅问答。",
             &[
                 "比 0.8B 质量更高",
@@ -537,14 +554,14 @@ pub fn built_in_model_catalog() -> Vec<ModelCatalogEntry> {
             false,
             "8GB 内存即可流畅运行；低配设备追求更好质量的升级档",
             Some("generation_qwen3_5_2b_q4"),
-            &["modelscope"],
+            &["ollama"],
         ),
         catalog_entry(
             "qwen3-5-4b-q4",
             ModelRole::Generation,
             "Qwen3.5",
             "Qwen3.5 4B",
-            "Qwen3.5-4B-Q4_K_M",
+            "qwen3.5:4b",
             "新一代 Qwen3.5 主流档，跨文件综合与复杂追问更强。",
             &[
                 "复杂问题质量更高",
@@ -560,14 +577,14 @@ pub fn built_in_model_catalog() -> Vec<ModelCatalogEntry> {
             false,
             "建议 12GB 以上内存；4GB 显存采用部分 GPU 卸载",
             Some("generation_qwen3_5_4b_q4"),
-            &["modelscope"],
+            &["ollama"],
         ),
         catalog_entry(
             "qwen3-5-9b-q4",
             ModelRole::Generation,
             "Qwen3.5",
             "Qwen3.5 9B",
-            "Qwen3.5-9B-Q4_K_M",
+            "qwen3.5:9b",
             "新一代 Qwen3.5 大参数档，接近旗舰水平的中文问答。",
             &["本地最强问答质量", "原生多模态可转作视觉模型"],
             &["下载 5.7GB", "需要 16GB 以上内存"],
@@ -579,30 +596,7 @@ pub fn built_in_model_catalog() -> Vec<ModelCatalogEntry> {
             false,
             "建议 16GB 以上内存；需要较大显存或依赖 CPU 卸载",
             Some("generation_qwen3_5_9b_q4"),
-            &["modelscope"],
-        ),
-        catalog_entry(
-            "bge-m3",
-            ModelRole::Embedding,
-            "BGE",
-            "BGE M3 · 多语言",
-            "bge-m3-int8",
-            "BGE-M3 多语言向量模型，中文与英文资料库均可获得稳定召回。",
-            &[
-                "多语言检索稳定",
-                "召回质量高于 BGE-small",
-                "官方 ONNX 双源下载",
-            ],
-            &["索引更慢且占用更多空间", "内存占用高于 BGE-small"],
-            Some(585_539_515),
-            2.5,
-            None,
-            "中等",
-            "MIT",
-            false,
-            "建议 8GB 以上内存；更换后需要新建索引代际",
-            Some("embedding_bge_m3"),
-            &["modelscope"],
+            &["ollama"],
         ),
         catalog_entry(
             "sensevoice-small",
@@ -721,20 +715,23 @@ pub fn locked_download_artifact(model_id: &str, source: ModelSource) -> Option<D
     let source_name = match source {
         ModelSource::Huggingface => "huggingface",
         ModelSource::Modelscope => "modelscope",
-        ModelSource::LocalImport => return None,
+        // 本地导入与 Ollama 均无「锁定文件下载」语义：本地导入文件由用户提供，
+        // Ollama 模型经 /api/pull 按 tag 拉取、无本地文件清单。二者都不进入文件级
+        // 配套恢复 / 包清单校验，直接返回 None，避免对非文件源解析文件型 edition
+        // （如 reranker）触发 artifact_url 的 unreachable panic。
+        ModelSource::LocalImport | ModelSource::Ollama => return None,
     };
     [
-        "embedding_bge_small",
         "reranker_bge_base_int8",
         // 2026-08-19 锁定：PP-OCRv6 与 SenseVoice（ModelScope 单源）
         "ocr_ppocrv6_small",
         "ocr_ppocrv6_medium",
         "asr_sensevoice",
+        "embedding_qwen3_embedding",
         "generation_qwen3_5_0_8b_q4",
         "generation_qwen3_5_2b_q4",
         "generation_qwen3_5_4b_q4",
         "generation_qwen3_5_9b_q4",
-        "embedding_bge_m3",
     ]
     .into_iter()
     .filter_map(|edition_id| resolved_model_edition(edition_id, source_name).ok())
@@ -746,21 +743,28 @@ fn resolved_model_edition(edition_id: &str, source: &str) -> Result<ModelEdition
     let source = match source {
         "huggingface" => ModelSource::Huggingface,
         "modelscope" => ModelSource::Modelscope,
+        // 生成 / embedding 改由本机 Ollama pull，不再有 ModelScope 文件下载。
+        "ollama" => ModelSource::Ollama,
         _ => {
             return Err(AppError::new(
                 "MODEL_DOWNLOAD_SOURCE_UNAVAILABLE",
-                "官方模型当前只允许 ModelScope 源（本地导入除外）",
+                "未知的模型下载来源",
                 false,
             ));
         }
     };
     match edition_id {
-        "embedding_bge_small" => Ok(edition(
+        "embedding_qwen3_embedding" => Ok(edition(
             edition_id,
-            "BGE-small-zh-v1.5",
-            "仅安装中文 Embedding；启用后建立新的向量索引代际。",
-            8,
-            vec![embedding_artifact(source)],
+            "Qwen3-Embedding 0.6B",
+            "经本机 Ollama 拉取多语言向量模型 qwen3-embedding:0.6b（1024 维）；启用后建立新的向量索引代际。",
+            4,
+            vec![ollama_artifact(
+                ModelRole::Embedding,
+                "qwen3-embedding:0.6b",
+                "qwen3-embedding:0.6b",
+                639_000_000,
+            )],
             &["embedding"],
         )),
         "reranker_bge_base_int8" => {
@@ -810,43 +814,55 @@ fn resolved_model_edition(edition_id: &str, source: &str) -> Result<ModelEdition
         }
         "generation_qwen3_5_0_8b_q4" => Ok(edition(
             edition_id,
-            "Qwen3.5 0.8B",
-            "安装 Qwen3.5 0.8B Q4_K_M 问答基础模型。",
+            "Qwen3.5 0.8B（Ollama）",
+            "经本机 Ollama 拉取 Qwen3.5 0.8B（qwen3.5:0.8b）问答基础模型，文本+图像。",
             8,
-            vec![qwen35_generation_artifact(source, "0.8B", "Q4_K_M")],
+            vec![ollama_artifact(
+                ModelRole::Generation,
+                "qwen3.5:0.8b",
+                "qwen3.5:0.8b",
+                532_517_120,
+            )],
             &["generation"],
         )),
         "generation_qwen3_5_2b_q4" => Ok(edition(
             edition_id,
-            "Qwen3.5 2B",
-            "安装 Qwen3.5 2B Q4_K_M 问答基础模型。",
+            "Qwen3.5 2B（Ollama）",
+            "经本机 Ollama 拉取 Qwen3.5 2B（qwen3.5:2b）问答基础模型，文本+图像。",
             8,
-            vec![qwen35_generation_artifact(source, "2B", "Q4_K_M")],
+            vec![ollama_artifact(
+                ModelRole::Generation,
+                "qwen3.5:2b",
+                "qwen3.5:2b",
+                1_280_835_840,
+            )],
             &["generation"],
         )),
         "generation_qwen3_5_4b_q4" => Ok(edition(
             edition_id,
-            "Qwen3.5 4B",
-            "安装 Qwen3.5 4B Q4_K_M 问答基础模型。",
+            "Qwen3.5 4B（Ollama）",
+            "经本机 Ollama 拉取 Qwen3.5 4B（qwen3.5:4b）问答基础模型，文本+图像。",
             12,
-            vec![qwen35_generation_artifact(source, "4B", "Q4_K_M")],
+            vec![ollama_artifact(
+                ModelRole::Generation,
+                "qwen3.5:4b",
+                "qwen3.5:4b",
+                2_740_937_888,
+            )],
             &["generation"],
         )),
         "generation_qwen3_5_9b_q4" => Ok(edition(
             edition_id,
-            "Qwen3.5 9B",
-            "安装 Qwen3.5 9B Q4_K_M 问答基础模型。",
+            "Qwen3.5 9B（Ollama）",
+            "经本机 Ollama 拉取 Qwen3.5 9B（qwen3.5:9b）问答基础模型，文本+图像。",
             16,
-            vec![qwen35_generation_artifact(source, "9B", "Q4_K_M")],
+            vec![ollama_artifact(
+                ModelRole::Generation,
+                "qwen3.5:9b",
+                "qwen3.5:9b",
+                5_680_522_464,
+            )],
             &["generation"],
-        )),
-        "embedding_bge_m3" => Ok(edition(
-            edition_id,
-            "BGE-M3",
-            "安装多语言向量模型 BGE-M3 ONNX；启用后建立新的向量索引代际。",
-            8,
-            vec![bge_m3_artifact(source)],
-            &["embedding"],
         )),
         _ => Err(AppError::new(
             "MODEL_EDITION_NOT_FOUND",
@@ -891,233 +907,30 @@ fn require_modelscope(source: ModelSource) -> Result<(), AppError> {
     }
 }
 
-#[derive(Clone, Copy)]
-struct DownloadSourceSpec {
-    repository_id: &'static str,
-    revision: &'static str,
-    file_name: &'static str,
-    sha256: &'static str,
-    size_bytes: u64,
-}
-
-fn generation_artifact(
-    source: ModelSource,
+/// 构建一个「Ollama pull」语义的下载组件。`tag` 即本机 Ollama 的模型标签
+/// （如 `qwen3-embedding:0.6b`），下载经 `/api/pull` 按 tag 拉取，无本地文件、
+/// 无 sha256 / URL 校验。`size_bytes` 仅用于前端展示「预计体积」。
+fn ollama_artifact(
+    role: ModelRole,
     model_id: &str,
-    huggingface: DownloadSourceSpec,
-    modelscope: DownloadSourceSpec,
+    tag: &str,
+    size_bytes: u64,
 ) -> DownloadArtifact {
-    let selected = match source {
-        ModelSource::Huggingface => huggingface,
-        ModelSource::Modelscope => modelscope,
-        ModelSource::LocalImport => unreachable!("download catalog has no local source"),
-    };
     DownloadArtifact {
         model_id: model_id.to_owned(),
-        role: ModelRole::Generation,
-        format: ModelFormat::Gguf,
-        source,
-        repository_id: selected.repository_id.to_owned(),
-        revision: selected.revision.to_owned(),
-        file_name: selected.file_name.to_owned(),
-        url: artifact_url(
-            source,
-            selected.repository_id,
-            selected.revision,
-            selected.file_name,
-        ),
-        sha256: selected.sha256.to_owned(),
-        size_bytes: selected.size_bytes,
+        role,
+        format: ModelFormat::Ollama,
+        source: ModelSource::Ollama,
+        repository_id: String::new(),
+        revision: String::new(),
+        file_name: tag.to_owned(),
+        url: String::new(),
+        sha256: String::new(),
+        size_bytes,
         companion_files: Vec::new(),
         license_name: "Apache-2.0".into(),
         query_prefix: None,
         max_length: None,
-    }
-}
-
-fn src_spec(
-    repository_id: &'static str,
-    revision: &'static str,
-    file_name: &'static str,
-    sha256: &'static str,
-    size_bytes: u64,
-) -> DownloadSourceSpec {
-    DownloadSourceSpec {
-        repository_id,
-        revision,
-        file_name,
-        sha256,
-        size_bytes,
-    }
-}
-
-fn qwen35_generation_artifact(source: ModelSource, size: &str, quant: &str) -> DownloadArtifact {
-    let (hf, ms) = qwen35_specs(size, quant);
-    generation_artifact(source, &format!("Qwen3.5-{size}-{quant}"), hf, ms)
-}
-
-fn qwen35_specs(size: &str, quant: &str) -> (DownloadSourceSpec, DownloadSourceSpec) {
-    match (size, quant) {
-        ("0.8B", "Q4_K_M") => (
-            src_spec(
-                "unsloth/Qwen3.5-0.8B-GGUF",
-                "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
-                "Qwen3.5-0.8B-Q4_K_M.gguf",
-                "bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517",
-                532_517_120,
-            ),
-            src_spec(
-                "unsloth/Qwen3.5-0.8B-GGUF",
-                "88467eb7c8e3b6e7894c794f373050d4dbc6ae8a",
-                "Qwen3.5-0.8B-Q4_K_M.gguf",
-                "bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517",
-                532_517_120,
-            ),
-        ),
-        ("0.8B", "Q8_0") => (
-            src_spec(
-                "unsloth/Qwen3.5-0.8B-GGUF",
-                "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",
-                "Qwen3.5-0.8B-Q8_0.gguf",
-                "0ad885ffd4bb022fc4f0d33a3308fa108ef8613159d3b3a67e23abca056b7a6c",
-                811_843_840,
-            ),
-            src_spec(
-                "unsloth/Qwen3.5-0.8B-GGUF",
-                "88467eb7c8e3b6e7894c794f373050d4dbc6ae8a",
-                "Qwen3.5-0.8B-Q8_0.gguf",
-                "0ad885ffd4bb022fc4f0d33a3308fa108ef8613159d3b3a67e23abca056b7a6c",
-                811_843_840,
-            ),
-        ),
-        ("2B", "Q4_K_M") => (
-            src_spec(
-                "unsloth/Qwen3.5-2B-GGUF",
-                "f6d5376be1edb4d416d56da11e5397a961aca8ae",
-                "Qwen3.5-2B-Q4_K_M.gguf",
-                "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223",
-                1_280_835_840,
-            ),
-            src_spec(
-                "unsloth/Qwen3.5-2B-GGUF",
-                "90057e31161eb95cc0bc1413c4f53b44de9b49c8",
-                "Qwen3.5-2B-Q4_K_M.gguf",
-                "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223",
-                1_280_835_840,
-            ),
-        ),
-        ("2B", "Q8_0") => (
-            src_spec(
-                "unsloth/Qwen3.5-2B-GGUF",
-                "f6d5376be1edb4d416d56da11e5397a961aca8ae",
-                "Qwen3.5-2B-Q8_0.gguf",
-                "1b04acba824817554f4ce23639bc8495ff70453b8fcb047900c731521021f2c1",
-                2_012_012_800,
-            ),
-            src_spec(
-                "unsloth/Qwen3.5-2B-GGUF",
-                "90057e31161eb95cc0bc1413c4f53b44de9b49c8",
-                "Qwen3.5-2B-Q8_0.gguf",
-                "1b04acba824817554f4ce23639bc8495ff70453b8fcb047900c731521021f2c1",
-                2_012_012_800,
-            ),
-        ),
-        ("4B", "Q4_K_M") => (
-            src_spec(
-                "unsloth/Qwen3.5-4B-GGUF",
-                "e87f176479d0855a907a41277aca2f8ee7a09523",
-                "Qwen3.5-4B-Q4_K_M.gguf",
-                "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
-                2_740_937_888,
-            ),
-            src_spec(
-                "unsloth/Qwen3.5-4B-GGUF",
-                "167b4afc359863325cb4164418c715421b4e9118",
-                "Qwen3.5-4B-Q4_K_M.gguf",
-                "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
-                2_740_937_888,
-            ),
-        ),
-        ("4B", "Q8_0") => (
-            src_spec(
-                "unsloth/Qwen3.5-4B-GGUF",
-                "e87f176479d0855a907a41277aca2f8ee7a09523",
-                "Qwen3.5-4B-Q8_0.gguf",
-                "10cc391b403021dd11c614679d2fd92f611c3681d29e29651b717316965d61e1",
-                4_482_403_488,
-            ),
-            src_spec(
-                "unsloth/Qwen3.5-4B-GGUF",
-                "167b4afc359863325cb4164418c715421b4e9118",
-                "Qwen3.5-4B-Q8_0.gguf",
-                "10cc391b403021dd11c614679d2fd92f611c3681d29e29651b717316965d61e1",
-                4_482_403_488,
-            ),
-        ),
-        ("9B", "Q4_K_M") => (
-            src_spec(
-                "unsloth/Qwen3.5-9B-GGUF",
-                "3885219b6810b007914f3a7950a8d1b469d598a5",
-                "Qwen3.5-9B-Q4_K_M.gguf",
-                "03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8",
-                5_680_522_464,
-            ),
-            src_spec(
-                "unsloth/Qwen3.5-9B-GGUF",
-                "ae90f0d1c1be2b9250b0ef68265615f6fe3c777b",
-                "Qwen3.5-9B-Q4_K_M.gguf",
-                "03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8",
-                5_680_522_464,
-            ),
-        ),
-        ("9B", "Q8_0") => (
-            src_spec(
-                "unsloth/Qwen3.5-9B-GGUF",
-                "3885219b6810b007914f3a7950a8d1b469d598a5",
-                "Qwen3.5-9B-Q8_0.gguf",
-                "809626574d0cb43d4becfa56169980da2bb448f2299270f7be443cb89d0a6ae4",
-                9_527_502_048,
-            ),
-            src_spec(
-                "unsloth/Qwen3.5-9B-GGUF",
-                "ae90f0d1c1be2b9250b0ef68265615f6fe3c777b",
-                "Qwen3.5-9B-Q8_0.gguf",
-                "809626574d0cb43d4becfa56169980da2bb448f2299270f7be443cb89d0a6ae4",
-                9_527_502_048,
-            ),
-        ),
-        _ => unreachable!("unknown Qwen3.5 size/quant"),
-    }
-}
-
-/// BGE-M3：Xenova 的 transformers.js ONNX 导出（int8 自包含），双源，支持多语言。
-fn bge_m3_artifact(source: ModelSource) -> DownloadArtifact {
-    const REPOSITORY: &str = "Xenova/bge-m3";
-    let revision = match source {
-        ModelSource::Huggingface => "4de13258303883538bd53b696b452bf8099f0858",
-        ModelSource::Modelscope => "fcfa0e19ea3493a798eedbdafbb31bb71088e01c",
-        ModelSource::LocalImport => unreachable!("download catalog has no local source"),
-    };
-    DownloadArtifact {
-        model_id: "bge-m3-int8".into(),
-        role: ModelRole::Embedding,
-        format: ModelFormat::Onnx,
-        source,
-        repository_id: REPOSITORY.into(),
-        revision: revision.into(),
-        file_name: "model_int8.onnx".into(),
-        url: artifact_url(source, REPOSITORY, revision, "onnx/model_int8.onnx"),
-        sha256: "a206e10e995aa2a833924bcd725ba5dd6c3425cd34bac3cf2b5677cd2a1c51d6".into(),
-        size_bytes: 568_456_694,
-        companion_files: vec![DownloadFile {
-            file_name: "tokenizer.json".into(),
-            remote_path: "tokenizer.json".into(),
-            url: artifact_url(source, REPOSITORY, revision, "tokenizer.json"),
-            sha256: "6710678b12670bc442b99edc952c4d996ae309a7020c1fa0096dd245c2faf790".into(),
-            size_bytes: 17_082_821,
-        }],
-        license_name: "MIT".into(),
-        query_prefix: None,
-        max_length: Some(8192),
     }
 }
 
@@ -1260,59 +1073,6 @@ fn asr_sensevoice_artifact(source: ModelSource) -> DownloadArtifact {
     }
 }
 
-fn embedding_artifact(source: ModelSource) -> DownloadArtifact {
-    const REPOSITORY: &str = "onnx-community/bge-small-zh-v1.5-ONNX";
-    const HF_REVISION: &str = "9507db33464b5da99a532ac26b2a251767cbc62b";
-    const MS_REVISION: &str = "5b414c2c2d177d066e7bdc32b6ad2a4518a59333";
-    let revision = match source {
-        ModelSource::Huggingface => HF_REVISION,
-        ModelSource::Modelscope => MS_REVISION,
-        ModelSource::LocalImport => unreachable!("download catalog has no local source"),
-    };
-    let primary_path = "onnx/model_quantized.onnx";
-    let companion_specs = [
-        (
-            "model_quantized.onnx_data",
-            "onnx/model_quantized.onnx_data",
-            "952623481ca8beea884e3d3c9ecaf8a3c7bf1d0c21de29e970cd31af9d37a90b",
-            23_774_208,
-        ),
-        (
-            "tokenizer.json",
-            "tokenizer.json",
-            "3d09c84ebd10306706a79a8276b3ab736a40d8ec03251c7639f4e52c3a1a4f8e",
-            362_603,
-        ),
-    ];
-    DownloadArtifact {
-        model_id: "bge-small-zh-v1.5-onnx-int8".into(),
-        role: ModelRole::Embedding,
-        format: ModelFormat::Onnx,
-        source,
-        repository_id: REPOSITORY.into(),
-        revision: revision.into(),
-        file_name: "model_quantized.onnx".into(),
-        url: artifact_url(source, REPOSITORY, revision, primary_path),
-        sha256: "99a6e522710c00220c89f8c52e0cc5aa09d4cbb1c34c0e932eab3a9dfdc65df3".into(),
-        size_bytes: 168_002,
-        companion_files: companion_specs
-            .into_iter()
-            .map(
-                |(file_name, remote_path, sha256, size_bytes)| DownloadFile {
-                    file_name: file_name.into(),
-                    remote_path: remote_path.into(),
-                    url: artifact_url(source, REPOSITORY, revision, remote_path),
-                    sha256: sha256.into(),
-                    size_bytes,
-                },
-            )
-            .collect(),
-        license_name: "MIT".into(),
-        query_prefix: Some("为这个句子生成表示以用于检索相关文章：".into()),
-        max_length: Some(512),
-    }
-}
-
 fn artifact_url(source: ModelSource, repository_id: &str, revision: &str, path: &str) -> String {
     match source {
         // HF host is overridable via FANFAN_HF_MIRROR (e.g. "hf-mirror.com" for
@@ -1325,7 +1085,10 @@ fn artifact_url(source: ModelSource, repository_id: &str, revision: &str, path: 
         ModelSource::Modelscope => format!(
             "https://modelscope.cn/api/v1/models/{repository_id}/repo?Revision={revision}&FilePath={path}"
         ),
-        ModelSource::LocalImport => unreachable!("download catalog has no local source"),
+        // 本地导入与 Ollama 均无远程文件 URL（本地导入由用户提供文件，
+        // Ollama 经 /api/pull 按 tag 拉取）。返回空串而非 panic，避免任何
+        // catalog 遍历路径把非文件源误传给文件型 edition 构造器时崩溃。
+        ModelSource::LocalImport | ModelSource::Ollama => String::new(),
     }
 }
 
@@ -1338,18 +1101,35 @@ mod tests {
         let catalog = built_in_model_catalog();
         // 8 GB RAM, unknown GPU: Qwen3.5 2B Q4 (3.0 GB) is the largest generation
         // that fits 8 GB (4B needs 8.5 GB with headroom and 9B needs 16 GB);
-        // BGE-M3 (2.5 GB) is the largest fitting embedding. The trimmed catalog
-        // ships no vision model, so only a generation and an embedding are picked.
+        // embedding 统一为 qwen3-embedding-0-6b（1.0 GB）作为唯一嵌入推荐。
         let ids = recommended_catalog_ids(&catalog, Some(8), None);
-        assert_eq!(ids, vec!["qwen3-5-2b-q4".to_owned(), "bge-m3".to_owned()]);
+        assert_eq!(
+            ids,
+            vec![
+                "qwen3-5-2b-q4".to_owned(),
+                "qwen3-embedding-0-6b".to_owned()
+            ]
+        );
         // 16 GB RAM + 8 GB VRAM: Qwen3.5 9B Q4 (12.0 GB memory, 7.0 GB VRAM) is
         // the largest generation that fits both memory and VRAM.
         let ids = recommended_catalog_ids(&catalog, Some(16), Some(8));
-        assert_eq!(ids, vec!["qwen3-5-9b-q4".to_owned(), "bge-m3".to_owned()]);
+        assert_eq!(
+            ids,
+            vec![
+                "qwen3-5-9b-q4".to_owned(),
+                "qwen3-embedding-0-6b".to_owned()
+            ]
+        );
         // 4 GB RAM: Qwen3.5 2B Q4 (3.0 GB, needs 3.9 GB with headroom) is the
-        // largest generation that fits; BGE-M3 (2.5 GB, needs 3.25 GB) also fits.
+        // largest generation that fits; qwen3-embedding-0-6b (1.0 GB) 也适合。
         let ids = recommended_catalog_ids(&catalog, Some(4), None);
-        assert_eq!(ids, vec!["qwen3-5-2b-q4".to_owned(), "bge-m3".to_owned()]);
+        assert_eq!(
+            ids,
+            vec![
+                "qwen3-5-2b-q4".to_owned(),
+                "qwen3-embedding-0-6b".to_owned()
+            ]
+        );
     }
 
     #[test]
@@ -1360,7 +1140,7 @@ mod tests {
         let basic = preset_by_id("basic").unwrap();
         assert_eq!(basic.display_name, "轻量模式");
         assert_eq!(basic.generation, "qwen3-5-0-8b-q4");
-        assert_eq!(basic.embedding, "bge-small-zh-int8");
+        assert_eq!(basic.embedding, "qwen3-embedding-0-6b");
         assert_eq!(basic.reranker, None);
         assert_eq!(basic.asr, None);
         assert_eq!(basic.ocr, "ppocr-v6-small");
@@ -1372,7 +1152,7 @@ mod tests {
 
         let smooth = preset_by_id("smooth").unwrap();
         assert_eq!(smooth.generation, "qwen3-5-2b-q4");
-        assert_eq!(smooth.embedding, "bge-small-zh-int8");
+        assert_eq!(smooth.embedding, "qwen3-embedding-0-6b");
         assert_eq!(smooth.reranker.as_deref(), Some("bge-reranker-base-int8"));
         assert_eq!(smooth.asr.as_deref(), Some("sensevoice-small"));
         assert_eq!(smooth.ocr, "ppocr-v6-small");
@@ -1381,13 +1161,13 @@ mod tests {
 
         let balanced = preset_by_id("balanced").unwrap();
         assert_eq!(balanced.generation, "qwen3-5-4b-q4");
-        assert_eq!(balanced.embedding, "bge-m3");
+        assert_eq!(balanced.embedding, "qwen3-embedding-0-6b");
         assert_eq!(balanced.reranker.as_deref(), Some("bge-reranker-base-int8"));
         assert_eq!(balanced.ocr, "ppocr-v6-medium");
 
         let high = preset_by_id("high").unwrap();
         assert_eq!(high.generation, "qwen3-5-9b-q4");
-        assert_eq!(high.embedding, "bge-m3");
+        assert_eq!(high.embedding, "qwen3-embedding-0-6b");
         assert_eq!(high.reranker.as_deref(), Some("bge-reranker-base-int8"));
         assert_eq!(high.ocr, "ppocr-v6-medium");
     }
@@ -1460,7 +1240,7 @@ mod tests {
         let basic = preset_by_id("basic").unwrap();
         assert_eq!(
             basic.required_catalog_ids(),
-            vec!["qwen3-5-0-8b-q4", "bge-small-zh-int8", "ppocr-v6-small"]
+            vec!["qwen3-5-0-8b-q4", "qwen3-embedding-0-6b", "ppocr-v6-small"]
         );
         // smooth 六组件完整（含 reranker / ASR），OCR 用 v6-small。
         let smooth = preset_by_id("smooth").unwrap();
@@ -1468,7 +1248,7 @@ mod tests {
             smooth.required_catalog_ids(),
             vec![
                 "qwen3-5-2b-q4",
-                "bge-small-zh-int8",
+                "qwen3-embedding-0-6b",
                 "bge-reranker-base-int8",
                 "sensevoice-small",
                 "ppocr-v6-small",

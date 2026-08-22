@@ -195,6 +195,8 @@ export interface ModelRuntimeState {
 export interface InferenceRuntimeState {
   backend: "cuda" | "vulkan" | "metal" | "cpu" | "unavailable" | string;
   device_names: string[];
+  /** 当前驻留内存的各模型硬件占用（来自 Ollama `/api/ps`），逐模型展示 CPU/GPU。 */
+  running_models: RuntimeModelPlacement[];
   gpu_available: boolean;
   gpu_offload_layers: number | null;
   gpu_offload_mode: "automatic" | "measured" | "disabled" | string;
@@ -205,6 +207,30 @@ export interface InferenceRuntimeState {
   hardware: HardwareProfile;
   runtime_package: RuntimeBackendPackage;
   budget: InferenceBudget;
+}
+
+/** 单个运行中模型的硬件占用描述。 */
+export interface RuntimeModelPlacement {
+  /** 模型 tag，如 `qwen3-embedding:0.6b`。 */
+  model: string;
+  /** 处理器占比描述，如 `GPU 100%` / `CPU 100%`。 */
+  device: string;
+  /** 驻留显存字节数；0 表示当前全在 CPU。 */
+  vram_bytes: number;
+  /** 模型总大小字节数。 */
+  total_bytes: number;
+}
+
+/** Ollama 三态快照（面向前端的启动/安装引导）。 */
+export interface OllamaStatusSnapshot {
+  /** `ready` / `installed_not_running` / `not_installed`。 */
+  status: "ready" | "installed_not_running" | "not_installed" | string;
+  /** 服务就绪时的版本；未就绪为空串。 */
+  version: string;
+  /** 是否处于后台启动中（已装未运行且已发起启动）。 */
+  starting: boolean;
+  /** 最近一次启动失败的结构化错误码；无失败为 null。 */
+  error_code: string | null;
 }
 
 export interface HardwareProfile {
@@ -307,19 +333,7 @@ export interface SpeechRecognitionSession {
 }
 
 export type ModelRole = "generation" | "embedding" | "vision" | "reranker" | "ocr" | "asr" | "router";
-export type ModelFormat = "gguf" | "onnx";
-
-export interface ImportCandidate {
-  candidate_id: string;
-  source_path: string;
-  display_name: string;
-  format: ModelFormat;
-  suggested_role: ModelRole | null;
-  size_bytes: number;
-  sha256: string;
-  companion_files: string[];
-  warnings: string[];
-}
+export type ModelFormat = "gguf" | "onnx" | "ollama";
 
 export interface ModelArtifact {
   artifact_id: string;
@@ -327,7 +341,7 @@ export interface ModelArtifact {
   format: ModelFormat;
   model_id: string;
   model_version: string | null;
-  source: "local_import" | "modelscope" | "huggingface";
+  source: "modelscope" | "huggingface" | "ollama";
   repository_id: string | null;
   revision: string | null;
   sha256: string;
@@ -354,7 +368,7 @@ export interface ModelEdition {
     model_id: string;
     role: ModelRole;
     format: ModelFormat;
-    source: "huggingface" | "modelscope";
+    source: "huggingface" | "modelscope" | "ollama";
     repository_id: string;
     revision: string;
     file_name: string;
@@ -392,7 +406,7 @@ export interface ModelCatalogEntry {
   device_guidance: string;
   verification_status: "verified" | "local_import_only";
   install_edition_id: string | null;
-  supported_sources: Array<"huggingface" | "modelscope">;
+  supported_sources: Array<"huggingface" | "modelscope" | "ollama">;
 }
 
 /** 能力档案：业务代码只判断 `capability_profile`，不得判断具体模型名。 */
@@ -491,7 +505,7 @@ export interface ModelDownloadJob {
   job_id: string;
   edition_id: ModelEdition["edition_id"];
   edition_name: string;
-  source: "huggingface" | "modelscope";
+  source: "huggingface" | "modelscope" | "ollama";
   status: ModelDownloadStatus;
   phase: ModelDownloadPhase;
   downloaded_bytes: number;
@@ -591,6 +605,8 @@ export interface HomeSummary {
   local_date: string;
   metrics: SummaryMetric[];
   scan_progress: ScanProgress | null;
+  /** 是否已建立过初始索引（存在可搜索文件）。用于无进行中扫描任务时区分“已完成”与“尚未整理”。 */
+  index_initialized: boolean;
   recent_files: RecentFile[];
   favorite_files: RecentFile[];
   collections: CollectionSummary[];
@@ -668,8 +684,38 @@ export interface AskRequest {
   strict_evidence: true;
   /** Step 7：用户对 NEED_CLARIFICATION 选项的选择（file_id），随本轮提问一并提交 */
   clarification_selection: string | null;
+  /** 兼容旧协议字段；普通 UI 不展示模型 thinking。 */
+  think_mode: boolean;
 }
 
+
+export type AskStreamEventType =
+  | "ask_started"
+  | "node_started"
+  | "node_progress"
+  | "node_completed"
+  | "node_failed"
+  | "node_skipped"
+  | "answer_started"
+  | "answer_delta"
+  | "answer_completed"
+  | "ask_completed";
+
+export interface AskStreamEvent {
+  event_type: AskStreamEventType;
+  operation_id: string;
+  sequence: number;
+  node_id: string | null;
+  node_name: string | null;
+  public_label: string | null;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled" | "skipped" | null;
+  public_summary: string | null;
+  progress_lines: string[] | null;
+  duration_ms: number | null;
+  delta: string | null;
+  step_count: number | null;
+  total_duration_ms: number | null;
+}
 export interface ClarificationOption {
   file_id: string;
   display_name: string;
@@ -726,6 +772,8 @@ export interface AnswerResult {
   retrieval_channels: string[];
   index_coverage: number;
   degradation_reason: string | null;
+  /** 兼容旧历史字段；普通 UI 不展示模型 thinking。 */
+  thinking: string | null;
 }
 
 export interface OperationHandle {
@@ -740,6 +788,15 @@ export interface IndexStaleStatus {
   stale: boolean;
   active_embedding_artifact_id: string | null;
   index_embedding_artifact_id: string | null;
+}
+
+/** 语义索引重建进度快照（换模型→重建索引期间前端轮询展示）。 */
+export interface IndexRebuildProgress {
+  running: boolean;
+  phase: "idle" | "embedding" | "indexing" | "done" | "failed";
+  done: number;
+  total: number;
+  percent: number;
 }
 
 export interface AskOperationSnapshot {
@@ -991,6 +1048,11 @@ export interface RootRecord {
   file_count: number;
   permission_error_count: number;
   last_scan_at: UtcDateTime | null;
+  indexed_file_count: number;
+  indexable_file_count: number;
+  parsed_file_count: number;
+  embedded_file_count: number;
+  active_index_file_count: number;
 }
 
 export interface RootDiscoveryResult {
@@ -1142,8 +1204,13 @@ export interface MaintenanceSnapshot {
   schema_version: number;
   database_size_bytes: number;
   indexed_files: number;
+  indexable_files: number;
+  parsed_files: number;
+  embedded_files: number;
+  active_index_files: number;
   searchable_chunks: number;
   embedded_chunks: number;
+  active_vector_keys: number;
   pending_files: number;
   failed_files: number;
   active_jobs: number;
@@ -1556,9 +1623,13 @@ export interface FanFanBridge {
   environment_detect(): Promise<EnvironmentCheck>;
   /** 手动重新探测推理运行时（GPU 候选）并刷新当前生效后端。 */
   inference_runtime_refresh(): Promise<void>;
+  /** 只读探测 Ollama 三态（ready / installed_not_running / not_installed）。 */
+  ollama_status_get(): Promise<OllamaStatusSnapshot>;
+  /** 请求启动本机 Ollama（防重复启动；未安装时只引导不自动安装）。 */
+  ollama_start(): Promise<OllamaStatusSnapshot>;
+  /** 请求关闭本机 Ollama（终止 ollama.exe 进程）。 */
+  ollama_stop(): Promise<OllamaStatusSnapshot>;
   model_state_get(): Promise<ModelRuntimeState>;
-  model_import_scan(paths: string[]): Promise<ImportCandidate[]>;
-  model_import_confirm(selections: Array<{ source_path: string; role: ModelRole }>): Promise<ModelArtifact[]>;
   model_role_catalog_list(): Promise<ModelCatalogEntry[]>;
   model_preset_list(): Promise<ModelPreset[]>;
   /** 当前选定的官方模型预设 id；未选择（含旧版逐角色配置）时返回 null。 */
@@ -1569,7 +1640,7 @@ export interface FanFanBridge {
   model_preset_select(preset_id: string): Promise<PresetPlanReport>;
   /** 依据当前硬件检测返回推荐的官方预设 id（recommended ≠ 强制）。 */
   model_preset_recommendation(): Promise<string>;
-  model_download_start(edition_id: ModelEdition["edition_id"], source: "huggingface" | "modelscope", confirmed: true): Promise<ModelDownloadJob>;
+  model_download_start(edition_id: ModelEdition["edition_id"], source: "huggingface" | "modelscope" | "ollama", confirmed: true): Promise<ModelDownloadJob>;
   model_download_list(): Promise<ModelDownloadJob[]>;
   model_store_status_get(): Promise<ModelStoreStatus>;
   model_download_get(job_id: string): Promise<ModelDownloadJob>;
@@ -1577,7 +1648,7 @@ export interface FanFanBridge {
   model_download_cancel(job_id: string): Promise<ModelDownloadRemoval>;
   model_download_resume(job_id: string): Promise<ModelDownloadJob>;
   model_download_retry(job_id: string): Promise<ModelDownloadJob>;
-  model_download_switch_source(job_id: string, source: "huggingface" | "modelscope"): Promise<ModelDownloadJob>;
+  model_download_switch_source(job_id: string, source: "huggingface" | "modelscope" | "ollama"): Promise<ModelDownloadJob>;
   model_download_remove(job_id: string): Promise<ModelDownloadRemoval>;
   home_get_summary(local_date: string): Promise<HomeSummary>;
   candidate_root_action(candidate_id: string, action: "add" | "ignore"): Promise<CandidateRoot>;
@@ -1679,6 +1750,8 @@ export interface FanFanBridge {
   diagnostic_event_append(request: DiagnosticEventInput): Promise<void>;
   diagnostic_export(target_path: string, confirmed: true): Promise<ExportResult>;
   index_rebuild(confirmation: "REBUILD_INDEX"): Promise<OperationHandle>;
+  /** 查询语义索引重建进度，换模型重建期间轮询展示 */
+  index_rebuild_progress(): Promise<IndexRebuildProgress>;
   /** 查询 Embedding 换代回落的索引代际状态；stale=true 提示需重建索引 */
   index_stale_check(): Promise<IndexStaleStatus>;
   root_list(): Promise<RootRecord[]>;

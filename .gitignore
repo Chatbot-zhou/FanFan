@@ -76,6 +76,9 @@ qa-fixtures/
 results*.json
 scripts/run_ragas.ps1
 
+# Local evaluation workspace (database snapshots, model registry copies)
+.evaluation-tmp/
+
 # Evaluation harness (depends on removed eval fixtures)
 evaluate_qa_fixtures.rs
 
@@ -96,5 +99,8 @@ build/
 # Runtime vector indexes (app data lives in %APPDATA%, local copies only)
 vector-indexes/
 
-# Local docs artifacts (project docs stay local, not uploaded to GitHub)
-docs/
+# Local docs artifacts stay local by default. The two product baselines below
+# are versioned because they define the implementation and review contract.
+docs/*
+!docs/翻翻-产品与开发规划书.md
+!docs/方案逐条审查清单.md

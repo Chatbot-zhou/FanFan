@@ -385,9 +385,12 @@ pub struct RetrievalTrace {
 pub(crate) const RAG_MIN_SEMANTIC_SCORE: f32 = 0.70;
 /// 融合排序时每个文件最多参与 RRF 分数累加的内容 chunk 数。
 const MAX_FUSED_CHUNKS_PER_FILE: usize = 3;
-/// 文件名/路径命中（「找文件」类查询的最强信号）在文件级排序时的保底加分，
+/// 文件名/路径命中（「找文件」类查询的最强信号）在排序时的保底加分，
 /// 保证语义噪声堆叠的大文档不会把真正目标文件挤出前列。
+/// 2026-08-22 拆分为 filename/path 两档：path 命中是弱信号，不再与
+/// filename 同等加成（原来 +2.0 会让目录路径里的弱相关文件霸榜）。
 const FILENAME_MATCH_BOOST: f32 = 2.0;
+const PATH_MATCH_BOOST: f32 = 1.0;
 /// MMR 去重参与候选中按融合分截断到 limit 的倍数：原实现对全部候选做
 /// O(N^2) 的 token 冗余比较，长文本语料下单次搜索可达数十秒（实测 41s），
 /// 截断只排除低分候选，不影响高分去重结果。
@@ -558,15 +561,6 @@ pub(crate) fn fuse_ranked_hits(
             });
     }
     let mut results = by_file.into_values().collect::<Vec<_>>();
-    for result in &mut results {
-        if result
-            .match_reasons
-            .iter()
-            .any(|reason| matches!(reason.as_str(), "filename" | "path"))
-        {
-            result.scores.fused += FILENAME_MATCH_BOOST;
-        }
-    }
     match sort {
         SearchSort::Relevance => results.sort_by(|left, right| {
             right
@@ -697,6 +691,22 @@ pub(crate) fn fuse_retrieval_candidates(
                 }
                 _ => {}
             }
+        }
+    }
+    // 文件名/路径命中加成必须在 MMR 去重之前应用：否则文件名命中的候选
+    // 可能因 snippet 冗余被 MMR 丢弃；且加成进入 fused 后 MMR 的
+    // relevance 归一化（fused / max_relevance）才能正确反映「找文件」信号。
+    // 优先 filename（2.0），path 是弱信号（1.0），二者皆无时保持原分。
+    // filename_fuzzy（错别字容错命中）与 filename 等价，同享 2.0 加成。
+    for entry in fused.values_mut() {
+        if entry
+            .match_reasons
+            .iter()
+            .any(|reason| matches!(reason.as_str(), "filename" | "filename_fuzzy"))
+        {
+            entry.scores.fused += FILENAME_MATCH_BOOST;
+        } else if entry.match_reasons.iter().any(|reason| reason == "path") {
+            entry.scores.fused += PATH_MATCH_BOOST;
         }
     }
     let mut remaining = fused.into_values().collect::<Vec<_>>();

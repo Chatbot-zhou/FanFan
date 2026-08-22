@@ -51,6 +51,9 @@ impl ModelRole {
 pub enum ModelFormat {
     Gguf,
     Onnx,
+    /// Ollama 托管模型（生成 / embedding）：无本地文件，经本机 Ollama pull
+    /// 拉取并以 tag 形式注册，不进入 FanFan 的 ModelStore。
+    Ollama,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +62,8 @@ pub enum ModelSource {
     LocalImport,
     Modelscope,
     Huggingface,
+    /// 本机 Ollama（`127.0.0.1:11434`）。只支持本机，不连局域网 / 远程 / 公网。
+    Ollama,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,6 +203,18 @@ pub struct RolePlanItem {
     #[serde(rename = "role")]
     pub role: ModelRole,
     pub catalog_id: String,
+}
+
+/// 由 Ollama 模型 tag 派生确定性 artifact UUID（幂等、可序列化），使
+/// `ollama_embedding_ready` 重复注册时始终指向同一个 artifact。
+fn ollama_artifact_uuid(tag: &str) -> Uuid {
+    let mut hasher = Sha256::new();
+    hasher.update(b"fanfan-ollama-embedding:");
+    hasher.update(tag.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Uuid::from_bytes(bytes)
 }
 
 /// 把一份 `RuntimeModelPlan` 展开为「（角色，catalog_id）」的有序元组，
@@ -823,6 +840,133 @@ impl ModelManager {
             .find(|artifact| artifact.artifact_id == *artifact_id && artifact.status == "ready"))
     }
 
+    /// Ollama 专属就绪层：把本机 Ollama 的 embedding 模型（`qwen3-embedding:0.6b`）
+    /// 以「合成 ready artifact」形式注册并激活，使既有的
+    /// `active_artifact(Embedding)` / 就绪门控 / 索引覆盖计算无需感知后端差异即可
+    /// 识别「Ollama embedding 已就绪」。幂等：tag 用确定性 UUID 标识，重复调用
+    /// 覆盖同一 artifact 并保持 ready。
+    pub fn ollama_embedding_ready(&self, tag: &str) -> Result<ModelArtifact, AppError> {
+        let dimension = crate::model_catalog::OLLAMA_EMBEDDING_DIMENSION;
+        let catalog_id = crate::model_catalog::OLLAMA_EMBEDDING_CATALOG_ID;
+        let artifact_id = ollama_artifact_uuid(tag);
+        let _registry_guard = self.lock_registry()?;
+        let mut registry = self.load_registry()?;
+        let now = Utc::now();
+        let artifact = ModelArtifact {
+            artifact_id,
+            role: ModelRole::Embedding,
+            format: ModelFormat::Ollama,
+            catalog_id: Some(catalog_id.to_owned()),
+            model_id: tag.to_owned(),
+            model_version: None,
+            source: ModelSource::Ollama,
+            repository_id: Some("local-ollama".to_owned()),
+            revision: None,
+            sha256: String::new(), // Ollama 由 /api/pull 托管，无本地文件无 sha256
+            size_bytes: 0,
+            local_path: tag.to_owned(), // 携带 tag，run_embedding 以此为模型标识
+            quantization: None,
+            context_length: None,
+            embedding_dimension: Some(dimension),
+            query_prefix: None,
+            max_length: Some(1024),
+            license_name: None,
+            status: "ready".into(),
+            package_manifest: None,
+            imported_at: now,
+        };
+        match registry
+            .artifacts
+            .iter_mut()
+            .find(|existing| existing.artifact_id == artifact_id)
+        {
+            Some(existing) => *existing = artifact.clone(),
+            None => registry.artifacts.push(artifact.clone()),
+        }
+        registry.active_artifacts.insert(
+            ModelRole::Embedding.directory_name().to_owned(),
+            artifact_id,
+        );
+        registry.active_profile_id = None;
+        registry.pending_embedding_activation = None;
+        registry
+            .profiles
+            .retain(|profile| profile.embedding_artifact_id != artifact_id);
+        registry.updated_at = now;
+        self.save_registry(&registry)?;
+        Ok(artifact)
+    }
+
+    /// Ollama 专属就绪层：模拟 `ollama_embedding_ready`，把本机 Ollama 的文本生成
+    /// 模型（如 `qwen3.5:2b`）以「合成 ready artifact」形式注册并激活，使
+    /// `collect_plan_report` / `apply_runtime_plan` 能识别「Ollama generation 已就绪」。
+    /// `catalog_id` 使用 `built_in_model_catalog` 的连字符 catalog_id（如
+    /// `qwen3-5-2b-q4`），与 preset 的 generation 一致，保证精确匹配。幂等：
+    /// tag 用确定性 UUID 标识，重复调用覆盖同一 artifact 并保持 ready。
+    ///
+    /// 该函数同时完成「旧 GGUF active → Ollama active」的数据迁移：覆盖
+    /// `active_artifacts[Generation]` 指向本 Ollama artifact，并把同 role 的旧
+    /// `format=Gguf` artifact 置为 `inactive`（保留来源证据以利审计）。
+    pub fn ollama_generation_ready(
+        &self,
+        tag: &str,
+        catalog_id: &str,
+    ) -> Result<ModelArtifact, AppError> {
+        let artifact_id = ollama_artifact_uuid(tag);
+        let _registry_guard = self.lock_registry()?;
+        let mut registry = self.load_registry()?;
+        let now = Utc::now();
+        let artifact = ModelArtifact {
+            artifact_id,
+            role: ModelRole::Generation,
+            format: ModelFormat::Ollama,
+            catalog_id: Some(catalog_id.to_owned()),
+            model_id: tag.to_owned(),
+            model_version: None,
+            source: ModelSource::Ollama,
+            repository_id: Some("local-ollama".to_owned()),
+            revision: None,
+            sha256: String::new(), // Ollama 由 /api/pull 托管，无本地文件无 sha256
+            size_bytes: 0,
+            local_path: tag.to_owned(), // 携带 tag，generation 以此为模型标识
+            quantization: None,
+            context_length: None,
+            embedding_dimension: None,
+            query_prefix: None,
+            max_length: None,
+            license_name: None,
+            status: "ready".into(),
+            package_manifest: None,
+            imported_at: now,
+        };
+        match registry
+            .artifacts
+            .iter_mut()
+            .find(|existing| existing.artifact_id == artifact_id)
+        {
+            Some(existing) => *existing = artifact.clone(),
+            None => registry.artifacts.push(artifact.clone()),
+        }
+        // 旧 GGUF generation artifact 置为 inactive，消除「注册表 GGUF 就绪 /
+        // 运行走 Ollama」的双轨错位；仅落地数据，不触碰检索业务。
+        for existing in registry.artifacts.iter_mut() {
+            if existing.role == ModelRole::Generation
+                && existing.format == ModelFormat::Gguf
+                && existing.status == "ready"
+            {
+                existing.status = "inactive".into();
+            }
+        }
+        registry.active_artifacts.insert(
+            ModelRole::Generation.directory_name().to_owned(),
+            artifact_id,
+        );
+        registry.active_profile_id = None;
+        registry.updated_at = now;
+        self.save_registry(&registry)?;
+        Ok(artifact)
+    }
+
     pub fn active_profile(&self) -> Result<Option<ModelProfile>, AppError> {
         let registry = self.load_registry()?;
         let Some(profile_id) = registry.active_profile_id else {
@@ -868,10 +1012,16 @@ impl ModelManager {
             .ok_or_else(|| {
                 AppError::new("MODEL_ARTIFACT_NOT_FOUND", "语义模型组件不存在", false)
             })?;
+        // 迁移后容纳 Ollama 后端：generation/embedding 可为 Gguf/Onnx 文件或本机
+        // Ollama（format=Ollama，local_path 为 tag）。格式不匹配的旧组合仍拒绝。
+        let generation_ok =
+            generation.format == ModelFormat::Gguf || generation.format == ModelFormat::Ollama;
+        let embedding_ok =
+            embedding.format == ModelFormat::Onnx || embedding.format == ModelFormat::Ollama;
         if generation.role != ModelRole::Generation
-            || generation.format != ModelFormat::Gguf
+            || !generation_ok
             || embedding.role != ModelRole::Embedding
-            || embedding.format != ModelFormat::Onnx
+            || !embedding_ok
         {
             return Err(AppError::new(
                 "MODEL_ACTIVATION_INVALID",
@@ -879,30 +1029,35 @@ impl ModelManager {
                 false,
             ));
         }
-        if !Path::new(&generation.local_path).is_file()
-            || !Path::new(&embedding.local_path).is_file()
-        {
+        let generation_file_ok =
+            generation.format == ModelFormat::Ollama || Path::new(&generation.local_path).is_file();
+        let embedding_file_ok =
+            embedding.format == ModelFormat::Ollama || Path::new(&embedding.local_path).is_file();
+        if !generation_file_ok || !embedding_file_ok {
             return Err(AppError::new(
                 "MODEL_SOURCE_UNAVAILABLE",
                 "完整RAG配置包含不可用的本地模型文件",
                 false,
             ));
         }
-        ensure_package_integrity(&generation)?;
-        ensure_package_integrity(&embedding)?;
+        // Ollama artifact 无 package_manifest，跳过包完整性校验（由 /api/pull 托管）。
+        if generation.package_manifest.is_some() {
+            ensure_package_integrity(&generation)?;
+        }
+        if embedding.package_manifest.is_some() {
+            ensure_package_integrity(&embedding)?;
+        }
         for artifact_id in [generation_artifact_id, embedding_artifact_id] {
             if let Some(artifact) = registry
                 .artifacts
                 .iter_mut()
                 .find(|artifact| artifact.artifact_id == *artifact_id)
             {
-                let manifest = artifact.package_manifest.as_mut().ok_or_else(|| {
-                    AppError::new(
-                        "MODEL_PACKAGE_NOT_VERIFIED",
-                        "模型包还没有完成完整性校验",
-                        true,
-                    )
-                })?;
+                // Ollama artifact 无 package_manifest，跳过包校验直写就绪。
+                let Some(manifest) = artifact.package_manifest.as_mut() else {
+                    artifact.status = "ready".into();
+                    continue;
+                };
                 manifest.self_test_status = "ready".into();
                 manifest.verified_at = Utc::now();
                 artifact.status = "ready".into();
@@ -995,14 +1150,18 @@ impl ModelManager {
             .iter_mut()
             .find(|artifact| artifact.artifact_id == *artifact_id)
             .ok_or_else(|| AppError::new("MODEL_ARTIFACT_NOT_FOUND", "模型组件不存在", false))?;
-        if artifact.role != ModelRole::Embedding || artifact.format != ModelFormat::Onnx {
+        if artifact.role != ModelRole::Embedding
+            || (artifact.format != ModelFormat::Onnx && artifact.format != ModelFormat::Ollama)
+        {
             return Err(AppError::new(
                 "MODEL_ACTIVATION_INVALID",
-                "只有通过自检的 ONNX Embedding 组件可以建立语义索引",
+                "只有通过自检的 ONNX/Ollama Embedding 组件可以建立语义索引",
                 false,
             ));
         }
-        if !Path::new(&artifact.local_path).is_file() {
+        let file_ok =
+            artifact.format == ModelFormat::Ollama || Path::new(&artifact.local_path).is_file();
+        if !file_ok {
             return Err(AppError::new(
                 "MODEL_SOURCE_UNAVAILABLE",
                 "模型组件文件已经离开翻翻管理目录",
@@ -1338,8 +1497,10 @@ impl ModelManager {
         Ok(self.collect_plan_report(&registry, preset_id, &plan))
     }
 
-    /// 依据 registry 中「已就绪且本地文件存在」的 artifact，比对 plan 各角色的
-    /// catalog_id，返回就绪 / 缺失清单。纯只读比对，不写 active_artifacts、不保存。
+    /// 依据 registry 中的「已就绪 artifact」比对 plan 各角色的 catalog_id，返回
+    /// 就绪 / 缺失清单。Ollama artifact（format=Ollama，local_path 为模型 tag）不受
+    /// 本地文件存在性约束；其余角色仍需本地文件存在于 `DATA\FanFanModelStore`。
+    /// 纯只读比对，不写 active_artifacts、不保存。
     fn collect_plan_report(
         &self,
         registry: &ModelRegistryState,
@@ -1350,9 +1511,13 @@ impl ModelManager {
         let mut missing = Vec::new();
         for (role, catalog_id) in plan_items(plan) {
             let matched = registry.artifacts.iter().any(|artifact| {
+                // Ollama 模型的 local_path 存的是模型 tag 而非真实文件路径，
+                // 就绪判定不得再用 Path::is_file 校验（Ollama 由本机 pull 托管）。
+                let local_ok = artifact.format == ModelFormat::Ollama
+                    || Path::new(&artifact.local_path).is_file();
                 artifact.role == role
                     && artifact.status == "ready"
-                    && Path::new(&artifact.local_path).is_file()
+                    && local_ok
                     && artifact.catalog_id.as_deref() == Some(catalog_id.as_str())
             });
             if matched {
@@ -1607,6 +1772,7 @@ impl ModelManager {
                     false,
                 ));
             }
+            ModelSource::Ollama => "ollama",
         };
         let directory = self
             .download_staging_directory()?

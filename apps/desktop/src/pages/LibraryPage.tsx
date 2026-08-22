@@ -8,12 +8,24 @@ import { confirmAction } from "../components/AppConfirm";
 import { AppSelect } from "../components/AppSelect";
 import { useAppStore } from "../state/app-store";
 import { errorMessage } from "../utils/app-error";
-import { displayPath } from "../utils/display-path";
+import { cleanFullPath, displayPath } from "../utils/display-path";
 
 const ROOT_STATUS_LABELS: Record<RootRecord["status"], string> = {
   discovering: "正在发现", ready: "就绪", scanning: "扫描中", partial_denied: "部分受限",
   permission_denied: "无权限", paused: "已暂停", offline: "离线", failed: "异常", removing: "正在移除",
 };
+
+/// 资料位置状态：只有可索引文件进入活动 USearch 索引后才算“就绪”；
+/// 未扫描、扫描/索引进度进行中均不显示绿色就绪。
+function resolveRootStatus(root: RootRecord, scanning: boolean): { dot: string; label: string; indexingText: string | null } {
+  if (scanning) return { dot: "scanning", label: "扫描中", indexingText: null };
+  if (root.status !== "ready") return { dot: root.status, label: ROOT_STATUS_LABELS[root.status] ?? root.status, indexingText: null };
+  if (root.last_scan_at === null) return { dot: "pending", label: "未扫描", indexingText: null };
+  const indexableFiles = root.indexable_file_count ?? root.file_count;
+  const activeIndexFiles = root.active_index_file_count ?? root.indexed_file_count;
+  if (indexableFiles > 0 && activeIndexFiles < indexableFiles) return { dot: "indexing", label: "索引中", indexingText: `已索引 ${activeIndexFiles} / ${indexableFiles} 个可索引文件` };
+  return { dot: "ready", label: "就绪", indexingText: null };
+}
 
 const GROUP_TYPE_LABELS: Record<RelationGroupType, string> = {
   duplicate: "完全重复",
@@ -32,7 +44,7 @@ export function LibraryPage() {
   const relationTask = useAppStore((state) => state.analysis_tasks.relation);
   const setAnalysisTask = useAppStore((state) => state.set_analysis_task);
   const queryClient = useQueryClient();
-  const roots = useQuery({ queryKey: ["roots"], queryFn: () => bridge.root_list() });
+  const roots = useQuery({ queryKey: ["roots"], queryFn: () => bridge.root_list(), refetchInterval: (query) => query.state.data?.some((root) => root.status === "scanning" || (root.status === "ready" && (root.indexable_file_count ?? root.file_count) > 0 && (root.active_index_file_count ?? root.indexed_file_count) < (root.indexable_file_count ?? root.file_count))) ? 2000 : 10_000 });
   const summary = useQuery({
     queryKey: ["home-summary", new Date().toLocaleDateString("sv-SE")],
     queryFn: () => bridge.home_get_summary(new Date().toLocaleDateString("sv-SE")),
@@ -126,7 +138,7 @@ export function LibraryPage() {
       {error && <p role="alert" className="inline-error">{error}</p>}{message && <p className="inline-success">{message}</p>}
       <div className="root-table">
         <div className="root-table__head"><span>资料位置</span><span>状态</span><span>文件</span><span>最近扫描</span><span /></div>
-        {roots.data?.map((root) => { const scan = summary.data?.scan_progress; const scanning = root.status === "scanning" && scan; return <div className="root-table__row" key={root.root_id}><span><strong>{root.label}</strong><small>{root.path}</small></span><span className="root-status-cell"><span><i className={`status-dot status-dot--${root.status}`} />{root.status === "scanning" ? "扫描中" : ROOT_STATUS_LABELS[root.status] ?? root.status}</span>{scanning && <><small>{Math.round(scan.progress * 100)}% · 已解析 {scan.parsed_files} 个</small><span className="root-progress"><i style={{ width: `${Math.round(scan.progress * 100)}%` }} /></span></>}</span><span>{root.file_count}</span><span>{root.last_scan_at ? new Date(root.last_scan_at).toLocaleString("zh-CN") : "—"}</span><span className="root-menu-wrap"><button type="button" aria-label={`操作${root.label}`} title="操作" onClick={() => setMenuRootId((current) => current === root.root_id ? null : root.root_id)}><MoreOutlined /></button>{menuRootId === root.root_id && <div className="root-menu" role="menu"><button type="button" role="menuitem" disabled={actionRootId !== null} onClick={() => void rescanRoot(root)}>{actionRootId === root.root_id ? "正在扫描…" : "重新扫描"}</button><button type="button" role="menuitem" disabled={actionRootId !== null} onClick={() => void removeRoot(root)}>{actionRootId === root.root_id ? "正在撤销授权…" : "从翻翻移除"}</button><button type="button" role="menuitem" onClick={() => { setMenuRootId(null); navigate("settings"); }}>前往设置管理</button></div>}</span></div>; })}
+        {roots.data?.map((root) => { const scan = summary.data?.scan_progress; const scanning = root.status === "scanning" && scan !== undefined; const rootStatus = resolveRootStatus(root, scanning); return <div className="root-table__row" key={root.root_id}><span><strong>{root.label}</strong><small title={cleanFullPath(root.path)}>{cleanFullPath(root.path)}</small></span><span className="root-status-cell"><span><i className={`status-dot status-dot--${rootStatus.dot}`} />{rootStatus.label}</span>{scanning && scan && <><small>{Math.round(scan.progress * 100)}% · 已解析 {scan.parsed_files} 个</small><span className="root-progress"><i style={{ width: `${Math.round(scan.progress * 100)}%` }} /></span></>}{rootStatus.indexingText && <small>{rootStatus.indexingText}</small>}</span><span>{root.file_count}</span><span>{root.last_scan_at ? new Date(root.last_scan_at).toLocaleString("zh-CN") : "—"}</span><span className="root-menu-wrap"><button type="button" aria-label={`操作${root.label}`} title="操作" onClick={() => setMenuRootId((current) => current === root.root_id ? null : root.root_id)}><MoreOutlined /></button>{menuRootId === root.root_id && <div className="root-menu" role="menu"><button type="button" role="menuitem" disabled={actionRootId !== null} onClick={() => void rescanRoot(root)}>{actionRootId === root.root_id ? "正在扫描…" : "重新扫描"}</button><button type="button" role="menuitem" disabled={actionRootId !== null} onClick={() => void removeRoot(root)}>{actionRootId === root.root_id ? "正在撤销授权…" : "从翻翻移除"}</button><button type="button" role="menuitem" onClick={() => { setMenuRootId(null); navigate("settings"); }}>前往设置管理</button></div>}</span></div>; })}
         {menuRootId && <div className="menu-backdrop" onClick={() => setMenuRootId(null)} />}
       </div>
 

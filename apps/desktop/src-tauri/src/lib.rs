@@ -28,7 +28,7 @@ use commands::{
 };
 use fanfan_core::{
     CatalogService, IncrementalWatchManager, LocalGenerationRuntime, MemorySettingsService,
-    ModelManager, RuntimeCapability, ThemeService, WelcomeService, WorkerClient, WorkerRole,
+    ModelManager, ThemeService, WelcomeService, WorkerClient, WorkerRole,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -103,10 +103,33 @@ pub fn run() {
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;
             let local_data_dir = app.path().app_local_data_dir()?;
-            let default_data_dir = app.path().app_data_dir()?;
+            let appdata_default = app.path().app_data_dir()?;
+            // 安装盘数据根：打包发布且安装目录可写时才生效，避免开发态把数据写进源码目录。
+            let installation_root = installation_data_root();
+            let legacy_model_store = durable_model_store_directory(&local_data_dir)?;
+            // 默认值层面把数据/模型目录指向安装盘，并把 C 盘既有数据自动迁过去；
+            // 迁移复用既有持久化迁移管线（storage-location.json / model-store-location.json）。
+            plan_auto_storage_migration(
+                &config_dir,
+                &appdata_default,
+                installation_root.as_deref(),
+            );
+            plan_auto_model_store_migration(
+                &config_dir,
+                &legacy_model_store,
+                installation_root.as_deref(),
+            );
+            let default_data_dir =
+                preferred_data_default(&appdata_default, installation_root.as_deref());
+            let installation_model_store = installation_root
+                .as_deref()
+                .map(|root| root.join(INSTALL_MODEL_STORE_DIR_NAME));
+            let durable_model_store = match &installation_model_store {
+                Some(path) if probe_directory_writable(path) => path.clone(),
+                _ => legacy_model_store.clone(),
+            };
             let (pre_reset_data_dir, _) =
                 resolve_application_data_directory(&config_dir, &default_data_dir);
-            let durable_model_store = durable_model_store_directory(&local_data_dir)?;
             let legacy_model_roots = unique_paths([
                 pre_reset_data_dir.join("models"),
                 config_dir.join("models"),
@@ -125,6 +148,7 @@ pub fn run() {
                     Err(error) => return Err(error.into()),
                 };
             runtime_log::install_panic_hook();
+            log_default_data_fallback_if_needed(&appdata_default, &default_data_dir);
             if let Some(error) = log_fallback_error {
                 runtime_log::event(
                     "warning",
@@ -198,6 +222,8 @@ pub fn run() {
                 image_ocr_running: AtomicBool::new(false),
                 vision_running: AtomicBool::new(false),
                 foreground_activity: std::sync::atomic::AtomicU32::new(0),
+                rebuild_active: AtomicBool::new(false),
+                rebuild_failed: AtomicBool::new(false),
                 search_embedding_cache: Mutex::new(SearchEmbeddingCache::new()),
             });
             app.manage(SidecarRegistryState(Arc::new(SidecarClients {
@@ -222,32 +248,11 @@ pub fn run() {
                     thread::sleep(Duration::from_millis(750));
                 }
             });
-            let (gpu_candidates, cpu_executable) = generation_runtime_candidates(app, &data_dir);
-            // Start with the CPU runtime immediately so setup never blocks on
-            // device probing; the GPU probe runs in the background and swaps
-            // the runtime in once it completes (cold GPU bring-up can take
-            // tens of seconds, which used to freeze the whole window).
-            let generation_inner = Arc::new(Mutex::new(LocalGenerationRuntime::new(
-                cpu_executable.clone(),
-            )));
+            // Ollama 迁移：generation 由本机 Ollama 托管，无需本地 llama-server 子进程
+            // 与 GPU/CPU 探测（Ollama 自行调度）。运行时在激活时按需处理 Ollama 就绪。
+            let generation_inner =
+                Arc::new(Mutex::new(LocalGenerationRuntime::new(PathBuf::new())));
             app.manage(GenerationServiceState(Arc::clone(&generation_inner)));
-            runtime_log::event(
-                "info",
-                "model.runtime",
-                "probe.started",
-                None,
-                &serde_json::json!({ "candidate_count": gpu_candidates.len() }),
-            );
-            let probe_generation = Arc::clone(&generation_inner);
-            let probe_app = app.handle().clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                background_probe_generation_runtime(
-                    probe_app,
-                    gpu_candidates.to_vec(),
-                    cpu_executable,
-                    probe_generation,
-                );
-            });
             app.manage(AskCoordinatorState::default());
             app.manage(ModelDownloadCoordinatorState::default());
 
@@ -321,8 +326,11 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            inference_runtime_refresh,
             commands::startup::startup_get_state,
+            commands::ollama::ollama_status_get,
+            commands::ollama::ollama_start,
+            commands::ollama::ollama_stop,
+            inference_runtime_refresh,
             commands::welcome::welcome_get_state,
             commands::welcome::welcome_complete,
             commands::welcome::welcome_authorization_complete,
@@ -332,8 +340,6 @@ pub fn run() {
             app_data::environment_detect,
             app_data::model_state_get,
             app_data::rag_readiness_get,
-            app_data::model_import_scan,
-            app_data::model_import_confirm,
             app_data::model_role_catalog_list,
             app_data::model_preset_list,
             app_data::model_preset_selected_get,
@@ -433,6 +439,7 @@ pub fn run() {
             app_data::diagnostic_event_append,
             app_data::diagnostic_export,
             app_data::index_rebuild,
+            app_data::index_rebuild_progress,
             app_data::index_stale_check,
             app_data::root_list,
             app_data::root_add,
@@ -450,6 +457,13 @@ const STORAGE_LOCATION_FILE: &str = "storage-location.json";
 const MANAGED_STORAGE_MARKER: &str = ".fanfan-managed-data-v1";
 const MODEL_STORE_LOCATION_FILE: &str = "model-store-location.json";
 const MODEL_STORE_TARGET_DIRECTORY_NAME: &str = "FanFanModelStore";
+/// 安装盘数据根下的应用数据子目录名（数据库/索引/缓存/日志）。
+const INSTALL_APP_DATA_DIR_NAME: &str = "app-data";
+/// 安装盘数据根下的模型仓库子目录名。
+const INSTALL_MODEL_STORE_DIR_NAME: &str = "model-store";
+/// 显式启用安装盘存储的逃生门（仅开发/测试用）：debug 构建下也可
+/// 启用安装盘默认路径，便于真机验证自动迁移而不改变默认开发行为。
+const INSTALL_STORAGE_ENV_OVERRIDE: &str = "FANFAN_ENABLE_INSTALL_STORAGE";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct StorageLocationConfig {
@@ -616,6 +630,196 @@ pub(crate) fn schedule_storage_migration(
         )
     })?;
     Ok(storage_location_status(config_dir, current_data_dir))
+}
+
+/// 探测目录是否可写：在其中创建唯一临时探针文件并删除，成功即可写。
+/// 用于规避 `Program Files` 这类 UAC 保护目录导致的静默写失败。
+fn probe_directory_writable(dir: &Path) -> bool {
+    if fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let nonce = format!("{:x}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
+    let probe = dir.join(format!(".fanfan-write-probe-{nonce}"));
+    let created = fs::File::create(&probe).is_ok();
+    let removed = created && fs::remove_file(&probe).is_ok();
+    if created && !removed {
+        let _ = fs::remove_file(&probe);
+    }
+    removed
+}
+
+/// 安装盘数据根 = 可写的程序所在目录。
+/// debug 构建默认关闭（避免开发把数据写进源码目录），可用环境变量
+/// `FANFAN_ENABLE_INSTALL_STORAGE=1` 显式启用以便真机验证自动迁移。
+fn installation_data_root() -> Option<PathBuf> {
+    if cfg!(debug_assertions) && std::env::var_os(INSTALL_STORAGE_ENV_OVERRIDE).is_none() {
+        return None;
+    }
+    let exe_dir = std::env::current_exe()
+        .ok()?
+        .parent()
+        .map(Path::to_path_buf)?;
+    probe_directory_writable(&exe_dir).then_some(exe_dir)
+}
+
+/// 计算新默认数据目录：安装盘根可用且可写 → `<安装盘>/app-data`，
+/// 否则回退旧 C 盘 AppData 默认值。
+fn preferred_data_default(appdata_default: &Path, exe_root: Option<&Path>) -> PathBuf {
+    match exe_root.filter(|root| probe_directory_writable(root)) {
+        Some(root) => root.join(INSTALL_APP_DATA_DIR_NAME),
+        None => appdata_default.to_path_buf(),
+    }
+}
+
+/// 目录内是否已有任何内容（用于判断旧默认位置是否值得自动迁移）。
+fn directory_has_content(dir: &Path) -> bool {
+    dir.read_dir()
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
+}
+
+/// 若当前数据目录仍是 C 盘旧默认且存在内容、且安装盘可写，则自动把它的迁移
+/// 计划（pending）注入到 `<安装盘>/app-data`，复用既有迁移管线于下次启动执行。
+/// 只有"从未自定义过位置"时才自动迁移，尊重用户手动配置。
+fn plan_auto_storage_migration(
+    config_dir: &Path,
+    appdata_default: &Path,
+    exe_root: Option<&Path>,
+) -> bool {
+    let Some(root) = exe_root.filter(|root| probe_directory_writable(root)) else {
+        return false;
+    };
+    let old_default = appdata_default.to_string_lossy().into_owned();
+    let source = Path::new(&old_default);
+    if root.join(INSTALL_APP_DATA_DIR_NAME) == appdata_default || !directory_has_content(source) {
+        return false;
+    }
+    let mut config = read_storage_location_config(config_dir).unwrap_or_default();
+    let active_is_old_default = config
+        .active_data_directory
+        .as_deref()
+        .map(|path| path == &old_default)
+        .unwrap_or(true);
+    if !active_is_old_default {
+        return false;
+    }
+    // 仅当已有 pending 正是"从旧默认迁走"时替换其目标；其它 pending 计划则不动。
+    if let Some(existing) = &config.pending {
+        if existing.source_directory != old_default {
+            return false;
+        }
+    }
+    config.active_data_directory = Some(old_default.clone());
+    config.pending = Some(PendingStorageMigration {
+        source_directory: old_default.clone(),
+        target_directory: root
+            .join(INSTALL_APP_DATA_DIR_NAME)
+            .to_string_lossy()
+            .into_owned(),
+        requested_at: Utc::now().to_rfc3339(),
+    });
+    config.last_error = None;
+    config.updated_at = Some(Utc::now().to_rfc3339());
+    if !write_storage_location_config(config_dir, &config).is_ok() {
+        return false;
+    }
+    runtime_log::event(
+        "info",
+        "storage",
+        "storage.auto_migration_planned",
+        None,
+        &serde_json::json!({
+            "source_directory": old_default,
+            "target_directory": config.pending.as_ref().map(|p| p.target_directory.as_str()),
+        }),
+    );
+    true
+}
+
+/// 与 plan_auto_storage_migration 平行：模型仓库默认位置改为 `<安装盘>/model-store`，
+/// 并把既有的 legacy 默认仓库（`LOCALAPPDATA/FanFan/ModelStore/v1`）自动迁移过去。
+fn plan_auto_model_store_migration(
+    config_dir: &Path,
+    legacy_model_store: &Path,
+    exe_root: Option<&Path>,
+) -> bool {
+    let Some(root) = exe_root.filter(|root| probe_directory_writable(root)) else {
+        return false;
+    };
+    let legacy_text = legacy_model_store.to_string_lossy().into_owned();
+    let source = Path::new(&legacy_text);
+    if root.join(INSTALL_MODEL_STORE_DIR_NAME) == legacy_model_store
+        || !directory_has_content(source)
+    {
+        return false;
+    }
+    let mut config = read_model_store_location_config(config_dir).unwrap_or_default();
+    let active_is_legacy = config
+        .active_model_store
+        .as_deref()
+        .map(|path| path == &legacy_text)
+        .unwrap_or(true);
+    if !active_is_legacy {
+        return false;
+    }
+    if let Some(existing) = &config.pending {
+        if existing.source_directory != legacy_text {
+            return false;
+        }
+    }
+    config.active_model_store = Some(legacy_text.clone());
+    config.pending = Some(PendingModelStoreMigration {
+        source_directory: legacy_text.clone(),
+        target_directory: root
+            .join(INSTALL_MODEL_STORE_DIR_NAME)
+            .to_string_lossy()
+            .into_owned(),
+        requested_at: Utc::now().to_rfc3339(),
+    });
+    config.last_error = None;
+    config.updated_at = Some(Utc::now().to_rfc3339());
+    if !write_model_store_location_config(config_dir, &config).is_ok() {
+        return false;
+    }
+    runtime_log::event(
+        "info",
+        "model_store",
+        "model_store.auto_migration_planned",
+        None,
+        &serde_json::json!({
+            "source_directory": legacy_text,
+            "target_directory": config.pending.as_ref().map(|p| p.target_directory.as_str()),
+        }),
+    );
+    true
+}
+
+/// 当安装盘根不可写、导致默认数据目录回退到 AppData 时写入一条警告日志，
+/// 便于用户在 Program Files 等受保护目录下诊断"为何数据没落安装盘"。
+fn log_default_data_fallback_if_needed(appdata_default: &Path, default_data_dir: &Path) {
+    if default_data_dir != appdata_default {
+        return;
+    }
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let Some(exe_dir) = exe_dir else { return };
+    if exe_dir == appdata_default {
+        return;
+    }
+    // debug 默认回退属预期，不告警；仅 release 下安装目录确不可写才提示。
+    if !cfg!(debug_assertions) && !probe_directory_writable(&exe_dir) {
+        runtime_log::event(
+            "warning",
+            "storage",
+            "storage.default_fell_back_to_appdata",
+            None,
+            &serde_json::json!({
+                "appdata_directory": appdata_default,
+                "exe_directory": exe_dir,
+            }),
+        );
+    }
 }
 
 /// 解析当前活动数据目录；若存在待执行的存储迁移则一并返回（迁移计划）。
@@ -2036,6 +2240,103 @@ fn is_pdf(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
 }
 
+/// 阶段5：启动期 Ollama 三态探测（已装运行 / 已装未运行 / 未安装）。
+/// 在既有后台初始化线程内执行（不阻塞 UI 主线程）；失败仅返回结构化状态并
+/// 上报 `ollama:state` 事件，绝不 panic / 崩溃。未运行则后台拉起 `ollama serve`
+///（防重复启动由 ensure_running 内部端口探测保证）。
+fn detect_ollama_runtime(app: &tauri::AppHandle, startup: &StartupServiceState) {
+    use fanfan_core::ollama::{OllamaStatus, ensure_running, probe_ollama, probe_status};
+    let probe = probe_ollama();
+    let status = probe_status(&probe);
+    let version = probe
+        .version
+        .as_ref()
+        .map(|v| v.version.clone())
+        .unwrap_or_default();
+    match status {
+        OllamaStatus::Ready => {
+            let _ = startup.publish(
+                app,
+                StartupState {
+                    phase: "ollama_ready",
+                    ready: false,
+                    progress: 1.0,
+                    pending_files: 0,
+                    blocker: None,
+                    recovery_actions: Vec::new(),
+                },
+            );
+            let _ = app.emit(
+                "ollama:state",
+                serde_json::json!({ "status": "ready", "version": version }),
+            );
+            runtime_log::event(
+                "info",
+                "startup",
+                "ollama.ready",
+                None,
+                &serde_json::json!({ "version": version }),
+            );
+        }
+        OllamaStatus::InstalledNotRunning => {
+            // 已安装未运行：后台拉起，轮询健康，不阻塞初始化。
+            let thread_app = app.clone();
+            let _ = app.emit(
+                "ollama:state",
+                serde_json::json!({ "status": "installed_not_running", "starting": true }),
+            );
+            std::thread::spawn(move || {
+                match ensure_running(fanfan_core::ollama::OLLAMA_START_TIMEOUT) {
+                    Ok(ready) if ready.running => {
+                        let _ = thread_app.emit("ollama:state", serde_json::json!({ "status": "ready", "version": ready.version.map(|v| v.version).unwrap_or_default() }));
+                        runtime_log::event(
+                            "info",
+                            "startup",
+                            "ollama.started",
+                            None,
+                            &serde_json::json!({}),
+                        );
+                    }
+                    Ok(_) => {
+                        let _ = thread_app.emit("ollama:state", serde_json::json!({ "status": "installed_not_running", "starting": false }));
+                        runtime_log::event(
+                            "warning",
+                            "startup",
+                            "ollama.start_timeout",
+                            None,
+                            &serde_json::json!({}),
+                        );
+                    }
+                    Err(error) => {
+                        let _ = thread_app.emit("ollama:state", serde_json::json!({ "status": "installed_not_running", "starting": false, "error_code": error.code }));
+                        runtime_log::event(
+                            "warning",
+                            "startup",
+                            "ollama.start_failed",
+                            None,
+                            &serde_json::json!({ "error_code": error.code }),
+                        );
+                    }
+                }
+            });
+        }
+        OllamaStatus::NotInstalled => {
+            // 未安装：引导安装，不静默安装、不下第三方包。
+            let _ = app.emit(
+                "ollama:state",
+                serde_json::json!({ "status": "not_installed" }),
+            );
+            runtime_log::event(
+                "warning",
+                "startup",
+                "ollama.not_installed",
+                None,
+                &serde_json::json!({}),
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn initialize_background_services(
     app: tauri::AppHandle,
@@ -2131,6 +2432,16 @@ fn initialize_background_services(
                     "retryable": error.retryable,
                 }),
             ),
+        }
+        // 阶段5：启动期 Ollama 三态检测（已装运行 / 已装未运行 / 未安装）。
+        // 不阻塞初始化、不因启动失败崩溃；未安装→引导，未运行→后台拉起。
+        detect_ollama_runtime(&app, &startup);
+        // 阶段5b：启动期自动登记本机 Ollama 已驻留模型。若 Ollama 已就绪
+        // 且本机已拉取对应 tag，则把 generation/embedding 登记为 ready，
+        // 覆盖旧 GGUF active，避免已装模型仍被判缺失/触发重复下载。
+        // Ollama 不可用时静默跳过，不阻塞后续初始化。
+        if let Some(preset_id) = catalog.selected_preset_id()? {
+            let _ = commands::app_data::ensure_ollama_registry_synced(&model_manager, &preset_id);
         }
         let ocr_runtime_available = model_manager
             .active_artifact(fanfan_core::ModelRole::Ocr)?
@@ -2430,42 +2741,9 @@ fn initialize_background_services(
     }
 }
 
-/// 生成运行时的候选可执行文件（GPU 优先，CPU 兜底）。setup 与手动刷新
-/// 命令共用同一套候选路径，避免两处构造漂移。
-fn generation_runtime_candidates(
-    app: &impl tauri::Manager<tauri::Wry>,
-    data_dir: &Path,
-) -> (Vec<PathBuf>, PathBuf) {
-    let packaged_runtime_root = app
-        .path()
-        .resource_dir()
-        .map(|dir| dir.join("runtime"))
-        .unwrap_or_default();
-    let development_runtime_root =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../.artifacts/runtime");
-    let managed_runtime_root = data_dir.join("runtime");
-    let gpu_candidates = [
-        managed_runtime_root.join("llama-cuda/llama-server.exe"),
-        managed_runtime_root.join("llama-vulkan/llama-server.exe"),
-        packaged_runtime_root.join("llama-cuda/llama-server.exe"),
-        packaged_runtime_root.join("llama-vulkan/llama-server.exe"),
-        development_runtime_root.join("llama-cuda/llama-server.exe"),
-        development_runtime_root.join("llama-vulkan/llama-server.exe"),
-    ];
-    let cpu_executable = [
-        managed_runtime_root.join("llama/llama-server.exe"),
-        packaged_runtime_root.join("llama/llama-server.exe"),
-        development_runtime_root.join("llama/llama-server.exe"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
-    .unwrap_or_else(|| development_runtime_root.join("llama/llama-server.exe"));
-    (gpu_candidates.to_vec(), cpu_executable)
-}
-
-/// 手动刷新推理运行时：重新探测 GPU 候选并在成功时换入，复用启动时的
-/// probe+swap 流程（含失败重试）。探测期间不会中断正在进行的推理；
-/// 已在探测中时忽略本次点击，避免并发拉起多个 llama-server。
+/// 手动刷新推理运行时：重探本机 Ollama 三态并上报 `ollama:state`，随后刷新
+/// `model:state` 让前端拿到最新后端与资源显示。生成/嵌入已由本机 Ollama
+/// 托管，不再存在 llama-server 子进程候选探测与 GPU/CPU swap（Ollama 自调度）。
 static REFRESH_PROBE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 #[tauri::command]
@@ -2473,176 +2751,42 @@ fn inference_runtime_refresh(app: tauri::AppHandle) -> Result<(), String> {
     if REFRESH_PROBE_IN_FLIGHT.swap(true, Ordering::AcqRel) {
         return Ok(());
     }
-    let data_dir = app
-        .state::<EnvironmentServiceState>()
-        .data_directory
-        .clone();
-    let (gpu_candidates, cpu_executable) = generation_runtime_candidates(&app, &data_dir);
-    let generation = app.state::<GenerationServiceState>().0.clone();
     let probe_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        background_probe_generation_runtime(probe_app, gpu_candidates, cpu_executable, generation);
+        refresh_ollama_runtime(&probe_app);
         REFRESH_PROBE_IN_FLIGHT.store(false, Ordering::Release);
     });
     Ok(())
 }
 
-/// Probe the GPU runtime candidates off the main thread and swap the
-/// generation runtime once a working GPU backend is found. The swap is
-/// skipped if a CPU instance is already serving so in-flight work is never
-/// interrupted; the new runtime only affects subsequent activations.
-fn background_probe_generation_runtime(
-    app: tauri::AppHandle,
-    gpu_candidates: Vec<PathBuf>,
-    cpu_executable: PathBuf,
-    generation: Arc<Mutex<LocalGenerationRuntime>>,
-) {
-    let started = Instant::now();
-    let mut best: Option<(PathBuf, RuntimeCapability)> = None;
-    // GPU 冷启动（驱动/CUDA 上下文）实测 12~25s，一次探测超时并不意味着
-    // 机器没有 GPU——先按 CPU 生效，等 60s 让驱动就绪后重试，最多 3 次。
-    // 全部失败才保持 CPU；任何一次成功后立即 swap，无需重启应用。
-    const PROBE_RETRY_ATTEMPTS: u32 = 3;
-    const PROBE_RETRY_DELAY: Duration = Duration::from_secs(60);
-    for attempt in 0..PROBE_RETRY_ATTEMPTS {
-        for path in &gpu_candidates {
-            if !path.is_file() {
-                continue;
-            }
-            let capability = LocalGenerationRuntime::new(path.clone()).probe_capability();
-            if capability.gpu_available {
-                best = Some((path.clone(), capability));
-                break;
-            }
-        }
-        if best.is_some() || attempt + 1 >= PROBE_RETRY_ATTEMPTS {
-            break;
-        }
-        runtime_log::event(
-            "warn",
-            "model.runtime",
-            "probe.retry_scheduled",
-            None,
-            &serde_json::json!({
-                "attempt": attempt + 1,
-                "attempts_total": PROBE_RETRY_ATTEMPTS,
-                "delay_seconds": PROBE_RETRY_DELAY.as_secs(),
-                "error_code": None::<String>,
-            }),
-        );
-        std::thread::sleep(PROBE_RETRY_DELAY);
-    }
-    let mut fields = serde_json::json!({
-        "duration_ms": started.elapsed().as_millis() as u64,
-        "gpu_available": best.is_some(),
-    });
-    match &best {
-        Some((gpu, capability)) => {
-            // 带时限拿锁：推理线程持锁可达数十秒，swap 只是换后续激活的运行时，
-            // 没必要无限期等锁——等锁期间 app_status_get 等查询会排队几十秒。
-            // 一次拿锁失败不代表 GPU 不可用：启动时 VLM/嵌入后台循环正占用
-            // 生成运行时，probe 与它们并发是常态（实测 probe 完成后锁被 VLM
-            // 推理持有，3s 拿锁必然失败）。失败后间隔重试，在推理空隙把 GPU
-            // runtime 换上去，避免整个会话因一次竞争永久留在 CPU。
-            // Phase 4.3 修复：旧窗口 8×15s≈2 分钟内后台推理持续占用时 swap
-            // 永久放弃（trace 实测 8 轮全跳过 → GPU 检测到但全程 CPU）。重试
-            // 上限提到 24（约 7 分钟窗口），且区分两种跳过原因：runtime_active
-            // （推理在途，不能杀）与 lock_timeout（锁竞争）。
-            const SWAP_RETRY_ATTEMPTS: u32 = 24;
-            const SWAP_RETRY_DELAY: Duration = Duration::from_secs(15);
-            let mut swapped = false;
-            for attempt in 0..SWAP_RETRY_ATTEMPTS {
-                let mut skip_reason = "lock_timeout";
-                swapped = match crate::commands::app_data::try_lock_generation_until(
-                    &generation,
-                    std::time::Duration::from_secs(3),
-                ) {
-                    Some(mut guard) => {
-                        if guard.is_active() {
-                            // llama 进程存活（推理中）：换掉会中断在途生成，
-                            // 放下锁等下一轮。
-                            drop(guard);
-                            skip_reason = "runtime_active";
-                            false
-                        } else {
-                            *guard = LocalGenerationRuntime::new_with_fallback_and_capability(
-                                gpu.clone(),
-                                cpu_executable.clone(),
-                                capability.clone(),
-                            );
-                            true
-                        }
-                    }
-                    None => false,
-                };
-                if swapped {
-                    break;
-                }
-                runtime_log::event(
-                    "warn",
-                    "model.runtime",
-                    "probe.swap_retrying",
-                    None,
-                    &serde_json::json!({
-                        "attempt": attempt + 1,
-                        "attempts_total": SWAP_RETRY_ATTEMPTS,
-                        "reason": skip_reason,
-                        "delay_seconds": SWAP_RETRY_DELAY.as_secs(),
-                    }),
-                );
-                std::thread::sleep(SWAP_RETRY_DELAY);
-            }
-            fields["backend"] = capability.backend.clone().into();
-            fields["devices"] = capability.devices.clone().into();
-            fields["error_code"] = capability.error_code.clone().into();
-            fields["swapped"] = swapped.into();
-        }
-        None => {
-            fields["backend"] = "cpu".into();
-            fields["swapped"] = false.into();
-        }
-    }
-    // Phase 4.3 第四部分：GPU 状态日志——探测完成时补显卡名称与显存
-    //（`CUDA available` / GPU / 显存一次打全，与任务要求的启动期排查字段对齐）。
-    let device_strings: Vec<String> = fields["devices"]
-        .as_array()
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|value| value.as_str().map(str::to_owned))
-                .collect()
-        })
+/// 重探本机 Ollama 三态并刷新 runtime/runtime 状态，供前端「刷新」按钮使用。
+fn refresh_ollama_runtime(app: &tauri::AppHandle) {
+    use fanfan_core::ollama::{OllamaStatus, probe_ollama, probe_status};
+    let probe = probe_ollama();
+    let version = probe
+        .version
+        .as_ref()
+        .map(|v| v.version.clone())
         .unwrap_or_default();
-    if let Some((gpu_name, gpu_memory_bytes)) =
-        app_data::gpu_details_from_devices(Some(&device_strings))
-    {
-        fields["gpu_name"] = gpu_name.into();
-        fields["gpu_memory_mb"] = gpu_memory_bytes.map(|bytes| bytes / (1024 * 1024)).into();
-    }
-    runtime_log::event("info", "model.runtime", "probe.completed", None, &fields);
-    // 探测完成：刷新环境状态（环境页/模型推荐拿到 GPU 信息并落盘），并广播
-    // model:state 事件驱动前端刷新——前端监听该事件后重拉 model-runtime，显示
-    // 与后端保持一致；探测失败也广播一次，让前端拿到"CPU 生效"的最终状态。
-    if let Some((_, capability)) = &best {
-        app_data::refresh_environment_after_probe(&app, capability);
-    }
+    let status = match probe_status(&probe) {
+        OllamaStatus::Ready => "ready",
+        OllamaStatus::InstalledNotRunning => "installed_not_running",
+        OllamaStatus::NotInstalled => "not_installed",
+    };
+    let _ = app.emit(
+        "ollama:state",
+        serde_json::json!({ "status": status, "version": version }),
+    );
+    // 刷新与模型/runtime 相关的状态快照，前端据此更新后端标签与资源显示。
     let models = app.state::<ModelServiceState>().get().ok();
     let catalog = app.state::<CatalogServiceState>().get().ok();
     let generation = app.state::<GenerationServiceState>();
-    let runtime_state = app_data::inference_runtime_state(&generation).ok();
     if let (Some(models), Some(catalog)) = (models, catalog)
+        && let Ok(runtime_state) = app_data::inference_runtime_state(&generation)
         && let Ok(state) =
-            app_data::model_state_from_manager(&models, Some(catalog.as_ref()), runtime_state)
+            app_data::model_state_from_manager(&models, Some(catalog.as_ref()), Some(runtime_state))
     {
         let _ = app.emit("model:state", state);
-    } else {
-        runtime_log::event(
-            "info",
-            "model.runtime",
-            "probe.emit_skipped",
-            None,
-            &serde_json::json!({ "reason": "catalog_not_ready" }),
-        );
     }
 }
 

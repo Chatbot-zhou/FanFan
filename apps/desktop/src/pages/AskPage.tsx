@@ -1,12 +1,9 @@
 import { AudioOutlined, CloseOutlined, EllipsisOutlined, FileSearchOutlined, FileTextOutlined, QuestionCircleOutlined, SendOutlined, StopOutlined, UserOutlined, WarningOutlined } from "@ant-design/icons";
 import { Dropdown, Input, Modal } from "antd";
-import { isTauri } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { bridge, type AnswerResult, type AskSessionSummary, type CollectionRecord, type FilePreview, type ModelRuntimeState, type RagReadiness } from "../bridge";
-import { RUNTIME_EVENTS } from "../bridge/runtime-events";
 import { displayPath } from "../utils/display-path";
 import { extractQuestionTerms, highlightPlainTerms } from "../utils/query-terms";
 import { PdfVisualPreview } from "../components/PdfVisualPreview";
@@ -14,6 +11,7 @@ import { OcrAttemptChain } from "../components/OcrAttemptChain";
 import { ImageAssetGallery } from "../components/ImageAssetGallery";
 import { confirmAction } from "../components/AppConfirm";
 import { AppSelect } from "../components/AppSelect";
+import { AskExecutionPanel } from "../features/ask/AskExecutionPanel";
 import { errorMessage } from "../utils/app-error";
 import { useAppStore, type AskTurn } from "../state/app-store";
 import fanfanLogo from "../assets/fanfan-logo.png";
@@ -116,22 +114,6 @@ function AnswerReferences({ answer, question, expanded, activeFile, onToggleRefs
   );
 }
 
-const ASK_PHASE_LABELS: Record<string, string> = {
-  queued: "正在进入本地问答队列",
-  intent_routing: "正在判断问题意图",
-  chat_generating: "正在生成回复",
-  understanding: "正在理解问题",
-  evidence_retrieval: "正在查找原文证据",
-  hybrid_retrieval: "正在执行混合检索",
-  reranking: "正在重排候选证据",
-  evidence_selection: "正在筛选证据",
-  answerability_gate: "正在核验证据能否回答问题",
-  image_reanalysis: "正在复核候选原图",
-  generating: "正在依据证据组织回答",
-  citation_validation: "正在逐句核验引用",
-  citation_structure_repair: "正在修复引用格式",
-  completed: "回答已完成",
-};
 
 // 回答模式徽标：clarification/extract/find 等非普通回答显示模式标签，
 // 让用户知道当前回答属于哪种处理结果（普通 RAG 回答与闲聊不显示）。
@@ -199,8 +181,9 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
   const setLoading = useAppStore((state) => state.set_ask_loading);
   const streamedAnswer = useAppStore((state) => state.ask_streamed_answer);
   const setStreamedAnswer = useAppStore((state) => state.set_ask_streamed_answer);
-  const activePhase = useAppStore((state) => state.ask_active_phase);
-  const setActivePhase = useAppStore((state) => state.set_ask_active_phase);
+  const askExecution = useAppStore((state) => state.ask_execution);
+  const toggleAskExecutionNode = useAppStore((state) => state.toggle_ask_execution_node);
+  const finalizeAskExecution = useAppStore((state) => state.finalize_ask_execution);
   const activeSessionId = useAppStore((state) => state.ask_active_session_id);
   const setActiveSessionId = useAppStore((state) => state.set_ask_active_session_id);
   const scopeCollectionIds = useAppStore((state) => state.ask_scope_collection_ids);
@@ -246,7 +229,7 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
     // 内容溢出时才显示滚动条，否则隐藏
     const overflow = element.scrollHeight > element.clientHeight + 2;
     element.classList.toggle("conversation-area--scrollable", overflow);
-  }, [turns, pendingQuestion, streamedAnswer, loading, error, preview]);
+  }, [turns, pendingQuestion, streamedAnswer, askExecution, loading, error, preview]);
   useEffect(() => {
     const element = conversationRef.current;
     if (!element) return;
@@ -307,7 +290,6 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
       setAskOperationId(null);
       setLoading(false);
       setStreamedAnswer("");
-      setActivePhase("queued");
       setTurns(loadedTurns);
       setLastFailedQuestion(lastIsFailure ? failedQuestion : null);
       setActiveSessionId(sessionId);
@@ -356,27 +338,6 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
     return () => { disposed = true; };
   }, [scope]);
 
-  useEffect(() => {
-    if (!window.__TAURI_INTERNALS__) return undefined;
-    let disposed = false;
-    const unlisteners: Array<() => void> = [];
-    void listen<{ operation_id: string; token: string }>(RUNTIME_EVENTS.askToken, (event) => {
-      const state = useAppStore.getState();
-      if (event.payload.operation_id === state.ask_operation_id) {
-        useAppStore.setState({ ask_streamed_answer: state.ask_streamed_answer + event.payload.token });
-      }
-    }).then((unlisten) => disposed ? unlisten() : unlisteners.push(unlisten));
-    void listen<{ operation_id: string; phase: string; progress: number }>(RUNTIME_EVENTS.askPhase, (event) => {
-      const state = useAppStore.getState();
-      if (event.payload.operation_id === state.ask_operation_id) {
-        useAppStore.setState({ ask_active_phase: event.payload.phase });
-      }
-    }).then((unlisten) => disposed ? unlisten() : unlisteners.push(unlisten));
-    return () => {
-      disposed = true;
-      unlisteners.forEach((unlisten) => unlisten());
-    };
-  }, []);
 
   const lastAnswer = turns.at(-1)?.answer;
   const lastQuestion = turns.at(-1)?.question ?? pendingQuestion ?? "";
@@ -397,7 +358,8 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
     setPreview(null);
     setPendingQuestion(trimmed);
     setQuestion("");
-    setActivePhase("queued");
+    setStreamedAnswer("");
+    useAppStore.setState({ ask_execution: null, ask_streamed_thinking: "", ask_think_mode: false });
     try {
       const result = await bridge.ask_start({
         question: trimmed,
@@ -408,11 +370,10 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
         max_source_files: 8,
         strict_evidence: true,
         clarification_selection: clarificationSelection,
+        think_mode: false,
       });
       activeOperationRef.current = result.operation_id;
       setAskOperationId(result.operation_id);
-      setActivePhase("understanding");
-      setStreamedAnswer("");
       while (activeOperationRef.current === result.operation_id) {
         const snapshot = await bridge.ask_operation_get(result.operation_id);
         if (snapshot.handle.status === "completed") {
@@ -420,8 +381,13 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
           // 问答成功即消除红色警告弹窗与重试记录（即使错误来自历史恢复或先前失败）
           setError(null);
           setLastFailedQuestion(null);
-          setTurns([...turns, { question: trimmed, answer: snapshot.result }]);
-          setActiveSessionId(snapshot.result.session_id);
+          // 函数式更新：避免闭包捕获的旧 turns 在异步等待期间覆盖其他路径新增的轮次。
+          // 用局部 const 固定已窄化的 result（TS 回调内会丢失非空窄化）。
+          const completedResult = snapshot.result;
+          finalizeAskExecution(completedResult.elapsed_ms);
+          const completedExecution = useAppStore.getState().ask_execution;
+          setTurns((current) => [...current, { question: trimmed, answer: completedResult, execution: completedExecution }]);
+          setActiveSessionId(completedResult.session_id);
           setPendingQuestion(null);
           void refreshSessions().catch(() => undefined);
           activeOperationRef.current = null;
@@ -439,7 +405,6 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
     } finally {
       activeOperationRef.current = null;
       setAskOperationId(null);
-      setActivePhase("queued");
       setLoading(false);
     }
   };
@@ -656,6 +621,7 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
             <UserMessage text={turn.question} />
             <AssistantMessage>
               <div className="chat-bubble chat-bubble--assistant">
+                {turn.execution && <AskExecutionPanel execution={turn.execution} />}
                 <div className="markdown-body"><MarkdownAnswer text={turn.answer.answer} question={turn.question} /></div>
                 {turn.answer.answer_mode === "clarification" && turn.answer.clarification && (
                   <div className="clarification-options">
@@ -710,7 +676,8 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
         {pendingQuestion && <UserMessage text={pendingQuestion} />}
         {loading && <AssistantMessage>
           <div className="chat-bubble chat-bubble--assistant" aria-live="polite">
-            <small className="ask-phase-label">{ASK_PHASE_LABELS[activePhase] ?? "正在处理本地资料"}</small>
+            {askExecution && <AskExecutionPanel execution={askExecution} onToggleNode={toggleAskExecutionNode} />}
+            {!askExecution && <small className="ask-phase-label">正在处理本地资料</small>}
             {streamedAnswer ? <div className="markdown-body"><MarkdownAnswer text={streamedAnswer} question={pendingQuestion ?? ""} /></div> : <span className="chat-typing"><i /><i /><i /></span>}
           </div>
         </AssistantMessage>}
@@ -719,12 +686,14 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
         </AssistantMessage>}
       </div>
       <form className="ask-composer" onSubmit={(event) => { event.preventDefault(); void submit(); }}>
-        <textarea ref={composerRef} value={question} onChange={(event) => setQuestion(event.target.value)} onInput={resizeComposer} onKeyDown={(event) => {
-          if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
-            event.preventDefault();
-            void submit();
-          }
-        }} placeholder={recording ? "正在录音，再次点击麦克风结束…" : recognizing ? "正在本地识别语音…" : "基于我的资料提问…"} disabled={recording || recognizing} />
+        <div className="ask-composer__controls">
+          <textarea ref={composerRef} value={question} onChange={(event) => setQuestion(event.target.value)} onInput={resizeComposer} onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+              event.preventDefault();
+              void submit();
+            }
+          }} placeholder={recording ? "正在录音，再次点击麦克风结束…" : recognizing ? "正在本地识别语音…" : "基于我的资料提问…"} disabled={recording || recognizing} />
+        </div>
         {recording && <button type="button" className="ask-composer__cancel-recording" onClick={() => void stopRecording(true)}>取消</button>}
         <button
           type="button"

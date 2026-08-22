@@ -100,9 +100,10 @@ mod tests {
     }
 
     #[test]
-    fn smooth_anchor_embeds_small_zh() {
+    fn smooth_anchor_embeds_ollama_qwen3_embedding() {
         let plan = resolve_runtime_model_plan("smooth").expect("smooth resolves");
-        assert_eq!(plan.embedding, "bge-small-zh-int8");
+        // 迁移后四档 embedding 统一指向 Ollama 的 qwen3-embedding:0.6b。
+        assert_eq!(plan.embedding, "qwen3-embedding-0-6b");
         // 标准模式（平滑档 smooth）复用了 base 同款 reranker，与定稿一致。
         assert_eq!(plan.reranker.as_deref(), Some("bge-reranker-base-int8"));
     }
@@ -111,7 +112,7 @@ mod tests {
     fn high_and_balanced_reranker_unified_to_base() {
         for preset_id in ["balanced", "high"] {
             let plan = resolve_runtime_model_plan(preset_id).expect("preset resolves");
-            assert_eq!(plan.embedding, "bge-m3");
+            assert_eq!(plan.embedding, "qwen3-embedding-0-6b");
             assert_eq!(plan.reranker.as_deref(), Some("bge-reranker-base-int8"));
             assert_eq!(plan.ocr, "ppocr-v6-medium");
         }

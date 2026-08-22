@@ -983,6 +983,7 @@ fn strict_ask_request(question: &str, session_id: Option<uuid::Uuid>) -> AskRequ
         max_source_files: 6,
         strict_evidence: true,
         clarification_selection: None,
+        think_mode: false,
     }
 }
 

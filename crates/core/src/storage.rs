@@ -67,7 +67,7 @@ struct Migration {
     sql: &'static str,
 }
 
-const ROOT_SELECT: &str = "SELECT root_id, path, canonical_path, path_key, root_file_id, volume_id, volume_type, authorization_source, root_kind, label, enabled, status, watch_mode, coverage_parent_root_id, file_count, permission_error_count, last_scan_at FROM roots";
+const ROOT_SELECT: &str = "SELECT root_id, path, canonical_path, path_key, root_file_id, volume_id, volume_type, authorization_source, root_kind, label, enabled, status, watch_mode, coverage_parent_root_id, file_count, permission_error_count, last_scan_at, COALESCE((SELECT COUNT(DISTINCT k.file_id) FROM vector_index_keys k JOIN index_generations g ON g.generation_id = k.generation_id AND g.status = 'active' JOIN chunks c ON c.chunk_id = k.chunk_id AND c.file_id = k.file_id AND c.revision_id = k.revision_id JOIN files f ON f.file_id = k.file_id WHERE f.current_revision_id = k.revision_id AND f.availability = 'present' AND EXISTS (SELECT 1 FROM file_root_memberships m WHERE m.root_id = roots.root_id AND m.file_id = f.file_id)), 0) AS indexed_file_count, COALESCE((SELECT COUNT(*) FROM file_root_memberships m JOIN files f ON f.file_id = m.file_id WHERE m.root_id = roots.root_id AND f.availability = 'present' AND f.processing_disposition IN ('parseable_content','image_ocr','read_only_text','archive_manifest')), 0) AS indexable_file_count, COALESCE((SELECT COUNT(*) FROM file_root_memberships m JOIN files f ON f.file_id = m.file_id WHERE m.root_id = roots.root_id AND f.availability = 'present' AND f.parse_status = 'parsed' AND f.processing_disposition IN ('parseable_content','image_ocr','read_only_text','archive_manifest')), 0) AS parsed_file_count, COALESCE((SELECT COUNT(DISTINCT e.file_id) FROM chunk_embeddings e JOIN chunks c ON c.chunk_id = e.chunk_id AND c.file_id = e.file_id AND c.revision_id = e.revision_id JOIN files f ON f.file_id = e.file_id WHERE f.current_revision_id = e.revision_id AND f.availability = 'present' AND EXISTS (SELECT 1 FROM file_root_memberships m WHERE m.root_id = roots.root_id AND m.file_id = f.file_id)), 0) AS embedded_file_count, COALESCE((SELECT COUNT(DISTINCT k.file_id) FROM vector_index_keys k JOIN index_generations g ON g.generation_id = k.generation_id AND g.status = 'active' JOIN chunks c ON c.chunk_id = k.chunk_id AND c.file_id = k.file_id AND c.revision_id = k.revision_id JOIN files f ON f.file_id = k.file_id WHERE f.current_revision_id = k.revision_id AND f.availability = 'present' AND EXISTS (SELECT 1 FROM file_root_memberships m WHERE m.root_id = roots.root_id AND m.file_id = f.file_id)), 0) AS active_index_file_count FROM roots";
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -2617,18 +2617,22 @@ impl CatalogStore {
             )
             .map_err(|error| storage_error("PROCESSING_COVERAGE_QUERY_FAILED", error, true))?;
         let fts_chunks = connection
-            .query_row("SELECT COUNT(*) FROM chunks", [], |row| {
-                row.get::<_, u64>(0)
-            })
+            .query_row(
+                &format!("SELECT COUNT(*) FROM chunks c JOIN files f ON f.file_id = c.file_id WHERE f.current_revision_id = c.revision_id AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL}"),
+                [],
+                |row| row.get::<_, u64>(0),
+            )
             .map_err(|error| storage_error("PROCESSING_COVERAGE_QUERY_FAILED", error, true))?;
         let embedding_chunks = connection
-            .query_row("SELECT COUNT(*) FROM chunk_embeddings", [], |row| {
-                row.get::<_, u64>(0)
-            })
+            .query_row(
+                &format!("SELECT COUNT(*) FROM chunk_embeddings e JOIN chunks c ON c.chunk_id = e.chunk_id AND c.file_id = e.file_id AND c.revision_id = e.revision_id JOIN files f ON f.file_id = e.file_id WHERE f.current_revision_id = e.revision_id AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL}"),
+                [],
+                |row| row.get::<_, u64>(0),
+            )
             .map_err(|error| storage_error("PROCESSING_COVERAGE_QUERY_FAILED", error, true))?;
         let active_vector_keys = connection
             .query_row(
-                "SELECT COUNT(*) FROM vector_index_keys k JOIN index_generations g ON g.generation_id = k.generation_id WHERE g.status = 'active'",
+                &format!("SELECT COUNT(*) FROM vector_index_keys k JOIN index_generations g ON g.generation_id = k.generation_id AND g.status = 'active' JOIN chunks c ON c.chunk_id = k.chunk_id AND c.file_id = k.file_id AND c.revision_id = k.revision_id JOIN files f ON f.file_id = k.file_id WHERE f.current_revision_id = k.revision_id AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL}"),
                 [],
                 |row| row.get::<_, u64>(0),
             )
@@ -2650,7 +2654,7 @@ impl CatalogStore {
             .map_err(|error| storage_error("PROCESSING_COVERAGE_QUERY_FAILED", error, true))?;
         let parse_coverage = ratio(parsed_files, parseable_files);
         let embedding_coverage = ratio(embedding_chunks, fts_chunks);
-        let vector_coverage = ratio(active_vector_keys, embedding_chunks);
+        let vector_coverage = ratio(active_vector_keys, fts_chunks);
         Ok(ProcessingCoverageSnapshot {
             discovered_files,
             parseable_files,
@@ -5735,6 +5739,26 @@ impl CatalogStore {
         Ok(committed)
     }
 
+    /// 统计指定 Embedding 模型在当前索引代上的重建进度：
+    /// 返回 (已用该模型嵌入的分块数, 可搜索分块总数)。
+    /// 重建换模型后，旧模型向量按 `(chunk_id, model_artifact_id)` 存储不会被计入，
+    /// 因此 `done` 从 0 逐步逼近 `total`，可可靠反映「语义索引重建」的真实进度。
+    pub fn embedding_rebuild_progress(
+        &self,
+        model_artifact_id: &str,
+    ) -> Result<(u64, u64), AppError> {
+        let connection = self.connect()?;
+        let done = connection
+            .query_row(
+                "SELECT COUNT(*) FROM chunk_embeddings WHERE model_artifact_id = ?1",
+                params![model_artifact_id],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(|error| storage_error("DATABASE_COUNT_QUERY_FAILED", error, true))?;
+        let total = count_query(&connection, "SELECT COUNT(*) FROM chunks")?;
+        Ok((done, total))
+    }
+
     pub fn active_vector_generation(
         &self,
         model_artifact_id: &str,
@@ -7156,13 +7180,10 @@ impl CatalogStore {
                         }
                         let name = file.display_name.to_lowercase();
                         let path = file.canonical_path.to_lowercase();
-                        let (reason, score) = if name == query {
-                            ("filename", 1.0)
-                        } else if name.contains(&query) {
-                            ("filename", 0.9)
-                        } else if path.contains(&query) {
-                            ("path", 0.65)
-                        } else {
+                        // 文件名通道匹配：前缀/规范化/词元覆盖 + 路径包含，
+                        // 比原来「整串 contains」覆盖更多真实查询形态（详见 filename_channel_match）。
+                        let Some((reason, score)) = filename_channel_match(&name, &path, &query)
+                        else {
                             continue;
                         };
                         hits.push(RankedHit {
@@ -7343,10 +7364,26 @@ impl CatalogStore {
         let connection = self.connect()?;
         let files = list_files_with_connection(&connection)?;
         let scoped_file_ids = collect_scoped_file_ids(&connection, &files, &request.scope)?;
+        // Questions often identify the intended source explicitly, for example
+        // `《季度复盘.md》主要讲了什么？`. Once an exact, authorized filename
+        // is present, searching unrelated files only adds semantically plausible
+        // but wrong evidence. Narrow both retrieval channels to the exact matches;
+        // an unknown title deliberately falls back to the caller's original scope.
+        let explicitly_named_file_ids = explicitly_named_file_ids(
+            &request.question,
+            files
+                .iter()
+                .map(|file| (file.file_id, file.display_name.as_str())),
+            &scoped_file_ids,
+        );
+        let has_explicit_document_scope = explicitly_named_file_ids.is_some();
+        let retrieval_file_ids =
+            explicitly_named_file_ids.unwrap_or_else(|| scoped_file_ids.clone());
         let mut fulltext_hits = search_fulltext(&connection, &request.question, &request.scope)?;
+        fulltext_hits.retain(|hit| retrieval_file_ids.contains(&hit.file.file_id));
         fulltext_hits.sort_by(|left, right| right.channel_score.total_cmp(&left.channel_score));
         let mut semantic_hits = if let Some(query) = semantic_query.as_ref() {
-            search_semantic(&connection, query, &scoped_file_ids)?
+            search_semantic(&connection, query, &retrieval_file_ids)?
         } else {
             Vec::new()
         };
@@ -7371,10 +7408,27 @@ impl CatalogStore {
             next_cursor: None,
             elapsed_ms: started_at.elapsed().as_millis() as u64,
         };
+        if has_explicit_document_scope && question_requests_document_summary(&request.question) {
+            let evidence = load_structural_summary_evidence(
+                &connection,
+                &files,
+                &retrieval_file_ids,
+                request.retrieval_limit as usize,
+            )?;
+            if !evidence.is_empty() {
+                let mut answer =
+                    crate::assemble_extractive_answer(request, &session, evidence, started_at);
+                answer.retrieval_channels = vec!["filename".into(), "document_structure".into()];
+                return Ok(answer);
+            }
+        }
         // 查询级整体门槛：乱码/无关查询的语义 top-1 虚高（模型先验方向）但
         // 无真实命中，整个查询判为与知识库无关 → evidence 为空 → 拒绝回答。
         // 只在语义引擎可用时启用（fulltext-only 回退不受影响）。
-        if semantic_query.is_some() && !crate::indexing::query_has_relevant_evidence(&candidates) {
+        if semantic_query.is_some()
+            && !has_explicit_document_scope
+            && !crate::indexing::query_has_relevant_evidence(&candidates)
+        {
             let mut refused =
                 crate::assemble_extractive_answer(request, &session, Vec::new(), started_at);
             refused.no_evidence_reason = Some(crate::ask::NoEvidenceReason::QueryGateRejected);
@@ -7386,7 +7440,11 @@ impl CatalogStore {
         let mut evidence = Vec::new();
         let mut evidence_tokens = 0_u64;
         for candidate in candidates.into_iter().filter(|candidate| {
-            crate::indexing::candidate_is_relevant_rag_evidence(candidate, semantic_query.is_some())
+            has_explicit_document_scope
+                || crate::indexing::candidate_is_relevant_rag_evidence(
+                    candidate,
+                    semantic_query.is_some(),
+                )
         }) {
             let Some(revision_id) = candidate.revision_id else {
                 continue;
@@ -9518,19 +9576,61 @@ impl CatalogStore {
         connection
             .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
             .map_err(|error| storage_error("DATABASE_HEALTH_CHECK_FAILED", error, true))?;
-        let indexed_files = count_query(
+        let authorized_file = "EXISTS (SELECT 1 FROM file_root_memberships m JOIN roots r ON r.root_id = m.root_id WHERE m.file_id = f.file_id AND r.enabled = 1)";
+        let indexable_files = count_query(
             &connection,
-            "SELECT COUNT(*) FROM files WHERE parse_status = 'parsed'",
+            &format!(
+                "SELECT COUNT(*) FROM files f WHERE f.availability = 'present' AND f.processing_disposition IN ('parseable_content','image_ocr','read_only_text','archive_manifest') AND {authorized_file}"
+            ),
         )?;
-        let searchable_chunks = count_query(&connection, "SELECT COUNT(*) FROM chunks")?;
-        let embedded_chunks = count_query(&connection, "SELECT COUNT(*) FROM chunk_embeddings")?;
+        let parsed_files = count_query(
+            &connection,
+            &format!(
+                "SELECT COUNT(*) FROM files f WHERE f.availability = 'present' AND f.parse_status = 'parsed' AND f.processing_disposition IN ('parseable_content','image_ocr','read_only_text','archive_manifest') AND {authorized_file}"
+            ),
+        )?;
+        let searchable_chunks = count_query(
+            &connection,
+            &format!(
+                "SELECT COUNT(*) FROM chunks c JOIN files f ON f.file_id = c.file_id WHERE f.current_revision_id = c.revision_id AND f.availability = 'present' AND {authorized_file}"
+            ),
+        )?;
+        let embedded_chunks = count_query(
+            &connection,
+            &format!(
+                "SELECT COUNT(*) FROM chunk_embeddings e JOIN chunks c ON c.chunk_id = e.chunk_id AND c.file_id = e.file_id AND c.revision_id = e.revision_id JOIN files f ON f.file_id = e.file_id WHERE f.current_revision_id = e.revision_id AND f.availability = 'present' AND {authorized_file}"
+            ),
+        )?;
+        let embedded_files = count_query(
+            &connection,
+            &format!(
+                "SELECT COUNT(DISTINCT e.file_id) FROM chunk_embeddings e JOIN chunks c ON c.chunk_id = e.chunk_id AND c.file_id = e.file_id AND c.revision_id = e.revision_id JOIN files f ON f.file_id = e.file_id WHERE f.current_revision_id = e.revision_id AND f.availability = 'present' AND {authorized_file}"
+            ),
+        )?;
+        let active_vector_keys = count_query(
+            &connection,
+            &format!(
+                "SELECT COUNT(*) FROM vector_index_keys k JOIN index_generations g ON g.generation_id = k.generation_id AND g.status = 'active' JOIN chunks c ON c.chunk_id = k.chunk_id AND c.file_id = k.file_id AND c.revision_id = k.revision_id JOIN files f ON f.file_id = k.file_id WHERE f.current_revision_id = k.revision_id AND f.availability = 'present' AND {authorized_file}"
+            ),
+        )?;
+        let active_index_files = count_query(
+            &connection,
+            &format!(
+                "SELECT COUNT(DISTINCT k.file_id) FROM vector_index_keys k JOIN index_generations g ON g.generation_id = k.generation_id AND g.status = 'active' JOIN chunks c ON c.chunk_id = k.chunk_id AND c.file_id = k.file_id AND c.revision_id = k.revision_id JOIN files f ON f.file_id = k.file_id WHERE f.current_revision_id = k.revision_id AND f.availability = 'present' AND {authorized_file}"
+            ),
+        )?;
+        let indexed_files = active_index_files;
         let pending_files = count_query(
             &connection,
-            "SELECT COUNT(*) FROM files WHERE parse_status IN ('pending','parsing','ocr_pending')",
+            &format!(
+                "SELECT COUNT(*) FROM files f WHERE f.availability = 'present' AND f.parse_status IN ('pending','parsing','ocr_pending') AND {authorized_file}"
+            ),
         )?;
         let failed_files = count_query(
             &connection,
-            "SELECT COUNT(*) FROM files WHERE parse_status IN ('failed','unsupported','encrypted')",
+            &format!(
+                "SELECT COUNT(*) FROM files f WHERE f.availability = 'present' AND f.parse_status IN ('failed','unsupported','encrypted') AND {authorized_file}"
+            ),
         )?;
         let active_jobs = count_query(
             &connection,
@@ -9587,8 +9687,13 @@ impl CatalogStore {
             schema_version: CURRENT_SCHEMA_VERSION,
             database_size_bytes,
             indexed_files,
+            indexable_files,
+            parsed_files,
+            embedded_files,
+            active_index_files,
             searchable_chunks,
             embedded_chunks,
+            active_vector_keys,
             pending_files,
             failed_files,
             active_jobs,
@@ -10714,6 +10819,7 @@ fn insert_document_node(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn replace_image_search_node(
     transaction: &Transaction<'_>,
     file_id: &Uuid,
@@ -11973,6 +12079,340 @@ fn collect_scoped_file_ids(
     Ok(scoped)
 }
 
+fn explicitly_named_file_ids<'a>(
+    question: &str,
+    files: impl IntoIterator<Item = (Uuid, &'a str)>,
+    scoped_file_ids: &HashSet<Uuid>,
+) -> Option<HashSet<Uuid>> {
+    static DOCUMENT_TITLE_PATTERN: OnceLock<Regex> = OnceLock::new();
+    let pattern = DOCUMENT_TITLE_PATTERN
+        .get_or_init(|| Regex::new(r"《([^《》]{1,260})》").expect("valid document title regex"));
+    let titles = pattern
+        .captures_iter(question)
+        .filter_map(|captures| captures.get(1))
+        .map(|capture| normalize_document_title(capture.as_str()))
+        .filter(|title| !title.is_empty())
+        .collect::<HashSet<_>>();
+    if titles.is_empty() {
+        return None;
+    }
+
+    let matches = files
+        .into_iter()
+        .filter(|(file_id, _)| scoped_file_ids.contains(file_id))
+        .filter_map(|(file_id, display_name)| {
+            let normalized_name = normalize_document_title(display_name);
+            let normalized_stem = normalized_document_stem(&normalized_name);
+            (titles.contains(&normalized_name) || titles.contains(normalized_stem))
+                .then_some(file_id)
+        })
+        .collect::<HashSet<_>>();
+    (!matches.is_empty()).then_some(matches)
+}
+
+fn question_requests_document_summary(question: &str) -> bool {
+    ["概括", "总结", "主要内容", "主要在讲", "主要讲了什么"]
+        .iter()
+        .any(|cue| question.contains(cue))
+}
+
+fn load_structural_summary_evidence(
+    connection: &Connection,
+    files: &[FileRecord],
+    file_ids: &HashSet<Uuid>,
+    limit: usize,
+) -> Result<Vec<(crate::EvidenceRef, AnswerSourceFile)>, AppError> {
+    const STRUCTURAL_SUMMARY_FALLBACK_SQL: &str = "SELECT chunk_id, node_id, text, locator_json, image_asset_id, token_count, ordinal FROM (\
+        SELECT c.chunk_id, c.node_id, c.text, c.locator_json, n.image_asset_id, c.token_count, c.ordinal, \
+               ROW_NUMBER() OVER (ORDER BY c.ordinal) AS rn, COUNT(*) OVER () AS total \
+        FROM chunks c JOIN document_nodes n ON n.node_id = c.node_id JOIN files f ON f.file_id = c.file_id \
+        WHERE c.file_id = ?1 AND c.revision_id = f.current_revision_id) \
+        WHERE rn = 1 OR rn = total OR rn = (total + 1) / 2 ORDER BY ordinal";
+    const STRUCTURAL_SUMMARY_CANDIDATES_SQL: &str = "SELECT c.chunk_id, c.node_id, c.text, c.locator_json, n.image_asset_id, c.token_count, c.ordinal \
+        FROM chunks c JOIN document_nodes n ON n.node_id = c.node_id JOIN files f ON f.file_id = c.file_id \
+        WHERE c.file_id = ?1 AND c.revision_id = f.current_revision_id ORDER BY c.ordinal LIMIT 96";
+    let mut evidence = Vec::new();
+    let mut evidence_tokens = 0_u64;
+    for file in files.iter().filter(|file| file_ids.contains(&file.file_id)) {
+        let candidate_rows = {
+            let mut statement = connection
+                .prepare(STRUCTURAL_SUMMARY_CANDIDATES_SQL)
+                .map_err(|error| storage_error("ASK_EVIDENCE_QUERY_FAILED", error, true))?;
+            statement
+                .query_map([file.file_id.to_string()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, u64>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                })
+                .map_err(|error| storage_error("ASK_EVIDENCE_QUERY_FAILED", error, true))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| storage_error("ASK_EVIDENCE_QUERY_FAILED", error, true))?
+        };
+        let mut rows = select_structural_summary_rows(
+            candidate_rows,
+            limit.saturating_sub(evidence.len()).min(3),
+            Some(file.display_name.as_str()),
+        );
+        if rows.is_empty() {
+            let mut statement = connection
+                .prepare(STRUCTURAL_SUMMARY_FALLBACK_SQL)
+                .map_err(|error| storage_error("ASK_EVIDENCE_QUERY_FAILED", error, true))?;
+            rows = statement
+                .query_map([file.file_id.to_string()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, u64>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                })
+                .map_err(|error| storage_error("ASK_EVIDENCE_QUERY_FAILED", error, true))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| storage_error("ASK_EVIDENCE_QUERY_FAILED", error, true))?;
+        }
+        for (chunk_id, node_id, quote, locator_json, image_asset_id, token_count, ordinal) in rows {
+            if evidence.len() >= limit {
+                return Ok(evidence);
+            }
+            if !evidence.is_empty() && evidence_tokens.saturating_add(token_count) > 2_400 {
+                continue;
+            }
+            evidence_tokens = evidence_tokens.saturating_add(token_count);
+            let (context_before, context_after) =
+                fetch_neighbor_context(connection, &node_id, ordinal)?;
+            evidence.push((
+                crate::EvidenceRef {
+                    evidence_id: Uuid::now_v7(),
+                    file_id: file.file_id,
+                    revision_id: file.current_revision_id.ok_or_else(|| {
+                        AppError::new("ASK_EVIDENCE_INVALID", "目标文档缺少当前修订版本", false)
+                    })?,
+                    node_id: parse_uuid_value(&node_id)?,
+                    chunk_id: parse_uuid_value(&chunk_id)?,
+                    image_asset_id: image_asset_id
+                        .as_deref()
+                        .map(parse_uuid_value)
+                        .transpose()?,
+                    quote,
+                    context_before,
+                    context_after,
+                    locator: serde_json::from_str::<SourceLocator>(&locator_json).map_err(
+                        |error| AppError::new("ASK_EVIDENCE_INVALID", error.to_string(), false),
+                    )?,
+                    retrieval_score: 1.0,
+                },
+                AnswerSourceFile {
+                    file_id: file.file_id,
+                    display_name: file.display_name.clone(),
+                    canonical_path: file.canonical_path.clone(),
+                },
+            ));
+        }
+    }
+    Ok(evidence)
+}
+
+type StructuralSummaryRow = (String, String, String, String, Option<String>, u64, i64);
+
+fn select_structural_summary_rows(
+    rows: Vec<StructuralSummaryRow>,
+    limit: usize,
+    document_title: Option<&str>,
+) -> Vec<StructuralSummaryRow> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut scored = rows
+        .into_iter()
+        .filter_map(|row| {
+            let score = structural_summary_text_score(&row.2);
+            (score > 0).then_some((score, row))
+        })
+        .collect::<Vec<_>>();
+    let mut selected = Vec::new();
+    let mut selected_chunk_ids = HashSet::new();
+    if let Some(title) = document_title {
+        if let Some(first_ordinal) = scored.iter().map(|(_, row)| row.6).min() {
+            let title_candidate = scored
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (score, row))| {
+                    if row.6.saturating_sub(first_ordinal) > 12 {
+                        return None;
+                    }
+                    let title_score = structural_summary_title_overlap_score(&row.2, title);
+                    (title_score > 0).then_some((index, title_score, *score, row.6))
+                })
+                .max_by(|left, right| {
+                    left.1
+                        .cmp(&right.1)
+                        .then_with(|| left.2.cmp(&right.2))
+                        .then_with(|| right.3.cmp(&left.3))
+                });
+            if let Some((index, _, _, _)) = title_candidate {
+                let (_, row) = scored.remove(index);
+                selected_chunk_ids.insert(row.0.clone());
+                selected.push(row);
+            }
+        }
+    }
+    scored.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left.6.cmp(&right.6))
+    });
+    for (_, row) in scored {
+        if selected.len() >= limit {
+            break;
+        }
+        if selected_chunk_ids.insert(row.0.clone()) {
+            selected.push(row);
+        }
+    }
+    selected.sort_by_key(|row| row.6);
+    selected
+}
+
+fn structural_summary_title_overlap_score(text: &str, document_title: &str) -> i64 {
+    let normalized_text = normalize_document_title(text);
+    let normalized_title = normalize_document_title(document_title);
+    let title_stem = normalized_document_stem(&normalized_title);
+    if title_stem.chars().count() < 4 {
+        return 0;
+    }
+    if normalized_text.contains(title_stem) {
+        return 1000;
+    }
+
+    let compact_text = retain_title_signal_characters(&normalized_text);
+    let compact_title = retain_title_signal_characters(title_stem);
+    let compact_len = compact_title.chars().count();
+    if compact_len < 4 {
+        return 0;
+    }
+    if compact_text.contains(&compact_title) {
+        return 900;
+    }
+
+    let matched = compact_title
+        .chars()
+        .filter(|character| compact_text.contains(*character))
+        .count();
+    let required = ((compact_len as f64) * 0.72).ceil() as usize;
+    if matched >= required && matched >= 8 {
+        matched as i64
+    } else {
+        0
+    }
+}
+
+fn retain_title_signal_characters(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| {
+            character.is_alphanumeric()
+                || matches!(
+                    *character as u32,
+                    0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF
+                )
+        })
+        .collect()
+}
+fn structural_summary_text_score(text: &str) -> i64 {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let char_count = normalized.chars().count();
+    if char_count < 8 {
+        return 0;
+    }
+
+    let mut han = 0_i64;
+    let mut letters = 0_i64;
+    let mut digits = 0_i64;
+    let mut markup = 0_i64;
+    let mut separators = 0_i64;
+    for character in normalized.chars() {
+        if matches!(
+            character as u32,
+            0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF
+        ) {
+            han += 1;
+        } else if character.is_ascii_alphabetic() {
+            letters += 1;
+        } else if character.is_ascii_digit() {
+            digits += 1;
+        }
+        if matches!(character, '\\' | '{' | '}' | '<' | '>' | ';') {
+            markup += 1;
+        }
+        if matches!(character, '/' | '-' | '_' | ':' | ',' | '"' | '[' | ']') {
+            separators += 1;
+        }
+    }
+
+    let useful = han * 3 + letters + digits;
+    if useful < 8 {
+        return 0;
+    }
+
+    let lower = normalized.to_ascii_lowercase();
+    let mut penalty = 0_i64;
+    if char_count <= 16 {
+        penalty += 80;
+    }
+    if markup * 5 > char_count as i64 {
+        penalty += 180;
+    }
+    if separators * 4 > char_count as i64 && han < 8 {
+        penalty += 80;
+    }
+    if lower.contains("\\rtf") || lower.contains("\\ansi") || lower.contains("\\fonttbl") {
+        penalty += 420;
+    }
+    if normalized.chars().all(|character| {
+        character.is_ascii_digit()
+            || character.is_whitespace()
+            || matches!(character, '/' | '.' | '-' | '_' | ':' | ')')
+    }) {
+        penalty += 220;
+    }
+
+    let mut score = useful.min(900);
+    if char_count >= 40 {
+        score += 40;
+    }
+    if normalized.contains('。')
+        || normalized.contains('，')
+        || normalized.contains('：')
+        || normalized.contains("##")
+    {
+        score += 25;
+    }
+    (score - penalty).max(0)
+}
+fn normalize_document_title(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn normalized_document_stem(normalized_name: &str) -> &str {
+    normalized_name
+        .rsplit_once('.')
+        .map_or(normalized_name, |(stem, _)| stem)
+}
+
 fn search_cursor_fingerprint(
     connection: &Connection,
     request: &crate::SearchRequest,
@@ -12055,6 +12495,140 @@ fn join_search_channel<T>(
     handle
         .join()
         .map_err(|_| AppError::new("SEARCH_THREAD_PANIC", "搜索通道线程异常退出", false))?
+}
+
+/// 文件名/路径通道匹配：返回 (reason, score)，None 表示不匹配。
+///
+/// 覆盖真实查询的多种形态（按区分度从高到低）：
+///   1. 完全一致：`周晨博-大模型开发.pdf` == `周晨博-大模型开发.pdf`
+///   2. 规范化一致：去掉分隔符/标点后相等（`applogtxt` ↔ `app_log.txt`）
+///   3. 文件名前缀：`周晨博` 命中 `周晨博-大模型开发.pdf`（比「包含」更强）
+///   4. 文件名包含：`周晨博` 命中 `编译原理周晨博论文.docx`
+///   5. 规范化包含：`applogtxt` 是 `app_log.txt` 规范化的子串
+///   6. 词元全覆盖：查询每个 ≥2 字符词元都在文件名中出现
+///      （`app_log txt` ↔ `app_log.txt`；分隔符差异不阻断匹配）
+///   7. 路径包含：`软考` 命中目录路径含软考的文件（弱信号，score 最低）
+///
+/// query 已由调用方 trim + to_lowercase。name/path 已 to_lowercase。
+fn filename_channel_match(name: &str, path: &str, query: &str) -> Option<(&'static str, f32)> {
+    if query.is_empty() {
+        return None;
+    }
+    if name == query {
+        return Some(("filename", 1.0));
+    }
+    let normalized = |value: &str| {
+        value
+            .chars()
+            .filter(|character| character.is_alphanumeric())
+            .collect::<String>()
+    };
+    let normalized_query = normalized(query);
+    let normalized_name = normalized(name);
+    if !normalized_query.is_empty() && normalized_name == normalized_query {
+        return Some(("filename", 0.95));
+    }
+    if name.starts_with(query) {
+        return Some(("filename", 0.93));
+    }
+    if name.contains(query) {
+        return Some(("filename", 0.9));
+    }
+    if !normalized_query.is_empty() && normalized_name.contains(&normalized_query) {
+        return Some(("filename", 0.85));
+    }
+    let mut has_query_tokens = false;
+    let mut all_tokens_covered = true;
+    for token in query.split(|character: char| !character.is_alphanumeric()) {
+        if token.chars().count() < 2 {
+            continue;
+        }
+        has_query_tokens = true;
+        if !name.contains(token) {
+            all_tokens_covered = false;
+            break;
+        }
+    }
+    if has_query_tokens && all_tokens_covered {
+        return Some(("filename", 0.8));
+    }
+    // 轻微错别字容错：查询与文件主干（去扩展名）的 Damerau-Levenshtein
+    // 距离足够小且长度相近时，视为「用户打错字但指的就是这份文件」。
+    // 覆盖真实拼写错误的常见形态：相邻字符交换（`kdsstep`↔`ksdstep`、
+    // `YCLonfig2`↔`YLConfig2`）、单字符增删改。置信度低于精确包含匹配
+    // （0.70），但仍高于 path 弱信号——错别字命中应排在纯语义/路径结果前。
+    // 只在无任何更强匹配时启用（位于匹配链末尾）。
+    const FILENAME_FUZZY_SCORE: f32 = 0.70;
+    let query_stem = strip_extension_for_fuzzy(query);
+    let name_stem = strip_extension_for_fuzzy(name);
+    let query_len = query_stem.chars().count();
+    let name_len = name_stem.chars().count();
+    if query_len >= 3 && name_len >= 3 && (query_len as isize - name_len as isize).abs() <= 2 {
+        let distance = damerau_levenshtein(&query_stem, &name_stem);
+        // 距离上限随长度微增（约 1/4），最短也允许 1 处差异；
+        // 长度相近的短名字（3-12 字符）只允许 1-2 处错误，避免误召回。
+        let max_allowed = ((query_len.min(name_len) as f32 * 0.25).ceil() as usize).max(1);
+        if distance <= max_allowed {
+            return Some(("filename_fuzzy", FILENAME_FUZZY_SCORE));
+        }
+    }
+    if path.contains(query) {
+        return Some(("path", 0.65));
+    }
+    None
+}
+
+/// 剥一次扩展名（"ksdstep.ini" → "ksdstep"；无扩展名或"a.b"形态原样保留主名）。
+/// 用于错别字容错的文件主干比较，避免扩展名干扰编辑距离。
+fn strip_extension_for_fuzzy(value: &str) -> &str {
+    match value.rsplit_once('.') {
+        Some((stem, extension))
+            if !stem.is_empty() && extension.chars().all(|ch| !ch.is_whitespace()) =>
+        {
+            stem
+        }
+        _ => value,
+    }
+}
+
+/// Optimal String Alignment（Damerau-Levenshtein 变体）距离：
+/// 相邻字符交换算 1 次编辑，覆盖中文/英文文件名最常见的错别字形态。
+/// 纯字符级 DP，与具体内容无关。
+fn damerau_levenshtein(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let n = a_chars.len();
+    let m = b_chars.len();
+    if n == 0 {
+        return m;
+    }
+    if m == 0 {
+        return n;
+    }
+    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    for i in 0..=n {
+        dp[i][0] = i;
+    }
+    for j in 0..=m {
+        dp[0][j] = j;
+    }
+    for i in 1..=n {
+        for j in 1..=m {
+            let cost = usize::from(a_chars[i - 1] != b_chars[j - 1]);
+            dp[i][j] = (dp[i - 1][j] + 1)
+                .min(dp[i][j - 1] + 1)
+                .min(dp[i - 1][j - 1] + cost);
+            // 相邻字符交换：a[i-1]==b[j-2] 且 a[i-2]==b[j-1]。
+            if i > 1
+                && j > 1
+                && a_chars[i - 1] == b_chars[j - 2]
+                && a_chars[i - 2] == b_chars[j - 1]
+            {
+                dp[i][j] = dp[i][j].min(dp[i - 2][j - 2] + 1);
+            }
+        }
+    }
+    dp[n][m]
 }
 
 fn search_fulltext(
@@ -12756,6 +13330,11 @@ fn root_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RootRecord> {
     let watch_mode: String = row.get(12)?;
     let coverage_parent_root_id: Option<String> = row.get(13)?;
     let last_scan_at: Option<String> = row.get(16)?;
+    let indexed_file_count: u64 = row.get(17)?;
+    let indexable_file_count: u64 = row.get(18)?;
+    let parsed_file_count: u64 = row.get(19)?;
+    let embedded_file_count: u64 = row.get(20)?;
+    let active_index_file_count: u64 = row.get(21)?;
     Ok(RootRecord {
         root_id: Uuid::parse_str(&root_id).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
@@ -12784,6 +13363,11 @@ fn root_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RootRecord> {
         last_scan_at: last_scan_at
             .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
             .map(|value| value.with_timezone(&Utc)),
+        indexed_file_count,
+        indexable_file_count,
+        parsed_file_count,
+        embedded_file_count,
+        active_index_file_count,
     })
 }
 
@@ -13231,6 +13815,163 @@ mod tests {
     use crate::OcrAttempt;
 
     #[test]
+    fn explicit_document_titles_narrow_only_to_authorized_exact_names() {
+        let target = Uuid::now_v7();
+        let duplicate = Uuid::now_v7();
+        let unrelated = Uuid::now_v7();
+        let unauthorized = Uuid::now_v7();
+        let files = [
+            (target, "季度 复盘.MD"),
+            (duplicate, "季度复盘.md"),
+            (unrelated, "季度规划.md"),
+            (unauthorized, "季度复盘.md"),
+        ];
+        let scoped = HashSet::from([target, duplicate, unrelated]);
+
+        let matches = explicitly_named_file_ids(
+            "请概括《季度复盘》并列出主要结论",
+            files.iter().map(|(id, name)| (*id, *name)),
+            &scoped,
+        )
+        .expect("an exact authorized title should narrow retrieval");
+
+        assert_eq!(matches, HashSet::from([target, duplicate]));
+        assert!(!matches.contains(&unauthorized));
+    }
+
+    #[test]
+    fn explicit_document_title_requires_an_exact_match_before_narrowing() {
+        let file_id = Uuid::now_v7();
+        let files = [(file_id, "季度复盘.md")];
+        let scoped = HashSet::from([file_id]);
+
+        assert_eq!(
+            explicitly_named_file_ids(
+                "《季度复盘.md》讲了什么？",
+                files.iter().map(|(id, name)| (*id, *name)),
+                &scoped,
+            ),
+            Some(HashSet::from([file_id]))
+        );
+        assert_eq!(
+            explicitly_named_file_ids(
+                "《季度复》讲了什么？",
+                files.iter().map(|(id, name)| (*id, *name)),
+                &scoped,
+            ),
+            None,
+            "partial titles must preserve the original retrieval scope"
+        );
+        assert_eq!(
+            explicitly_named_file_ids(
+                "这些季度资料讲了什么？",
+                files.iter().map(|(id, name)| (*id, *name)),
+                &scoped,
+            ),
+            None,
+            "questions without an explicit document title keep broad retrieval"
+        );
+    }
+
+    #[test]
+    fn document_summary_detection_is_generic_and_does_not_depend_on_a_filename() {
+        for question in [
+            "请概括《任意文档.md》的主要内容",
+            "总结一下这份资料",
+            "这篇文章主要在讲什么？",
+        ] {
+            assert!(question_requests_document_summary(question));
+        }
+        assert!(!question_requests_document_summary(
+            "《任意文档.md》是否提到了向量检索？"
+        ));
+    }
+
+    #[test]
+    fn structural_summary_score_rejects_markup_and_tiny_page_counters() {
+        let natural =
+            "本文介绍系统背景、核心模块、实验结果和后续改进方向，适合作为主要内容摘要的证据。";
+        let rtf = r"{\rtf1 \ansi \fonttbl {\f0 Times New Roman;} \u9424 ?\uc1 \u9425 ?}";
+        assert!(structural_summary_text_score(natural) > 0);
+        assert_eq!(structural_summary_text_score("28/28"), 0);
+        assert_eq!(structural_summary_text_score(rtf), 0);
+    }
+
+    #[test]
+    fn structural_summary_rows_prefer_informative_chunks_without_expanding_scope() {
+        fn row(text: &str, ordinal: i64) -> StructuralSummaryRow {
+            (
+                format!("chunk-{ordinal}"),
+                format!("node-{ordinal}"),
+                text.to_owned(),
+                "{}".to_owned(),
+                None,
+                10,
+                ordinal,
+            )
+        }
+
+        let selected = select_structural_summary_rows(
+            vec![
+                row("希赛", 1),
+                row("28/28", 2),
+                row(
+                    "本文围绕数据库系统工程师考试上午题，覆盖计算机组成、数据结构、网络安全和数据库基础等内容。",
+                    3,
+                ),
+                row("最后总结实验结果、系统限制和未来改进方向。", 9),
+            ],
+            2,
+            None,
+        );
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].6, 3);
+        assert_eq!(selected[1].6, 9);
+    }
+
+    #[test]
+    fn structural_summary_rows_keep_opening_title_when_it_matches_document_name() {
+        fn row(text: &str, ordinal: i64) -> StructuralSummaryRow {
+            (
+                format!("chunk-{ordinal}"),
+                format!("node-{ordinal}"),
+                text.to_owned(),
+                "{}".to_owned(),
+                None,
+                10,
+                ordinal,
+            )
+        }
+
+        let selected = select_structural_summary_rows(
+            vec![
+                row(
+                    ")希赛 内部资料，禁止传播 2014年上半年数据库系统工程师考试上午真题（参考答案）",
+                    1,
+                ),
+                row(
+                    "3、海明码利用奇偶性检错和纠错，通过在n个数据位之间插入k个检验位。",
+                    3,
+                ),
+                row(
+                    "4、通常可以将计算机系统中执行一条指令的过程分为取指令，分析和执行指令3步。",
+                    4,
+                ),
+                row("最后总结实验结果、系统限制和未来改进方向。", 40),
+            ],
+            3,
+            Some("2014年上半年数据库系统工程师考试上午真题（参考答案）.pdf"),
+        );
+
+        assert_eq!(selected.len(), 3);
+        assert_eq!(selected[0].6, 1);
+        assert!(
+            selected[0]
+                .2
+                .contains("2014年上半年数据库系统工程师考试上午真题")
+        );
+    }
+    #[test]
     fn interactive_writes_are_not_starved_by_background_waiters() {
         let coordinator = Arc::new(WriteCoordinator::default());
         let held = coordinator.acquire(WritePriority::Background);
@@ -13540,6 +14281,119 @@ mod tests {
         );
     }
 
+    #[test]
+    fn coverage_and_root_counts_use_active_vector_index() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+        let root = store
+            .upsert_root(&test_root_registration())
+            .expect("insert root");
+        let generation_id = Uuid::now_v7();
+        let now = Utc::now().to_rfc3339();
+        let connection = store.connect().expect("connect");
+        connection
+            .execute(
+                "INSERT INTO index_generations (generation_id, model_artifact_id, dimension, metric, quantization, index_path, status, item_count, coverage, created_at, activated_at) VALUES (?1, 'embedding-test', 2, 'cosine', 'f32', 'active.usearch', 'active', 1, 0.5, ?2, ?2)",
+                params![generation_id.to_string(), now],
+            )
+            .expect("insert active generation");
+
+        let mut seeded_chunks = Vec::new();
+        for (name, active_key) in [("active.pdf", Some(1_i64)), ("embedded-only.pdf", None)] {
+            let file_id = Uuid::now_v7();
+            let revision_id = Uuid::now_v7();
+            let node_id = Uuid::now_v7();
+            let chunk_id = Uuid::now_v7();
+            let path = format!("C:\\Users\\Test\\Documents\\{name}");
+            let path_key = path.to_ascii_lowercase();
+            connection
+                .execute(
+                    "INSERT INTO files (file_id, canonical_path, path_key, name, extension, size_bytes, modified_at, discovered_at, availability, volume_id, display_name, mime_type, current_revision_id, parse_status, first_seen_at, last_seen_at, processing_disposition) VALUES (?1, ?2, ?3, ?4, 'pdf', 256, ?5, ?5, 'present', 'vol-test', ?4, 'application/pdf', ?6, 'parsed', ?5, ?5, 'parseable_content')",
+                    params![file_id.to_string(), path, path_key, name, now, revision_id.to_string()],
+                )
+                .expect("insert file");
+            connection
+                .execute(
+                    "INSERT INTO file_revisions (revision_id, file_id, size_bytes, fs_modified_at, metadata_fingerprint, created_at, parse_status) VALUES (?1, ?2, 256, ?3, ?4, ?3, 'parsed')",
+                    params![revision_id.to_string(), file_id.to_string(), now, format!("256:{name}")],
+                )
+                .expect("insert revision");
+            connection
+                .execute(
+                    "INSERT INTO file_root_memberships (file_id, root_id, relative_path, is_primary) VALUES (?1, ?2, ?3, 1)",
+                    params![file_id.to_string(), root.root_id.to_string(), name],
+                )
+                .expect("insert membership");
+            connection
+                .execute(
+                    "INSERT INTO document_nodes (node_id, revision_id, ordinal, node_type, locator_json, heading_path_json, text) VALUES (?1, ?2, 0, 'paragraph', '{}', '[]', ?3)",
+                    params![node_id.to_string(), revision_id.to_string(), name],
+                )
+                .expect("insert node");
+            connection
+                .execute(
+                    "INSERT INTO chunks (chunk_id, file_id, revision_id, node_id, ordinal, text, normalized_text, token_count, content_hash, language, locator_json) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, 4, ?1, 'zh', '{}')",
+                    params![chunk_id.to_string(), file_id.to_string(), revision_id.to_string(), node_id.to_string(), name],
+                )
+                .expect("insert chunk");
+            connection
+                .execute(
+                    "INSERT INTO chunk_embeddings (chunk_id, model_artifact_id, file_id, revision_id, dimension, vector_blob, created_at) VALUES (?1, 'embedding-test', ?2, ?3, 2, X'00000000', ?4)",
+                    params![chunk_id.to_string(), file_id.to_string(), revision_id.to_string(), now],
+                )
+                .expect("insert embedding");
+            if let Some(vector_key) = active_key {
+                connection
+                    .execute(
+                        "INSERT INTO vector_index_keys (generation_id, vector_key, chunk_id, file_id, revision_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![generation_id.to_string(), vector_key, chunk_id.to_string(), file_id.to_string(), revision_id.to_string()],
+                    )
+                    .expect("insert active vector key");
+            }
+            seeded_chunks.push(chunk_id);
+        }
+
+        let unsupported_id = Uuid::now_v7();
+        connection
+            .execute(
+                "INSERT INTO files (file_id, canonical_path, path_key, name, extension, size_bytes, modified_at, discovered_at, availability, volume_id, display_name, mime_type, parse_status, first_seen_at, last_seen_at, processing_disposition) VALUES (?1, 'C:\\Users\\Test\\Documents\\tool.exe', 'c:\\users\\test\\documents\\tool.exe', 'tool.exe', 'exe', 128, ?2, ?2, 'present', 'vol-test', 'tool.exe', 'application/x-msdownload', 'unsupported', ?2, ?2, 'capability_missing')",
+                params![unsupported_id.to_string(), now],
+            )
+            .expect("insert unsupported file");
+        connection
+            .execute(
+                "INSERT INTO file_root_memberships (file_id, root_id, relative_path, is_primary) VALUES (?1, ?2, 'tool.exe', 1)",
+                params![unsupported_id.to_string(), root.root_id.to_string()],
+            )
+            .expect("insert unsupported membership");
+        drop(connection);
+
+        let coverage = store
+            .processing_coverage_snapshot()
+            .expect("coverage snapshot");
+        assert_eq!(coverage.fts_chunks, 2);
+        assert_eq!(coverage.embedding_chunks, 2);
+        assert_eq!(coverage.active_vector_keys, 1);
+        assert_eq!(coverage.embedding_coverage, 1.0);
+        assert_eq!(coverage.vector_coverage, 0.5);
+
+        let maintenance = store.maintenance_snapshot().expect("maintenance");
+        assert_eq!(maintenance.indexable_files, 2);
+        assert_eq!(maintenance.parsed_files, 2);
+        assert_eq!(maintenance.embedded_files, 2);
+        assert_eq!(maintenance.active_index_files, 1);
+        assert_eq!(maintenance.indexed_files, 1);
+        assert_eq!(maintenance.searchable_chunks, 2);
+        assert_eq!(maintenance.embedded_chunks, 2);
+        assert_eq!(maintenance.active_vector_keys, 1);
+
+        let root = store.list_roots().expect("roots").remove(0);
+        assert_eq!(root.indexable_file_count, 2);
+        assert_eq!(root.parsed_file_count, 2);
+        assert_eq!(root.embedded_file_count, 2);
+        assert_eq!(root.active_index_file_count, 1);
+        assert_eq!(root.indexed_file_count, 1);
+    }
     /// 造一个「已解析 + 已嵌入」的文件：files/revisions/root 归属/节点/chunk/embedding 全链。
     /// 单 chunk → 文档向量即该 chunk 向量（mean_normalized_vector 归一化后 cosine 不变）。
     /// 返回 (file_id, revision_id)。
@@ -16696,6 +17550,7 @@ mod tests {
             max_source_files: 8,
             strict_evidence: true,
             clarification_selection: None,
+            think_mode: false,
         };
         let image_answer = store
             .answer_extractively(&ask, None)
@@ -16867,6 +17722,7 @@ mod tests {
                     max_source_files: 8,
                     strict_evidence: true,
                     clarification_selection: None,
+                    think_mode: false,
                 },
                 None,
             )

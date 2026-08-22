@@ -2,9 +2,10 @@ import { isTauri } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
-import type { AppError, JobRecord, SystemNotice } from "../bridge";
+import type { AppError, AskStreamEvent, JobRecord, SystemNotice } from "../bridge";
 import { recordDiagnosticEvent } from "../bridge/observed-bridge";
 import { RUNTIME_EVENTS } from "../bridge/runtime-events";
+import { useAppStore } from "../state/app-store";
 import { normalizeAppError } from "../utils/app-error";
 
 const LIGHT_QUERY_KEYS = ["home-summary", "roots", "settings-roots", "maintenance", "app-status"];
@@ -36,13 +37,45 @@ export function useBackendEvents() {
         listen(RUNTIME_EVENTS.runtimeState, () => {
           void queryClient.invalidateQueries({ queryKey: ["app-status"] });
         }),
+        listen<{ status: string; error_code?: string; starting?: boolean }>(RUNTIME_EVENTS.ollamaState, (event) => {
+          void queryClient.invalidateQueries({ queryKey: ["app-status"] });
+          void queryClient.invalidateQueries({ queryKey: ["ollama-status"] });
+          const status = event.payload?.status;
+          if (status === "not_installed") {
+            upsertNotice({
+              notice_key: "ollama-not-installed",
+              level: "warning",
+              message: "本机未安装 Ollama，问答与语义检索暂不可用",
+              details: "翻翻使用本机 Ollama 做本地问答与语义检索；需要你自行安装，翻翻不会自动下载或安装第三方包。",
+              action_label: "去设置",
+              action_route: "settings",
+            });
+          } else if (status === "installed_not_running") {
+            upsertNotice({
+              notice_key: "ollama-not-running",
+              level: "warning",
+              message: "Ollama 已安装但服务未启动",
+              details: event.payload?.error_code
+                ? `启动失败：${event.payload.error_code}。可在设置里重试。`
+                : event.payload?.starting === false ? "启动超时，可在设置里重试。" : "正在后台启动，稍候自动刷新。",
+              action_label: "去设置",
+              action_route: "settings",
+            });
+          } else {
+            setNotices((current) => current.filter((item) => item.notice_key === "ollama-not-installed" ? false : item.notice_key !== "ollama-not-running"));
+          }
+        }),
+        listen<AskStreamEvent>(RUNTIME_EVENTS.askStream, (event) => {
+          useAppStore.getState().apply_ask_stream_event(event.payload);
+        }),
         listen<JobRecord>(RUNTIME_EVENTS.jobProgress, (event) => {
           const terminal = ["succeeded", "partial", "failed", "cancelled"].includes(event.payload.status);
           refresh(terminal ? CATALOG_QUERY_KEYS : LIGHT_QUERY_KEYS);
         }),
         listen(RUNTIME_EVENTS.catalogChanged, () => refresh(CATALOG_QUERY_KEYS)),
-        listen(RUNTIME_EVENTS.indexChanged, () => refresh(["home-summary", "maintenance", "inbox"])),
-        listen(RUNTIME_EVENTS.indexRebuildStarted, () => refresh(["maintenance"])),
+        listen(RUNTIME_EVENTS.indexChanged, () => refresh(["home-summary", "maintenance", "inbox", "index-rebuild-progress"])),
+        listen(RUNTIME_EVENTS.indexRebuildStarted, () => refresh(["maintenance", "index-rebuild-progress"])),
+        listen(RUNTIME_EVENTS.indexRebuildProgress, () => refresh(["index-rebuild-progress"])),
         listen(RUNTIME_EVENTS.collectionSuggestionsChanged, () => refresh(["collections", "collection-suggestions", "collection-files", "file-relations"])),
         listen(RUNTIME_EVENTS.modelDownloadStarted, () => {
           refresh();

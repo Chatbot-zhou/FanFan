@@ -30,6 +30,10 @@ pub struct AskRequest {
     /// 原问题 + 该字段继续问答；锁定 scope、写 USER_SELECTION 记忆。
     #[serde(default)]
     pub clarification_selection: Option<Uuid>,
+    /// 深度思考模式：true 时最终回答开启思考并流式展示推理过程；
+    /// false 时关闭思考（RAG 内部调用始终关闭思考，不受此开关影响）。
+    #[serde(default)]
+    pub think_mode: bool,
 }
 
 impl AskRequest {
@@ -264,6 +268,10 @@ pub struct AnswerResult {
     /// NEED_CLARIFICATION 载荷（仅 answer_mode = "clarification" 时非空）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clarification: Option<ClarificationPayload>,
+    /// 深度思考模式累积的推理轨迹（message.thinking 全文）。非思考模式为
+    /// `None`。随 answer_json 一起持久化，前端完成后仍可折叠回看。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -527,10 +535,12 @@ pub fn assemble_extractive_answer(
             degradation_reason: None,
             no_evidence_reason: None,
             clarification: None,
+            thinking: None,
         };
     }
 
     let mut seen_files = HashSet::new();
+    let mut seen_claim_texts = HashSet::new();
     let mut source_files = Vec::new();
     let mut claims = Vec::new();
     for (evidence, source) in evidence.into_iter().take(request.retrieval_limit as usize) {
@@ -542,9 +552,13 @@ pub fn assemble_extractive_answer(
         if seen_files.insert(source.file_id) {
             source_files.push(source);
         }
+        let claim_text = compact_quote(&evidence.quote, 260);
+        if is_machine_noise_summary(&claim_text) && !seen_claim_texts.insert(claim_text.clone()) {
+            continue;
+        }
         claims.push(AnswerClaim {
             claim_id: Uuid::now_v7(),
-            text: compact_quote(&evidence.quote, 260),
+            text: claim_text,
             support_status: SupportStatus::Supported,
             citations: vec![evidence],
         });
@@ -580,15 +594,164 @@ pub fn assemble_extractive_answer(
         degradation_reason: None,
         no_evidence_reason: None,
         clarification: None,
+        thinking: None,
     }
 }
 
 fn compact_quote(text: &str, limit: usize) -> String {
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let Some(summary) = markup_control_summary(&normalized) {
+        return summary;
+    }
+    if looks_like_opaque_encoded_text(&normalized) {
+        return opaque_encoded_summary(&normalized);
+    }
     if normalized.chars().count() <= limit {
         return normalized;
     }
     format!("{}…", normalized.chars().take(limit).collect::<String>())
+}
+
+fn is_machine_noise_summary(text: &str) -> bool {
+    text.contains("富文本格式源码")
+        || text.contains("格式控制源码")
+        || text.contains("配置/初始化")
+        || text.contains("十六进制编码")
+}
+
+fn markup_control_summary(text: &str) -> Option<String> {
+    if !looks_like_markup_control_text(text) {
+        return None;
+    }
+    let lower = text.to_ascii_lowercase();
+    let mut details = Vec::new();
+    if lower.contains("\\rtf") {
+        details.push("RTF/富文本格式源码");
+    } else {
+        details.push("标记/格式控制源码");
+    }
+    if lower.contains("wps office") {
+        details.push("WPS Office 生成信息");
+    }
+    if lower.contains("\\fonttbl") {
+        details.push("字体表");
+    }
+    if lower.contains("\\stylesheet") || lower.contains("\\lsd") {
+        details.push("样式表");
+    }
+    if contains_rtf_unicode_escape(text) {
+        details.push("Unicode 字符码序列");
+    }
+    details.dedup();
+    Some(format!(
+        "该证据片段主要是{}，可读正文有限；只能确认这些文档结构/编码信息，不能据此推断额外主题。",
+        details.join("、")
+    ))
+}
+
+fn contains_rtf_unicode_escape(text: &str) -> bool {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut index = 0_usize;
+    while index + 2 < chars.len() {
+        if chars[index] == '\\' && chars[index + 1] == 'u' {
+            let mut end = index + 2;
+            if end < chars.len() && matches!(chars[end], '-' | '+') {
+                end += 1;
+            }
+            let start_digits = end;
+            while end < chars.len() && chars[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > start_digits {
+                return true;
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
+fn opaque_encoded_summary(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let mut details = Vec::new();
+    if text.contains('=') {
+        details.push("键值项");
+    }
+    if text.contains('[') && text.contains(']') {
+        details.push("节名");
+    }
+    if lower
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .count()
+        >= 48
+    {
+        details.push("十六进制编码值");
+    }
+    if details.is_empty() {
+        details.push("编码串或机器标识符");
+    }
+    details.dedup();
+    format!(
+        "该证据片段主要是配置/初始化文件内容，包含{}；可读业务语义有限，不能据此推断额外主题。",
+        details.join("、")
+    )
+}
+
+fn looks_like_markup_control_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("\\rtf") || lower.contains("\\ansi") || lower.contains("\\fonttbl") {
+        return true;
+    }
+    let char_count = text.chars().count().max(1);
+    let control_markers = text
+        .chars()
+        .filter(|character| matches!(character, '\\' | '{' | '}' | ';'))
+        .count();
+    if control_markers * 5 > char_count {
+        return true;
+    }
+
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut control_sequences = 0_usize;
+    let mut index = 0_usize;
+    while index < chars.len() {
+        if chars[index] != '\\' {
+            index += 1;
+            continue;
+        }
+        let mut end = index + 1;
+        while end < chars.len() && chars[end].is_ascii_alphabetic() {
+            end += 1;
+        }
+        if end.saturating_sub(index + 1) >= 2 {
+            control_sequences += 1;
+        }
+        index = end.max(index + 1);
+    }
+    control_sequences >= 3
+}
+
+fn looks_like_opaque_encoded_text(text: &str) -> bool {
+    let longest_opaque = text
+        .split(|character: char| character.is_whitespace() || matches!(character, '=' | ':' | ','))
+        .map(|token| {
+            token
+                .chars()
+                .filter(|character| character.is_ascii_hexdigit())
+                .count()
+        })
+        .max()
+        .unwrap_or(0);
+    if longest_opaque >= 48 {
+        return true;
+    }
+    let char_count = text.chars().count().max(1);
+    let opaque_chars = text
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .count();
+    opaque_chars * 4 > char_count * 3 && char_count >= 80
 }
 
 pub fn generation_prompt(
@@ -641,10 +804,11 @@ pub fn generation_prompt(
 1. 把证据整理成一段通顺、自然的中文回答，直接回答用户的问题；用自己的话改写证据内容，不要照抄原文。\n\
 2. 回答按逻辑分成 2-8 条 claim（每条一到两句），每条 claim 在 citation_ids 中列出直接支持它的 S 编号。\n\
 3. 改写时保留关键数字和专有名词。\n\
-4. 回答中出现的每个事实都必须能从可用证据中找到依据，不得凭空编造或补充外部知识。\n\
+4. 回答中出现的每个事实、数字、日期、学号、人名、单位都必须原样来自【可用证据】；证据中未出现的具体信息一律不得写出，禁止推断、补全或编造任何数值/日期/姓名。\n\
 5. 不得使用不存在的编号，不得把对话历史当作证据。每条证据中的【上文】/【下文】只是命中块在原文中的邻近文本，仅用于帮助你理解正文证据的语境，不得作为引用来源。\n\
 6. 证据不足时 claims 为空，并在 refusal 中说明“当前资料中未找到足够依据”。\n\
-7. 只输出符合指定 JSON Schema 的对象，不要输出 Markdown、代码块或解释。\n\n\
+7. 若是“是否/是否提到/是非/数据”类问题，先给出由证据支持的结论（是/否＋证据中出现的原文依据），再简短补充说明；不要展开证据之外的信息。\n\
+8. 只输出符合指定 JSON Schema 的对象，不要输出 Markdown、代码块或解释。\n\n\
 【参考示例】\n\
 示例一（证据充足时的润色输出）：\n\
 问题：公司年假政策是什么？\n\
@@ -659,6 +823,66 @@ pub fn generation_prompt(
         sources
     ));
     prompt
+}
+
+/// 生成层占位符护栏：弱模型有时会把 prompt 里的指令结构标签（如【可用证据】
+/// 【上文】【下文】）原样抄进回答，形成「根据【可用证据】显示…」这类占位式
+/// 输出。任一 claim 命中即判定本次合成不合格，整体回退到摘录式，避免占位文本
+/// 泄漏给用户，也防止其污染 answer.answer 与知识点。
+const PROMPT_PLACEHOLDER_MARKERS: [&str; 6] = [
+    "【可用证据】",
+    "【上文】",
+    "【下文】",
+    "【问题】",
+    "【对话历史】",
+    "【参考示例】",
+];
+
+/// 判断合成回答是否复用了 prompt 指令结构标签（见 PROMPT_PLACEHOLDER_MARKERS）。
+fn contains_prompt_placeholder(text: &str) -> bool {
+    PROMPT_PLACEHOLDER_MARKERS
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
+/// 判断是否值得把已严格引用的摘录答案交给 LLM 二次合成。
+///
+/// 大量证据或已经较长的摘录答案会显著增加本地小模型延迟，并更容易产出
+/// 结构不合格或语义漂移的重写结果；这类场景保留摘录式严格引用答案更稳。
+pub fn should_synthesize_grounded_answer(extractive: &AnswerResult) -> bool {
+    if extractive.insufficient_evidence {
+        return false;
+    }
+    let mut unique_citations = HashSet::new();
+    let mut evidence_chars = 0_usize;
+    for citation in extractive
+        .claims
+        .iter()
+        .flat_map(|claim| claim.citations.iter())
+    {
+        let normalized_quote = citation
+            .quote
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if looks_like_markup_control_text(&normalized_quote)
+            || looks_like_opaque_encoded_text(&normalized_quote)
+        {
+            return false;
+        }
+        unique_citations.insert(citation.chunk_id);
+        evidence_chars = evidence_chars.saturating_add(citation.quote.chars().count());
+    }
+    if evidence_chars < 40 {
+        return false;
+    }
+    if unique_citations.len() >= 6 {
+        return false;
+    }
+    if extractive.answer.chars().count() >= 600 {
+        return false;
+    }
+    true
 }
 
 pub fn apply_grounded_generation(
@@ -684,7 +908,11 @@ pub fn apply_grounded_generation(
     let mut claims = Vec::new();
     for draft_claim in draft.claims {
         let text = draft_claim.text.trim();
-        if text.is_empty() || text.chars().count() > 1000 || text.contains("[S") {
+        if text.is_empty()
+            || text.chars().count() > 1000
+            || text.contains("[S")
+            || contains_prompt_placeholder(text)
+        {
             return None;
         }
         if draft_claim.citation_ids.is_empty() || draft_claim.citation_ids.len() > 6 {
@@ -1060,6 +1288,7 @@ mod tests {
             max_source_files: 8,
             strict_evidence: true,
             clarification_selection: None,
+            think_mode: false,
         }
     }
 
@@ -1095,6 +1324,82 @@ mod tests {
         assert!(result.insufficient_evidence);
         assert_eq!(result.grounding_status, GroundingStatus::Insufficient);
         assert!(result.answer.contains("未找到足够依据"));
+    }
+
+    #[test]
+    fn compact_quote_sanitizes_machine_noise_without_hiding_readable_evidence() {
+        let readable = "本文介绍系统背景、核心模块、实验结果和后续改进方向。";
+        assert_eq!(compact_quote(readable, 260), readable);
+
+        let rtf = r"{\rtf1 \ansi \fonttbl {\f0 Times New Roman;} \itap0 \uc1 \u9424 ?}";
+        let rtf_compact = compact_quote(rtf, 260);
+        assert!(rtf_compact.contains("RTF/富文本格式源码"));
+        assert!(rtf_compact.contains("字体表"));
+        assert!(rtf_compact.contains("Unicode 字符码序列"));
+        assert!(!rtf_compact.contains("\\rtf1"));
+        assert!(is_machine_noise_summary(&rtf_compact));
+
+        let encoded = "token=4400000000000000C3400F9E9B985F78B3B4CA5FF0879401A1C018EBF1BCADEBC8420C96EA888955ED9EC23C68DF882AA494E6DD4EF491641E9C221054CE80F9C802D0AA98C04AF6F9A015DA243A47E8C89C86F3969F5EE0";
+        let encoded_compact = compact_quote(encoded, 260);
+        assert!(encoded_compact.contains("配置/初始化文件内容"));
+        assert!(encoded_compact.contains("键值项"));
+        assert!(encoded_compact.contains("十六进制编码值"));
+        assert!(!encoded_compact.contains("4400000000000000C3400F9E"));
+        assert!(is_machine_noise_summary(&encoded_compact));
+
+        let control_tail = r"sdunhideused0 \lsdqformat1 \lsdpriority99 \lsdlocked0 index 1;\lsdsemihidden0 \lsdunhideused0";
+        assert!(compact_quote(control_tail, 260).contains("标记/格式控制源码"));
+    }
+    #[test]
+    fn extractive_answer_dedupes_repeated_display_claims() {
+        let file_id = Uuid::now_v7();
+        let revision_id = Uuid::now_v7();
+        let node_id = Uuid::now_v7();
+        let source = AnswerSourceFile {
+            file_id,
+            display_name: "config.ini".into(),
+            canonical_path: "D:\\config.ini".into(),
+        };
+        let evidence = (0..3)
+            .map(|_| {
+                (
+                    EvidenceRef {
+                        evidence_id: Uuid::now_v7(),
+                        file_id,
+                        revision_id,
+                        node_id,
+                        chunk_id: Uuid::now_v7(),
+                        image_asset_id: None,
+                        quote: "token=4400000000000000C3400F9E9B985F78B3B4CA5FF0879401A1C018EBF1BCADEBC8420C96EA888955ED9EC23C68DF882AA494E6DD4EF491641E9C221054CE80F9C802D0AA98C04AF6F9A".into(),
+                        context_before: None,
+                        context_after: None,
+                        locator: Default::default(),
+                        retrieval_score: 1.0,
+                    },
+                    source.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let answer = assemble_extractive_answer(
+            &request(),
+            &SearchSession {
+                search_id: Uuid::now_v7(),
+                status: "completed".into(),
+                channels: SearchChannels {
+                    filename: SearchChannelState::Completed,
+                    fulltext: SearchChannelState::Completed,
+                    semantic: SearchChannelState::Unavailable,
+                },
+                results: vec![],
+                next_cursor: None,
+                elapsed_ms: 1,
+            },
+            evidence,
+            Instant::now(),
+        );
+        assert_eq!(answer.claims.len(), 1);
+        assert_eq!(answer.source_files.len(), 1);
+        assert_eq!(answer.answer.matches("配置/初始化文件内容").count(), 1);
     }
 
     #[test]
@@ -1141,6 +1446,32 @@ mod tests {
             display_name: "资料.md".into(),
             canonical_path: "D:\\资料.md".into(),
         }];
+        assert!(!should_synthesize_grounded_answer(&base));
+        base.claims[0].citations[0].quote =
+            "项目采用混合召回，同时结合全文检索、语义检索、引用校验和结构化生成来回答本地资料问题，并要求每个事实都能回到原文证据。".into();
+        base.answer = "项目采用混合召回。".into();
+        assert!(should_synthesize_grounded_answer(&base));
+        base.answer = "长".repeat(600);
+        assert!(!should_synthesize_grounded_answer(&base));
+        base.answer = "项目采用混合召回。".into();
+        let seed = base.claims[0].citations[0].clone();
+        base.claims[0].citations = (0..6)
+            .map(|index| EvidenceRef {
+                evidence_id: Uuid::now_v7(),
+                chunk_id: Uuid::now_v7(),
+                quote: format!(
+                    "第{index}段证据说明系统采用严格引用、本地检索和结构化生成来回答资料问题。"
+                ),
+                ..seed.clone()
+            })
+            .collect();
+        assert!(!should_synthesize_grounded_answer(&base));
+        base.claims[0].citations = vec![EvidenceRef {
+            quote: r"{\rtf1 \ansi \fonttbl {\f0 Times New Roman;} \itap0 \uc1}".into(),
+            ..seed.clone()
+        }];
+        assert!(!should_synthesize_grounded_answer(&base));
+        base.claims[0].citations = vec![seed];
         assert!(
             apply_grounded_generation(
                 &base,
@@ -1163,6 +1494,7 @@ mod tests {
             )
             .is_none()
         );
+
         // refusal 与 claims 在 schema 中允许共存：弱模型常把「部分不确定」
         // 写进 refusal。claims 非空时以 claims 为准，refusal 不构成拒绝。
         let coexistence = apply_grounded_generation(
@@ -1172,6 +1504,7 @@ mod tests {
         .expect("claims with refusal should resolve to claims");
         assert_eq!(coexistence.claims.len(), 1);
         assert_eq!(coexistence.answer_mode, AnswerMode::Generated);
+
         assert_eq!(grounded_answer_json_schema()["additionalProperties"], false);
     }
 

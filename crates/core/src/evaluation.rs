@@ -2603,6 +2603,18 @@ fn evidence_snippet(chunks: &[String]) -> Option<String> {
         })
 }
 
+/// 判断关键词是否适合作为检索/集合评测的检索词。
+///
+/// 过短（<3 字符）或纯数字的关键词缺乏区分度：用它生成的用例要么命中
+/// 过多无关文件（如「ap」「开发」），要么根本无法定义明确集合（如
+/// 「to」「1年」「e_」），判定结果不可靠，属于退化用例，应过滤。
+fn is_degenerate_keyword(keyword: &str) -> bool {
+    if keyword.chars().count() < 3 {
+        return true;
+    }
+    keyword.chars().all(|character| character.is_ascii_digit())
+}
+
 fn generate_search_cases(
     files: &[EvaluationCorpusFile],
     options: &DatasetGenerationOptions,
@@ -2697,7 +2709,7 @@ fn generate_search_cases(
         if let Some(keyword) = file
             .keywords
             .iter()
-            .find(|keyword| keyword.chars().count() >= 2)
+            .find(|keyword| !is_degenerate_keyword(keyword))
         {
             cases.push(search_case(
                 file,
@@ -2764,11 +2776,14 @@ fn generate_ask_cases(
             "summary",
             "以文档全文为 Gold Evidence 生成摘要问题",
         ));
-        // BOOLEAN_EXISTENCE：仅对确实出现在文本中的关键词生成（可验证）
+        // BOOLEAN_EXISTENCE：仅对确实出现在文本中的关键词生成（可验证）。
+        // 过滤退化关键词（<3 字符或纯数字，如 "og"/"Co"/"1002"）：它们缺乏
+        // 区分度，且 embedding/FTS 无法为「2 字符子串」提供可靠召回，生成
+        // 的布尔问题不是真实用户会问的形态，属于退化用例。
         if let Some(keyword) = file
             .keywords
             .iter()
-            .find(|keyword| keyword.chars().count() >= 2 && file.contains(keyword))
+            .find(|keyword| !is_degenerate_keyword(keyword) && file.contains(keyword))
         {
             cases.push(ask_case(
                 file,
@@ -2871,7 +2886,7 @@ fn generate_collection_cases(
         for keyword in file
             .keywords
             .iter()
-            .filter(|keyword| keyword.chars().count() >= 2 && file.contains(keyword))
+            .filter(|keyword| !is_degenerate_keyword(keyword) && file.contains(keyword))
         {
             keyword_files.entry(keyword.clone()).or_default().push(file);
         }

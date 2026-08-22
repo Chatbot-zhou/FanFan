@@ -87,6 +87,12 @@ export function AppShell({ startup_notice }: AppShellProps) {
     refetchInterval: (query) => query.state.data?.maintenance.active_jobs ? 1500 : 15_000,
     enabled: backendReady,
   });
+  const indexRebuild = useQuery({
+    queryKey: ["index-rebuild-progress"],
+    queryFn: () => bridge.index_rebuild_progress(),
+    refetchInterval: (query) => query.state.data?.running ? 1000 : false,
+    enabled: backendReady,
+  });
 
   useEffect(() => {
     recordDiagnosticEvent({
@@ -198,7 +204,7 @@ export function AppShell({ startup_notice }: AppShellProps) {
   }
 
   const page = {
-    home: <HomePage summary={home.data ?? null} loading={home.isLoading} />,
+    home: <HomePage summary={home.data ?? null} loading={home.isLoading} maintenance={appStatus.data?.maintenance ?? null} />,
     search: <SearchPage />,
     ask: <AskPage model_state={currentModelState} />,
     library: <LibraryPage />,
@@ -218,7 +224,7 @@ export function AppShell({ startup_notice }: AppShellProps) {
           {page}
         </main>
       </div>
-      <StatusBar snapshot={appStatus.data ?? null} />
+      <StatusBar snapshot={appStatus.data ?? null} rebuildProgress={indexRebuild.data} />
     </div>
   );
 }

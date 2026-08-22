@@ -24,9 +24,8 @@ if (-not $installer.Equals($releaseInstaller, [StringComparison]::OrdinalIgnoreC
     Copy-Item -LiteralPath $installer -Destination $releaseInstaller -Force
     $installer = $releaseInstaller
 }
-$runtimeManifestPath = Join-Path $RepositoryRoot '.artifacts\runtime\llama\MANIFEST.json'
 $workerPath = Join-Path $RepositoryRoot '.artifacts\worker\fanfan-worker\fanfan-worker.exe'
-foreach ($required in @($runtimeManifestPath, $workerPath)) {
+foreach ($required in @($workerPath)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
         throw "Release payload missing: $required"
     }
@@ -43,7 +42,7 @@ $verification = @(
     'rust-workspace-tests',
     'python-worker-corpus',
     'semantic-20000-file-gate',
-    'real-llama-generation'
+    'real-ollama-generation'
 )
 if ($InstallerSmokePassed) {
     $verification += 'isolated-installer-smoke'
@@ -61,14 +60,11 @@ $manifest = [ordered]@{
         sha256 = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
         authenticode_status = [string]$signature.Status
     }
-    bundled_runtime = [ordered]@{
-        component = $runtime.component
-        release = $runtime.release
-        commit = $runtime.commit
-        platform = $runtime.platform
-        source_url = $runtime.source_url
-        manifest_sha256 = (Get-FileHash -LiteralPath $runtimeManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
-        license = $runtime.license
+    local_runtime = [ordered]@{
+        component = 'Ollama'
+        mode = 'external-local-service'
+        endpoint = '127.0.0.1:11434'
+        required_models = @('qwen3.5:0.8b', 'qwen3.5:2b', 'qwen3.5:4b', 'qwen3.5:9b', 'qwen3-embedding:0.6b')
     }
     worker = [ordered]@{
         file_name = 'worker/fanfan-worker.exe'

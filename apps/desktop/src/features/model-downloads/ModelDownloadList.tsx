@@ -18,7 +18,7 @@ interface ModelDownloadListProps {
   on_action?: (job: ModelDownloadJob, action: ModelDownloadAction) => void;
 }
 
-const sourceLabel = (job: ModelDownloadJob) => job.source === "modelscope" ? "魔搭社区" : "Hugging Face";
+const sourceLabel = (job: ModelDownloadJob) => job.source === "modelscope" ? "魔搭社区" : job.source === "ollama" ? "本机 Ollama" : "Hugging Face";
 
 export function ModelDownloadList({
   jobs,
@@ -53,7 +53,9 @@ export function ModelDownloadList({
               <div className="model-download-row__actions">
                 {on_manage && <button type="button" onClick={() => on_manage(job)}>管理</button>}
                 {!compact && on_action && (job.status === "queued" || job.status === "running") && <>
-                  <button type="button" disabled={Boolean(pendingAction)} onClick={() => on_action(job, "pause")}>{pendingAction === "pause" ? "暂停中" : "暂停"}</button>
+                  {job.source !== "ollama" && (
+                    <button type="button" disabled={Boolean(pendingAction)} onClick={() => on_action(job, "pause")}>{pendingAction === "pause" ? "暂停中" : "暂停"}</button>
+                  )}
                   <button type="button" disabled={Boolean(pendingAction)} onClick={() => on_action(job, "cancel")}>{pendingAction === "cancel" ? "取消中" : "取消"}</button>
                 </>}
                 {!compact && on_action && job.status === "paused" && <>

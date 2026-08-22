@@ -18,7 +18,7 @@ import {
 } from "@ant-design/icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { bridge, type CandidateRoot, type HomeSummary, type RecentFile } from "../bridge";
+import { bridge, type CandidateRoot, type HomeSummary, type MaintenanceSnapshot, type RecentFile } from "../bridge";
 import { confirmAction } from "../components/AppConfirm";
 import { useAppStore } from "../state/app-store";
 import { errorMessage } from "../utils/app-error";
@@ -26,6 +26,9 @@ import { errorMessage } from "../utils/app-error";
 interface HomePageProps {
   summary: HomeSummary | null;
   loading: boolean;
+  /** 检索覆盖数据源：与状态栏「检索覆盖」同源（active USearch keys / searchable chunks），
+   *  保证首页索引进度与下方状态一致。 */
+  maintenance: MaintenanceSnapshot | null;
 }
 
 const metricIcons = {
@@ -82,7 +85,7 @@ function CandidateSourceCard({ candidate, onResolved }: { candidate: CandidateRo
   );
 }
 
-export function HomePage({ summary, loading }: HomePageProps) {
+export function HomePage({ summary, loading, maintenance }: HomePageProps) {
   const queryClient = useQueryClient();
   const startSearch = useAppStore((state) => state.start_search);
   const navigate = useAppStore((state) => state.navigate);
@@ -101,7 +104,16 @@ export function HomePage({ summary, loading }: HomePageProps) {
       ]);
     },
   });
-  const progress = scan ? scan.progress : 1;
+  // 「检索覆盖」与状态栏同源：活动 USearch 向量键 / 全部可搜索文本块。
+  // 扫描任务结束（scan 为 null）后嵌入和 USearch 激活仍在后台进行，首页进度必须继续跟随后台。
+  const searchableChunks = maintenance?.searchable_chunks ?? 0;
+  const activeVectorKeys = maintenance?.active_vector_keys ?? 0;
+  const coveragePercent = searchableChunks > 0
+    ? Math.min(100, Math.round((activeVectorKeys / searchableChunks) * 100))
+    : 0;
+  const progress = coveragePercent / 100;
+  const scanLabel = scan?.status === "running" ? "正在整理你的资料" : scan?.status === "paused" ? "资料整理已暂停" : coveragePercent >= 100 ? "资料已整理" : summary?.index_initialized ? "正在整理你的资料" : "尚未开始整理";
+  const searchableHint = scan ? `已有 ${scan.searchable_files} 个文件可以搜索` : coveragePercent >= 100 ? `检索覆盖 ${coveragePercent}%` : "正在建立语义检索索引…";
 
   return (
     <section className="page page--home">
@@ -144,12 +156,12 @@ export function HomePage({ summary, loading }: HomePageProps) {
           <button className="card-link" type="button" onClick={() => navigate("collections")}>查看全部 <RightOutlined /></button>
         </article>
         <article className="content-card content-card--progress">
-          <h2>{scan?.status === "running" ? "正在整理你的资料" : scan?.status === "paused" ? "资料整理已暂停" : "资料已整理"}</h2>
+          <h2>{scanLabel}</h2>
           <div className="progress-ring" style={{ "--progress": `${Math.round(progress * 360)}deg` } as React.CSSProperties}>
             <div><strong>{Math.round(progress * 100)}%</strong></div>
           </div>
-          <strong>索引进度 {Math.round(progress * 100)}%</strong>
-          <small>{scan ? `已有 ${scan.searchable_files} 个文件可以搜索` : "当前没有进行中的扫描任务"}</small>
+          <strong>检索覆盖 {Math.round(progress * 100)}%</strong>
+          <small>{searchableHint}</small>
           {scan && <div className="scan-controls">
             {scan.status === "running" && <button type="button" disabled={scanControl.isPending} onClick={() => scanControl.mutate({ action: "pause", jobId: scan.scan_job_id })}><PauseOutlined /> 暂停</button>}
             {scan.status === "paused" && <button type="button" disabled={scanControl.isPending} onClick={() => scanControl.mutate({ action: "resume", jobId: scan.scan_job_id })}><CaretRightOutlined /> 继续</button>}

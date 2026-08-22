@@ -194,6 +194,218 @@ pub fn rank_document_candidates(
     ranked
 }
 
+// ===========================================================================
+// 并行召回（Parallel Recall）+ RRF 融合
+// ===========================================================================
+// 需求四的核心：文件级召回应「并行召回 + 融合」，**禁止先 metadata 过滤、
+// 再在剩余文件里做 embedding**——那会永久丢掉 filename/metadata 无法识别、
+// 但正文向量与 query 相近的正确文件（如「我的简历 → final_v3.pdf」，文件名
+// 里没有「简历」）。因此这里提供独立于既有 `rank_document_candidates` 的
+// 三通道并行召回：
+//   A. 精确/标题通道（precise filename/title）
+//   B. 元数据通道（文档类型/实体/会话上下文/关键词/摘要）
+//   C. 纯语义通道（profile_vector 余弦，**不设 metadata 门槛**）
+// 三个通道各自产出有序候选，再用 RRF（Reciprocal Rank Fusion）融合成最终
+// 排序。所有函数均为确定性纯函数（不含 LLM 调用）。
+//
+// 说明：既有 `rank_document_candidates` 仍保留（向后兼容，场景化测试与部分
+// 调用方依赖其加权和打分）；新的并行召回由调用方显式选用。
+
+/// 纯语义通道：问题向量与每个画像 profile_vector 的余弦相似度下限。
+/// 低于此相似度不进语义候选（补召回也要守住基本相关性，避免 embedding
+/// 相近的无关文档污染 scope）。取低阈值偏召回，交由 RRF 融合做最终排序。
+pub const SEMANTIC_RECALL_MIN_SIMILARITY: f32 = 0.24;
+/// 纯语义通道返回的最大候选数（全库也可能数千画像，语义候选截断到该上限）。
+pub const SEMANTIC_RECALL_MAX_CANDIDATES: usize = 40;
+/// RRF 融合常数 k（出现在每个列表的分数分母中，k 越大越平滑、惩罚靠后名次）。
+pub const RRF_K: f32 = 60.0;
+/// 并行召回最终返回的候选上限（融合后截断）。
+pub const PARALLEL_RECALL_TOP_N: usize = 8;
+
+/// 纯语义召回通道：对每个「有 profile_vector」的画像计算余弦相似度，
+/// 高于 [`SEMANTIC_RECALL_MIN_SIMILARITY`] 即进候选，**不要求任何元数据命中**
+/// ——文件名/标题表达不了真实用途、但正文向量与 query 语义相近的文件靠
+/// 本通道召回。无向量的画像不参与。返回按相似度降序的 (file_id, cosine)。
+pub fn semantic_document_recall(
+    question_vector: &[f32],
+    profiles: &[(DocumentProfile, String)],
+    vectors: &HashMap<Uuid, Vec<f32>>,
+) -> Vec<(Uuid, f32)> {
+    let mut scored: Vec<(Uuid, f32)> = profiles
+        .iter()
+        .filter_map(|(profile, _)| {
+            let cosine = vectors
+                .get(&profile.file_id)
+                .map(|v| cosine_similarity(question_vector, v))
+                .unwrap_or(0.0);
+            (cosine >= SEMANTIC_RECALL_MIN_SIMILARITY).then_some((profile.file_id, cosine))
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.to_string().cmp(&b.0.to_string()))
+    });
+    scored.truncate(SEMANTIC_RECALL_MAX_CANDIDATES);
+    scored
+}
+
+/// 精确/标题通道 + 元数据通道即既有 metadata 打分（`score_document_metadata`
+/// 已同时覆盖 title/type/entity/keyword/summary，A 与 B 合并为一列表）。
+/// 返回按分数降序的候选，供 RRF 融合使用（只用于排序，分数本身不进融合）。
+pub fn metadata_ranked_ids(question: &str, profiles: &[(DocumentProfile, String)]) -> Vec<Uuid> {
+    let mut preselected = preselect_document_profiles(question, profiles);
+    preselected.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.to_string().cmp(&b.1.to_string()))
+    });
+    preselected
+        .into_iter()
+        .map(|(_, file_id, _)| file_id)
+        .collect()
+}
+
+/// 元数据通道的候选（含信号），供 trace 展示「按哪些依据找到」。
+pub fn metadata_ranked_candidates(
+    question: &str,
+    profiles: &[(DocumentProfile, String)],
+) -> Vec<DocumentCandidateMatch> {
+    let mut preselected = preselect_document_profiles(question, profiles);
+    preselected.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.to_string().cmp(&b.1.to_string()))
+    });
+    preselected
+        .into_iter()
+        .map(|(score, file_id, signals)| DocumentCandidateMatch {
+            file_id,
+            score: score.min(1.0),
+            signals,
+        })
+        .collect()
+}
+
+/// RRF 融合：把多个有序候选列表（每项 file_id）融合为一个有序列表。
+/// 名次越靠前分数越高；同一 file_id 出现在越多列表、越靠前，总分越高。
+/// 返回按分数降序的 (Uuid, rrf_score)（未归一化）。
+pub fn rrf_fuse(ranked_lists: &[Vec<Uuid>], k: f32) -> Vec<(Uuid, f32)> {
+    use std::collections::HashMap;
+    let mut score: HashMap<Uuid, f32> = HashMap::new();
+    for list in ranked_lists {
+        for (rank, file_id) in list.iter().enumerate() {
+            *score.entry(*file_id).or_insert(0.0) += 1.0 / (k + rank as f32 + 1.0);
+        }
+    }
+    let mut fused: Vec<(Uuid, f32)> = score.into_iter().collect();
+    fused.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.to_string().cmp(&b.0.to_string()))
+    });
+    fused
+}
+
+/// 三通道并行召回的完整结果：各通道候选 + RRF 融合后的 top-N。供调用方取
+/// scope，也供 trace 展示「每个通道召回什么、融合后谁排前」——据此能明确
+/// 归因 Planner / Resolver / Semantic Recall / Scope 各自的成败。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParallelDocumentRecall {
+    /// A/B 元数据通道候选（标题/类型/实体/上下文/关键词），按分数降序。
+    pub metadata_candidates: Vec<DocumentCandidateMatch>,
+    /// C 纯语义通道候选（仅 file_id，无 metadata 门槛）。
+    pub semantic_candidates: Vec<(Uuid, f32)>,
+    /// RRF 融合后的 top-N 候选（归一化到 0..=1，信号为命中来源并集）。
+    pub fused: Vec<DocumentCandidateMatch>,
+    /// 语义通道是否生效（question_vector 存在且至少一个画像有向量）。
+    pub semantic_enabled: bool,
+}
+
+/// 主入口：A(精确/标题)+B(元数据) 与 C(语义) 并行召回 → RRF 融合 → top-N。
+///
+/// - 语义通道要求 `question_vector` 非空；否则退化为 metadata-only（与既有
+///   `rank_document_candidates` 行为一致，Fast Path 优先、模型/嵌入缺失不报错）。
+/// - metadata 候选即使为空也**不短路**：只要语义能召回，文件仍进入融合，
+///   这才是真正的「并行不预筛」。若两通道皆空返回空集。
+pub fn parallel_document_recall(
+    question: &str,
+    question_vector: Option<&[f32]>,
+    profiles: &[(DocumentProfile, String)],
+    vectors: &HashMap<Uuid, Vec<f32>>,
+) -> ParallelDocumentRecall {
+    let metadata_candidates = metadata_ranked_candidates(question, profiles);
+    let semantic_enabled = question_vector.is_some() && vectors.values().any(|v| !v.is_empty());
+    let semantic_candidates = match question_vector {
+        Some(q) if semantic_enabled => semantic_document_recall(q, profiles, vectors),
+        _ => Vec::new(),
+    };
+
+    // 三个有序列表：A/B(metadata)→RRF；C(semantic)→RRF。
+    let metadata_ids: Vec<Uuid> = metadata_candidates.iter().map(|c| c.file_id).collect();
+    let semantic_ids: Vec<Uuid> = semantic_candidates.iter().map(|(fid, _)| *fid).collect();
+    let mut lists: Vec<Vec<Uuid>> = Vec::with_capacity(2);
+    if !metadata_ids.is_empty() {
+        lists.push(metadata_ids);
+    }
+    if !semantic_ids.is_empty() {
+        lists.push(semantic_ids);
+    }
+    let fused_raw = if lists.is_empty() {
+        Vec::new()
+    } else {
+        rrf_fuse(&lists, RRF_K)
+    };
+
+    // 归一化 RRF 分数，并把每个候选的命中来源信号合并到 meta 信号（语义命中
+    // 补 semantic_match），截断到 top-N。
+    let meta_by_id: HashMap<Uuid, DocumentCandidateMatch> = metadata_candidates
+        .into_iter()
+        .map(|c| (c.file_id, c))
+        .collect();
+    let max_score = fused_raw
+        .iter()
+        .map(|(_, score)| *score)
+        .fold(0.0f32, f32::max)
+        .max(1e-6);
+    let fused: Vec<DocumentCandidateMatch> = fused_raw
+        .into_iter()
+        .map(|(file_id, score)| {
+            let mut match_candidate =
+                meta_by_id
+                    .get(&file_id)
+                    .cloned()
+                    .unwrap_or(DocumentCandidateMatch {
+                        file_id,
+                        score: 0.0,
+                        signals: Vec::new(),
+                    });
+            let semantic = semantic_candidates
+                .iter()
+                .find(|(fid, _)| *fid == file_id)
+                .map(|(_, cosine)| *cosine as f64);
+            if semantic.is_some()
+                && !match_candidate
+                    .signals
+                    .iter()
+                    .any(|s| s == "semantic_match")
+            {
+                match_candidate.signals.push("semantic_match".to_owned());
+            }
+            match_candidate.score = (score / max_score).min(1.0);
+            match_candidate
+        })
+        .collect::<Vec<_>>();
+    let fused = fused.into_iter().take(PARALLEL_RECALL_TOP_N).collect();
+
+    ParallelDocumentRecall {
+        metadata_candidates: meta_by_id.into_values().collect(),
+        semantic_candidates,
+        fused,
+        semantic_enabled,
+    }
+}
+
 /// 纯向量召回（metadata 预筛之外的兜底路径已由调用方接管 wider chunk
 /// retrieval，此函数只用于场景化测试与 trace 辅助）。
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {

@@ -210,6 +210,13 @@ pub struct QueryTarget {
     pub document_type: Option<DocumentType>,
     /// 用户给目标文档起的名字（弱信号，正文语义优先）
     pub document_name: Option<String>,
+    /// 模型驱动精确定位标记：LLM Parser 凭语义判定用户是否**精确点名**了
+    /// 某份文档（给出完整标题/文件名），此时把完整标题放进 `document_name`
+    /// 并把本字段置 true。resolver 据此信任模型的判定，把候选收敛到精确
+    /// 对应的文档，不再做相似度加权推测。判定职责完全在 LLM，不收集任何
+    /// 关键词，也不构成硬规则。
+    #[serde(default)]
+    pub precise_named_document: bool,
     /// 归属者（self = 用户自己）
     pub owner: Option<String>,
     pub entity_type: Option<String>,

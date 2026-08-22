@@ -39,6 +39,7 @@ pub mod phase_4_2_cases;
 pub mod query_normalize;
 pub mod query_parser;
 pub mod query_plan;
+pub mod query_planner;
 #[cfg(test)]
 pub mod scenarios;
 pub mod source_router;
@@ -63,8 +64,10 @@ pub use document_retrieval::{
     DOCUMENT_RECALL_METADATA_ONLY_WEIGHT, DOCUMENT_RECALL_METADATA_WEIGHT,
     DOCUMENT_RECALL_MIN_SCORE, DOCUMENT_RECALL_MIN_SIGNAL_LEN, DOCUMENT_RECALL_TOP_N,
     DOCUMENT_RECALL_VECTOR_CANDIDATES, DOCUMENT_RECALL_VECTOR_WEIGHT, DocumentCandidateMatch,
-    cosine_similarity, preselect_document_profiles, rank_document_candidates,
-    score_document_metadata,
+    PARALLEL_RECALL_TOP_N, ParallelDocumentRecall, RRF_K, SEMANTIC_RECALL_MAX_CANDIDATES,
+    SEMANTIC_RECALL_MIN_SIMILARITY, cosine_similarity, metadata_ranked_candidates,
+    metadata_ranked_ids, parallel_document_recall, preselect_document_profiles,
+    rank_document_candidates, rrf_fuse, score_document_metadata, semantic_document_recall,
 };
 pub use document_summary::{
     DocumentOverview, DocumentSection, MAX_SECTION_CHARS, MAX_SECTIONS, SectionChunk,
@@ -89,6 +92,7 @@ pub use query_plan::{
     DocumentCandidate, DocumentResolution, EvidenceStatus, QueryFilters, QueryIntent,
     QueryOperation, QueryPlan, QueryTarget, QuestionShape, ResolutionStatus, SourceIntent,
 };
+pub use query_planner::{FAST_PATH_CONFIDENCE_THRESHOLD, FastPathPlan, fast_path_plan};
 pub use source_router::{
     SourceRouting, parse_source_routing, source_router_prompt, source_routing_schema,
 };

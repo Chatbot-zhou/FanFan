@@ -146,12 +146,8 @@ try {
 
     $desktopExecutable = Join-Path $installRoot "fanfan-desktop.exe"
     $workerExecutable = Join-Path $installRoot "worker\fanfan-worker.exe"
-    $llamaRuntime = Join-Path $installRoot "runtime\llama"
-    $llamaExecutable = Join-Path $llamaRuntime "llama-server.exe"
-    $llamaManifest = Join-Path $llamaRuntime "MANIFEST.json"
-    $llamaLicense = Join-Path $llamaRuntime "LICENSE-llama.cpp.txt"
     $uninstaller = Join-Path $installRoot "uninstall.exe"
-    foreach ($requiredPath in @($desktopExecutable, $workerExecutable, $llamaExecutable, $llamaManifest, $llamaLicense, $uninstaller)) {
+    foreach ($requiredPath in @($desktopExecutable, $workerExecutable, $uninstaller)) {
         if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
             throw "Installed payload missing: $requiredPath"
         }
@@ -160,8 +156,6 @@ try {
     Assert-AssociatedIconMatches -ExecutablePath $uninstaller -ExpectedIconPath $canonicalIcon -Label "Uninstaller"
     Assert-PeSubsystem -ExecutablePath $desktopExecutable -Expected 2 -Label "Installed application"
     Assert-PeSubsystem -ExecutablePath $workerExecutable -Expected 3 -Label "Packaged worker"
-
-    & (Join-Path $repositoryRoot "scripts\validate_llama_runtime.ps1") -RepositoryRoot $repositoryRoot -RuntimeRoot $llamaRuntime
 
     & $PythonExecutable (Join-Path $repositoryRoot "scripts\validate_packaged_worker.py") $workerExecutable
     if ($LASTEXITCODE -ne 0) {

@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { bridge, type HomeSummary, type JobRecord } from "../bridge";
+import { bridge, type HomeSummary, type JobRecord, type MaintenanceSnapshot } from "../bridge";
 import { useAppStore } from "../state/app-store";
 import { HomePage } from "./HomePage";
 
@@ -23,15 +23,35 @@ const summary: HomeSummary = {
     ocr_pages: 3,
     progress: 0.75,
   },
+  index_initialized: true,
   recent_files: [],
   favorite_files: [],
   collections: [{ collection_id: "collection-1", name: "项目资料", item_count: 4, tone: "purple" }],
   candidate_roots: [],
 };
 
-function renderHome(value = summary) {
+const maintenance: MaintenanceSnapshot = {
+  schema_version: 34,
+  database_size_bytes: 1024,
+  indexed_files: 1,
+  indexable_files: 2,
+  parsed_files: 2,
+  embedded_files: 2,
+  active_index_files: 1,
+  searchable_chunks: 20_534,
+  embedded_chunks: 20_534,
+  active_vector_keys: 19_054,
+  pending_files: 0,
+  failed_files: 0,
+  active_jobs: 0,
+  log_events: 0,
+  background_notice: null,
+  checks: [],
+  checked_at: "2026-08-22T00:00:00Z",
+};
+function renderHome(value = summary, maintenance?: MaintenanceSnapshot) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
-  return render(<QueryClientProvider client={client}><HomePage summary={value} loading={false} /></QueryClientProvider>);
+  return render(<QueryClientProvider client={client}><HomePage summary={value} loading={false} maintenance={maintenance ?? null} /></QueryClientProvider>);
 }
 
 describe("HomePage", () => {
@@ -64,6 +84,12 @@ describe("HomePage", () => {
     expect(useAppStore.getState()).toMatchObject({ route: "collections", selected_collection_id: "collection-1" });
   });
 
+  it("uses active USearch keys for retrieval coverage", () => {
+    renderHome({ ...summary, scan_progress: null }, maintenance);
+
+    expect(screen.getByText("检索覆盖 93%")).toBeInTheDocument();
+    expect(screen.queryByText("检索覆盖 100%")).not.toBeInTheDocument();
+  });
   it("pauses the active backend scan job", async () => {
     const pausedJob: JobRecord = {
       job_id: summary.scan_progress!.scan_job_id,
