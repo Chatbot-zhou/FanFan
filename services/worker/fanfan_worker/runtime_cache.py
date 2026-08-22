@@ -15,11 +15,11 @@ SESSION_IDLE_SECONDS = 300.0
 MAX_SESSIONS = 2
 
 # 推理设备策略：资源满足时优先 GPU，显存不足时回退 CPU（规划书 2/7 章）。
-# onnxruntime-gpu 提供 CUDAExecutionProvider；CUDA 初始化失败时 ORT 非 strict
-# 模式自动回退 CPU，不会破坏当前任务。当前随安装包提供的 INT8 量化
-# Embedding/Rerank 模型在目标机实测 CPU 更快，因此默认受性能保护留在 CPU；
-# 新的非量化/浮点 ONNX 模型仍按 CUDA -> CPU 顺序选择。
-# 所以除"CUDA 可用"外还必须探测模型类型与显存余量。
+# 生产构建使用 CPU 版 onnxruntime（onnxruntime-gpu 打包时 CUDA provider
+# 初始化不稳定，且 embedding 已迁移 Ollama，ONNX 仅承担 rerank/OCR，均走 CPU）。
+# 下方 CUDA 分支为将来引入非量化/浮点 ONNX 模型预留：如需启用，把构建依赖换回
+# onnxruntime-gpu 并保留 CUDA 可用时的回退逻辑。CPU 版下 get_available_providers
+# 不含 CUDA，自然落入 no_cuda -> CPU，不影响当前任务。
 # 环境变量 FANFAN_WORKER_PROVIDERS 可强制覆盖（测试/回退）；
 # FANFAN_WORKER_GPU_MIN_FREE_MB 可调整显存余量阈值（默认 1536）。
 _ENABLED_PROVIDERS = ["CUDAExecutionProvider", "CPUExecutionProvider"]
@@ -59,10 +59,9 @@ def _probe_gpu_free_mb() -> int | None:
 def _cudnn_loadable() -> bool:
     """验证 CUDA EP 运行时依赖 cudnn 是否真的可加载。
 
-    onnxruntime-gpu 的 CUDA EP 在 cudnn_graph64_9.dll 缺失/不在库路径时不会
-    回退——它直接 abort 整个进程（实测 2026-08：dll 在 site-packages 但不在
-    进程搜索路径，ORT 打印 "Could not locate cudnn_graph64_9.dll" 后崩溃）。
-    这里在创建 session 前按名字探测主符号，加载不到就提前走 CPU。
+    生产用 CPU 版 onnxruntime，无 cudnn DLL，此处自然返回 False 走 CPU；若将来
+    换回 onnxruntime-gpu 则保留该探测，避免 ORT 在 cudnn_graph64_9.dll 缺失时
+    直接 abort 整个进程。这里在创建 session 前按名字探测主符号，加载不到就提前走 CPU。
     """
     import ctypes
 
