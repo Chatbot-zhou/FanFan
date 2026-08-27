@@ -186,6 +186,71 @@ impl OllamaClient {
         }
     }
 
+    /// 将 OpenAI 风格的多模态消息（`content` 为含 `image_url` 的内容块数组）
+    /// 归一化为旧版 Ollama 兼容格式：`content` 拼接为字符串、图片放入
+    /// `images` base64 数组。新版 Ollama 同时接受两种格式，旧版仅接受
+    /// 本函数产出的格式；统一转换可避免 `/api/chat` 因 `content` 为数组
+    /// 返回 HTTP 400（`json: cannot unmarshal array ... content of type string`）。
+    fn normalize_ollama_messages(messages: &mut Value) {
+        let Some(array) = messages.as_array_mut() else {
+            return;
+        };
+        for message in array.iter_mut() {
+            let Some(message) = message.as_object_mut() else {
+                continue;
+            };
+            let Some(content) = message.get_mut("content") else {
+                continue;
+            };
+            if content.is_string() {
+                // 已是 Ollama 原生字符串格式，无需转换。
+                continue;
+            }
+            let Some(blocks) = content.as_array() else {
+                continue;
+            };
+            let mut text_parts: Vec<String> = Vec::new();
+            let mut images: Vec<String> = Vec::new();
+            for block in blocks {
+                let Some(block) = block.as_object() else {
+                    continue;
+                };
+                match block.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        if let Some(text) = block.get("text").and_then(Value::as_str) {
+                            text_parts.push(text.to_owned());
+                        }
+                    }
+                    Some("image_url") => {
+                        if let Some(url) = block
+                            .get("image_url")
+                            .and_then(|value| value.get("url"))
+                            .and_then(Value::as_str)
+                            && let Some(base64) = Self::data_url_base64(url)
+                        {
+                            images.push(base64.to_owned());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            message.insert("content".into(), Value::String(text_parts.join("\n")));
+            if !images.is_empty() {
+                message.insert(
+                    "images".into(),
+                    Value::Array(images.into_iter().map(Value::String).collect()),
+                );
+            }
+        }
+    }
+
+    /// 从 `data:<mime>;base64,<data>` 形式的数据 URL 中提取 base64 数据。
+    fn data_url_base64(data_url: &str) -> Option<&str> {
+        let rest = data_url.strip_prefix("data:")?;
+        let (_, payload) = rest.split_once(";base64,")?;
+        Some(payload)
+    }
+
     /// `POST /api/chat`：对话生成（单次回包）。
     ///
     /// `messages` 为 `/api/chat` 语义的消息数组（`content` 可以是字符串，
@@ -194,7 +259,7 @@ impl OllamaClient {
     pub fn chat(
         &self,
         model: &str,
-        messages: Value,
+        mut messages: Value,
         options: OllamaChatOptions,
         format: Option<Value>,
         cancelled: Option<&AtomicBool>,
@@ -206,6 +271,7 @@ impl OllamaClient {
                 false,
             ));
         }
+        Self::normalize_ollama_messages(&mut messages);
         let mut payload = json!({
             "model": model,
             "stream": false,
@@ -232,10 +298,10 @@ impl OllamaClient {
         if !option_parts.as_object().is_none_or(|map| map.is_empty()) {
             payload["options"] = option_parts;
         }
-        if let Some(format) = format {
-            if !format.is_null() {
-                payload["format"] = format;
-            }
+        if let Some(format) = format
+            && !format.is_null()
+        {
+            payload["format"] = format;
         }
         let (status, body) = self.http_json("POST", "/api/chat", Some(&payload), cancelled)?;
         if status == 404 {
@@ -284,7 +350,7 @@ impl OllamaClient {
     pub fn chat_stream(
         &self,
         model: &str,
-        messages: Value,
+        mut messages: Value,
         options: OllamaChatOptions,
         format: Option<Value>,
         cancelled: Option<&AtomicBool>,
@@ -297,6 +363,7 @@ impl OllamaClient {
                 false,
             ));
         }
+        Self::normalize_ollama_messages(&mut messages);
         let mut payload = json!({
             "model": model,
             "stream": true,
@@ -322,10 +389,10 @@ impl OllamaClient {
         if !option_parts.as_object().is_none_or(|map| map.is_empty()) {
             payload["options"] = option_parts;
         }
-        if let Some(format) = format {
-            if !format.is_null() {
-                payload["format"] = format;
-            }
+        if let Some(format) = format
+            && !format.is_null()
+        {
+            payload["format"] = format;
         }
         let body_bytes =
             serde_json::to_vec(&payload).map_err(|_| invalid_request("流式对话请求构造失败"))?;
@@ -491,14 +558,14 @@ impl OllamaClient {
         let mut line = String::new();
         loop {
             // 每次迭代开头先检查取消，避免在 layer 间隙长时间空转。
-            if let Some(check) = should_cancel {
-                if check() {
-                    return Err(AppError::new(
-                        "OPERATION_CANCELLED",
-                        format!("Ollama 拉取模型 {model} 已取消"),
-                        false,
-                    ));
-                }
+            if let Some(check) = should_cancel
+                && check()
+            {
+                return Err(AppError::new(
+                    "OPERATION_CANCELLED",
+                    format!("Ollama 拉取模型 {model} 已取消"),
+                    false,
+                ));
             }
             line.clear();
             let read = match reader.read_line(&mut line) {
@@ -508,14 +575,14 @@ impl OllamaClient {
                         || error.kind() == std::io::ErrorKind::TimedOut =>
                 {
                     // 读超时后再次检查取消，再判断总体超时。
-                    if let Some(check) = should_cancel {
-                        if check() {
-                            return Err(AppError::new(
-                                "OPERATION_CANCELLED",
-                                format!("Ollama 拉取模型 {model} 已取消"),
-                                false,
-                            ));
-                        }
+                    if let Some(check) = should_cancel
+                        && check()
+                    {
+                        return Err(AppError::new(
+                            "OPERATION_CANCELLED",
+                            format!("Ollama 拉取模型 {model} 已取消"),
+                            false,
+                        ));
                     }
                     if Instant::now() >= deadline {
                         return Err(AppError::new(
@@ -1297,6 +1364,17 @@ fn set_child_below_normal_priority(child: &Child) {
 #[cfg(not(windows))]
 fn set_child_below_normal_priority(_child: &Child) {}
 
+/// 由探测结果映射三态标签（供测试与前端状态机复用）。
+pub fn probe_status(probe: &OllamaProbe) -> OllamaStatus {
+    if probe.running {
+        OllamaStatus::Ready
+    } else if probe.executable.is_some() {
+        OllamaStatus::InstalledNotRunning
+    } else {
+        OllamaStatus::NotInstalled
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1424,24 +1502,13 @@ mod tests {
             running: false,
             version: None,
         };
-        let kind = probe_status(&mut probe);
+        let kind = probe_status(&probe);
         assert_eq!(kind, OllamaStatus::InstalledNotRunning);
         probe.running = true;
         probe.version = Some(OllamaVersion {
             version: "0.8.0".into(),
             tag: None,
         });
-        assert_eq!(probe_status(&mut probe), OllamaStatus::Ready);
-    }
-}
-
-/// 由探测结果映射三态标签（供测试与前端状态机复用）。
-pub fn probe_status(probe: &OllamaProbe) -> OllamaStatus {
-    if probe.running {
-        OllamaStatus::Ready
-    } else if probe.executable.is_some() {
-        OllamaStatus::InstalledNotRunning
-    } else {
-        OllamaStatus::NotInstalled
+        assert_eq!(probe_status(&probe), OllamaStatus::Ready);
     }
 }

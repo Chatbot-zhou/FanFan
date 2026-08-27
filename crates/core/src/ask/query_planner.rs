@@ -122,11 +122,7 @@ fn is_precise_document_naming(question: &str) -> bool {
         return true;
     }
     // 含分隔符的「标题式」引用（书名号之外的下划线/连字符学名）
-    question
-        .split(|c: char| c == '_' || c == '-' || c == ' ')
-        .count()
-        >= 4
-        && question.contains('.')
+    question.split(['_', '-', ' ']).count() >= 4 && question.contains('.')
 }
 
 /// 通用指代（deictic）标记：会话中指代上一对象的词。
@@ -239,6 +235,17 @@ pub fn fast_path_plan(question: &str, session: &AskSessionContext) -> Option<Fas
                 continue;
             }
             content_tokens.push(token.clone());
+        }
+        // 类型词覆盖了全部词元时（「合同里有哪些条款」的「条款/甲方/违约责任」
+        // 既是类型词也是真正要检索的内容，如内容只由类型词构成则不应剥空），
+        // 退化为只剥主类型锚（展示名），保留方面词作为内容词元。
+        if content_tokens.is_empty() {
+            let anchor = document_type.display_name().to_lowercase();
+            for token in &tokens {
+                if token != &anchor {
+                    content_tokens.push(token.clone());
+                }
+            }
         }
     } else {
         content_tokens = tokens.clone();

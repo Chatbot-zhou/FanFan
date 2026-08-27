@@ -4,7 +4,7 @@
 //!   cargo run -p fanfan-core --example diagnose_search -- <db_path> --model-store <path> --hybrid <query> ...
 //! 前两种分别运行 Filename / Fulltext 通道并打印命中；--hybrid 与评测同口径运行三通道
 //! 混合检索（语义通道走本机 Ollama embedding），用于定位融合阶段的文件流失。
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 
 use fanfan_core::{
     Availability, CatalogStore, ModelManager, ModelRole, OllamaClient, ScopeFilter, SearchMode,
@@ -127,6 +127,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if arg == "--model-store" {
             next_is_model_store = true;
+            continue;
+        }
+        // 以 @path 形式传入，从文件读取逐行查询，避免命令行对引号/特殊字符的拆解。
+        if let Some(path) = arg.strip_prefix('@') {
+            let content = fs::read_to_string(path).map_err(|error| {
+                Box::<dyn std::error::Error>::from(format!("读取查询文件失败 {path}: {error}"))
+            })?;
+            for line in content.lines() {
+                let line = line.trim();
+                if !line.is_empty() {
+                    targets.push(line.to_owned());
+                }
+            }
             continue;
         }
         targets.push(arg);

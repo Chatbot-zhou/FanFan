@@ -250,6 +250,137 @@ pub fn extract_query_entities(question: &str, content_query: Option<&str>) -> Ve
 }
 
 // ============================================================
+// 中文内容词一致性（通用机制，非针对某文件/关键词）
+// ============================================================
+
+/// 判定 CJK 基本区 / 扩展 A / 兼容表意字符。
+fn is_han_char(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF
+    )
+}
+
+/// 单字填充位：任一 bigram 含其中任一字符即视为「句式词」丢弃。
+/// 目的是让「主题性」内容词（如 火星/移民/事务/索引）与句式填充
+/// （我的/里面/有没有/提到）分离；只做通用过滤，允许个别词回归。
+const FRAME_CHARS: &[char] = &[
+    '我', '你', '他', '她', '它', '的', '了', '呢', '啊', '哦', '这', '那', '哪', '什', '么', '怎',
+    '何', '为', '是', '没', '否', '提', '讲', '问', '看', '找', '里', '中', '会', '能', '要', '想',
+    '吧', '请', '已', '被', '到', '有',
+];
+
+/// 通用高频泛化词（二元）：拆掉后不参与「证据是否含查询主题」判定。
+/// 只收真正高频率、偏虚的名词/动词；具体领域词（事务/模型/视图）绝不在此列。
+///
+/// 除句式泛化词外，还收一类「容器/框架名词」（报告/条款/说明/章节…）：
+/// 这类词本身不是主题，只是把主题内容装起来的外壳（如「体检报告」的
+/// 「报告」、「付款条款」的「条款」）。它们在不同文档里极常见，若让它们
+/// 单独参与「证据含主题词」判定，会让「体检报告」仅凭一个碰巧同现的
+/// 「报告」就误判存在（CASE：[26]「体检报告」误命中「健康状态报告」）。
+/// 因此把它们一并过滤——只有真正的主题词（体检/付款/事务…）才计入。
+const GENERIC_BIGRAMS: &[&str] = &[
+    "计划", "内容", "方面", "部分", "情况", "东西", "问题", "相关", "时候", "文件", "资料", "文档",
+    "系统", "模块", "功能", "概念", "原理", "知识", "基础", "重点", "作用", "区别", "联系", "比较",
+    "解释", "介绍", "讲述", "提到", "包括", "包含", "涉及", "关于", "报告", "条款", "说明", "描述",
+    "章节", "小节",
+];
+
+/// 从查询（问题 + 内容查询）抽取「主题性」中文内容词。
+/// 复用与 FTS 索引用同一套 Han 连续段 bigram 概念：
+///   1. 提取连续汉字段；
+///   2. 对每段按窗口 2 生成 bigram；
+///   3. 丢弃含句式单字（FRAME_CHARS）或落在通用泛化词（GENERIC_BIGRAMS）
+///      的 bigram，保留主题性内容词；
+///   4. 去重并截断。
+/// 该结果用于「证据完全不含查询主题词 → 回答与主题无关」的拒答门控，
+/// 只做通用过滤，不对任何具体文件/关键词做特判。
+fn extract_chinese_content_terms(text: &str) -> Vec<String> {
+    const SEGMENT_MIN: usize = 2;
+    const MAX_TERMS: usize = 6;
+    let mut terms: Vec<String> = Vec::new();
+    let mut han_run: Vec<char> = Vec::new();
+    for character in text.chars() {
+        if is_han_char(character) {
+            han_run.push(character);
+        } else {
+            push_chinese_bigrams(&mut terms, &han_run, SEGMENT_MIN);
+            han_run.clear();
+        }
+    }
+    push_chinese_bigrams(&mut terms, &han_run, SEGMENT_MIN);
+    let mut seen = std::collections::HashSet::new();
+    terms.retain(|term| seen.insert(term.clone()));
+    terms.truncate(MAX_TERMS);
+    terms
+}
+
+/// 把单个连续汉字段切成 bigram，过滤句式/泛化词后加入集合。
+fn push_chinese_bigrams(terms: &mut Vec<String>, run: &[char], min_len: usize) {
+    if run.len() < min_len {
+        return;
+    }
+    for pair in run.windows(2) {
+        let bigram: String = pair.iter().collect();
+        if bigram.chars().any(|ch| FRAME_CHARS.contains(&ch)) {
+            continue;
+        }
+        if GENERIC_BIGRAMS.iter().any(|generic| generic == &bigram) {
+            continue;
+        }
+        if !terms.contains(&bigram) {
+            terms.push(bigram);
+        }
+    }
+}
+
+/// 提取主题中的「复合」连续汉字段（长度 ≥ `MIN_COMPOSITE_LEN`）。
+///
+/// 复合词（如「量子计算」「火星移民计划」「机器学习」）常由「罕见核心词 +
+/// 常见半词」构成。单独用 2 字 bigram 判定时，「量子计算」中的「计算」、
+/// 「机器学习」中的「学习」等常见半词单独落地会**带偏整个主题**（把
+/// 无关证据误判为该主题存在，生成侧据此杜撰）。本函数把这类复合字段整体
+/// 保留，供存在性/事实类问句做更严格的落地判定。只做通用句式判定，不针对
+/// 任何具体文件/关键词/case。
+fn extract_composite_han_fields(text: &str) -> Vec<String> {
+    const MIN_COMPOSITE_LEN: usize = 4;
+    let mut fields: Vec<String> = Vec::new();
+    let mut han_run: Vec<char> = Vec::new();
+    for character in text.chars() {
+        if is_han_char(character) {
+            han_run.push(character);
+        } else {
+            if han_run.len() >= MIN_COMPOSITE_LEN {
+                fields.push(han_run.iter().collect());
+            }
+            han_run.clear();
+        }
+    }
+    if han_run.len() >= MIN_COMPOSITE_LEN {
+        fields.push(han_run.iter().collect());
+    }
+    fields
+}
+
+/// 统计复合字段在（已小写的）证据中命中的不同 bigram 个数（去重）。
+/// 「量子计算」在证据只有「计算」→ 命中数 1；「量子计算」完整落地 →
+/// 命中数 ≥2。
+fn count_field_bigram_hits(field: &str, evidence_lower: &str) -> usize {
+    let chars: Vec<char> = field.chars().collect();
+    let mut hits: Vec<String> = Vec::new();
+    if chars.len() < 2 {
+        return 0;
+    }
+    for pair in chars.windows(2) {
+        let bigram: String = pair.iter().collect();
+        if evidence_lower.contains(&bigram) && !hits.contains(&bigram) {
+            hits.push(bigram);
+        }
+    }
+    hits.len()
+}
+
+// ============================================================
 // Evidence Role（spec 五：「提到了 Agent」≠「做过 Agent 项目」）
 // ============================================================
 
@@ -380,6 +511,109 @@ pub fn existence_requires_project_context(question: &str, plan: &QueryPlan) -> b
     plan.requires_project_context && plan.question_shape == QuestionShape::BooleanExistence
 }
 
+/// 中文主题门控的失败详情：机器可读原因码 + 判定缺哪些主题信息。
+struct ChineseThemeFail {
+    /// 机器可读原因码（year_mismatch:<年份> / entity_mismatch:<词>）
+    reason: String,
+    /// 判定为缺失的主题信息（年份或未命中的主题词），用于问题描述与 trace。
+    missing: Vec<String>,
+}
+
+/// 从主题文本提取第一个显式年份（4 位 19xx / 20xx），如「2024 年真题」→ "2024"。
+/// 只匹配 ASCII 数字年份；用于存在类问题里「某年真题/记录是否存在」的强事实门控。
+fn specified_year(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() < 4 {
+        return None;
+    }
+    for i in 0..=chars.len() - 4 {
+        let first = chars[i];
+        if first != '1' && first != '2' {
+            continue;
+        }
+        if chars[i + 1].is_ascii_digit()
+            && chars[i + 2].is_ascii_digit()
+            && chars[i + 3].is_ascii_digit()
+        {
+            let year: String = chars[i..i + 4].iter().collect();
+            if year.starts_with("19") || year.starts_with("20") {
+                return Some(year);
+            }
+        }
+    }
+    None
+}
+
+/// 规则 6 核心判定：中文内容词一致性 + 强事实年份落地（防编造）。
+///
+/// 对纯中文 / 无 ASCII 强实体命中的查询，证据与问题主题不一致时必须拒答，
+/// 否则生成模型会拿无关证据编造主题。两路通用判定：
+///
+///  1. 年份强事实（存在/事实类回答）：主题里显式指定的年份必须在证据中
+///     落地。例：「2024 年数据库系统工程师真题」证据却只到 2012 年 → 拒答。
+///  2. 主题词落地：必须至少有一个「主题性」中文内容词在证据中出现。容器/
+///     框架词（报告/条款/章节…）已在 `GENERIC_BIGRAMS` 过滤，不会因一个
+///     碰巧同现的「报告」就误判「体检报告」存在。
+///
+/// 返回 `Some(fail)` 表示应拒答；`None` 表示放行。只做通用判定，不做任何
+/// 模型调用，且不对具体文件/关键词做特判。
+fn check_chinese_theme_gate(
+    question: &str,
+    content_query: Option<&str>,
+    evidence_lower: &str,
+    answer_shape: AnswerShape,
+) -> Option<ChineseThemeFail> {
+    let theme_source = content_query
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| question.trim());
+    let theme_terms = extract_chinese_content_terms(theme_source);
+
+    // 1. 强事实年份门控：存在性/事实类问题里显式年份必须落到证据。
+    if matches!(
+        answer_shape,
+        AnswerShape::BooleanExistence | AnswerShape::FactLookup
+    ) {
+        if let Some(year) = specified_year(theme_source) {
+            if !evidence_lower.contains(&year) {
+                return Some(ChineseThemeFail {
+                    reason: format!("year_mismatch:{year}"),
+                    missing: vec![year],
+                });
+            }
+        }
+
+        // 1b. 复合词落地（存在/事实类问句的防偏带强门控）：长度 ≥4 的连续
+        //     汉字段（复合词，如「量子计算」「机器学习」）若「未完整落地 且
+        //     其内部不同 bigram 命中数 <2」，则证据只覆盖了该词的某个常见
+        //     半词（如「计算」），不足以证明整个复合主题存在。此时必须拒答，
+        //     否则生成模型会拿只含半词的无关证据杜撰复合主题内容（CASE：
+        //     「量子计算」被数据库真题里的「计算」带偏，杜撰 CISC/分组计算）。
+        //     只对复合词收紧；短主题词（≤3 字）维持下方 bigram 宽松判定，
+        //     避免误伤「事务/隔离/范式」等正常术语。
+        let composite_fields = extract_composite_han_fields(theme_source);
+        for field in &composite_fields {
+            if !evidence_lower.contains(field) && count_field_bigram_hits(field, evidence_lower) < 2
+            {
+                return Some(ChineseThemeFail {
+                    reason: format!("composite_mismatch:{}", field),
+                    missing: vec![field.clone()],
+                });
+            }
+        }
+    }
+
+    // 2. 主题词落地：至少一个主题性中文内容词出现在证据里。
+    if !theme_terms.is_empty() && !theme_terms.iter().any(|term| evidence_lower.contains(term)) {
+        return Some(ChineseThemeFail {
+            reason: format!("entity_mismatch:{}", theme_terms.join(",")),
+            missing: theme_terms,
+        });
+    }
+
+    None
+}
+
 // ============================================================
 // Answerability Gate（spec 二）
 // ============================================================
@@ -453,6 +687,8 @@ pub struct AnswerabilityVerdict {
 /// 4. 部分强实体缺失 → PARTIAL(partial_entity_coverage)（只答找到的部分）；
 /// 5. 无强实体（纯中文问题）→ ANSWERABLE(no_strong_entities)，
 ///    一致性交给引用核验兜底。
+/// 6. 中文内容词一致性：对无 ASCII 强实体命中的查询，证据完全不含任何
+///    主题性中文内容词 → NOT_ANSWERABLE(entity_mismatch)（防编造）。
 pub fn evaluate_answerability(input: &AnswerabilityInput) -> AnswerabilityVerdict {
     let answer_shape = classify_answer_shape(input.question, input.plan);
     let query_entities = extract_query_entities(input.question, input.content_query);
@@ -542,6 +778,28 @@ pub fn evaluate_answerability(input: &AnswerabilityInput) -> AnswerabilityVerdic
         };
     }
 
+    // 规则 6：中文内容词一致性（防编造）——详见 `check_chinese_theme_gate`。
+    // 仅在无 ASCII 强实体命中（matched 为空）时生效；有英文锚点交给既有规则。
+    if matched.is_empty() {
+        if let Some(fail) = check_chinese_theme_gate(
+            input.question,
+            input.content_query,
+            &evidence_lower,
+            answer_shape,
+        ) {
+            return AnswerabilityVerdict {
+                status: AnswerabilityStatus::NotAnswerable,
+                confidence: 0.1,
+                reason: fail.reason,
+                answer_shape,
+                query_entities,
+                evidence_entities: matched,
+                missing_entities: fail.missing,
+                evidence_roles,
+            };
+        }
+    }
+
     // 规则 5：无强实体 → 低置信放行（一致性由引用核验兜底）
     let (confidence, reason) = if query_entities.is_empty() {
         (0.55, "no_strong_entities".to_owned())
@@ -564,7 +822,7 @@ pub fn evaluate_answerability(input: &AnswerabilityInput) -> AnswerabilityVerdic
 // LOCAL STRICT MODE（spec 六 / 十四 / 十六）
 // ============================================================
 
-/// LOCAL 生成的系统提示词（严格证据约束）。与 GENERAL（chat_prompt，
+/// LOCAL 生成的系统提示词（严格证据约束）。
 /// 允许模型知识）完全分离，禁止两个模式共用。
 pub const LOCAL_STRICT_SYSTEM_PROMPT: &str = "你是翻翻的本地资料回答器，运行在 LOCAL STRICT MODE：\
 1. 只能使用当前提供的证据回答；\
@@ -682,6 +940,7 @@ mod tests {
             filters: Default::default(),
             requires_document_resolution: true,
             requires_full_document: false,
+            structure_enumeration: false,
             confidence: 0.9,
         }
     }
@@ -944,6 +1203,75 @@ mod tests {
     }
 
     #[test]
+    fn chinese_content_terms_partition_frame_and_topic() {
+        // 通用抽取：句式填充被拆走，主题性中文词保留。
+        let terms = extract_chinese_content_terms("我的资料里有没有提到火星移民");
+        assert!(terms.contains(&"火星".to_owned()));
+        assert!(terms.contains(&"移民".to_owned()));
+        // 句式填充字不残留为内容词（如「到火」这类跨词噪音）
+        assert!(!terms.iter().any(|t| t.contains('到')));
+        // 数据库概念词保留
+        let terms = extract_chinese_content_terms("事务的隔离级别有哪些");
+        assert!(terms.contains(&"事务".to_owned()));
+        assert!(terms.contains(&"隔离".to_owned()));
+        // 泛化词被丢弃（不参与判定）：计划
+        assert!(!extract_chinese_content_terms("火星移民计划").contains(&"计划".to_owned()));
+    }
+
+    #[test]
+    fn chinese_no_evidence_topic_is_not_answerable() {
+        // 防编造核心：问题主题（火星/移民）在证据里完全不存在 → 必须拒答，
+        // 否则生成模型会拿无关证据杜撰该主题的内容。
+        let mut p = plan(QueryIntent::LibraryQa, QueryOperation::Qa);
+        p.question_shape = QuestionShape::BooleanExistence;
+        let unrelated = evidence(
+            "某巴士维修连锁公司开发信息系统，包含通用信息查询、药品管理等功能模块。",
+            None,
+        );
+        let input = AnswerabilityInput {
+            question: "我的资料里有没有提到火星移民计划",
+            content_query: Some("火星移民计划"),
+            plan: &p,
+            evidence: &[unrelated],
+        };
+        let verdict = evaluate_answerability(&input);
+        assert_eq!(verdict.status, AnswerabilityStatus::NotAnswerable);
+        // m18 复合词门控：整词「火星移民计划」完全无证据 → 直接 composite_mismatch
+        assert!(verdict.reason.starts_with("composite_mismatch"));
+        assert!(verdict.missing_entities.contains(&"火星移民计划".to_owned()));
+    }
+
+    #[test]
+    fn chinese_on_topic_evidence_is_answerable() {
+        // 证据含查询中文主题词 → 放行（不过度拦截）
+        let p = plan(QueryIntent::LibraryQa, QueryOperation::Qa);
+        let on_topic = evidence("事务具有原子性、一致性、隔离性和持久性。", None);
+        let input = AnswerabilityInput {
+            question: "事务的隔离级别是什么意思",
+            content_query: Some("事务 隔离"),
+            plan: &p,
+            evidence: &[on_topic],
+        };
+        let verdict = evaluate_answerability(&input);
+        assert_eq!(verdict.status, AnswerabilityStatus::Answerable);
+    }
+
+    #[test]
+    fn chinese_gate_yields_to_ascii_anchor() {
+        // 查询有 ASCII 锚点命中（RAG）时，中文门控不重复拦截
+        let p = plan(QueryIntent::LibraryQa, QueryOperation::Qa);
+        let ascii = evidence("RAG 通过先检索再生成缓解幻觉，检索增强生成是核心。", None);
+        let input = AnswerabilityInput {
+            question: "RAG的核心思想是什么",
+            content_query: Some("RAG 核心"),
+            plan: &p,
+            evidence: &[ascii],
+        };
+        let verdict = evaluate_answerability(&input);
+        assert_eq!(verdict.status, AnswerabilityStatus::Answerable);
+    }
+
+    #[test]
     fn claim_subject_mismatch_catches_agent_evidence_rag_claim() {
         // spec 十五示例：Evidence 讲 Agent，Claim 说 RAG → UNSUPPORTED
         let mismatch = claim_subject_mismatch(
@@ -987,5 +1315,83 @@ mod tests {
         assert_eq!(json["answer_shape"], "description");
         assert!(json["query_entities"].is_array());
         assert!(json["evidence_roles"].is_array());
+    }
+
+    #[test]
+    fn container_word_does_not_ground_specific_artifact() {
+        // [26] 错误肯定：问「体检报告」，证据只有「健康状态报告 / 个人成绩报告」。
+        // 「报告」是容器词，已在 GENERIC_BIGRAMS 过滤，不得凭它单独判定「体检报告」存在。
+        let mut p = plan(QueryIntent::LibraryQa, QueryOperation::Qa);
+        p.question_shape = QuestionShape::BooleanExistence;
+        let input = AnswerabilityInput {
+            question: "我的资料里有我的体检报告吗？",
+            content_query: Some("体检报告"),
+            plan: &p,
+            evidence: &[evidence("健康状态报告 个人成绩报告", None)],
+        };
+        let verdict = evaluate_answerability(&input);
+        assert_eq!(verdict.status, AnswerabilityStatus::NotAnswerable);
+        // m18 复合词门控：整词「体检报告」未落地且半词「报告」是容器词 → composite_mismatch
+        assert!(verdict.reason.starts_with("composite_mismatch"));
+        // 真实「体检报告」文本应放行（主题词「体检」落地）
+        let genuine = evidence("体检报告：体温、血压、血常规等检查结果。", None);
+        let input = AnswerabilityInput {
+            question: "我的资料里有我的体检报告吗？",
+            content_query: Some("体检报告"),
+            plan: &p,
+            evidence: &[genuine],
+        };
+        assert_eq!(
+            evaluate_answerability(&input).status,
+            AnswerabilityStatus::Answerable
+        );
+    }
+
+    #[test]
+    fn explicit_year_in_existence_query_must_land_in_evidence() {
+        // [28] 错误肯定：问「2024 年数据库系统工程师真题」，证据只有 2012 年真题，
+        // 年份未落地 → 存在性命中不得成立。
+        let mut p = plan(QueryIntent::LibraryQa, QueryOperation::Qa);
+        p.question_shape = QuestionShape::BooleanExistence;
+        let input = AnswerabilityInput {
+            question: "资料里有 2024 年数据库系统工程师真题吗？",
+            content_query: Some("2024年数据库系统工程师真题"),
+            plan: &p,
+            evidence: &[evidence("2012年上半年数据库系统工程师考试上午真题（参考答案）", None)],
+        };
+        let verdict = evaluate_answerability(&input);
+        assert_eq!(verdict.status, AnswerabilityStatus::NotAnswerable);
+        assert!(verdict.reason.starts_with("year_mismatch:2024"));
+
+        // 年份确实落地 → 放行
+        let on_year = evidence("2024年数据库系统工程师真题（参考答案）", None);
+        let input = AnswerabilityInput {
+            question: "资料里有 2024 年数据库系统工程师真题吗？",
+            content_query: Some("2024年数据库系统工程师真题"),
+            plan: &p,
+            evidence: &[on_year],
+        };
+        assert_eq!(
+            evaluate_answerability(&input).status,
+            AnswerabilityStatus::Answerable
+        );
+    }
+
+    #[test]
+    fn ascii_anchor_keeps_existence_question_answerable() {
+        // [18] 回归防线：问「SCI 论文投稿内容有没有」有 ASCII 强实体 "SCI"
+        // 落在证据里 → 走既有实体规则放行，中文门控不得误伤（即便证据没逐字
+        // 命中「相关的内容」）。
+        let p = plan(QueryIntent::LibraryQa, QueryOperation::Qa);
+        let input = AnswerabilityInput {
+            question: "我的资料里有 SCI 论文投稿相关的内容吗？",
+            content_query: Some("SCI 论文投稿相关的内容"),
+            plan: &p,
+            evidence: &[evidence("SCI 论文智能辅助投稿系统，面向科研作者的投稿准备与合规辅助平台", None)],
+        };
+        assert_eq!(
+            evaluate_answerability(&input).status,
+            AnswerabilityStatus::Answerable
+        );
     }
 }

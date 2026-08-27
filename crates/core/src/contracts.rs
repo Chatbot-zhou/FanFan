@@ -374,6 +374,8 @@ pub struct SourceLocator {
     pub line_end: Option<u32>,
     pub shape_no: Option<u32>,
     pub bbox: Option<BoundingBox>,
+    /// 章节路径（旧版数据可能缺失该字段，缺省视为空章节）。
+    #[serde(default)]
     pub heading_path: Vec<String>,
 }
 

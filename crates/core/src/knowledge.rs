@@ -6,7 +6,6 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::router::Intent;
 use crate::{AppError, DocumentType, EvidenceRef, ScopeFilter, SearchSession};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -30,6 +29,12 @@ pub struct AskRequest {
     /// 原问题 + 该字段继续问答；锁定 scope、写 USER_SELECTION 记忆。
     #[serde(default)]
     pub clarification_selection: Option<Uuid>,
+    /// 原地升级目标（澄清收拢为一轮）：当用户对一条澄清消息做出选择
+    /// （选文件或自定义输入）后，最终回答应**覆写**这条澄清 assistant 消息，
+    /// 而非再插入一个新的 user+assistant 对。此字段携带被澄清的那条回答的
+    /// message_id；record_ask_exchange 会据此 UPDATE 而非 INSERT。
+    #[serde(default)]
+    pub clarification_message_id: Option<Uuid>,
     /// 深度思考模式：true 时最终回答开启思考并流式展示推理过程；
     /// false 时关闭思考（RAG 内部调用始终关闭思考，不受此开关影响）。
     #[serde(default)]
@@ -978,7 +983,7 @@ fn strip_code_fence(raw: &str) -> &str {
 
 /// 将时间升序的会话历史折叠为「用户：/翻翻：」文本行。
 /// 取最近 user_limit 条 user 消息与最近 assistant_limit 条 assistant 消息，
-/// 按原时间顺序交错输出；单条空白折叠 + 400 字截断（与 chat_prompt /
+/// 按原时间顺序交错输出；单条空白折叠 + 400 字截断（与 generation_prompt /
 /// generation_prompt 现状风格一致）。空历史或某角色不足时只输出存在的一侧。
 pub fn fold_recent_history(
     history: &[AskMessage],
@@ -1022,60 +1027,6 @@ pub fn fold_recent_history(
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// 构建 LLM 意图直路由 prompt（替代 few-shot 语义路由 + 仲裁）。
-/// system 说明角色与 JSON 输出约束；user 含两分支行为定义、最近 5+5 对话
-/// 历史（`fold_recent_history`）与当前问题。只输出 JSON，不输出其他内容。
-pub fn intent_routing_prompt(question: &str, history: &[AskMessage]) -> (String, String) {
-    let system =
-        "你是对话意图判断助手。只输出JSON，不要输出其他任何文字、解释或 markdown 标记。".into();
-    let mut user = String::new();
-    let folded = fold_recent_history(history, 5, 5);
-    if !folded.is_empty() {
-        user.push_str(&format!(
-            "【对话历史】以下是最近 5 条对话的历史记录（用于判断当前问题是否延续上文），不是用户现在说的话：\n{folded}\n\n"
-        ));
-    }
-    user.push_str(&format!(
-        r#"【当前问题】下面这一句才是用户刚刚说的最新一句话，请只根据这一句判断意图：
-用户说：{question}
-
-判断用户这句话是想「检索本地资料库」还是「闲聊」。
-
-检索资料（retrieval）：想找文档、查数据、问制度流程、需要引用本地材料作答，或对之前检索过的资料继续追问。判断为检索时，将执行：检索本地资料库 → 按用户问题精排（Rerank）→ 结合检索结果与对话历史给出带引用的回答。例如：
-- 公司的报销流程是什么
-- 归航计划的时间安排是怎样的
-- 去年的财务报表数据
-- 那报销金额的上限是多少
-
-闲聊（chat）：寒暄、谈感受、与资料无关的日常对话。判断为闲聊时，直接自然对话回复，不检索。例如：
-- 你好啊
-- 今天天气怎么样
-- 给我讲个笑话
-- 你最近怎么样
-
-只凭以上两类定义和这条消息本身判断，不要犹豫。如果无法确定，或更接近寒暄/延续闲聊，输出 {{"intent":"chat"}}。宁可闲聊也绝不误检索。
-
-只输出：{{"intent":"retrieval"}} 或 {{"intent":"chat"}}"#,
-        question = question.trim()
-    ));
-    (system, user)
-}
-
-/// 解析路由输出为意图；解析失败或意图非法返回 None
-/// （route_question 兜底默认走 Chat，不再静默落 RAG）。
-pub fn parse_intent_verdict(raw: &str) -> Option<Intent> {
-    let cleaned = strip_code_fence(raw).trim();
-    serde_json::from_str::<serde_json::Value>(cleaned)
-        .ok()?
-        .get("intent")
-        .and_then(|value| value.as_str())
-        .and_then(|intent| match intent {
-            "retrieval" => Some(Intent::Retrieval),
-            "chat" => Some(Intent::Chat),
-            _ => None,
-        })
 }
 
 /// 构建追问改写 prompt（极简，0.6B 友好）：输入按「history」与「question」
@@ -1142,37 +1093,6 @@ pub fn parse_rewritten_queries(raw: &str) -> Vec<String> {
         }
     }
     queries
-}
-
-/// 闲聊 persona 的补全 prompt（纯补全非 JSON）：人设 + 回答规则 + 对话历史折叠
-/// + 当前问题。历史格式与 generation_prompt 一致（「用户：/翻翻：」，每条约 400
-///   字），最多折叠 5 轮（5 条用户 + 5 条模型回复）。
-///
-/// 回答规则分两支（Phase 4.1 技术问答质量修复，CASE 二）：
-/// - 日常闲聊：简短自然、不复读问题、不以「你好！我是翻翻」固定开场；
-/// - 知识/技术问题：定义 → 核心机制 → 适用场景/区别 的结构化回答，不编造人名/
-///   年份/出处/数字，不牺牲准确性迁就口语化，知识不足时明确报告模型能力限制。
-///
-/// 两套规则常驻 system prompt，不依赖关键词判定（闲聊与科普本来就无法硬切）。
-pub fn chat_prompt(request: &AskRequest, history: &[AskMessage]) -> (String, String) {
-    let system = "你是翻翻，用户本地资料库中的中文智能助手。当前是闲聊场景，不涉及资料检索，直接自然对话即可。\
-\n\n回答规则：\
-\n1. 日常闲聊（寒暄、问候、闲聊话题）：简短、自然、口语化，直接回答，不要重复用户的话，不要以「你好！我是翻翻」之类的固定开场白开头。\
-\n2. 知识或技术问题（例如「Transformer 是什么」「RAG 和微调有什么区别」「帮我解释 LangGraph」）：\
-\n   - 按「定义 → 核心机制 → 适用场景或区别」的结构直接讲清楚概念本身，先给定义再展开；\
-\n   - 可以用类比帮助理解，但不要为了口语化牺牲准确性；\
-\n   - 不编造人名、年份、出处、数字、机构等事实细节，不确定的细节宁可不说；\
-\n   - 对不确定的专有框架/库/工具（尤其是较新的开源项目），宁可简短说明「我对它不够熟悉，可能存在偏差」，也不要编造定义或机制；\
-\n   - 知识超出能力范围时，明确回答「我的知识有限/这部分超出了我的模型能力范围」，不要强行编造。\
-\n3. 回答保持简洁，直接回答问题，不要东拉西扯。".to_owned();
-    let mut user = String::new();
-    let folded = fold_recent_history(history, 5, 5);
-    if !folded.is_empty() {
-        user.push_str(&format!("【对话历史】\n{folded}\n\n"));
-    }
-    user.push_str("【当前问题】\n");
-    user.push_str(&format!("用户：{}", request.question.trim()));
-    (system, user)
 }
 
 /// 剥离文本中的 [S\d+] 引用标记（如 "[S1]"），保留正文
@@ -1288,6 +1208,7 @@ mod tests {
             max_source_files: 8,
             strict_evidence: true,
             clarification_selection: None,
+            clarification_message_id: None,
             think_mode: false,
         }
     }
@@ -1537,26 +1458,6 @@ mod tests {
     }
 
     #[test]
-    fn intent_verdict_parsing() {
-        assert_eq!(
-            parse_intent_verdict(r#"{"intent":"retrieval"}"#),
-            Some(Intent::Retrieval)
-        );
-        assert_eq!(
-            parse_intent_verdict("```json\n{\"intent\":\"chat\"}\n```"),
-            Some(Intent::Chat)
-        );
-        assert_eq!(
-            parse_intent_verdict("```\n{\"intent\":\"retrieval\"}\n```"),
-            Some(Intent::Retrieval)
-        );
-        assert_eq!(parse_intent_verdict("随便说点什么"), None);
-        assert_eq!(parse_intent_verdict(r#"{"intent":"ambiguous"}"#), None);
-        assert_eq!(parse_intent_verdict(r#"{"other":1}"#), None);
-        assert_eq!(parse_intent_verdict(""), None);
-    }
-
-    #[test]
     fn query_rewrite_prompt_injects_history_and_instructs_line_output() {
         let history = vec![
             message("user", "报销流程是什么"),
@@ -1621,71 +1522,6 @@ mod tests {
     }
 
     #[test]
-    fn chat_prompt_folds_history_and_question() {
-        let history = vec![
-            message("user", "  你好  呀 "),
-            message("assistant", "你好！"),
-        ];
-        let (system, user) = chat_prompt(&request(), &history);
-        assert!(system.contains("翻翻"));
-        assert!(user.contains("用户：你好 呀"));
-        assert!(user.contains("翻翻：你好！"));
-        assert!(user.contains("用户：项目如何优化召回率？"));
-        // 无历史时不出现历史段
-        let (_, user2) = chat_prompt(&request(), &[]);
-        assert!(!user2.contains("对话历史"));
-        assert!(user2.starts_with("【当前问题】"));
-    }
-
-    #[test]
-    fn chat_prompt_has_technical_qa_rules() {
-        // CASE 二（GENERAL 质量）：技术问答必须有结构纪律与反编造约束，
-        // 且固定开场白仍被禁止；闲聊分支保持口语化短答
-        let (system, _) = chat_prompt(&request(), &[]);
-        assert!(
-            system.contains("定义 → 核心机制 → 适用场景或区别"),
-            "技术问答结构"
-        );
-        assert!(system.contains("不编造人名、年份、出处"), "反编造约束");
-        assert!(system.contains("不要为了口语化牺牲准确性"), "准确性优先");
-        assert!(
-            system.contains("不要以「你好！我是翻翻」之类的固定开场白开头"),
-            "禁固定开场"
-        );
-        assert!(system.contains("模型能力范围"), "能力限制要明说");
-        assert!(system.contains("简短、自然、口语化"), "闲聊分支保留");
-        // 模型必须看到「Transformer 是什么」这类问题属于知识问题
-        assert!(system.contains("Transformer 是什么"));
-        assert!(system.contains("RAG 和微调有什么区别"));
-    }
-
-    #[test]
-    fn chat_prompt_folds_at_most_five_rounds() {
-        // 8 轮（16 条消息）→ 只折叠最近 5 轮（5 用户 + 5 翻翻）
-        let mut history = Vec::new();
-        for round in 1..=8 {
-            history.push(message("user", &format!("第{round}轮问题")));
-            history.push(message("assistant", &format!("第{round}轮回答")));
-        }
-        let (_, user) = chat_prompt(&request(), &history);
-        // 折叠段 5 用户 + 5 翻翻；末尾另有 chat_prompt 追加的一行当前提问
-        let user_lines = user
-            .lines()
-            .filter(|line| line.starts_with("用户："))
-            .count();
-        let assistant_lines = user
-            .lines()
-            .filter(|line| line.starts_with("翻翻："))
-            .count();
-        assert_eq!(assistant_lines, 5, "最多折叠 5 条翻翻回复");
-        assert_eq!(user_lines, 6, "5 条历史用户消息 + 1 行当前提问");
-        assert!(user.contains("用户：第4轮问题"), "最近 5 轮包含第 4 轮");
-        assert!(!user.contains("第1轮"), "早于最近 5 轮的历史被丢弃");
-        assert!(!user.contains("第2轮"));
-        assert!(!user.contains("第3轮"));
-    }
-
-    #[test]
     fn fold_recent_history_caps_and_interleaves_by_role() {
         // 10 轮（20 条）→ 只保留最近 5 用户 + 5 翻翻，保持时间升序交错
         let mut history = Vec::new();
@@ -1739,41 +1575,6 @@ mod tests {
         assert!(line.starts_with("用户："));
         // 400 字截断 + 角色标签（“用户：”3 个字符）
         assert_eq!(line.chars().count(), 3 + 400);
-    }
-
-    #[test]
-    fn intent_routing_prompt_specifies_branches_and_history() {
-        let history = vec![message("user", "你好"), message("assistant", "你好！")];
-        let (system, user) = intent_routing_prompt("报销流程是什么", &history);
-        assert!(system.contains("只输出JSON"));
-        // 两分支行为定义
-        assert!(user.contains("检索资料（retrieval）"));
-        assert!(user.contains("检索本地资料库"));
-        assert!(user.contains("Rerank"));
-        assert!(user.contains("闲聊（chat）"));
-        assert!(user.contains("直接自然对话回复，不检索"));
-        // 5+5 历史段（【对话历史】标记，明确不是当前输入）+ 当前问题（【当前问题】标记）
-        assert!(user.contains("【对话历史】"));
-        assert!(user.contains("不是用户现在说的话"));
-        assert!(user.contains("用户：你好"));
-        assert!(user.contains("翻翻：你好！"));
-        assert!(user.contains("【当前问题】"));
-        assert!(user.contains("只根据这一句判断意图"));
-        // JSON 输出约束与兜底句
-        assert!(user.contains(r#"{"intent":"retrieval"}"#));
-        assert!(user.contains(r#"{"intent":"chat"}"#));
-        assert!(user.contains("宁可闲聊也绝不误检索"));
-        assert!(user.contains("用户说：报销流程是什么"));
-    }
-
-    #[test]
-    fn intent_routing_prompt_empty_history_has_no_history_section() {
-        let (_, user) = intent_routing_prompt("今天天气怎么样", &[]);
-        // 历史段头部只在有历史时出现（【对话历史】为该段独有的标记）
-        assert!(!user.contains("【对话历史】"));
-        assert!(!user.contains("延续上文"));
-        assert!(user.contains("【当前问题】"));
-        assert!(user.contains("用户说：今天天气怎么样"));
     }
 
     #[test]

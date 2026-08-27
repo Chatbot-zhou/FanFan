@@ -18,8 +18,10 @@ use uuid::Uuid;
 
 use crate::AskSessionContext;
 use crate::ask::document_retrieval::cosine_similarity;
-use crate::ask::query_normalize::meaningful_tokens;
-use crate::ask::query_plan::{DocumentCandidate, DocumentResolution, QueryPlan, ResolutionStatus};
+use crate::ask::query_normalize::{meaningful_tokens, strip_target_stop_phrases};
+use crate::ask::query_plan::{
+    DocumentCandidate, DocumentResolution, QueryIntent, QueryPlan, ResolutionStatus,
+};
 use crate::contracts::DocumentType;
 use crate::knowledge::DocumentProfile;
 use crate::profile_builder::type_keywords_for;
@@ -36,6 +38,15 @@ pub const SIGNAL_WEIGHTS: &[(&str, f32)] = &[
     ("semantic", 0.30),
     ("filename", 0.10),
     ("owner_match", 0.05),
+    // FIND 定位：content_query/filters 描述串与文件名的「子序列+二元组重合」
+    // 命中（仅 DOCUMENT_FIND intent）。命中即 +weight，再按重合度加
+    // weight×coverage 的梯度，使「2019年数据库下午真题」这类描述唯一指向
+    // 正确文件（同年的其它文件只覆盖部分片段，分数明显落后）。
+    ("find_content", 0.40),
+    // 非 FIND 的定位类 intent：target.reference/document_name 描述串与文件名
+    // 的「子序列+二元组重合」匹配（词序翻转/插字容忍，见 7.6）。命中即
+    // +weight，再按重合度加 weight×coverage 梯度。
+    ("reference_match", 0.35),
 ];
 
 /// 语义通道的余弦下限：低于此相似度不贡献语义分（避免 embedding 相近的
@@ -106,8 +117,14 @@ impl<'a> ResolverInput<'a> {
 }
 
 /// 目标对象是否完全为空（没有任何可定位依据）。
+///
+/// FIND 例外：FIND 的 content_query 就是用户对文件的描述（「2019年数据库
+/// 下午的真题文件」），即使 reference/type/name 全空也具备定位依据。判定
+/// 口径与 find_content 信号（见 `score_candidate` 7.5）一致：描述清洗后
+/// ≥4 字符才算可定位；过短（如「合同」）不构成区分信号，判空退回宽 scope。
 fn target_is_empty(plan: &QueryPlan) -> bool {
-    plan.target
+    let no_target = plan
+        .target
         .reference
         .as_deref()
         .unwrap_or("")
@@ -127,7 +144,15 @@ fn target_is_empty(plan: &QueryPlan) -> bool {
             .as_deref()
             .unwrap_or("")
             .trim()
-            .is_empty()
+            .is_empty();
+    if !no_target {
+        return false;
+    }
+    if plan.intent == QueryIntent::DocumentFind {
+        let desc = plan.content_query.as_deref().unwrap_or("").trim();
+        return strip_target_stop_phrases(desc).chars().count() < 4;
+    }
+    true
 }
 
 /// 解析目标对象为文件白名单。返回的 `DocumentResolution` 供编排层：
@@ -144,11 +169,18 @@ pub fn resolve_documents(input: &ResolverInput<'_>) -> DocumentResolution {
 
     // 模型驱动精确定位：当 LLM Parser 凭语义判定用户「精确点名」了某份文档
     // （给出完整标题/文件名）并把完整标题放进 target.document_name 时，
-    // resolver 不在此处引入相似度/阈值规则，而是**信任模型**，把候选收敛到
-    // 名字精确对应的文档：库内恰好一份 → 锁定；多份同名副本 → 全部进 scope
-    //（它们是被点名的同一内容族）；库内不存在该精确文档 → Unresolved，压实
-    // 「宁缺毋滥、不拿相近文档顶替」的安全边界。这里的「精确相等」只是
-    // 「模型点名的标题 → file_id」的机械映射，不构成任何启发式规则。
+    // resolver **信任模型**，把候选收敛到名字精确对应的内容族：库内恰好一份
+    // → 锁定；多份同名副本 → 全部进 scope（它们是被点名的同一内容族）。
+    // 精确匹配覆盖两种层级（见 [`precise_name_equals`]）：
+    //   1. 全串相等型：完整标题/文件名（含剥扩展名、副本序号）；
+    //   2. 内容族子串型：目标名是真实文件名的连续子串，用于同名内容族的
+    //      版本前缀/后缀（如 `人工智能面试宝典` ⊂ `1人工智能面试宝典_V6.6(20250606)`）。
+    // 当两层都落空时，**不**立即判「不在库内」：真实文档因年份/措辞与生成
+    // 标题存在词序或插字差异（如「数据库系统工程师考试2020年上午真题」vs
+    // 「2020年数据库系统工程师考试上午真题」）时，回退到下方的通用多信号
+    // 评分（语义/类型/标题/文件名）继续定位，避免把库内真实存在的文档误报
+    // 为不存在、进而丢失 Document Recall。通用评分自身有阈值与 margin 约束，
+    // 仍不会仅凭一个弱信号就错误锁定；确实与库内任何文档不相干时才 Unresolved。
     if input.plan.target.precise_named_document
         && let Some(target_name) = input.plan.target.document_name.as_deref()
     {
@@ -166,40 +198,38 @@ pub fn resolve_documents(input: &ResolverInput<'_>) -> DocumentResolution {
                     precise_name_equals(target_name, profile, file_name)
                 })
                 .collect();
-            if exact.is_empty() {
-                return DocumentResolution::unresolved(
-                    "模型判定的精确点名的文档不在本地库内，不回退到相近文档",
-                );
-            }
-            let scope: Vec<Uuid> = exact.iter().map(|profile| profile.file_id).collect();
-            let candidates = exact
-                .iter()
-                .map(|profile| {
-                    DocumentCandidate::new(
-                        profile.file_id,
-                        1.0,
-                        vec!["precise_named_document".to_owned()],
-                    )
-                })
-                .collect();
-            if exact.len() == 1 {
-                return DocumentResolution {
-                    candidates,
-                    resolved_file_ids: scope,
-                    confidence: 1.0,
-                    status: ResolutionStatus::Resolved,
-                    fallback_reason: None,
+            if !exact.is_empty() {
+                let scope: Vec<Uuid> = exact.iter().map(|profile| profile.file_id).collect();
+                let candidates = exact
+                    .iter()
+                    .map(|profile| {
+                        DocumentCandidate::new(
+                            profile.file_id,
+                            1.0,
+                            vec!["precise_named_document".to_owned()],
+                        )
+                    })
+                    .collect();
+                return if exact.len() == 1 {
+                    DocumentResolution {
+                        candidates,
+                        resolved_file_ids: scope,
+                        confidence: 1.0,
+                        status: ResolutionStatus::Resolved,
+                        fallback_reason: None,
+                    }
+                } else {
+                    DocumentResolution {
+                        candidates,
+                        resolved_file_ids: scope,
+                        confidence: 1.0,
+                        status: ResolutionStatus::MultipleCandidates,
+                        fallback_reason: Some(
+                            "精确点名命中多份同名副本（同一内容族），一并进 scope".to_owned(),
+                        ),
+                    }
                 };
             }
-            return DocumentResolution {
-                candidates,
-                resolved_file_ids: scope,
-                confidence: 1.0,
-                status: ResolutionStatus::MultipleCandidates,
-                fallback_reason: Some(
-                    "精确点名命中多份同名副本（同一内容族），一并进 scope".to_owned(),
-                ),
-            };
         }
     }
 
@@ -274,10 +304,14 @@ pub fn resolve_documents(input: &ResolverInput<'_>) -> DocumentResolution {
 }
 
 /// 精准姓名映射（模型驱动精确定位）：判断「模型点名的标题」是否就是该
-/// 文档。只做最直接的**全串相等**（两侧去空白）加两种机械归一化——剥一次
-/// 扩展名、剥尾部「副本序号」`_<数字>`——使「带/不带扩展名」「主名/副本」
-/// 三种点名都能对齐；不做任何相似度/子串启发。归一化是通用语义（`报告`
-/// 与 `报告_1` 是同一内容族的副本），不针对任何具体文档。
+/// 文档。两级判定，均为通用机械归一化，不构成针对任何文件的特判：
+///   1. **全串相等**（两侧去空白）：剥一次扩展名 + 剥尾部「副本序号」后相等，
+///      使「带/不带扩展名」「主名/副本」三种点名都能对齐；
+///   2. **内容族子串**：目标名的字母数字归一化形式是真实文件名归一化形式的
+///      连续子串（或反过来），用于同名内容族的版本前缀/后缀/DocumentProfile
+///      补全，如目标 `人工智能面试宝典` ⊂ 文件名 `1人工智能面试宝典_V6.6(20250606)`。
+///      为避免过短的泛化子串（如「报告」）一次性吞掉多个无关文档，子串层只
+///      在目标归一化长度 ≥ [`SUFFIX_CORE_MIN`] 时启用。
 fn precise_name_equals(target: &str, profile: &DocumentProfile, file_name: &str) -> bool {
     let target = target.trim();
     if target.is_empty() {
@@ -293,7 +327,118 @@ fn precise_name_equals(target: &str, profile: &DocumentProfile, file_name: &str)
         return true;
     }
     let stem_norm = normalize_precise_name(file_name);
-    !stem_norm.is_empty() && stem_norm == target_norm
+    if !stem_norm.is_empty() && stem_norm == target_norm {
+        return true;
+    }
+    // 内容族子串层（版本前缀/后缀、补全）：真实文档名/标题的归一化形式**包含**
+    // 点名的归一化形式时视为同一内容族。只做正向包含（真实名是点名名的超集，
+    // 如 `1人工智能面试宝典_V6.6(20250606)` ⊇ `人工智能面试宝典`），不做反向
+    // （点名名包含短文件名）——反向会让短泛化标题（如「SQL」「报告」）被较长
+    // 的点名名一次性吞进精确 scope。目标长度低于下限时不启用该层。
+    let alnum = |value: &str| {
+        value
+            .chars()
+            .filter(|character| character.is_alphanumeric())
+            .collect::<String>()
+    };
+    let target_alnum = alnum(&target_norm);
+    if target_alnum.chars().count() < SUFFIX_CORE_MIN {
+        return false;
+    }
+    let title_alnum = alnum(&title_norm);
+    if !title_alnum.is_empty() && title_alnum.contains(&target_alnum) {
+        return true;
+    }
+    let stem_alnum = alnum(&stem_norm);
+    if !stem_alnum.is_empty() && stem_alnum.contains(&target_alnum) {
+        return true;
+    }
+    // 3. **词序翻转/插字容错**：目标与真实名的字母数字串字符二元组高重合且
+    //    关键限定（4 位年份、上下午）一致 → 同一内容族。
+    //    「数据库系统工程师考试2020年上午真题」与真实文件名
+    //    「2020年数据库系统工程师考试上午真题（参考答案）」全串不等、互不包含
+    //    （年份位置不同），只有二元组重合能识别为同一文档；年份/上下午门保证
+    //    不把「2020上午」误并到「2020下午」或「2019年」的同类文件。
+    if (!title_alnum.is_empty() && reordered_same_family(&target_alnum, &title_alnum))
+        || (!stem_alnum.is_empty() && reordered_same_family(&target_alnum, &stem_alnum))
+    {
+        return true;
+    }
+    false
+}
+
+/// 内容族子串层的最小归一化长度：目标归一化字符数低于该值时不走子串匹配，
+/// 防止「报告」「简历」这类短泛化子串把多个无关文档一次性吞进精确 scope。
+const SUFFIX_CORE_MIN: usize = 6;
+
+/// 词序翻转内容族层的二元组重合下限。二元组是集合式度量、对词序不敏感——
+/// 「数据库系统工程师考试2020年上午真题」与「2020年数据库系统工程师考试上午真题
+/// （参考答案）」字符组成几乎一致、只是年份位置不同，重合率≈0.95；而同年份的
+/// 下午卷因上下午限定不同会低于该值，配合下方年份/上下午门做最终区分。
+///
+/// 下限须兼顾**整句子句平移**场景：压缩描述「2020年上午数据库真题」把「上午」
+/// 整个从句挪到年份之后（实况文件名是「2020年数据库系统工程师考试上午真题
+/// （参考答案）」，主题串夹在年份与会话之间），从句边界二元组（年→上午、
+/// 上午→数据库、数据库→真题）随平移丢失，二元组去重后重合率≈0.70。这类描述
+/// 仍是有年份+上下午+主题的唯一指代，年份/上下午门已把跨年、跨会话文件排除，
+/// 故下限须放到能容纳该平移丢失（≈0.70）的水平才不至于把「不同文件」误判漏
+/// 锁。低于 0.68 会开始把明显缺词的泛化描述与同年份同会话的同类文件误并（靠
+/// MultipleCandidates/ambiguous 兜底，不误答），故保守取 0.68。
+const REORDERED_FAMILY_MIN_COVERAGE: f32 = 0.68;
+
+/// 上下午/册次/篇次会话标记：识别「上午/下午」「上卷/下卷」「上册/下册」
+/// 「上篇/下篇」，用于区分同一年份的会话版本（上午真题 vs 下午真题）。
+/// [`SessionMarker::None`] 表示文本不含会话限定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionMarker {
+    None,
+    First,
+    Second,
+}
+
+/// 提取文本的会话标记（上午→First，下午→Second，无→None）。
+fn session_marker(text: &str) -> SessionMarker {
+    let first = text.contains("上午")
+        || text.contains("上卷")
+        || text.contains("上册")
+        || text.contains("上篇");
+    let second = text.contains("下午")
+        || text.contains("下卷")
+        || text.contains("下册")
+        || text.contains("下篇");
+    match (first, second) {
+        (true, false) => SessionMarker::First,
+        (false, true) => SessionMarker::Second,
+        // 同时出现上/下限定时无法把它当作单份文档的可靠身份信号。
+        _ => SessionMarker::None,
+    }
+}
+
+/// 词序翻转/插字容忍的「同一内容族」判定（输入应为字母数字归一化串）。
+///
+/// 目标串与真实名的字符二元组重合 ≥ [`REORDERED_FAMILY_MIN_COVERAGE`]，且
+/// 关键限定一致时才视为同一文档：
+/// - **年份门**：两侧都含 4 位年份且不一致 → 不同文件（「2020年真题」与
+///   「2019年真题」二元组覆盖率基本打平，年份一致是唯一区分信号）；
+/// - **上下午门**：目标限定上午而真实名是下午（或反之）→ 不同文件。
+/// 目标无年份/无会话限定时不约束（只靠重合率与对方的一致性判断），避免
+/// 「真题」这类无限定描述把所有同类文件误并。通用机械归一化，不针对任何文件。
+fn reordered_same_family(target: &str, real_name: &str) -> bool {
+    if target.chars().count() < SUFFIX_CORE_MIN || real_name.chars().count() < SUFFIX_CORE_MIN {
+        return false;
+    }
+    if bigram_coverage(target, real_name) < REORDERED_FAMILY_MIN_COVERAGE {
+        return false;
+    }
+    match (extract_year(target), extract_year(real_name)) {
+        (Some(target_year), Some(real_year)) if target_year != real_year => return false,
+        _ => {}
+    }
+    let target_session = session_marker(target);
+    let real_session = session_marker(real_name);
+    !(target_session != SessionMarker::None
+        && real_session != SessionMarker::None
+        && target_session != real_session)
 }
 
 /// 归一化精确点名标题：去两侧空白 → 剥一次扩展名 → 剥一次尾部「副本序号」
@@ -333,8 +478,183 @@ fn strip_extension_like(file_name: &str) -> &str {
     }
 }
 
+/// `needle` 是否按序（允许跳字符）出现在 `haystack` 中。
+///
+/// FIND 定位专用：用户描述「2019年数据库下午真题」与真实文件名
+/// 「2019年上半年数据库系统工程师考试下午真题」之间存在插词（上半年/系统
+/// 工程师考试），全串子串匹配会失败，子序列匹配容忍这些插入词，是「年份+
+/// 上下午+主题」这类描述的通用定位手段。`needle` 为空返回 false。
+fn is_subsequence(needle: &str, haystack: &str) -> bool {
+    let mut needle_chars = needle.chars();
+    let mut pending = needle_chars.next();
+    for ch in haystack.chars() {
+        if let Some(need) = pending {
+            if need == ch {
+                pending = needle_chars.next();
+            }
+        }
+        if pending.is_none() {
+            return true;
+        }
+    }
+    pending.is_none()
+}
+
+/// 描述串与文件名的相邻字符二元组重合率（0..=1）：衡量描述串的字符序列在
+/// 文件名里保留了多大比例。描述为空返回 0。子序列已覆盖「插词」场景，二元组
+/// 重合度是它的梯度分量（描述覆盖越完整、加分越多，正确文件与同年的其它
+/// 文件由此拉开差距）。
+fn bigram_coverage(needle: &str, haystack: &str) -> f32 {
+    let needle_chars = needle.chars().collect::<Vec<_>>();
+    if needle_chars.len() < 2 || haystack.is_empty() {
+        return 0.0;
+    }
+    let needle_bigrams: std::collections::HashSet<(char, char)> =
+        needle_chars.windows(2).map(|w| (w[0], w[1])).collect();
+    let haystack_bigrams: std::collections::HashSet<(char, char)> = haystack
+        .chars()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .map(|w| (w[0], w[1]))
+        .collect();
+    let hit = needle_bigrams
+        .iter()
+        .filter(|bigram| haystack_bigrams.contains(bigram))
+        .count();
+    hit as f32 / needle_bigrams.len() as f32
+}
+
+/// 从任意文本中提取「4 位年份」（如 "2020-09-01" → 2020，"2019" → 2019）。
+///
+/// FIND 定位专用：时间过滤器可能是完整日期或年份，描述串与文件名都含年份时
+/// 需要归一成 4 位整数做一致性比较。只取 `1900..=2099` 的合理区间，避免
+/// 「1234」这类纯数字串误判；字节级扫描保证不会切开多字节汉字。提取不到返回
+/// None（调用方据此不做年份判定）。
+fn extract_year(text: &str) -> Option<u32> {
+    let bytes = text.as_bytes();
+    let mut best = None;
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        if bytes[i].is_ascii_digit()
+            && bytes[i + 1].is_ascii_digit()
+            && bytes[i + 2].is_ascii_digit()
+            && bytes[i + 3].is_ascii_digit()
+        {
+            if let Some(year) = text[i..i + 4].parse::<u32>().ok() {
+                if (1900..=2099).contains(&year) {
+                    best = Some(year);
+                    break;
+                }
+            }
+        }
+        i += 1;
+    }
+    best
+}
+
+/// DocumentProfile 的摘要由正文头部生成；短文件名缺失年份/卷次时，摘要开头
+/// 往往仍保留封面标题。只读取一个有界前缀作为身份补充，避免把正文后部提到的
+/// 其它版本误当成当前文件身份。
+const PROFILE_IDENTITY_SUMMARY_CHARS: usize = 160;
+
+fn profile_identity_summary(profile: &DocumentProfile) -> String {
+    profile
+        .summary
+        .chars()
+        .take(PROFILE_IDENTITY_SUMMARY_CHARS)
+        .collect()
+}
+
+fn merge_session_markers(markers: impl IntoIterator<Item = SessionMarker>) -> SessionMarker {
+    let mut merged = SessionMarker::None;
+    for marker in markers {
+        if marker == SessionMarker::None {
+            continue;
+        }
+        if merged != SessionMarker::None && merged != marker {
+            return SessionMarker::None;
+        }
+        merged = marker;
+    }
+    merged
+}
+
+fn unambiguous_year<'a>(texts: impl IntoIterator<Item = &'a str>) -> Option<u32> {
+    let mut found = None;
+    for text in texts {
+        let bytes = text.as_bytes();
+        let mut index = 0;
+        while index + 4 <= bytes.len() {
+            if bytes[index..index + 4]
+                .iter()
+                .all(|byte| byte.is_ascii_digit())
+                && let Ok(year) = text[index..index + 4].parse::<u32>()
+                && (1900..=2099).contains(&year)
+            {
+                if found.is_some_and(|existing| existing != year) {
+                    return None;
+                }
+                found = Some(year);
+                index += 4;
+                continue;
+            }
+            index += 1;
+        }
+    }
+    found
+}
+
+/// 明确目标描述与候选画像是否存在确定性的身份冲突。
+///
+/// 文件名/画像标题优先；仅当它们缺失对应限定时，才用摘要头部补齐。两侧都明确
+/// 给出年份或卷次且不一致时才判冲突；任一侧缺失或摘要同时出现上下卷时保持未知，
+/// 继续走原有多信号评分。该门只收窄带身份限定的目标 scope；普通概念问答没有
+/// 年份/卷次限定，不受影响。
+fn target_identity_conflicts(input: &ResolverInput<'_>, profile: &DocumentProfile) -> bool {
+    let target = [
+        input.plan.target.document_name.as_deref(),
+        input.plan.target.reference.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+        .filter(|value| !value.trim().is_empty())
+        .max_by_key(|value| value.chars().count());
+    let Some(target) = target else {
+        return false;
+    };
+    let file_name = input
+        .file_names
+        .get(&profile.file_id)
+        .map(String::as_str)
+        .unwrap_or("");
+    let summary = profile_identity_summary(profile);
+
+    let target_year = unambiguous_year([target]);
+    let candidate_year = unambiguous_year([profile.title.as_str(), file_name, summary.as_str()]);
+    if matches!(
+        (target_year, candidate_year),
+        (Some(target_year), Some(candidate_year)) if target_year != candidate_year
+    ) {
+        return true;
+    }
+
+    let candidate_session = merge_session_markers([
+        session_marker(&profile.title),
+        session_marker(file_name),
+        session_marker(&summary),
+    ]);
+    let target_session = session_marker(target);
+    target_session != SessionMarker::None
+        && candidate_session != SessionMarker::None
+        && target_session != candidate_session
+}
+
 /// 对单个画像综合打分，返回候选与命中信号列表。
 fn score_candidate(input: &ResolverInput<'_>, profile: &DocumentProfile) -> DocumentCandidate {
+    if target_identity_conflicts(input, profile) {
+        return DocumentCandidate::new(profile.file_id, 0.0, vec!["identity_conflict".to_owned()]);
+    }
     let mut score = 0.0;
     let mut signals = Vec::new();
 
@@ -472,6 +792,148 @@ fn score_candidate(input: &ResolverInput<'_>, profile: &DocumentProfile) -> Docu
         {
             score += weight("filename");
             signals.push("graduation_filename".to_owned());
+        }
+    }
+
+    // 7.5 FIND 定位：content_query/filters 描述串与文件名的「子序列+二元组
+    //     重合」匹配。仅 DOCUMENT_FIND 生效——FIND 里 content_query 就是用户
+    //     对文件的描述（「2019年数据库下午的真题文件」），必须参与定位；
+    //     其它 intent 的 content_query 是正文问题，绝不用来定位文件（见
+    //     target_lock_does_not_depend_on_content_query_hits 的约束）。
+    //     子序列匹配容忍真实文件名里的插词（上半年/系统工程师考试），二元组
+    //     重合度提供梯度，使覆盖完整描述的文件显著领先只覆盖部分片段的文件。
+    if input.plan.intent == QueryIntent::DocumentFind {
+        let mut find_desc = input
+            .plan
+            .content_query
+            .clone()
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        // 时间过滤器年份归一：日期（2020-09-01）或年份（2019）都只提取
+        // 「4 位年份」追加到描述串，且描述里已有同年时跳过——把日期整体
+        // 追加会把 2020-09-01 这类噪音混入描述、稀释二元组重合度。
+        if let Some(time) = input.plan.filters.time.as_deref() {
+            if let Some(year) = extract_year(time) {
+                let year = year.to_string();
+                if !find_desc.contains(&year) {
+                    find_desc.push_str(&year);
+                }
+            }
+        }
+        let find_desc = strip_target_stop_phrases(&find_desc);
+        let filename = input
+            .file_names
+            .get(&profile.file_id)
+            .map(String::as_str)
+            .unwrap_or("");
+        // 描述过短（清洗后 <4 字符，如「合同」）时不参与：短描述对所有同类
+        // 文件一视同仁，起不到区分作用，反而可能让无关文件的字符恰好按序
+        // 命中而误加信号。
+        if find_desc.chars().count() >= 4 && !filename.is_empty() {
+            let matched = is_subsequence(&find_desc, filename);
+            let coverage = bigram_coverage(&find_desc, filename);
+            // 年份一致性：描述串与文件名**都**含 4 位年份时要求一致。二元组
+            // 重合是集合式度量、对词序不敏感，「2020年」与「2021年」两份文件
+            // 覆盖率基本打平（都含 20/02/年上），子序列又因年份位置差异（用户
+            // 把年份放中间 vs 文件名放开头）失配——年份一致是唯一能区分「同
+            // 一年的版本」与「不同年份的其它文件」的通用信号。描述没给年份时
+            // 不靠年份判定（false），避免「真题」这类无年份描述把所有年份的
+            // 同类文件一锅端升级进 scope。
+            let year_consistent = match (extract_year(&find_desc), extract_year(filename)) {
+                (Some(desc_year), Some(file_year)) => desc_year == file_year,
+                _ => false,
+            };
+            // 上下午/册次一致性：描述串与文件名都带会话限定（上午/下午、上/下卷、
+            // 上/下册）时要求一致。二元组重合是集合式度量、对词序不敏感，
+            // 「2020年…上午真题」与「2020年…下午真题」覆盖率几乎打平（只差
+            // 一个上/下字），子序列又因「上午」的「上」不在下午文件名里而失配——
+            // 会话一致是唯一能区分用户指的上/下午版本的通用信号。描述没给会话
+            // 限定时不约束（None），避免「真题」这类无限定描述误伤。
+            let session_consistent = match (session_marker(&find_desc), session_marker(filename)) {
+                (SessionMarker::None, _) | (_, SessionMarker::None) => true,
+                (desc_session, file_session) => desc_session == file_session,
+            };
+            if matched {
+                // 子序列命中天然携带会话一致性（「上午」的「上」不在下午文件名
+                // 里，子序列必然失配），无需额外门。
+                let find_weight = weight("find_content");
+                score += find_weight + find_weight * coverage;
+                signals.push("find_content".to_owned());
+            } else if coverage >= 0.6 && year_consistent && session_consistent {
+                // 词序翻转但二元组高重合、**年份一致且上下午一致**：视为命中——
+                // 描述与文件是同一份文件、只是年份/词序位置不同（「数据库系统
+                // 工程师2020年上午真题」vs「2020年数据库系统工程师考试上午真题」）。
+                // 任一门冲突（不同年份 / 上午对下午）都不得靠覆盖率锁定，降级为
+                // 下方部分分（补召回不锁定）。
+                let find_weight = weight("find_content");
+                score += find_weight + find_weight * coverage;
+                signals.push("find_content".to_owned());
+            } else if coverage >= 0.6 {
+                // 未形成完整子序列且年份冲突/无年份：给部分分（补召回不锁定），
+                // 避免真实存在的文件因词序差异在打分里被完全丢掉，但绝不靠它
+                // 锁定——年份冲突说明不是用户指的那一年。
+                score += weight("find_content") * 0.6 * coverage;
+                signals.push("find_content_partial".to_owned());
+            }
+        }
+    }
+
+    // 7.6 参考串定位：target.reference/document_name 描述串与文件名的「子序列
+    //     +二元组重合」匹配（非 FIND 的定位类 intent 通用）。
+    //     与 7.5 的分工：7.5 只服务 DOCUMENT_FIND（那里 content_query 就是用户
+    //     对文件的描述）；这里是用户对目标文件的描述（reference/document_name），
+    //     如「数据库系统工程师考试2020年上午真题」vs 真实文件名
+    //     「2020年数据库系统工程师考试上午真题（参考答案）」——词序不同（年份
+    //     位置）、存在插字，全串互含匹配失败，只有子序列+二元组重合能识别为
+    //     同一文档，且年份/上下午一致性是区分「同一年版本」与「其它年份/另一
+    //     会话文件」的通用信号（见 [`reordered_same_family`]）。描述过短（清洗
+    //     后 <6 字符）时可能只是概念名或内容词（「ACID」「事务特性」），不参与
+    //     定位，避免把无关文件的字符恰好按序命中而误加信号。
+    if input.plan.intent != QueryIntent::DocumentFind {
+        let reference = input
+            .plan
+            .target
+            .reference
+            .as_deref()
+            .unwrap_or("")
+            .trim();
+        let doc_name = input
+            .plan
+            .target
+            .document_name
+            .as_deref()
+            .unwrap_or("")
+            .trim();
+        // 取更完整的描述串（parser 不稳定时有时填 reference、有时填 document_name）。
+        let reference_desc = if reference.chars().count() >= doc_name.chars().count() {
+            reference
+        } else {
+            doc_name
+        };
+        let reference_desc = strip_target_stop_phrases(reference_desc);
+        let filename = input
+            .file_names
+            .get(&profile.file_id)
+            .map(String::as_str)
+            .unwrap_or("");
+        if reference_desc.chars().count() >= 6 && !filename.is_empty() {
+            let matched = is_subsequence(&reference_desc, filename);
+            let coverage = bigram_coverage(&reference_desc, filename);
+            if matched {
+                let reference_weight = weight("reference_match");
+                score += reference_weight + reference_weight * coverage;
+                signals.push("reference_match".to_owned());
+            } else if reordered_same_family(&reference_desc, filename) {
+                // 词序翻转但字符组成几乎一致且年份/上下午一致：同一文档。
+                let reference_weight = weight("reference_match");
+                score += reference_weight + reference_weight * coverage;
+                signals.push("reference_match".to_owned());
+            } else if coverage >= 0.6 {
+                // 未形成完整子序列且关键限定冲突/缺失：给部分分（补召回不锁定）。
+                score += weight("reference_match") * 0.6 * coverage;
+                signals.push("reference_match_partial".to_owned());
+            }
         }
     }
 
@@ -1007,6 +1469,338 @@ mod tests {
     }
 
     #[test]
+    fn find_content_query_locks_year_session_exam_paper() {
+        // FIND「2019年数据库下午的真题文件是哪个」：正确文件
+        // 「2019年上半年数据库系统工程师考试下午真题」靠 content_query 描述串的
+        // 子序列+二元组命中锁定；2023 备考集锦只剩 document_type 底分，绝不抢位。
+        let correct = profile(
+            Uuid::now_v7(),
+            Some(DocumentType::LearningMaterial),
+            "2019年上半年数据库系统工程师考试下午真题（参考答案）",
+        );
+        let wrong_a = profile(
+            Uuid::now_v7(),
+            Some(DocumentType::LearningMaterial),
+            "2023年数据库系统工程师备考知识点集锦",
+        );
+        let wrong_b = profile(
+            Uuid::now_v7(),
+            Some(DocumentType::LearningMaterial),
+            "2023年数据库系统工程师易混淆知识点",
+        );
+        let mut plan = resume_plan();
+        plan.intent = QueryIntent::DocumentFind;
+        plan.target.document_type = Some(DocumentType::LearningMaterial);
+        plan.content_query = Some("2019年数据库下午的真题文件".to_owned());
+        plan.filters.time = Some("2019".to_owned());
+        let session = AskSessionContext::default();
+        let mut file_names = HashMap::new();
+        for p in [&correct, &wrong_a, &wrong_b] {
+            file_names.insert(p.file_id, p.title.clone());
+        }
+        let input = ResolverInput::new(&plan, &session, vec![correct, wrong_a, wrong_b], file_names);
+        let resolution = resolve_documents(&input);
+        assert_eq!(resolution.status, ResolutionStatus::Resolved);
+        assert_eq!(resolution.resolved_file_ids.len(), 1);
+        let best = &resolution.candidates[0];
+        assert!(best.signals.iter().any(|s| s == "find_content"));
+    }
+
+    #[test]
+    fn find_content_trailing_question_residue_still_locks_unique_file() {
+        // 常见功能词干扰：FIND 描述末尾带裸疑问残词（「真题文件是哪个」里的
+        // 「哪个」、「真题是哪份」里的「哪份」）。组合停止词只收录了「哪个文件」
+        // 没收录裸「哪个/哪些/哪份/哪几」，残词会让子序列匹配在「真题」之后卡在
+        // 「哪」上失配、退化成弱一档的二元组覆盖率兜底。停止词表补齐裸疑问词后
+        // 描述收敛为「2019年数据库下午真题」，直接命中子序列、唯一锁定正确文件；
+        // 同时正确文件与「同年下午 vs 其它年」的竞争文件保持足够差距，不退化。
+        let correct = profile(
+            Uuid::now_v7(),
+            Some(DocumentType::LearningMaterial),
+            "2019年上半年数据库系统工程师考试下午真题（参考答案）",
+        );
+        let morning = profile(
+            Uuid::now_v7(),
+            Some(DocumentType::LearningMaterial),
+            "2019年上半年数据库系统工程师考试上午真题（参考答案）",
+        );
+        let other_year = profile(
+            Uuid::now_v7(),
+            Some(DocumentType::LearningMaterial),
+            "2020年数据库系统工程师考试下午真题（参考答案）",
+        );
+        let knowledge = profile(
+            Uuid::now_v7(),
+            Some(DocumentType::LearningMaterial),
+            "2023年数据库系统工程师备考知识点集锦",
+        );
+        let mut plan = resume_plan();
+        plan.intent = QueryIntent::DocumentFind;
+        plan.target.document_type = None;
+        plan.content_query = Some("2019年数据库下午的真题文件是哪个".to_owned());
+        let session = AskSessionContext::default();
+        let mut file_names = HashMap::new();
+        for p in [&correct, &morning, &other_year, &knowledge] {
+            file_names.insert(p.file_id, p.title.clone());
+        }
+        let input = ResolverInput::new(
+            &plan,
+            &session,
+            vec![correct.clone(), morning, other_year, knowledge],
+            file_names,
+        );
+        let correct_score = score_candidate(&input, &input.profiles[0]);
+        assert!(
+            correct_score.signals.iter().any(|s| s == "find_content"),
+            "清洗掉尾部疑问残词后必须命中完整 find_content: {:?}",
+            correct_score.signals
+        );
+        let resolution = resolve_documents(&input);
+        assert_eq!(resolution.status, ResolutionStatus::Resolved);
+        assert_eq!(resolution.resolved_file_ids, vec![correct.file_id]);
+    }
+
+    #[test]
+    fn find_resolves_from_content_query_when_parser_drops_target() {
+        // 真实 parser 输出：FIND 问句（r14「2019年数据库下午的真题文件是哪个」）
+        // 模型把文件描述放进 content_query、却把 reference/document_type/name 全
+        // 留空。target_is_empty 的 FIND 例外必须让 content_query 参与定位——
+        // find_content 信号（7.5）本就按「FIND 的 content_query 就是文件描述」
+        // 设计，早退会把它短路成「目标对象为空」。此测试锁定 r14 正确文件。
+        let correct = profile(
+            Uuid::now_v7(),
+            Some(DocumentType::LearningMaterial),
+            "2019年上半年数据库系统工程师考试下午真题（参考答案）",
+        );
+        let morning = profile(
+            Uuid::now_v7(),
+            Some(DocumentType::LearningMaterial),
+            "2019年上半年数据库系统工程师考试上午真题（参考答案）",
+        );
+        let other_year = profile(
+            Uuid::now_v7(),
+            Some(DocumentType::LearningMaterial),
+            "2020年数据库系统工程师考试下午真题（参考答案）",
+        );
+        let mut plan = resume_plan();
+        plan.intent = QueryIntent::DocumentFind;
+        plan.target.reference = None;
+        plan.target.document_type = None;
+        plan.target.document_name = None;
+        plan.target.entity_name = None;
+        plan.target.owner = None;
+        plan.content_query = Some("2019年数据库下午的真题文件".to_owned());
+        let session = AskSessionContext::default();
+        let mut file_names = HashMap::new();
+        for p in [&correct, &morning, &other_year] {
+            file_names.insert(p.file_id, p.title.clone());
+        }
+        let input = ResolverInput::new(
+            &plan,
+            &session,
+            vec![correct.clone(), morning, other_year],
+            file_names,
+        );
+        assert!(
+            !target_is_empty(&plan),
+            "FIND 的 content_query 必须构成定位依据，不得判空"
+        );
+        let resolution = resolve_documents(&input);
+        assert_eq!(resolution.status, ResolutionStatus::Resolved);
+        assert_eq!(resolution.resolved_file_ids, vec![correct.file_id]);
+        assert!(
+            resolution.candidates[0]
+                .signals
+                .iter()
+                .any(|s| s == "find_content"),
+            "正解必须靠 find_content 锁定: {:?}",
+            resolution.candidates[0].signals
+        );
+    }
+
+    #[test]
+    fn find_content_query_ignores_word_order_but_high_coverage_gets_partial() {
+        // 描述串与文件名词序不同且**年份冲突**（描述「数据库系统工程师考试2020年
+        // 上午真题」vs 文件「2021年数据库系统工程师考试上午真题」）：子序列失败、
+        // 二元组重合度高但年份不一致 → 部分分（find_content_partial）。部分分是
+        // 「补召回」不是「锁定」：分数仅 ~0.23（+owner 底分 0.05）远低于
+        // MEDIUM_CONFIDENCE_THRESHOLD，resolver 因此不错误锁定（Unresolved 退回
+        // 宽 scope 由检索层收敛），只保证真实存在的文件不会因词序差异在打分里被
+        // 完全丢掉——直接断言 score_candidate 的打分：年份冲突文件带
+        // find_content_partial 且分数明显高于共享词元少的无关文件。
+        //
+        // 注意：二元组重合是集合式度量（对词序不敏感），「2020年」与「2021年
+        // 上半年」两份文件共享全部内容二元组，覆盖率相同——部分分不承诺区分
+        // 年份，只承诺「正确内容词序翻转不丢失」。年份的精确区分由命中子序列的
+        // find_content 主路径（结合 filters.time）负责。
+        let correct = profile(
+            Uuid::now_v7(),
+            None,
+            "2021年数据库系统工程师考试上午真题（参考答案）",
+        );
+        let unrelated = profile(
+            Uuid::now_v7(),
+            None,
+            "教师资格考试综合素质真题",
+        );
+        let mut plan = resume_plan();
+        plan.intent = QueryIntent::DocumentFind;
+        plan.target.document_type = None;
+        plan.content_query = Some("数据库系统工程师考试2020年上午真题".to_owned());
+        let session = AskSessionContext::default();
+        let mut file_names = HashMap::new();
+        file_names.insert(correct.file_id, correct.title.clone());
+        file_names.insert(unrelated.file_id, unrelated.title.clone());
+        let input = ResolverInput::new(&plan, &session, vec![correct, unrelated], file_names);
+
+        let correct_score = score_candidate(&input, &input.profiles[0]);
+        let unrelated_score = score_candidate(&input, &input.profiles[1]);
+        assert!(
+            correct_score
+                .signals
+                .iter()
+                .any(|s| s == "find_content_partial"),
+            "词序翻转但高重合的描述必须触发部分分: {:?}",
+            correct_score.signals
+        );
+        assert!(
+            !unrelated_score
+                .signals
+                .iter()
+                .any(|s| s == "find_content_partial"),
+            "共享词元过少的无关文件不得触发部分分: {:?}",
+            unrelated_score.signals
+        );
+        assert!(
+            correct_score.score > unrelated_score.score,
+            "正确文件({:.3})应领先无关文件({:.3})",
+            correct_score.score,
+            unrelated_score.score
+        );
+
+        // 低置信度不锁定（部分分仅补召回），退回宽 scope。
+        let resolution = resolve_documents(&input);
+        assert_eq!(resolution.status, ResolutionStatus::Unresolved);
+    }
+
+    #[test]
+    fn find_content_session_conflict_does_not_lock_wrong_session() {
+        // r10 真实口径：FIND「我电脑里有数据库系统工程师2020年上午的真题吗」，
+        // content_query=「数据库系统工程师2020年上午的真题」。上午真题与下午真题
+        // 二元组重合度几乎打平（只差上/下字）、年份相同——会话门必须把下午卷
+        // 降级为 find_content_partial（补召回不锁定），让上午卷成为唯一锁定目标；
+        // 2023 备考集锦年份冲突、内容词元少，分数更低不构成竞争。
+        let morning = profile(
+            Uuid::now_v7(),
+            Some(DocumentType::LearningMaterial),
+            "2020年数据库系统工程师考试上午真题（参考答案）",
+        );
+        let afternoon = profile(
+            Uuid::now_v7(),
+            Some(DocumentType::LearningMaterial),
+            "2020年数据库系统工程师考试下午真题（参考答案）",
+        );
+        let knowledge = profile(
+            Uuid::now_v7(),
+            Some(DocumentType::LearningMaterial),
+            "2023年数据库系统工程师备考知识点集锦",
+        );
+        let mut plan = resume_plan();
+        plan.intent = QueryIntent::DocumentFind;
+        plan.target.document_type = None;
+        plan.content_query = Some("数据库系统工程师2020年上午的真题".to_owned());
+        let session = AskSessionContext::default();
+        let mut file_names = HashMap::new();
+        for p in [&morning, &afternoon, &knowledge] {
+            file_names.insert(p.file_id, p.title.clone());
+        }
+        let input = ResolverInput::new(
+            &plan,
+            &session,
+            vec![morning.clone(), afternoon.clone(), knowledge.clone()],
+            file_names,
+        );
+        let morning_score = score_candidate(&input, &input.profiles[0]);
+        let afternoon_score = score_candidate(&input, &input.profiles[1]);
+        let knowledge_score = score_candidate(&input, &input.profiles[2]);
+        assert!(
+            morning_score.signals.iter().any(|s| s == "find_content"),
+            "上午卷应命中完整 find_content: {:?}",
+            morning_score.signals
+        );
+        assert!(
+            afternoon_score.signals.iter().any(|s| s == "find_content_partial"),
+            "下午卷因会话冲突只能部分分: {:?}",
+            afternoon_score.signals
+        );
+        assert!(
+            !afternoon_score
+                .signals
+                .iter()
+                .any(|s| s == "find_content"),
+            "下午卷绝不得命中完整 find_content: {:?}",
+            afternoon_score.signals
+        );
+        assert!(
+            morning_score.score - afternoon_score.score >= HIGH_MARGIN,
+            "上午卷({:.3})与下午卷({:.3})差距应足以锁定",
+            morning_score.score,
+            afternoon_score.score
+        );
+        assert!(
+            afternoon_score.score > knowledge_score.score,
+            "下午卷({:.3})仍应领先知识集锦({:.3})（补召回）",
+            afternoon_score.score,
+            knowledge_score.score
+        );
+        let resolution = resolve_documents(&input);
+        assert_eq!(resolution.status, ResolutionStatus::Resolved);
+        assert_eq!(resolution.resolved_file_ids, vec![morning.file_id]);
+        assert!(resolution.candidates[0].signals.iter().any(|s| s == "find_content"));
+    }
+
+    #[test]
+    fn find_content_query_not_applied_to_document_qa() {
+        // 非 FIND intent：content_query 是正文问题，绝不参与目标定位——
+        // 「简历里有没有身份证号」的 content_query=身份证号 不影响锁定简历。
+        let resume = profile(
+            Uuid::now_v7(),
+            Some(DocumentType::Resume),
+            "大模型开发工程师-周晨",
+        );
+        let unrelated = profile(
+            Uuid::now_v7(),
+            Some(DocumentType::LearningMaterial),
+            "2019年上半年数据库系统工程师考试下午真题（参考答案）",
+        );
+        let mut plan = resume_plan();
+        plan.intent = QueryIntent::DocumentQa;
+        plan.content_query = Some("身份证号".to_owned());
+        let session = AskSessionContext::default();
+        let mut file_names = HashMap::new();
+        file_names.insert(resume.file_id, "大模型开发工程师-周晨.pdf".to_owned());
+        file_names.insert(
+            unrelated.file_id,
+            "2019年上半年数据库系统工程师考试下午真题（参考答案）.pdf".to_owned(),
+        );
+        let input = ResolverInput::new(
+            &plan,
+            &session,
+            vec![resume, unrelated],
+            file_names,
+        );
+        let resolution = resolve_documents(&input);
+        assert_eq!(resolution.status, ResolutionStatus::Resolved);
+        assert_eq!(resolution.resolved_file_ids.len(), 1);
+        let best = &resolution.candidates[0];
+        assert!(
+            !best.signals.iter().any(|s| s == "find_content"),
+            "DocumentQa 不得触发 find_content: {:?}",
+            best.signals
+        );
+    }
+
+    #[test]
     fn weights_are_configured_together() {
         // 可配置信号权重的健康检查：所有信号都在表里且为正权重
         let total: f32 = SIGNAL_WEIGHTS.iter().map(|(_, weight)| *weight).sum();
@@ -1120,6 +1914,162 @@ mod tests {
     }
 
     #[test]
+    fn precise_named_target_matches_versioned_file_prefix() {
+        // 模型精确点名简名，真实文件带版本前缀/后缀：内容族子串层应命中共进 scope。
+        let target_name = "人工智能面试宝典";
+        let real = Uuid::now_v7();
+        let similar = Uuid::now_v7();
+        let mut plan = resume_plan();
+        plan.target.document_type = None;
+        plan.target.reference = None;
+        plan.target.document_name = Some(target_name.to_owned());
+        plan.target.precise_named_document = true;
+        let session = AskSessionContext::default();
+        let mut file_names = HashMap::new();
+        file_names.insert(real, "1人工智能面试宝典_V6.6(20250606).pdf".to_owned());
+        file_names.insert(similar, "人工智能求职笔记.pdf".to_owned());
+        let docs = vec![
+            profile(real, None, "1人工智能面试宝典_V6.6(20250606).pdf"),
+            profile(similar, None, "人工智能求职笔记.pdf"),
+        ];
+        let input = ResolverInput::new(&plan, &session, docs, file_names);
+        let resolution = resolve_documents(&input);
+        assert_eq!(resolution.status, ResolutionStatus::Resolved);
+        assert_eq!(resolution.resolved_file_ids, vec![real]);
+        assert!(!resolution.resolved_file_ids.contains(&similar));
+    }
+
+    #[test]
+    fn precise_named_target_missing_name_falls_through_to_signals() {
+        // 精确点名落空但库内有同类型强信号文档：回退到通用评分，避免把真实存在
+        // 的文档误报为「不在库内」（年份/措辞与生成标题存在词序差异时）。
+        let mut plan = resume_plan();
+        plan.target.document_type = Some(DocumentType::LearningMaterial);
+        plan.target.reference = None;
+        plan.target.document_name = Some("数据库系统工程师考试2020年上午真题".to_owned());
+        plan.target.precise_named_document = true;
+        let session = AskSessionContext::default();
+        let real = Uuid::now_v7();
+        let docs = vec![profile(
+            real,
+            Some(DocumentType::LearningMaterial),
+            "2020年数据库系统工程师考试上午真题（参考答案）.pdf",
+        )];
+        let mut file_names = HashMap::new();
+        file_names.insert(real, "2020年数据库系统工程师考试上午真题（参考答案）.pdf".to_owned());
+        let input = ResolverInput::new(&plan, &session, docs, file_names);
+        let resolution = resolve_documents(&input);
+        assert_eq!(resolution.status, ResolutionStatus::Resolved);
+        assert_eq!(resolution.resolved_file_ids, vec![real]);
+    }
+
+    #[test]
+    fn precise_named_reordered_title_wins_over_type_matched_similar_docs() {
+        // r15 真实口径：parser 点名的标题与真实文件名词序不同（年份位置），
+        // 精确匹配第三层（二元组重合+年份/上下午门）必须把 2020 上午真题锁为
+        // 唯一目标；类型信号命中的 2023 知识点与同年下午卷都不得进精确 scope。
+        let target_name = "数据库系统工程师考试2020年上午真题";
+        let real = Uuid::now_v7();
+        let wrong_year = Uuid::now_v7();
+        let wrong_session = Uuid::now_v7();
+        let similar_type = Uuid::now_v7();
+        let mut plan = resume_plan();
+        plan.target.document_type = Some(DocumentType::LearningMaterial);
+        plan.target.reference = None;
+        plan.target.document_name = Some(target_name.to_owned());
+        plan.target.precise_named_document = true;
+        let session = AskSessionContext::default();
+        // 真实库里 2020 上午真题被分类器标成 spreadsheet（类型信号完全不命中）。
+        let docs = vec![
+            profile(real, Some(DocumentType::Spreadsheet), "2020年数据库系统工程师考试上午真题（参考答案）.pdf"),
+            profile(wrong_year, Some(DocumentType::Spreadsheet), "2019年上半年数据库系统工程师考试上午真题（参考答案）.pdf"),
+            profile(wrong_session, Some(DocumentType::Spreadsheet), "2020年数据库系统工程师考试下午真题（参考答案）.pdf"),
+            profile(similar_type, Some(DocumentType::LearningMaterial), "2023年数据库系统工程师备考知识点集锦.pdf"),
+        ];
+        let mut file_names = HashMap::new();
+        file_names.insert(real, "2020年数据库系统工程师考试上午真题（参考答案）.pdf".to_owned());
+        file_names.insert(wrong_year, "2019年上半年数据库系统工程师考试上午真题（参考答案）.pdf".to_owned());
+        file_names.insert(wrong_session, "2020年数据库系统工程师考试下午真题（参考答案）.pdf".to_owned());
+        file_names.insert(similar_type, "2023年数据库系统工程师备考知识点集锦.pdf".to_owned());
+        let input = ResolverInput::new(&plan, &session, docs, file_names);
+        let resolution = resolve_documents(&input);
+        assert_eq!(resolution.status, ResolutionStatus::Resolved);
+        assert_eq!(resolution.resolved_file_ids, vec![real]);
+        // 精确路径命中 → 第一候选带 precise 信号，且绝不含 2019/下午/知识点。
+        assert!(
+            resolution.candidates[0]
+                .signals
+                .iter()
+                .any(|signal| signal == "precise_named_document")
+        );
+    }
+
+    #[test]
+    fn reference_desc_subsequence_locks_reordered_target_when_precise_false() {
+        // r15 的 parser 不稳定口径：目标描述被放进 reference（precise=false），
+        // 且与真实文件名词序不同。通用打分的 reference_match 信号（子序列+
+        // 二元组重合+年份/上下午门）必须把 2020 上午真题锁为唯一目标。
+        let target_reference = "数据库系统工程师考试2020年上午真题";
+        let real = Uuid::now_v7();
+        let wrong_year = Uuid::now_v7();
+        let wrong_session = Uuid::now_v7();
+        let mut plan = resume_plan();
+        plan.target.document_type = None;
+        plan.target.document_name = None;
+        plan.target.reference = Some(target_reference.to_owned());
+        plan.target.precise_named_document = false;
+        plan.target.owner = Some("self".to_owned());
+        let session = AskSessionContext::default();
+        let docs = vec![
+            profile(real, None, "2020年数据库系统工程师考试上午真题（参考答案）.pdf"),
+            profile(wrong_year, None, "2019年上半年数据库系统工程师考试上午真题（参考答案）.pdf"),
+            profile(wrong_session, None, "2020年数据库系统工程师考试下午真题（参考答案）.pdf"),
+        ];
+        let mut file_names = HashMap::new();
+        file_names.insert(real, "2020年数据库系统工程师考试上午真题（参考答案）.pdf".to_owned());
+        file_names.insert(wrong_year, "2019年上半年数据库系统工程师考试上午真题（参考答案）.pdf".to_owned());
+        file_names.insert(wrong_session, "2020年数据库系统工程师考试下午真题（参考答案）.pdf".to_owned());
+        let input = ResolverInput::new(&plan, &session, docs, file_names);
+        let resolution = resolve_documents(&input);
+        assert_eq!(resolution.status, ResolutionStatus::Resolved);
+        assert_eq!(resolution.resolved_file_ids, vec![real]);
+        let best = &resolution.candidates[0];
+        assert!(
+            best.signals.iter().any(|signal| signal == "reference_match"),
+            "应命中 reference_match 信号: {:?}",
+            best.signals
+        );
+        // 错误年份/会话的文件只拿到部分分或 0，不构成锁定竞争。
+        assert!(
+            resolution
+                .candidates
+                .iter()
+                .any(|candidate| candidate.file_id == real)
+        );
+    }
+
+    #[test]
+    fn concept_reference_does_not_participate_in_locating() {
+        // 概念名/内容词放进 reference（如 parser 把「事务的ACID特性」当目标）
+        // 时，不得对任何文件名产生定位信号（文件名不含其字符，子序列/二元组
+        // 重合均为 0，只可能拿到 owner 底分、进不了候选）。
+        let mut plan = resume_plan();
+        plan.target.document_type = None;
+        plan.target.document_name = None;
+        plan.target.reference = Some("事务的ACID特性".to_owned());
+        plan.target.precise_named_document = false;
+        let session = AskSessionContext::default();
+        let unrelated = profile(Uuid::now_v7(), None, "2020年数据库系统工程师考试上午真题（参考答案）.pdf");
+        let mut file_names = HashMap::new();
+        file_names.insert(unrelated.file_id, "2020年数据库系统工程师考试上午真题（参考答案）.pdf".to_owned());
+        let input = ResolverInput::new(&plan, &session, vec![unrelated], file_names);
+        let resolution = resolve_documents(&input);
+        // 没有任何可定位信号 → Unresolved（退回宽 scope 或诚实拒答，不误锁）。
+        assert_eq!(resolution.status, ResolutionStatus::Unresolved);
+        assert!(resolution.resolved_file_ids.is_empty());
+    }
+
+    #[test]
     fn precise_named_target_folds_copy_suffix_into_content_family() {
         // 模型驱动精确定位：用户点名主名（无副本序号）时，`_1` 副本序号是被
         // 点名的同一内容族，应一并进 scope；但绝不会把相近但不同名的文档混入。
@@ -1160,6 +2110,72 @@ mod tests {
         assert!(
             !resolution.resolved_file_ids.contains(&similar.file_id),
             "相近但不同名的文档绝不进精确 scope"
+        );
+    }
+
+    #[test]
+    fn partial_target_uses_profile_header_to_reject_identity_conflicts() {
+        let correct_id = Uuid::now_v7();
+        let wrong_session_id = Uuid::now_v7();
+        let wrong_year_id = Uuid::now_v7();
+        let mut correct = profile(correct_id, None, "2031年上.pdf");
+        correct.summary = "2031 年云平台认证考试试题 上午卷 考生须知".to_owned();
+        correct.keywords = vec!["2031".to_owned()];
+        let mut wrong_session = profile(wrong_session_id, None, "2031年下午卷.pdf");
+        wrong_session.summary = "2031 年云平台认证考试试题 下午卷 考生须知".to_owned();
+        wrong_session.keywords = vec!["2031".to_owned()];
+        let mut wrong_year = profile(wrong_year_id, None, "2030年上午卷.pdf");
+        wrong_year.summary = "2030 年云平台认证考试试题 上午卷 考生须知".to_owned();
+        wrong_year.keywords = vec!["2030".to_owned()];
+
+        let mut plan = resume_plan();
+        plan.target.document_type = None;
+        plan.target.reference = Some("2031年的云平台认证上午试卷".to_owned());
+        plan.target.document_name = Some("上午试卷".to_owned());
+        plan.target.precise_named_document = false;
+        let session = AskSessionContext::default();
+        let mut file_names = HashMap::new();
+        file_names.insert(correct_id, "2031年上.pdf".to_owned());
+        file_names.insert(wrong_session_id, "2031年下午卷.pdf".to_owned());
+        file_names.insert(wrong_year_id, "2030年上午卷.pdf".to_owned());
+        let input = ResolverInput::new(
+            &plan,
+            &session,
+            vec![correct, wrong_session, wrong_year],
+            file_names,
+        );
+
+        let resolution = resolve_documents(&input);
+        assert_eq!(resolution.status, ResolutionStatus::Resolved);
+        assert_eq!(resolution.resolved_file_ids, vec![correct_id]);
+        assert!(
+            resolution
+                .candidates
+                .iter()
+                .all(|candidate| candidate.file_id != wrong_session_id
+                    && candidate.file_id != wrong_year_id),
+            "年份或卷次冲突的候选不得进入目标 scope"
+        );
+    }
+
+    #[test]
+    fn ambiguous_profile_header_does_not_create_a_false_identity_conflict() {
+        let candidate_id = Uuid::now_v7();
+        let mut candidate = profile(candidate_id, None, "认证资料汇编.pdf");
+        candidate.summary = "2031 年认证资料，包含上午卷与下午卷的统一说明".to_owned();
+        let mut plan = resume_plan();
+        plan.target.document_type = None;
+        plan.target.reference = Some("2031年的云平台认证上午试卷".to_owned());
+        plan.target.document_name = Some("上午试卷".to_owned());
+        plan.target.precise_named_document = false;
+        let session = AskSessionContext::default();
+        let mut file_names = HashMap::new();
+        file_names.insert(candidate_id, "认证资料汇编.pdf".to_owned());
+        let input = ResolverInput::new(&plan, &session, vec![candidate.clone()], file_names);
+
+        assert!(
+            !target_identity_conflicts(&input, &candidate),
+            "摘要同时出现两个卷次时必须保持未知，不能硬拒绝候选"
         );
     }
 }

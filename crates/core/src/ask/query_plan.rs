@@ -267,6 +267,11 @@ pub struct QueryPlan {
     pub requires_document_resolution: bool,
     /// 为 true 时必须读取整份文档结构（DOCUMENT_SUMMARY），不能只拿 top-3 chunk
     pub requires_full_document: bool,
+    /// 整文问句的具体类型：true = 结构枚举大纲（「分了哪些章节/讲了哪几章」，
+    /// 只要章节标题串，走 get_outline）；false = 整文内容摘要（「写了什么内容/
+    /// 总结一下」）。由 Query Parser 升级 DocumentSummary 时据问句语义判定。
+    #[serde(default)]
+    pub structure_enumeration: bool,
     pub confidence: f32,
 }
 
@@ -285,6 +290,7 @@ impl Default for QueryPlan {
             filters: QueryFilters::default(),
             requires_document_resolution: false,
             requires_full_document: false,
+            structure_enumeration: false,
             confidence: 0.0,
         }
     }

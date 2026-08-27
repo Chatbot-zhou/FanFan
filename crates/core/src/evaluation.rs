@@ -2017,6 +2017,24 @@ fn aggregate_ask_metrics(results: &[&EvaluationResultRecord]) -> serde_json::Val
         serde_json::Value::from(fraction(grounded_hits, grounded_denominator)),
     );
     output.insert("case_count".into(), serde_json::Value::from(results.len()));
+    // 引用定位覆盖率均值：证据 citation 里具备可用定位（页/行等）的比例。
+    let locator_values = results
+        .iter()
+        .filter_map(|result| {
+            let metrics = result.metrics.as_object().cloned().unwrap_or_default();
+            metrics
+                .contains_key("evidence_location_coverage")
+                .then(|| metric_fraction(&metrics, "evidence_location_coverage"))
+        })
+        .collect::<Vec<_>>();
+    if !locator_values.is_empty() {
+        output.insert(
+            "evidence_location_coverage".into(),
+            serde_json::Value::from(
+                locator_values.iter().sum::<f64>() / locator_values.len() as f64,
+            ),
+        );
+    }
     serde_json::Value::Object(output)
 }
 
@@ -2588,21 +2606,87 @@ fn typo_variant(word: &str) -> Option<String> {
     Some(variant.into_iter().collect())
 }
 
-/// 有信息量的证据句：第一个长度在 8..=120 字符的 chunk 规范化。
-fn evidence_snippet(chunks: &[String]) -> Option<String> {
-    chunks
-        .iter()
-        .map(|chunk| chunk.split_whitespace().collect::<Vec<_>>().join(" "))
-        .find(|text| (8..=120).contains(&text.chars().count()))
-        .map(|text| {
-            if text.chars().count() > 120 {
-                text.chars().take(120).collect()
-            } else {
-                text
-            }
-        })
+/// 把原始 chunk 归一化：合并空白、去首尾空白，得到可比较的规范句。
+fn normalize_evidence_chunk(chunk: &str) -> String {
+    chunk.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// 内容反查文件用例的证据句必须对目标文件具备区分度。
+///
+/// 返回目标文件在长度 8..=120 的规范 chunk 中，第一个**不在语料中任何其它文件
+/// chunk 里出现**的句子。页脚/水印等多文件通用文案（如「内部资料，禁止传播」）
+/// 会让「在哪份文档里提到了 X」无法唯一对应某个文件，属于病态 gold；找不到
+/// 有区分度的句子时返回 `None`，由调用方跳过该用例。规则仅基于跨文件区分度，
+/// 不做任何具体关键词/文件特判。
+fn discriminative_evidence_snippet(
+    files: &[EvaluationCorpusFile],
+    target: &EvaluationCorpusFile,
+) -> Option<String> {
+    // 其它文件所有规范 chunk 的平面集合，用于区分度判定。
+    let mut other_chunks = Vec::<String>::new();
+    for file in files.iter() {
+        if file.file_id == target.file_id {
+            continue;
+        }
+        other_chunks.extend(
+            file.text_chunks
+                .iter()
+                .map(|chunk| normalize_evidence_chunk(chunk)),
+        );
+    }
+    for chunk in &target.text_chunks {
+        let text = normalize_evidence_chunk(chunk);
+        let chars = text.chars().count();
+        if !(8..=120).contains(&chars) {
+            continue;
+        }
+        // 任何其它文件 chunk 里出现该句子 → 句子不能唯一定位本文件，跳过。
+        if other_chunks.iter().any(|other| other.contains(&text)) {
+            continue;
+        }
+        return Some(if chars > 120 {
+            text.chars().take(120).collect()
+        } else {
+            text
+        });
+    }
+    None
+}
+
+fn existence_term_from_text(chunks: &[String]) -> Option<String> {
+    let mut seen = HashSet::<String>::new();
+    for chunk in chunks {
+        for token in chunk.split(|character: char| {
+            !(character.is_alphanumeric() || matches!(character, '_' | '-' | '.'))
+        }) {
+            let term = token.trim_matches(|character: char| matches!(character, '_' | '-' | '.'));
+            if is_degenerate_keyword(term) || term.chars().count() > 30 {
+                continue;
+            }
+            let normalized = term.to_ascii_lowercase();
+            if !seen.insert(normalized) {
+                continue;
+            }
+            if existence_term_has_signal(term) {
+                return Some(term.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn existence_term_has_signal(term: &str) -> bool {
+    let has_letter = term.chars().any(|character| character.is_alphabetic());
+    let has_digit = term.chars().any(|character| character.is_ascii_digit());
+    let has_separator = term
+        .chars()
+        .any(|character| matches!(character, '_' | '-' | '.'));
+    let has_ascii = term
+        .chars()
+        .any(|character| character.is_ascii_alphabetic());
+    let has_non_ascii = term.chars().any(|character| !character.is_ascii());
+    has_letter && (has_digit || has_separator || has_ascii || has_non_ascii)
+}
 /// 判断关键词是否适合作为检索/集合评测的检索词。
 ///
 /// 过短（<3 字符）或纯数字的关键词缺乏区分度：用它生成的用例要么命中
@@ -2660,8 +2744,8 @@ fn generate_search_cases(
                 "模糊标题检索",
             ));
         }
-        // 内容反查文件
-        if let Some(snippet) = evidence_snippet(&file.text_chunks) {
+        // 内容反查文件：仅在该文件存在跨语料唯一的证据句时生成（病态 gold 过滤）。
+        if let Some(snippet) = discriminative_evidence_snippet(files, file) {
             cases.push(search_case(
                 file,
                 format!("search-content-{file_id}"),
@@ -2780,18 +2864,20 @@ fn generate_ask_cases(
         // 过滤退化关键词（<3 字符或纯数字，如 "og"/"Co"/"1002"）：它们缺乏
         // 区分度，且 embedding/FTS 无法为「2 字符子串」提供可靠召回，生成
         // 的布尔问题不是真实用户会问的形态，属于退化用例。
-        if let Some(keyword) = file
+        let existence_term = file
             .keywords
             .iter()
             .find(|keyword| !is_degenerate_keyword(keyword) && file.contains(keyword))
-        {
+            .cloned()
+            .or_else(|| existence_term_from_text(&file.text_chunks));
+        if let Some(keyword) = existence_term {
             cases.push(ask_case(
                 file,
                 format!("ask-boolean-{file_id}"),
                 format!("《{title}》里提到了“{keyword}”吗？"),
                 "boolean_existence",
                 "yes_no",
-                &format!("关键词“{keyword}”出现在文档文本中，作为 Gold Evidence"),
+                &format!("词元“{keyword}”出现在文档文本中，作为 Gold Evidence"),
             ));
         }
         // EXTRACT：仅对出现在文本中的实体生成（可验证）
@@ -3072,6 +3158,11 @@ pub struct EvaluationObservation {
     pub retrieval_latency_ms: Option<u64>,
     #[serde(default)]
     pub generation_latency_ms: Option<u64>,
+    /// ASK：引用证据中具备可用定位（PDF 页 / 文本行 / 幻灯片 / 工作表 / 段落）
+    /// 的 locator 占比。用于衡量「点击引用 → 定位到对应页/段落」的可用性，
+    /// 不设硬门禁，仅作通用观测。基于去重后的证据 chunk 统计，不做任何文件特判。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_location_coverage: Option<f64>,
     #[serde(default)]
     pub model_fingerprint: Option<String>,
     #[serde(default)]
@@ -3272,6 +3363,12 @@ pub fn evaluate_case_verdict(
                 "expected_source".into(),
                 serde_json::Value::from(case.expected_source.clone().unwrap_or_default()),
             );
+            if let Some(coverage) = observation.evidence_location_coverage {
+                metrics.insert(
+                    "evidence_location_coverage".into(),
+                    serde_json::Value::from(coverage),
+                );
+            }
             let expected_files = case.expected_file_ids.clone().unwrap_or_default();
             let expected_cited = !expected_files.is_empty()
                 && expected_files.iter().any(|file_id| {
@@ -3873,6 +3970,31 @@ mod tests {
         assert_eq!(error.code, "EVALUATION_DATASET_VERSION_REQUIRED");
     }
 
+    #[test]
+    fn generated_existence_case_falls_back_to_real_text_terms() {
+        let corpus = vec![EvaluationCorpusFile {
+            file_id: "file-1".into(),
+            display_name: "project-note.md".into(),
+            document_type: Some("markdown".into()),
+            title: "Project Note".into(),
+            summary: "A project note without profile keywords".into(),
+            keywords: Vec::new(),
+            entities: Vec::new(),
+            section_titles: Vec::new(),
+            text_chunks: vec!["ProjectAlpha-2026 rollout plan keeps staged review markers.".into()],
+            content_sha256: None,
+            modified_at: None,
+        }];
+
+        let cases = generate_evaluation_dataset(&corpus, &DatasetGenerationOptions::default())
+            .expect("dataset");
+        let existence = cases
+            .iter()
+            .find(|case| case.expected_intent.as_deref() == Some("boolean_existence"))
+            .expect("existence case from text term");
+        assert!(existence.question_or_request.contains("ProjectAlpha-2026"));
+        assert_eq!(existence.expected_answer_shape.as_deref(), Some("yes_no"));
+    }
     fn batched_positive_case(index: usize, split: &str) -> EvaluationCaseRecord {
         let file_id = format!("00000000-0000-7000-8000-{index:012}");
         EvaluationCaseRecord {

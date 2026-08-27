@@ -96,19 +96,28 @@ pub fn build_document_sections(
     let mut current_title: Option<String> = None;
     let mut title_seen = 0_usize;
     for chunk in chunks {
-        let heading = node_heading_paths
+        // 标题来源：结构 `heading_path` 优先；缺失时从正文首行兜底识别标题行。
+        // 兜底保证「无 heading_path 的 OCR/纯文本文档」大纲能列出真实章节标题，
+        // 而不是全部退化成「未命名内容」。通用句式判定，不针对具体文件/case。
+        let struct_heading = node_heading_paths
             .get(&chunk.node_id)
             .and_then(|path| path.iter().last())
             .filter(|text| !text.trim().is_empty())
             .map(|text| text.trim().to_owned());
+        let heading = struct_heading
+            .clone()
+            .or_else(|| extract_heading_candidate(&chunk.text));
         let heading_key = heading.as_deref().unwrap_or("").trim().to_ascii_lowercase();
         let split_oversize = sections
             .last()
             .is_some_and(|section| section.char_count() >= max_section_chars);
-        let new_section = split_oversize
-            || sections
-                .last()
-                .is_none_or(|section| section.heading_key != heading_key);
+        // 新节触发：首 chunk；超长拆分；或「有标题信号且标题键发生变化」。
+        // 无标题正文 chunk 并入当前节（不因 heading_key 为空而另开「未命名」节），
+        // 消除「标题节 + 未命名节」交错，保证正文标题能聚合为一条章节线。
+        let new_section = sections.is_empty()
+            || split_oversize
+            || (heading.is_some()
+                && sections.last().is_some_and(|section| section.heading_key != heading_key));
         if new_section {
             let base_title = heading.clone().unwrap_or_else(|| "未命名内容".to_owned());
             if !split_oversize || heading.is_some() {
@@ -136,6 +145,200 @@ pub fn build_document_sections(
             .push(chunk.clone());
     }
     sections
+}
+
+/// 从 chunk 正文首行尝试提取「章节标题行」（无结构 heading_path 时的兜底）。
+///
+/// 动机：OCR/纯文本派生文档的 `document_nodes.heading_path` 常为全空结构，导致
+/// `build_document_sections` 只能产出「未命名内容」，大纲/结构枚举无法给出真实
+/// 章节。这类文档常用「编号 / 章节标记」行作标题（如「1. 现状」「2.1 原理」
+/// 「第3章 部署」「一、背景」）。本函数从该 chunk 首行判断是否为标题：特征为
+/// 首行、较短、不以句末标点结尾、且带编号或章节词信号。无标记的普通正文段落
+/// 不认，避免误切分。只做通用句式判定，不针对任何具体文件/关键词/case 特判。
+fn extract_heading_candidate(text: &str) -> Option<String> {
+    let first_line = text.lines().next()?.trim();
+    if first_line.is_empty() {
+        return None;
+    }
+    // 1) 行内章节标题兜底（先于整行判定，长正文行同样适用）：OCR/纯文本速记文档常把
+    //    「第N 章 <标题>」内嵌在正文行中而不是单独成行，整行判定无法命中。命中且
+    //    标题被强约束收尾时，直接返回提取出的标题。
+    if let Some(title) = extract_inline_chapter_title(first_line) {
+        return Some(title);
+    }
+    // 2) 整行标题判定（原逻辑）：较短、不以句末标点结尾、带编号/章节词信号。
+    //    标题行一般较短（含符号 2..=48 字符）；超长行视作正文段落。
+    let char_count = first_line.chars().count();
+    if !(2..=48).contains(&char_count) {
+        return None;
+    }
+    // 标题通常不以句末标点结尾（。！？；…），正文成句才带句号。
+    if first_line.ends_with(['。', '！', '？', '；', '.', '，']) {
+        return None;
+    }
+    if has_heading_signal(first_line) {
+        Some(first_line.to_owned())
+    } else {
+        None
+    }
+}
+
+/// 行内章节标题的硬边界：标题命中这些符号即视为在此终止（强约束，避免把正文章节
+/// 引用误判成标题）。
+const INLINE_TITLE_ENDERS: &[char] = &[
+    '●', '■', '◆', '○', '·', '・', '、', '。', '；', '！', '？', '．', '，', '｜', '/', '|',
+    '：', ':',
+];
+
+/// 中文数字（合数用，用于「第<编号> 章」的编号判定）。
+fn is_cjk_numerical(c: char) -> bool {
+    matches!(
+        c,
+        '一' | '二'
+            | '三'
+            | '四'
+            | '五'
+            | '六'
+            | '七'
+            | '八'
+            | '九'
+            | '十'
+            | '百'
+            | '千'
+            | '万'
+    )
+}
+
+/// 从正文行内提取强约束的章节标题（无结构 heading_path 时的行内兜底）。
+///
+/// 动机：OCR/纯文本速记文档的 `document_nodes.heading_path` 常为全空结构，且章节
+/// 标题常嵌在正文行中间（如「备考精华第1 章计算机硬件基础 CPU 中的相关组件」），
+/// `has_heading_signal` 的整行判定无法命中，大纲只能退化为「未命名内容」。
+/// 本函数扫描行内「第<编号> 章」标记，读取紧跟其后的章节标题，并仅当标题被
+/// **硬边界**（项目符号 / 句末标点 / 行尾）或 **ASCII 字母**（正文常以英文缩写
+/// 起步，如「CPU 中的相关组件」）收尾时才返回——强约束，正文里「详见第5 章…」
+/// 这类引用不命中；标题长度上限 `MAX_INLINE_TITLE_CHARS`（超出判为正文）。通用
+/// 句式判定，不针对任何具体文件/关键词/case。
+fn extract_inline_chapter_title(line: &str) -> Option<String> {
+    const MAX_INLINE_TITLE_CHARS: usize = 14;
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] != '第' {
+            i += 1;
+            continue;
+        }
+        // 编号：阿拉伯数字或中文数字，其间允许空白（如「第1 章」「第十二 章」）。
+        let mut j = i + 1;
+        let mut found_digit = false;
+        while j < chars.len()
+            && (chars[j].is_ascii_digit() || is_cjk_numerical(chars[j]) || chars[j] == ' ')
+        {
+            if chars[j] != ' ' {
+                found_digit = true;
+            }
+            j += 1;
+        }
+        if !found_digit {
+            i += 1;
+            continue;
+        }
+        // 跳过编号后空白，必须紧跟「章」单位。
+        while j < chars.len() && chars[j] == ' ' {
+            j += 1;
+        }
+        if j >= chars.len() || chars[j] != '章' {
+            i += 1;
+            continue;
+        }
+        j += 1;
+        // 跳过标题前空白。
+        while j < chars.len() && chars[j] == ' ' {
+            j += 1;
+        }
+        // 读取有界标题：字母/汉字（不含空白与符号），上限 `MAX_INLINE_TITLE_CHARS`。
+        let mut title: Vec<char> = Vec::new();
+        while j < chars.len() && title.len() < MAX_INLINE_TITLE_CHARS && chars[j].is_alphabetic() {
+            title.push(chars[j]);
+            j += 1;
+        }
+        if title.len() < 2 {
+            i += 1;
+            continue;
+        }
+        // 标题终止语境判定（强约束）：
+        // - 行尾：可接受；
+        // - 硬边界符号：可接受；
+        // - 空白后接 ASCII 字母（英文缩写起步的正文）或硬边界或行尾：可接受；
+        // - 其余（空白后接汉字、标题被上限截断等）：不置信，跳过此标记。
+        let accept = if j >= chars.len() {
+            true
+        } else {
+            let nc = chars[j];
+            if INLINE_TITLE_ENDERS.contains(&nc) {
+                true
+            } else if nc == ' ' {
+                let after = chars[j..]
+                    .iter()
+                    .copied()
+                    .find(|c| *c != ' ')
+                    .unwrap_or(' ');
+                chars[j..].iter().all(|c| *c == ' ')
+                    || INLINE_TITLE_ENDERS.contains(&after)
+                    || after.is_ascii_alphabetic()
+            } else {
+                false
+            }
+        };
+        if accept {
+            return Some(title.into_iter().collect());
+        }
+        // 该标记不能被置信，继续向后查找下一个「第」。
+        i += 1;
+    }
+    None
+}
+
+/// 标题行「信号」判定：带编号前缀或章节词前缀。
+fn has_heading_signal(line: &str) -> bool {
+    let line = line.trim_start();
+    // 1) 章节词前缀：「第<编号><章|节|部分|篇|讲|回>」。
+    //    「第」必须后接数字（阿拉伯或中文）再跟章节单位，避免「第一步先…」级正文误判。
+    if let Some(rest) = line.strip_prefix('第') {
+        let rest = rest.trim_start();
+        let digit_run: String = rest
+            .chars()
+            .take_while(|c| {
+                c.is_ascii_digit()
+                    || matches!(c, '一'|'二'|'三'|'四'|'五'|'六'|'七'|'八'|'九'|'十'|'百'|'千'|'万')
+            })
+            .collect();
+        if !digit_run.is_empty() {
+            let after = rest[digit_run.len()..].trim_start();
+            const CHAPTER_UNITS: &[&str] = &["章", "节", "部分", "篇", "讲", "回"];
+            if CHAPTER_UNITS.iter().any(|unit| after.starts_with(unit)) {
+                return true;
+            }
+        }
+        // 固定的具名章节词。
+        const NAMED_SECTIONS: &[&str] = &["附录", "前言", "目录", "绪论", "结语", "导言", "后记", "引言"];
+        return NAMED_SECTIONS.iter().any(|named| line.starts_with(named));
+    }
+    // 2) 编号前缀：阿拉伯数字（如「1」「1.1」「2-1」）后跟分隔符/空白；或中文序号
+    //    「一、」「（一）」。
+    if let Some(first) = line.chars().next() {
+        if first.is_ascii_digit() {
+            return true;
+        }
+        if matches!(first, '一'|'二'|'三'|'四'|'五'|'六'|'七'|'八'|'九'|'十') {
+            let after = line[first.len_utf8()..].trim_start();
+            return after.starts_with('、') || after.starts_with('．') || after.starts_with('.');
+        }
+        if first == '（' || first == '(' {
+            return true;
+        }
+    }
+    false
 }
 
 /// 节数超过 `max_sections` 时，把尾部小节并入「其余内容」一节（保留分节边界）。
@@ -313,6 +516,76 @@ pub fn parse_section_summaries(raw: &str) -> Vec<SectionSummary> {
             })
         })
         .collect()
+}
+
+/// 把模型产出的摘要批次对齐到输入小节（保持小节顺序）。
+///
+/// 背景：无结构化标题的文档会把整段正文按长度拆成多节「未命名内容」，
+/// 标题键在批次内重复，纯标题匹配会互相挤占、大量回退为节内摘录
+/// （r31 实测 5/10 批次回退）。这里采用「唯一标题优先 + 位置补齐」：
+/// - 标题键在批次内唯一的节，优先按标题精确/基准键匹配（结构化文档主路径）；
+/// - 其余（重复标题或唯一键未命中）按模型输出顺序位置补齐——模型被要求
+///   按输入顺序逐节输出，顺序本身即最可靠的对应关系。
+/// 仍对不上的节（模型少输出/解析丢项）回退为确定性节内摘录。
+///
+/// 返回 `(digests, fallback_count)`，`digests` 与 `sections` 一一对应。
+pub fn match_section_digests(
+    sections: &[DocumentSection],
+    parsed: Vec<SectionSummary>,
+    fallback_chars: usize,
+) -> (Vec<SectionSummary>, usize) {
+    // 标题键在批次内的出现次数：唯一键才走标题匹配，重复键视为不可靠标题。
+    let mut key_counts = HashMap::<String, usize>::new();
+    for section in sections {
+        let key = section.title.trim().to_ascii_lowercase();
+        *key_counts.entry(key).or_insert(0) += 1;
+    }
+    // 模型输出顺序保留在 pool 中，标题命中时从 pool 移除，避免重复占用。
+    let mut pool = parsed;
+    let mut matched = Vec::<Option<SectionSummary>>::with_capacity(sections.len());
+    for section in sections {
+        let key = section.title.trim().to_ascii_lowercase();
+        let base_key = key
+            .trim_end_matches(|ch: char| ch.is_ascii_digit())
+            .trim_end_matches("（续")
+            .trim();
+        let unique = key_counts.get(&key).copied().unwrap_or(0) == 1;
+        let digest = if unique {
+            pool.iter()
+                .position(|digest| {
+                    let dk = digest.title.trim().to_ascii_lowercase();
+                    dk == key || dk == base_key
+                })
+                .map(|pos| pool.remove(pos))
+        } else {
+            None
+        };
+        matched.push(digest);
+    }
+    // 未按标题匹配上的节按模型输出顺序位置补齐（先进先出）。
+    let mut digests = Vec::with_capacity(sections.len());
+    let mut fallbacks = 0_usize;
+    for (section, digest) in sections.iter().zip(matched) {
+        let digest = digest.or_else(|| (!pool.is_empty()).then(|| pool.remove(0)));
+        match digest {
+            Some(digest) => digests.push(digest),
+            None => {
+                fallbacks += 1;
+                digests.push(SectionSummary {
+                    title: section.title.clone(),
+                    summary: compact_text(&section.text(), fallback_chars),
+                    key_points: Vec::new(),
+                });
+            }
+        }
+    }
+    (digests, fallbacks)
+}
+
+/// 折叠空白后按字符数截断的确定性压缩（确定性节内摘录回退用）。
+fn compact_text(value: &str, limit: usize) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    normalized.chars().take(limit).collect()
 }
 
 /// 宽容解析文档总览：剥围栏取首个 JSON 对象；失败返回 None。

@@ -5,8 +5,8 @@
 //! 「本地 llama.cpp(GGUF) 子进程」迁移到**本机 Ollama**（`/api/chat`）。
 //!
 //! 迁移原则：
-//! - 保持 [LocalGenerationRuntime] 类型名、构造器与公共方法签名不变，
-//!   上层调用零改动；`activate(model_path, ...)` 的 `model_path` 语义改为
+//! - 保持 [LocalGenerationRuntime] 类型名与主要调用契约；`activate(model_path, ...)`
+//!   的 `model_path` 语义改为
 //!   **Ollama 模型 tag**（如 `qwen3.5:2b`）。
 //! - 生成与视觉均走 `ollama.chat`；视觉复用同一模型（图像能力），不再需要
 //!   独立的 GGUF + mmproj 投影组件。
@@ -48,23 +48,6 @@ pub struct RuntimeModelPlacement {
     pub total_bytes: u64,
 }
 
-/// 一次生成激活的结果（沿用原契约，字段不变）。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct GenerationActivation {
-    pub backend: String,
-    pub model_path: String,
-    pub context_size: u32,
-    pub self_test: String,
-    pub multimodal: bool,
-    pub device: Option<String>,
-    pub threads: u32,
-    pub gpu_layers: Option<u32>,
-    /// 本次激活是否发生 GPU→CPU 降级及其原因；未降级时为 `None`。
-    pub fallback_reason: Option<String>,
-    /// 本次激活实测显存占用（字节）；无法可靠测得时为 `None`。
-    pub vram_usage_bytes: Option<u64>,
-}
-
 /// 当前激活的 Ollama 模型状态（内部）。
 #[derive(Debug, Clone)]
 struct OllamaActiveModel {
@@ -76,8 +59,7 @@ struct OllamaActiveModel {
     vram_usage_bytes: Option<u64>,
 }
 
-/// 生成运行时。构造器兼容旧签名（忽略传入的可执行路径），
-/// 内部固定通过本机 Ollama 发包，不做 GPU/CPU 后端选择（由 Ollama 自行调度）。
+/// 生成运行时固定通过本机 Ollama 发包；GPU/CPU 调度由 Ollama 管理。
 #[derive(Debug)]
 pub struct LocalGenerationRuntime {
     client: OllamaClient,
@@ -85,9 +67,14 @@ pub struct LocalGenerationRuntime {
     last_capability: Option<RuntimeCapability>,
 }
 
+impl Default for LocalGenerationRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LocalGenerationRuntime {
-    /// 兼容旧签名：忽略 `_executable`，固定走本机 Ollama。
-    pub fn new(_executable: PathBuf) -> Self {
+    pub fn new() -> Self {
         Self {
             client: OllamaClient::local(),
             active: None,
@@ -97,7 +84,7 @@ impl LocalGenerationRuntime {
 
     /// 兼容旧签名：忽略可执行路径，固定走本机 Ollama。
     pub fn new_with_fallback(_executable: PathBuf, _fallback_executable: PathBuf) -> Self {
-        Self::new(PathBuf::new())
+        Self::new()
     }
 
     /// 兼容旧签名：忽略可执行路径与能力快照，固定走本机 Ollama。
@@ -106,7 +93,7 @@ impl LocalGenerationRuntime {
         _fallback_executable: PathBuf,
         _capability: RuntimeCapability,
     ) -> Self {
-        Self::new(PathBuf::new())
+        Self::new()
     }
 
     /// Ollama 是否已安装（旧语义：本地可执行是否存在）。
@@ -140,19 +127,17 @@ impl LocalGenerationRuntime {
         model_tag: &str,
         context_size: u32,
         threads: u32,
-    ) -> Result<GenerationActivation, AppError> {
+    ) -> Result<(), AppError> {
         self.activate_internal(model_tag, false, context_size, threads)
     }
 
-    /// 激活多模态（视觉）生成。`model_tag` 为 Ollama 模型 tag；
-    /// 忽略传入的 `mmproj_path`（Ollama 侧 qwen3.5 已内建图像能力）。
+    /// 激活多模态（视觉）生成。`model_tag` 为内建图像能力的 Ollama 模型 tag。
     pub fn activate_multimodal(
         &mut self,
         model_tag: &str,
-        _mmproj_path: &str,
         context_size: u32,
         threads: u32,
-    ) -> Result<GenerationActivation, AppError> {
+    ) -> Result<(), AppError> {
         self.activate_internal(model_tag, true, context_size, threads)
     }
 
@@ -162,16 +147,15 @@ impl LocalGenerationRuntime {
         multimodal: bool,
         context_size: u32,
         threads: u32,
-    ) -> Result<GenerationActivation, AppError> {
+    ) -> Result<(), AppError> {
         validate_runtime_config(context_size, threads)?;
 
-        // 复用已激活的同模型：不重新执行模型存在性检查与自检，`self_test`
-        // 标记为已就绪，避免每次搜索/问答多一轮完整 LLM 推理。
+        // 复用已激活的同模型，避免每次搜索/问答多一轮完整 LLM 自检。
         if let Some(active) = &self.active
             && active.model_tag == model_tag
             && active.multimodal == multimodal
         {
-            return Ok(self.build_activation(active, "ready (reused)"));
+            return Ok(());
         }
 
         // 确保 Ollama 服务就绪；未安装会返回 `OLLAMA_NOT_INSTALLED`。
@@ -224,10 +208,7 @@ impl LocalGenerationRuntime {
         // 从 `/api/ps` 补充设备与显存信息（仅供状态面板展示）。
         self.refresh_device_info();
 
-        let active = self.active.as_ref().ok_or_else(|| {
-            AppError::new("GENERATION_RUNTIME_INACTIVE", "生成模型尚未启动", true)
-        })?;
-        Ok(self.build_activation(active, self_test.as_str()))
+        Ok(())
     }
 
     /// 确保 Ollama 服务已就绪；未安装返回 `OLLAMA_NOT_INSTALLED`。
@@ -238,26 +219,6 @@ impl LocalGenerationRuntime {
         }
         ensure_running(OLLAMA_START_TIMEOUT)?;
         Ok(())
-    }
-
-    /// 构造激活结果。
-    fn build_activation(
-        &self,
-        active: &OllamaActiveModel,
-        self_test: &str,
-    ) -> GenerationActivation {
-        GenerationActivation {
-            backend: "ollama".into(),
-            model_path: active.model_tag.clone(),
-            context_size: active.context_size,
-            self_test: self_test.to_owned(),
-            multimodal: active.multimodal,
-            device: active.device.clone(),
-            threads: active.threads,
-            gpu_layers: None,
-            fallback_reason: None,
-            vram_usage_bytes: active.vram_usage_bytes,
-        }
     }
 
     /// 基于 `/api/ps` 更新当前激活模型的设备与显存信息。
@@ -349,15 +310,14 @@ impl LocalGenerationRuntime {
         ]);
         // RAG 内部调用（路由/解析/校验等）强制关闭思考：思考类模型默认开启
         // 思考会消耗 token 预算并污染 JSON 输出，必须显式声明 think=false。
-        self.chat_with_active(
-            active,
-            messages,
-            max_tokens,
-            json_schema,
-            temperature,
-            Some(false),
-            cancelled,
-        )
+        let options = OllamaChatOptions {
+            num_predict: Some(max_tokens),
+            temperature: Some(temperature),
+            num_ctx: Some(active.context_size),
+            think: Some(false),
+        };
+        let format = json_schema.filter(|schema| !schema.is_null()).cloned();
+        self.chat_with_active(active, messages, options, format, cancelled)
     }
 
     /// 多模态自检辅助：向当前激活模型发送一张测试图。
@@ -379,7 +339,15 @@ impl LocalGenerationRuntime {
                 ]
             }
         ]);
-        self.chat_with_active(&active, messages, 256, None, 0.1, None, None)
+        let options = OllamaChatOptions {
+            num_predict: Some(256),
+            temperature: Some(0.1),
+            num_ctx: Some(active.context_size),
+            // 自检同样关闭思考，避免思考型模型把 token 耗在 thinking 上导致
+            // 自检返回空文本而误报 `GENERATION_SELF_TEST_FAILED`。
+            think: Some(false),
+        };
+        self.chat_with_active(&active, messages, options, None, None)
     }
 
     /// 统一的 `/api/chat` 封装调用。
@@ -389,19 +357,10 @@ impl LocalGenerationRuntime {
         &self,
         active: &OllamaActiveModel,
         messages: Value,
-        max_tokens: u32,
-        json_schema: Option<&Value>,
-        temperature: f32,
-        think: Option<bool>,
+        options: OllamaChatOptions,
+        format: Option<Value>,
         cancelled: Option<&AtomicBool>,
     ) -> Result<String, AppError> {
-        let options = OllamaChatOptions {
-            num_predict: Some(max_tokens),
-            temperature: Some(temperature),
-            num_ctx: Some(active.context_size),
-            think,
-        };
-        let format = json_schema.filter(|schema| !schema.is_null()).cloned();
         let content = self
             .client
             .chat(&active.model_tag, messages, options, format, cancelled)?;
@@ -506,24 +465,20 @@ impl LocalGenerationRuntime {
                 ]
             }
         ]);
-        self.chat_with_active(
-            &active,
-            messages,
-            max_tokens,
-            None,
-            0.1,
-            None,
-            Some(cancelled),
-        )
+        let options = OllamaChatOptions {
+            num_predict: Some(max_tokens),
+            temperature: Some(0.1),
+            num_ctx: Some(active.context_size),
+            // 关闭思考：qwen3.5 等思考型模型默认开启 thinking，视觉理解时会把
+            // 上下文 token 全部耗在思考轨迹上，正文被截断为空（done=length），
+            // 导致摘要 JSON 解析失败。图片理解只要求直接输出正文 JSON。
+            think: Some(false),
+        };
+        self.chat_with_active(&active, messages, options, None, Some(cancelled))
     }
 
     pub fn active_model_path(&self) -> Option<&str> {
         self.active.as_ref().map(|active| active.model_tag.as_str())
-    }
-
-    /// Ollama 不再使用独立的 mmproj 投影组件，恒返回 `None`。
-    pub fn active_mmproj_path(&self) -> Option<&str> {
-        None
     }
 
     pub fn active_backend(&self) -> Option<&str> {
@@ -606,7 +561,7 @@ mod tests {
     #[test]
     fn runtime_rejects_out_of_range_config() {
         // 配置非法时在触碰 Ollama 前即失败（纯本地校验）。
-        let mut runtime = LocalGenerationRuntime::new(PathBuf::new());
+        let mut runtime = LocalGenerationRuntime::new();
         assert_eq!(
             runtime.activate("qwen3.5:2b", 128, 2).unwrap_err().code,
             "GENERATION_RUNTIME_CONFIG_INVALID"
@@ -619,35 +574,11 @@ mod tests {
     }
 
     #[test]
-    fn build_activation_preserves_contract_fields() {
-        let active = OllamaActiveModel {
-            model_tag: "qwen3.5:2b".into(),
-            context_size: 4096,
-            threads: 4,
-            multimodal: true,
-            device: Some("GPU".into()),
-            vram_usage_bytes: Some(2048),
-        };
-        let runtime = LocalGenerationRuntime {
-            client: OllamaClient::local(),
-            active: Some(active),
-            last_capability: None,
-        };
-        let activation = runtime.build_activation(runtime.active.as_ref().unwrap(), "就绪");
-        assert_eq!(activation.backend, "ollama");
-        assert_eq!(activation.model_path, "qwen3.5:2b");
-        assert!(activation.multimodal);
-        assert_eq!(activation.device.as_deref(), Some("GPU"));
-        assert_eq!(activation.vram_usage_bytes, Some(2048));
-    }
-
-    #[test]
     fn capability_maps_not_installed_status() {
         // 依赖真实环境探测，不作为强断言；仅验证字段默认值守恒。
-        let runtime = LocalGenerationRuntime::new(PathBuf::new());
+        let runtime = LocalGenerationRuntime::new();
         assert_eq!(runtime.active_backend(), Some("ollama"));
         assert_eq!(runtime.active_gpu_layers(), None);
-        assert_eq!(runtime.active_mmproj_path(), None);
         assert!(!runtime.cpu_fallback_available());
     }
 }

@@ -220,7 +220,7 @@ fn ollama_artifact_uuid(tag: &str) -> Uuid {
 /// 把一份 `RuntimeModelPlan` 展开为「（角色，catalog_id）」的有序元组，
 /// 供 `apply_runtime_plan` 逐角色对齐 active artifact；已去重、不包含 Router。
 fn plan_items(plan: &RuntimeModelPlan) -> Vec<(ModelRole, String)> {
-    let mut out: Vec<(ModelRole, String)> = Vec::with_capacity(7);
+    let mut out: Vec<(ModelRole, String)> = Vec::with_capacity(6);
     out.push((ModelRole::Generation, plan.generation.clone()));
     out.push((ModelRole::Embedding, plan.embedding.clone()));
     if let Some(value) = &plan.reranker {
@@ -229,9 +229,6 @@ fn plan_items(plan: &RuntimeModelPlan) -> Vec<(ModelRole, String)> {
     out.push((ModelRole::Ocr, plan.ocr.clone()));
     if let Some(value) = &plan.asr {
         out.push((ModelRole::Asr, value.clone()));
-    }
-    if let Some(value) = &plan.vision {
-        out.push((ModelRole::Vision, value.clone()));
     }
     out
 }
@@ -665,30 +662,17 @@ impl ModelManager {
         let mut imported = Vec::new();
         let mut installation_guards = Vec::new();
         for selection in selections {
-            let source = fs::canonicalize(&selection.source_path).map_err(|error| {
-                AppError::new("MODEL_SOURCE_UNAVAILABLE", error.to_string(), true)
-            })?;
-            let mut candidate = import_candidate(&source)?;
-            if selection.role == ModelRole::Vision
-                && candidate.format == ModelFormat::Gguf
-                && candidate.companion_files.is_empty()
-            {
-                candidate.companion_files = discover_gguf_vision_companions(&source)?;
-            }
-            if selection.role == ModelRole::Vision
-                && candidate.format == ModelFormat::Gguf
-                && source.file_name().is_some_and(|name| {
-                    name.to_string_lossy()
-                        .to_ascii_lowercase()
-                        .contains("mmproj")
-                })
-            {
+            if selection.role == ModelRole::Vision {
                 return Err(AppError::new(
-                    "VISION_MODEL_MAIN_REQUIRED",
-                    "请选择视觉语言模型主GGUF文件；mmproj只能作为同目录配套文件导入",
+                    "MODEL_RUNTIME_UNSUPPORTED",
+                    "图片理解已迁移到 Ollama 多模态 Generation，不再导入独立 Vision GGUF",
                     false,
                 ));
             }
+            let source = fs::canonicalize(&selection.source_path).map_err(|error| {
+                AppError::new("MODEL_SOURCE_UNAVAILABLE", error.to_string(), true)
+            })?;
+            let candidate = import_candidate(&source)?;
             if let Some(existing) = registry
                 .artifacts
                 .iter()
@@ -1556,52 +1540,6 @@ impl ModelManager {
         Ok(())
     }
 
-    pub fn vision_projector_path(&self, artifact: &ModelArtifact) -> Result<PathBuf, AppError> {
-        if artifact.role != ModelRole::Vision || artifact.format != ModelFormat::Gguf {
-            return Err(AppError::new(
-                "VISION_MODEL_INVALID",
-                "图片理解模型必须是带mmproj配套文件的GGUF视觉语言模型",
-                false,
-            ));
-        }
-        let directory = Path::new(&artifact.local_path)
-            .parent()
-            .ok_or_else(|| AppError::new("VISION_MODEL_INVALID", "图片理解模型目录无效", false))?;
-        let mut projectors = fs::read_dir(directory)
-            .map_err(|error| {
-                AppError::new("VISION_PROJECTOR_UNAVAILABLE", error.to_string(), true)
-            })?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.is_file()
-                    && path
-                        .extension()
-                        .is_some_and(|value| value.eq_ignore_ascii_case("gguf"))
-                    && path.file_name().is_some_and(|value| {
-                        value
-                            .to_string_lossy()
-                            .to_ascii_lowercase()
-                            .contains("mmproj")
-                    })
-            })
-            .collect::<Vec<_>>();
-        projectors.sort();
-        match projectors.as_slice() {
-            [path] => Ok(path.clone()),
-            [] => Err(AppError::new(
-                "VISION_PROJECTOR_MISSING",
-                "视觉模型目录缺少与主模型匹配的mmproj文件",
-                false,
-            )),
-            _ => Err(AppError::new(
-                "VISION_PROJECTOR_AMBIGUOUS",
-                "视觉模型目录包含多个mmproj文件，请只保留与主模型匹配的一个",
-                false,
-            )),
-        }
-    }
-
     pub fn create_download_job(
         &self,
         edition_id: &str,
@@ -2294,8 +2232,6 @@ fn import_candidate(path: &Path) -> Result<ImportCandidate, AppError> {
     let suggested_role = infer_role(path, format);
     let companion_files = if format == ModelFormat::Onnx {
         discover_companion_files(path)?
-    } else if suggested_role == Some(ModelRole::Vision) {
-        discover_gguf_vision_companions(path)?
     } else {
         Vec::new()
     };
@@ -2310,17 +2246,6 @@ fn import_candidate(path: &Path) -> Result<ImportCandidate, AppError> {
             .any(|value| value.ends_with("tokenizer.json"))
     {
         warnings.push("向量模型目录缺少tokenizer.json，运行自检可能失败".into());
-    }
-    if format == ModelFormat::Gguf
-        && suggested_role == Some(ModelRole::Vision)
-        && !path.file_name().is_some_and(|name| {
-            name.to_string_lossy()
-                .to_ascii_lowercase()
-                .contains("mmproj")
-        })
-        && companion_files.is_empty()
-    {
-        warnings.push("视觉模型目录缺少匹配的mmproj GGUF文件，无法启用图片理解".into());
     }
     Ok(ImportCandidate {
         candidate_id: Uuid::now_v7(),
@@ -2415,33 +2340,6 @@ fn discover_companion_files(path: &Path) -> Result<Vec<String>, AppError> {
             files.push(entry.path().to_string_lossy().into_owned());
         }
     }
-    files.sort();
-    Ok(files)
-}
-
-fn discover_gguf_vision_companions(path: &Path) -> Result<Vec<String>, AppError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| AppError::new("MODEL_SOURCE_UNAVAILABLE", "GGUF模型缺少父目录", false))?;
-    let mut files = fs::read_dir(parent)
-        .map_err(|error| AppError::new("MODEL_SOURCE_UNAVAILABLE", error.to_string(), true))?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|candidate| {
-            candidate != path
-                && candidate.is_file()
-                && candidate
-                    .extension()
-                    .is_some_and(|value| value.eq_ignore_ascii_case("gguf"))
-                && candidate.file_name().is_some_and(|value| {
-                    value
-                        .to_string_lossy()
-                        .to_ascii_lowercase()
-                        .contains("mmproj")
-                })
-        })
-        .map(|candidate| candidate.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
     files.sort();
     Ok(files)
 }
@@ -2825,38 +2723,5 @@ mod tests {
         assert_eq!(second.job_id, first.job_id);
         assert_eq!(second.source, ModelSource::Huggingface);
         assert_eq!(manager.list_download_jobs().expect("list jobs").len(), 1);
-    }
-
-    #[test]
-    fn vision_import_copies_matching_mmproj_and_rejects_projector_as_main() {
-        let data = tempfile::tempdir().expect("data tempdir");
-        let source = tempfile::tempdir().expect("source tempdir");
-        let model = source.path().join("Qwen3-VL-2B-Q4_K_M.gguf");
-        let projector = source.path().join("mmproj-Qwen3-VL-2B-F16.gguf");
-        fs::write(&model, b"vision-main").expect("write vision model");
-        fs::write(&projector, b"vision-projector").expect("write projector");
-        let manager = ModelManager::open(data.path()).expect("open manager");
-
-        let imported = manager
-            .import_artifacts(&[ModelImportSelection {
-                source_path: model.to_string_lossy().into_owned(),
-                role: ModelRole::Vision,
-            }])
-            .expect("import vision model");
-        let copied_projector = manager
-            .vision_projector_path(&imported[0])
-            .expect("resolve copied projector");
-        assert_eq!(
-            fs::read(copied_projector).expect("read copied projector"),
-            b"vision-projector"
-        );
-
-        let error = manager
-            .import_artifacts(&[ModelImportSelection {
-                source_path: projector.to_string_lossy().into_owned(),
-                role: ModelRole::Vision,
-            }])
-            .expect_err("projector cannot be imported as main model");
-        assert_eq!(error.code, "VISION_MODEL_MAIN_REQUIRED");
     }
 }

@@ -23,8 +23,13 @@
 //! 各子模块只依赖本模块内的类型与 `crate::knowledge` 的共享 prompt 工具，
 //! 编排逻辑在桌面应用层（app_data.rs）调用，不在此堆 SQL 与模型调用。
 
+pub mod agent;
+pub use agent::{
+    KnowledgeTool, PlanCapability, PlanDecision, PlannerTier, ToolInput, ToolOutput, ToolSpec,
+    ToolStatus, ToolValidation, ToolValidator, agent_router_enabled, plan_question, registry,
+    tool_for_plan,
+};
 pub mod answer_gate;
-pub mod builtin_knowledge;
 pub mod compare;
 pub mod context_resolver;
 pub mod document_resolver;
@@ -94,5 +99,6 @@ pub use query_plan::{
 };
 pub use query_planner::{FAST_PATH_CONFIDENCE_THRESHOLD, FastPathPlan, fast_path_plan};
 pub use source_router::{
-    SourceRouting, parse_source_routing, source_router_prompt, source_routing_schema,
+    SourceRouting, apply_ambiguous_override, parse_source_routing, source_router_prompt,
+    source_routing_schema,
 };

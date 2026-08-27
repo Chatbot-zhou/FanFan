@@ -669,7 +669,7 @@ impl CatalogService {
         Ok(())
     }
 
-    pub fn home_file_summary(&self, local_date: &str) -> Result<(u64, Vec<FileRecord>), AppError> {
+    pub fn home_file_summary(&self, local_date: &str) -> Result<u64, AppError> {
         self.store.home_file_summary(local_date)
     }
 
@@ -1228,6 +1228,11 @@ impl CatalogService {
         self.store.retry_image_understanding(asset_id)
     }
 
+    /// 批量恢复上次失败的图片理解资产，返回本次恢复数量。
+    pub fn recover_failed_image_understandings(&self) -> Result<u64, AppError> {
+        self.store.recover_failed_image_understandings()
+    }
+
     pub fn image_understanding_stats(&self) -> Result<(u64, u64, u64), AppError> {
         self.store.image_understanding_stats()
     }
@@ -1258,6 +1263,15 @@ impl CatalogService {
         semantic_query: Option<SemanticQuery<'_>>,
     ) -> Result<AnswerResult, AppError> {
         self.store.answer_extractively(request, semantic_query)
+    }
+
+    pub fn answer_extractively_in_authoritative_scope(
+        &self,
+        request: &AskRequest,
+        semantic_query: Option<SemanticQuery<'_>>,
+    ) -> Result<AnswerResult, AppError> {
+        self.store
+            .answer_extractively_in_authoritative_scope(request, semantic_query)
     }
 
     pub fn load_ask_history(

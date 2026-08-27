@@ -13,7 +13,9 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use rusqlite::types::Value as SqlValue;
-use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter,
+};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -1379,6 +1381,24 @@ impl CatalogStore {
         Ok(())
     }
 
+    /// 判断某个迁移是否仅用于开发/CI 构建。
+    ///
+    /// 调试与测评数据表（node_traces / operation_traces / evaluation_*）只服务于
+    /// 开发与 GitHub CI 的调试环节，发布（release）打包不建这些表，也不记录任何
+    /// 数据（对应写入侧在 record_node_trace_with_meta / record_operation_trace 内
+    /// 已按 debug_assertions 短路）。被排除的 22(建 node_traces) / 31(清 node_traces
+    /// 孤儿) / 32(建 operation_traces 并给 node_traces 加列) / 33(建 evaluation_*)
+    /// 相互依赖，必须整体跳过，否则发布库上会因缺失 node_traces 而迁移失败。
+    #[cfg(debug_assertions)]
+    fn is_dev_only_migration(_version: u32) -> bool {
+        false
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn is_dev_only_migration(version: u32) -> bool {
+        matches!(version, 22 | 31 | 32 | 33)
+    }
+
     fn migrate(&self, connection: &mut Connection) -> Result<(), AppError> {
         let current_version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -1407,6 +1427,7 @@ impl CatalogStore {
         for migration in MIGRATIONS
             .iter()
             .filter(|migration| migration.version <= current_version)
+            .filter(|migration| !Self::is_dev_only_migration(migration.version))
         {
             connection
                 .execute(
@@ -1419,6 +1440,7 @@ impl CatalogStore {
         for migration in MIGRATIONS
             .iter()
             .filter(|migration| migration.version > current_version)
+            .filter(|migration| !Self::is_dev_only_migration(migration.version))
         {
             let transaction = connection
                 .transaction()
@@ -1637,10 +1659,13 @@ impl CatalogStore {
                 }),
             ),
         ];
+        // 用 UPSERT 而非 INSERT OR IGNORE：旧库中内置规则集合可能因早期版本的播种
+        // 未写入 rule_json 而留下 NULL，这里在启动时回填规则，否则点击集合查询成员会报
+        // COLLECTION_RULE_INVALID，前端误显示为「空集合」。
         for (collection_id, name, description, icon, color, rule) in built_ins {
             connection
                 .execute(
-                    "INSERT OR IGNORE INTO collections (collection_id, name, description, icon, color, kind, rule_json, built_in, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'rule', ?6, 1, ?7, ?7)",
+                    "INSERT INTO collections (collection_id, name, description, icon, color, kind, rule_json, built_in, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'rule', ?6, 1, ?7, ?7) ON CONFLICT(collection_id) DO UPDATE SET name = excluded.name, description = excluded.description, icon = excluded.icon, color = excluded.color, kind = excluded.kind, rule_json = excluded.rule_json, updated_at = excluded.updated_at",
                     params![collection_id, name, description, icon, color, rule.to_string(), now],
                 )
                 .map_err(|error| storage_error("COLLECTION_SEED_FAILED", error, false))?;
@@ -2878,7 +2903,10 @@ impl CatalogStore {
         })
     }
 
-    pub fn home_file_summary(&self, local_date: &str) -> Result<(u64, Vec<FileRecord>), AppError> {
+    /// 统计指定日新增的文件数（首页指标「今日新增」用）。
+    /// 不再返回 recent 文件列表：旧首页「最近资料」卡片已下线，
+    /// 相关字段与查询一并移除，避免每次拉取首页都做全表排序扫描。
+    pub fn home_file_summary(&self, local_date: &str) -> Result<u64, AppError> {
         let connection = self.connect()?;
         let today_added = connection
             .query_row(
@@ -2887,17 +2915,7 @@ impl CatalogStore {
                 |row| row.get::<_, u64>(0),
             )
             .map_err(|error| storage_error("FILE_QUERY_FAILED", error, true))?;
-        let mut statement = connection
-            .prepare(
-                "SELECT file_id, volume_id, canonical_path, display_name, extension, mime_type, size_bytes, fs_created_at, modified_at, windows_file_id, content_sha256, availability, current_revision_id, parse_status, first_seen_at, last_seen_at FROM files ORDER BY last_seen_at DESC, file_id DESC LIMIT 8",
-            )
-            .map_err(|error| storage_error("FILE_QUERY_FAILED", error, true))?;
-        let recent = statement
-            .query_map([], file_from_row)
-            .map_err(|error| storage_error("FILE_QUERY_FAILED", error, true))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| storage_error("FILE_QUERY_FAILED", error, true))?;
-        Ok((today_added, recent))
+        Ok(today_added)
     }
 
     pub fn query_inbox(&self, query: &InboxQuery) -> Result<InboxPage, AppError> {
@@ -2909,6 +2927,9 @@ impl CatalogStore {
         let mut values = Vec::<SqlValue>::new();
         if query.status == TriageStatus::Error {
             predicates.push("i.resolution_status IN ('pending_retry','retrying')".into());
+        } else if query.status == TriageStatus::Ignored {
+            predicates
+                .push("i.triage_status = 'ignored' AND i.resolution_status = 'abandoned'".into());
         } else if query.status != TriageStatus::All {
             predicates.push("i.triage_status = ?".into());
             values.push(SqlValue::Text(query.status.as_storage().into()));
@@ -4603,11 +4624,15 @@ impl CatalogStore {
             "EXISTS (SELECT 1 FROM file_root_memberships m JOIN roots rt ON rt.root_id = m.root_id WHERE m.file_id = r.left_file_id AND rt.enabled = 1)".to_owned(),
             "EXISTS (SELECT 1 FROM file_root_memberships m JOIN roots rt ON rt.root_id = m.root_id WHERE m.file_id = r.right_file_id AND rt.enabled = 1)".to_owned(),
         ];
+        // review_status 来自用户输入，必须参数化传值（relation_type 来自受控枚举，
+        // as_storage() 仅产出固定字符串，无需参数化）。
+        let mut query_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         if let Some(relation_type) = request.relation_type {
             predicates.push(format!("relation_type = '{}'", relation_type.as_storage()));
         }
         if let Some(review_status) = request.review_status.as_deref() {
-            predicates.push(format!("review_status = '{review_status}'"));
+            predicates.push("review_status = ?".to_owned());
+            query_params.push(Box::new(review_status.to_owned()));
         } else {
             predicates.push("review_status <> 'rejected'".to_owned());
         }
@@ -4615,18 +4640,22 @@ impl CatalogStore {
         let total = connection
             .query_row(
                 &format!("SELECT COUNT(*) FROM file_relations r WHERE {predicate}"),
-                [],
+                params_from_iter(query_params.iter()),
                 |row| row.get::<_, u64>(0),
             )
             .map_err(|error| storage_error("RELATION_QUERY_FAILED", error, true))?;
         let raw = {
+            // 统一未编号占位符：参数按顺序绑定（COUNT 只用前面的谓词参数，
+            // 列表查询追加 page_size/offset 到尾部，顺序与 SQL 一致）。
+            query_params.push(Box::new(page_size));
+            query_params.push(Box::new(offset));
             let mut statement = connection
                 .prepare(&format!(
-                    "SELECT relation_id, relation_type, left_file_id, right_file_id, confidence, reasons_json, review_status, created_at FROM file_relations r WHERE {predicate} ORDER BY confidence DESC, created_at DESC, relation_id DESC LIMIT ?1 OFFSET ?2"
+                    "SELECT relation_id, relation_type, left_file_id, right_file_id, confidence, reasons_json, review_status, created_at FROM file_relations r WHERE {predicate} ORDER BY confidence DESC, created_at DESC, relation_id DESC LIMIT ? OFFSET ?"
                 ))
                 .map_err(|error| storage_error("RELATION_QUERY_FAILED", error, true))?;
             statement
-                .query_map(params![page_size, offset], |row| {
+                .query_map(params_from_iter(query_params.iter()), |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -5095,11 +5124,14 @@ impl CatalogStore {
         let page_size = u64::from(request.page_size);
         let connection = self.connect()?;
         let mut predicates = Vec::<String>::new();
+        // review_status 来自用户输入，必须参数化传值。
+        let mut query_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         if let Some(group_type) = request.group_type {
             predicates.push(format!("group_type = '{}'", group_type.as_storage()));
         }
         if let Some(review_status) = request.review_status.as_deref() {
-            predicates.push(format!("review_status = '{review_status}'"));
+            predicates.push("review_status = ?".to_owned());
+            query_params.push(Box::new(review_status.to_owned()));
         } else {
             predicates.push("review_status <> 'rejected'".to_owned());
         }
@@ -5111,18 +5143,20 @@ impl CatalogStore {
         let total = connection
             .query_row(
                 &format!("SELECT COUNT(*) FROM relation_groups{predicate}"),
-                [],
+                params_from_iter(query_params.iter()),
                 |row| row.get::<_, u64>(0),
             )
             .map_err(|error| storage_error("RELATION_GROUP_QUERY_FAILED", error, true))?;
         let raw = {
             let mut statement = connection
                 .prepare(&format!(
-                    "SELECT group_id, group_type, title, confidence, member_count, review_status, created_at, updated_at FROM relation_groups{predicate} ORDER BY confidence DESC, updated_at DESC, group_id DESC LIMIT ?1 OFFSET ?2"
+                    "SELECT group_id, group_type, title, confidence, member_count, review_status, created_at, updated_at FROM relation_groups{predicate} ORDER BY confidence DESC, updated_at DESC, group_id DESC LIMIT ? OFFSET ?"
                 ))
                 .map_err(|error| storage_error("RELATION_GROUP_QUERY_FAILED", error, true))?;
+            query_params.push(Box::new(page_size));
+            query_params.push(Box::new(offset));
             statement
-                .query_map(params![page_size, offset], |row| {
+                .query_map(params_from_iter(query_params.iter()), |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -6440,7 +6474,9 @@ impl CatalogStore {
                 (
                     "image_ocr",
                     "图片文字",
-                    format!("图片文字：{}", ocr_text.expect("validated image text")),
+                    // SQL 已保证该分支 ocr_text 非空，但为避免跨层不变量漂移导致
+                    // 生产路径 panic，缺失时降级为空字符串。
+                    format!("图片文字：{}", ocr_text.unwrap_or_default()),
                 )
             };
             replace_image_search_node(
@@ -6475,13 +6511,10 @@ impl CatalogStore {
             ));
         }
         let mut connection = self.connect()?;
-        let transaction = connection
-            .transaction()
-            .map_err(|error| storage_error("IMAGE_OCR_CLAIM_FAILED", error, true))?;
         let sql = format!(
             "SELECT ia.asset_id, ia.file_id, ia.revision_id, ia.cache_path, ia.mime_type, ia.asset_kind, ia.size_bytes, ia.sha256, ia.locator_json, ia.ocr_attempt_count FROM image_assets ia JOIN files f ON f.file_id = ia.file_id WHERE ia.status = 'pending_ocr' AND f.current_revision_id = ia.revision_id AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL} ORDER BY ia.updated_at, ia.asset_id LIMIT 1"
         );
-        let row = transaction
+        let row = connection
             .query_row(&sql, [], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -6523,19 +6556,21 @@ impl CatalogStore {
             .map_err(|error| AppError::new("IMAGE_ASSET_UNAVAILABLE", error.to_string(), true))?;
         if !metadata.is_file() || metadata.len() != size_bytes || hash_file_sha256(&path)? != sha256
         {
-            transaction
+            connection
                 .execute(
                     "UPDATE image_assets SET status = 'failed', ocr_error_json = ?1, updated_at = ?2 WHERE asset_id = ?3",
                     params![serde_json::to_string(&AppError::new("IMAGE_ASSET_CACHE_INVALID", "图片缓存大小或哈希已经变化，需要重新解析源文件", false)).expect("serialize static error"), Utc::now().to_rfc3339(), asset_id.to_string()],
                 )
                 .map_err(|error| storage_error("IMAGE_OCR_CLAIM_FAILED", error, true))?;
-            transaction
-                .commit()
-                .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))?;
             return Ok(None);
         }
         let idempotency_key = format!("image-ocr:v1:{model_artifact_id}:{sha256}");
         let now = Utc::now().to_rfc3339();
+        // 缓存哈希可能读取数 MB 数据，不能在 SQLite 事务内持有读锁。校验结束后
+        // 再用 IMMEDIATE 事务原子领取，避免并发消费者的 DEFERRED 事务升级冲突。
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| storage_error("IMAGE_OCR_CLAIM_FAILED", error, true))?;
         let changed = transaction
             .execute(
                 "UPDATE image_assets SET status = 'ocr_processing', ocr_attempt_count = ocr_attempt_count + 1, ocr_error_json = NULL, ocr_idempotency_key = ?1, updated_at = ?2 WHERE asset_id = ?3 AND status = 'pending_ocr'",
@@ -6589,7 +6624,7 @@ impl CatalogStore {
         }
         let mut connection = self.connect()?;
         let transaction = connection
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| storage_error("IMAGE_OCR_COMMIT_FAILED", error, true))?;
         let sql = format!(
             "SELECT ia.file_id, ia.revision_id, ia.locator_json, ia.status, ia.ocr_idempotency_key FROM image_assets ia JOIN files f ON f.file_id = ia.file_id WHERE ia.asset_id = ?1 AND f.current_revision_id = ia.revision_id AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL} LIMIT 1"
@@ -6733,13 +6768,10 @@ impl CatalogStore {
             ));
         }
         let mut connection = self.connect()?;
-        let transaction = connection
-            .transaction()
-            .map_err(|error| storage_error("IMAGE_UNDERSTANDING_CLAIM_FAILED", error, true))?;
         let sql = format!(
             "SELECT ia.asset_id, ia.file_id, ia.revision_id, ia.cache_path, ia.mime_type, ia.size_bytes, ia.sha256, ia.locator_json, ia.ocr_text, ia.attempt_count FROM image_assets ia JOIN files f ON f.file_id = ia.file_id WHERE ia.status = 'pending_understanding' AND f.current_revision_id = ia.revision_id AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL} ORDER BY ia.updated_at, ia.asset_id LIMIT 1"
         );
-        let row = transaction
+        let row = connection
             .query_row(&sql, [], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -6781,19 +6813,21 @@ impl CatalogStore {
             .map_err(|error| AppError::new("IMAGE_ASSET_UNAVAILABLE", error.to_string(), true))?;
         if !metadata.is_file() || metadata.len() != size_bytes || hash_file_sha256(&path)? != sha256
         {
-            transaction
+            connection
                 .execute(
                     "UPDATE image_assets SET status = 'failed', error_json = ?1, updated_at = ?2 WHERE asset_id = ?3",
                     params![serde_json::to_string(&AppError::new("IMAGE_ASSET_CACHE_INVALID", "图片缓存大小或哈希已经变化，需要重新解析源文件", false)).expect("serialize static error"), Utc::now().to_rfc3339(), asset_id.to_string()],
                 )
                 .map_err(|error| storage_error("IMAGE_UNDERSTANDING_CLAIM_FAILED", error, true))?;
-            transaction
-                .commit()
-                .map_err(|error| storage_error("DATABASE_COMMIT_FAILED", error, true))?;
             return Ok(None);
         }
         let idempotency_key = format!("vision:v1:{model_artifact_id}:{sha256}");
         let now = Utc::now().to_rfc3339();
+        // 与 OCR claim 一致：缓存哈希在事务外完成，再用 IMMEDIATE 事务原子领取，
+        // 缩短写锁时间并避免并发读事务升级为写事务时直接返回 SQLITE_BUSY。
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| storage_error("IMAGE_UNDERSTANDING_CLAIM_FAILED", error, true))?;
         let changed = transaction
             .execute(
                 "UPDATE image_assets SET status = 'processing', attempt_count = attempt_count + 1, error_json = NULL, idempotency_key = ?1, started_at = ?2, completed_at = NULL, updated_at = ?2 WHERE asset_id = ?3 AND status = 'pending_understanding'",
@@ -6874,6 +6908,24 @@ impl CatalogStore {
         Ok(())
     }
 
+    /// 批量恢复上次因代码/服务问题而失败的图片理解资产（防永久卡死）。
+    ///
+    /// 将 `status='failed'` 且文件仍在授权范围内的资产重置为 `pending_understanding`，
+    /// 使后台视觉理解循环可以重新处理。`claim` 阶段会对缓存文件做大小与哈希校验，
+    /// 无效资产会再次转回 `failed`，不会造成死循环。
+    ///
+    /// 返回本次恢复的资产数量。
+    pub fn recover_failed_image_understandings(&self) -> Result<u64, AppError> {
+        let connection = self.connect()?;
+        let sql = format!(
+            "UPDATE image_assets SET status = 'pending_understanding', attempt_count = 0, error_json = NULL, started_at = NULL, completed_at = NULL, idempotency_key = NULL, updated_at = ?1 WHERE status = 'failed' AND EXISTS (SELECT 1 FROM files f WHERE f.file_id = image_assets.file_id AND f.current_revision_id = image_assets.revision_id AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL})"
+        );
+        let changed = connection
+            .execute(&sql, params![Utc::now().to_rfc3339()])
+            .map_err(|error| storage_error("IMAGE_UNDERSTANDING_RECOVERY_FAILED", error, true))?;
+        Ok(changed as u64)
+    }
+
     pub fn commit_image_understanding(
         &self,
         result: &ImageUnderstandingResult,
@@ -6893,7 +6945,7 @@ impl CatalogStore {
         }
         let mut connection = self.connect()?;
         let transaction = connection
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| storage_error("IMAGE_UNDERSTANDING_COMMIT_FAILED", error, true))?;
         let sql = format!(
             "SELECT ia.file_id, ia.revision_id, ia.locator_json, ia.ocr_text, ia.status, ia.idempotency_key FROM image_assets ia JOIN files f ON f.file_id = ia.file_id WHERE ia.asset_id = ?1 AND f.current_revision_id = ia.revision_id AND f.availability = 'present' AND {AUTHORIZED_FILE_SQL} LIMIT 1"
@@ -7212,13 +7264,14 @@ impl CatalogStore {
             });
             let semantic_handle = scope.spawn(|| -> Result<Vec<RankedHit>, AppError> {
                 if run_semantic {
-                    let semantic_query =
-                        semantic_query.expect("semantic query prepared when run_semantic");
-                    let connection = self.connect()?;
-                    let scoped = scoped_file_ids
-                        .as_ref()
-                        .expect("semantic scope is prepared");
-                    return search_semantic(&connection, &semantic_query, scoped);
+                    // run_semantic 保证向量与授权范围已就绪；万一跨层不变量漂移，
+                    // 缺失时降级为空结果而非 panic，避免生产路径崩溃。
+                    if let (Some(semantic_query), Some(scoped)) =
+                        (semantic_query, scoped_file_ids.as_ref())
+                    {
+                        let connection = self.connect()?;
+                        return search_semantic(&connection, &semantic_query, scoped);
+                    }
                 }
                 Ok(Vec::new())
             });
@@ -7359,6 +7412,33 @@ impl CatalogStore {
         request: &AskRequest,
         semantic_query: Option<SemanticQuery<'_>>,
     ) -> Result<AnswerResult, AppError> {
+        self.answer_extractively_with_scope_authority(request, semantic_query, false)
+    }
+
+    /// 在上游已通过用户选择、Document Resolver 或可信 Memory 锁定文件白名单时检索。
+    /// 该入口只跳过面向全库/召回候选的弱相关性淘汰；授权校验、真实 chunk 读取、
+    /// Evidence 与 Citation 校验仍与普通严格检索完全一致。
+    pub fn answer_extractively_in_authoritative_scope(
+        &self,
+        request: &AskRequest,
+        semantic_query: Option<SemanticQuery<'_>>,
+    ) -> Result<AnswerResult, AppError> {
+        if request.scope.file_ids.is_empty() {
+            return Err(AppError::new(
+                "ASK_AUTHORITATIVE_SCOPE_REQUIRED",
+                "权威文档范围检索必须提供至少一个 file_id",
+                false,
+            ));
+        }
+        self.answer_extractively_with_scope_authority(request, semantic_query, true)
+    }
+
+    fn answer_extractively_with_scope_authority(
+        &self,
+        request: &AskRequest,
+        semantic_query: Option<SemanticQuery<'_>>,
+        authoritative_file_scope: bool,
+    ) -> Result<AnswerResult, AppError> {
         request.validate()?;
         let started_at = std::time::Instant::now();
         let connection = self.connect()?;
@@ -7376,12 +7456,14 @@ impl CatalogStore {
                 .map(|file| (file.file_id, file.display_name.as_str())),
             &scoped_file_ids,
         );
-        let has_explicit_document_scope = explicitly_named_file_ids.is_some();
+        let has_explicit_document_scope =
+            authoritative_file_scope || explicitly_named_file_ids.is_some();
         let retrieval_file_ids =
             explicitly_named_file_ids.unwrap_or_else(|| scoped_file_ids.clone());
         let mut fulltext_hits = search_fulltext(&connection, &request.question, &request.scope)?;
         fulltext_hits.retain(|hit| retrieval_file_ids.contains(&hit.file.file_id));
-        fulltext_hits.sort_by(|left, right| right.channel_score.total_cmp(&left.channel_score));
+        // search_fulltext 已按 SQLite FTS5 bm25（越小越相关）返回。不能再按
+        // `1 / (1 + abs(bm25))` 降序，否则会把最强词法命中反向排到末尾。
         let mut semantic_hits = if let Some(query) = semantic_query.as_ref() {
             search_semantic(&connection, query, &retrieval_file_ids)?
         } else {
@@ -7437,6 +7519,8 @@ impl CatalogStore {
         // 融合后有无候选（区分「检索为空」与「有候选但全被相关门槛滤掉」，
         // 供 NO_EVIDENCE 六分类诊断）
         let had_candidates = !candidates.is_empty();
+        let required_exact_terms =
+            required_exact_evidence_terms_for_scope(&request.question, has_explicit_document_scope);
         let mut evidence = Vec::new();
         let mut evidence_tokens = 0_u64;
         for candidate in candidates.into_iter().filter(|candidate| {
@@ -7472,6 +7556,9 @@ impl CatalogStore {
             else {
                 continue;
             };
+            if !evidence_quote_satisfies_exact_terms(&quote, &required_exact_terms) {
+                continue;
+            }
             // 相邻块上下文：命中块的前/后一块构成线性语境（块间本身已含 64
             // token 重叠），供生成模型理解「这段文字在原文中前后是什么」。
             // 只取同节点的相邻块，跨节点（标题、页眉）不视为相邻。
@@ -7857,6 +7944,9 @@ impl CatalogStore {
                 [session_id.to_string()],
             )
             .map_err(|error| storage_error("ASK_SESSION_DELETE_FAILED", error, true))?;
+        // node_traces 仅存在于开发/CI 构建；发布构建不建表，因此同步删除只在
+        // debug_assertions 下执行，避免无表时破坏会话删除主流程。
+        #[cfg(debug_assertions)]
         transaction
             .execute(
                 "DELETE FROM node_traces WHERE session_id = ?1",
@@ -7950,6 +8040,12 @@ impl CatalogStore {
         request: &AskRequest,
         result: &AnswerResult,
     ) -> Result<(), AppError> {
+        // 澄清收拢（方案 B）：当 request 指定了要原地升级的澄清消息时，不再
+        // 插入新的 user+assistant 对，而是把最终回答覆写到那条澄清 assistant
+        // 消息上，使「提问→澄清→最终回答」在历史里始终是一个 turn。
+        if let Some(target) = request.clarification_message_id {
+            return self.upgrade_ask_exchange_in_place(request, result, target);
+        }
         let mut connection = self.connect()?;
         let transaction = connection
             .transaction()
@@ -7976,6 +8072,50 @@ impl CatalogStore {
             .execute(
                 "INSERT INTO ask_messages (message_id, session_id, role, content, answer_json, error_json, created_at) VALUES (?1, ?2, 'assistant', ?3, ?4, NULL, ?5)",
                 params![result.message_id.to_string(), result.session_id.to_string(), result.answer, answer_json, Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| storage_error("ASK_HISTORY_WRITE_FAILED", error, true))?;
+        transaction
+            .commit()
+            .map_err(|error| storage_error("ASK_HISTORY_WRITE_FAILED", error, true))
+    }
+
+    /// 澄清收拢（方案 B）落库：原地覆写目标 assistant 消息，不新增用户消息。
+    ///
+    /// - 会话仍按该请求 upsert（scope / title / updated_at）；
+    /// - 目标 assistant 消息行更新 `content = 最终回答文本`、
+    ///   `answer_json = 最终 AnswerResult`、`error_json = NULL`；
+    /// - 不插入新的 user 行：原提问消息保留，所以历史里「一次提问 + 一条
+    ///   回答」，澄清请求与最终回答不拆成两轮。
+    /// - 存进 answer_json 的 result 会改写 message_id 为目标 id，保证
+    ///   加载历史时「消息行 id == 答案内部 id」一致，避免两端 mismatch。
+    fn upgrade_ask_exchange_in_place(
+        &self,
+        request: &AskRequest,
+        result: &AnswerResult,
+        target_message_id: Uuid,
+    ) -> Result<(), AppError> {
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| storage_error("ASK_HISTORY_WRITE_FAILED", error, true))?;
+        let now = Utc::now();
+        let scope_json = serde_json::to_string(&request.scope)
+            .map_err(|error| AppError::new("ASK_SCOPE_INVALID", error.to_string(), false))?;
+        let title = ask_session_title(&request.question);
+        transaction
+            .execute(
+                "INSERT INTO ask_sessions (session_id, scope_json, created_at, updated_at, title, last_error_json) VALUES (?1, ?2, ?3, ?3, ?4, NULL) ON CONFLICT(session_id) DO UPDATE SET scope_json = excluded.scope_json, updated_at = excluded.updated_at, title = COALESCE(ask_sessions.title, excluded.title), last_error_json = NULL",
+                params![result.session_id.to_string(), scope_json, now.to_rfc3339(), title],
+            )
+            .map_err(|error| storage_error("ASK_HISTORY_WRITE_FAILED", error, true))?;
+        let mut clarified = result.clone();
+        clarified.message_id = target_message_id;
+        let answer_json = serde_json::to_string(&clarified)
+            .map_err(|error| AppError::new("ASK_RESULT_INVALID", error.to_string(), false))?;
+        transaction
+            .execute(
+                "UPDATE ask_messages SET content = ?3, answer_json = ?4, error_json = NULL WHERE message_id = ?1 AND role = 'assistant'",
+                params![target_message_id.to_string(), result.session_id.to_string(), result.answer, answer_json],
             )
             .map_err(|error| storage_error("ASK_HISTORY_WRITE_FAILED", error, true))?;
         transaction
@@ -9881,8 +10021,40 @@ impl CatalogStore {
 
     /// 记录一条节点追踪（扩展版：额外写入 operation/评测/设备元数据）。
     /// 新增列可空，未提供的字段写 NULL，与既有记录完全兼容。
+    ///
+    /// 该调试/测评数据只存在于开发与 CI 构建：发布（release）构建不建
+    /// node_traces 表，本方法整体短路为无操作，不写任何数据。
     #[allow(clippy::too_many_arguments)]
     pub fn record_node_trace_with_meta(
+        &self,
+        flow: &str,
+        node: &str,
+        correlation_id: &str,
+        session_id: Option<&str>,
+        entity_id: Option<&str>,
+        input_json: &serde_json::Value,
+        output_json: &serde_json::Value,
+        status: &str,
+        elapsed_ms: Option<u64>,
+        meta: &TraceNodeMeta,
+    ) -> Result<(), AppError> {
+        #[cfg(debug_assertions)]
+        return self.record_node_trace_with_meta_debug(
+            flow, node, correlation_id, session_id, entity_id,
+            input_json, output_json, status, elapsed_ms, meta,
+        );
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = (flow, node, correlation_id, session_id, entity_id,
+                     input_json, output_json, status, elapsed_ms, meta);
+            Ok(())
+        }
+    }
+
+    /// 开发/CI 构建的节点追踪写入实现（仅 debug_assertions 编译；发布构建不建表）。
+    #[cfg(debug_assertions)]
+    #[allow(clippy::too_many_arguments)]
+    fn record_node_trace_with_meta_debug(
         &self,
         flow: &str,
         node: &str,
@@ -9967,7 +10139,26 @@ impl CatalogStore {
     /// 新建一条操作级追踪（OperationTrace）。status 固定 running，
     /// completed_at/total_duration_ms 由 complete_operation_trace 补齐。
     /// 返回新生成的 operation_id 供后续完成态回写。
+    ///
+    /// 该调试/测评数据只存在于开发与 CI 构建：发布（release）构建不建
+    /// operation_traces 表，本方法短路为无操作，仅返回供调用方线程关联的
+    /// 占位 id，不落任何数据。
     pub fn record_operation_trace(&self, input: &OperationTraceInput) -> Result<String, AppError> {
+        #[cfg(debug_assertions)]
+        return self.record_operation_trace_debug(input);
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = input;
+            Ok(Uuid::now_v7().to_string())
+        }
+    }
+
+    /// 开发/CI 构建的操作级追踪写入实现（仅 debug_assertions 编译；发布构建不建表）。
+    #[cfg(debug_assertions)]
+    fn record_operation_trace_debug(
+        &self,
+        input: &OperationTraceInput,
+    ) -> Result<String, AppError> {
         let _permit = self.acquire_write(WritePriority::Background);
         let connection = self.connect()?;
         let operation_id = Uuid::now_v7().to_string();
@@ -12115,6 +12306,61 @@ fn question_requests_document_summary(question: &str) -> bool {
         .iter()
         .any(|cue| question.contains(cue))
 }
+fn required_exact_evidence_terms_for_scope(
+    question: &str,
+    has_explicit_document_scope: bool,
+) -> Vec<String> {
+    if has_explicit_document_scope {
+        Vec::new()
+    } else {
+        required_exact_evidence_terms(question)
+    }
+}
+fn required_exact_evidence_terms(question: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    for ch in question.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':') {
+            current.push(ch);
+        } else {
+            push_required_exact_term(&mut terms, &current);
+            current.clear();
+        }
+    }
+    push_required_exact_term(&mut terms, &current);
+    terms
+}
+
+fn push_required_exact_term(terms: &mut Vec<String>, raw: &str) {
+    let term = raw.trim_matches(|ch: char| matches!(ch, '_' | '-' | '.' | ':'));
+    if !is_required_exact_term(term) {
+        return;
+    }
+    let normalized = term.to_ascii_lowercase();
+    if !terms.iter().any(|existing| existing == &normalized) {
+        terms.push(normalized);
+    }
+}
+
+fn is_required_exact_term(term: &str) -> bool {
+    let ascii_len = term.chars().filter(|ch| ch.is_ascii_alphanumeric()).count();
+    if ascii_len < 6 {
+        return false;
+    }
+    let has_digit = term.chars().any(|ch| ch.is_ascii_digit());
+    let has_separator = term.chars().any(|ch| matches!(ch, '_' | '-' | '.' | ':'));
+    let has_lower = term.chars().any(|ch| ch.is_ascii_lowercase());
+    let has_upper = term.chars().any(|ch| ch.is_ascii_uppercase());
+    has_digit || has_separator || (has_lower && has_upper && ascii_len >= 8)
+}
+
+fn evidence_quote_satisfies_exact_terms(quote: &str, required_terms: &[String]) -> bool {
+    if required_terms.is_empty() {
+        return true;
+    }
+    let quote = quote.to_ascii_lowercase();
+    required_terms.iter().all(|term| quote.contains(term))
+}
 
 fn load_structural_summary_evidence(
     connection: &Connection,
@@ -12240,29 +12486,29 @@ fn select_structural_summary_rows(
         .collect::<Vec<_>>();
     let mut selected = Vec::new();
     let mut selected_chunk_ids = HashSet::new();
-    if let Some(title) = document_title {
-        if let Some(first_ordinal) = scored.iter().map(|(_, row)| row.6).min() {
-            let title_candidate = scored
-                .iter()
-                .enumerate()
-                .filter_map(|(index, (score, row))| {
-                    if row.6.saturating_sub(first_ordinal) > 12 {
-                        return None;
-                    }
-                    let title_score = structural_summary_title_overlap_score(&row.2, title);
-                    (title_score > 0).then_some((index, title_score, *score, row.6))
-                })
-                .max_by(|left, right| {
-                    left.1
-                        .cmp(&right.1)
-                        .then_with(|| left.2.cmp(&right.2))
-                        .then_with(|| right.3.cmp(&left.3))
-                });
-            if let Some((index, _, _, _)) = title_candidate {
-                let (_, row) = scored.remove(index);
-                selected_chunk_ids.insert(row.0.clone());
-                selected.push(row);
-            }
+    if let Some(title) = document_title
+        && let Some(first_ordinal) = scored.iter().map(|(_, row)| row.6).min()
+    {
+        let title_candidate = scored
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (score, row))| {
+                if row.6.saturating_sub(first_ordinal) > 12 {
+                    return None;
+                }
+                let title_score = structural_summary_title_overlap_score(&row.2, title);
+                (title_score > 0).then_some((index, title_score, *score, row.6))
+            })
+            .max_by(|left, right| {
+                left.1
+                    .cmp(&right.1)
+                    .then_with(|| left.2.cmp(&right.2))
+                    .then_with(|| right.3.cmp(&left.3))
+            });
+        if let Some((index, _, _, _)) = title_candidate {
+            let (_, row) = scored.remove(index);
+            selected_chunk_ids.insert(row.0.clone());
+            selected.push(row);
         }
     }
     scored.sort_by(|(left_score, left), (right_score, right)| {
@@ -12501,13 +12747,14 @@ fn join_search_channel<T>(
 ///
 /// 覆盖真实查询的多种形态（按区分度从高到低）：
 ///   1. 完全一致：`周晨博-大模型开发.pdf` == `周晨博-大模型开发.pdf`
-///   2. 规范化一致：去掉分隔符/标点后相等（`applogtxt` ↔ `app_log.txt`）
-///   3. 文件名前缀：`周晨博` 命中 `周晨博-大模型开发.pdf`（比「包含」更强）
-///   4. 文件名包含：`周晨博` 命中 `编译原理周晨博论文.docx`
-///   5. 规范化包含：`applogtxt` 是 `app_log.txt` 规范化的子串
-///   6. 词元全覆盖：查询每个 ≥2 字符词元都在文件名中出现
+///   2. 文件主干一致：`周晨博-大模型开发` == `周晨博-大模型开发.pdf`
+///   3. 规范化一致：去掉分隔符/标点后相等（`applogtxt` ↔ `app_log.txt`）
+///   4. 文件名前缀：`周晨博` 命中 `周晨博-大模型开发.pdf`（比「包含」更强）
+///   5. 文件名包含：`周晨博` 命中 `编译原理周晨博论文.docx`
+///   6. 规范化包含：`applogtxt` 是 `app_log.txt` 规范化的子串
+///   7. 词元全覆盖：查询每个 ≥2 字符词元都在文件名中出现
 ///      （`app_log txt` ↔ `app_log.txt`；分隔符差异不阻断匹配）
-///   7. 路径包含：`软考` 命中目录路径含软考的文件（弱信号，score 最低）
+///   8. 路径包含：`软考` 命中目录路径含软考的文件（弱信号，score 最低）
 ///
 /// query 已由调用方 trim + to_lowercase。name/path 已 to_lowercase。
 fn filename_channel_match(name: &str, path: &str, query: &str) -> Option<(&'static str, f32)> {
@@ -12517,6 +12764,10 @@ fn filename_channel_match(name: &str, path: &str, query: &str) -> Option<(&'stat
     if name == query {
         return Some(("filename", 1.0));
     }
+    let name_stem = strip_extension_for_fuzzy(name);
+    if name_stem == query {
+        return Some(("filename", 0.98));
+    }
     let normalized = |value: &str| {
         value
             .chars()
@@ -12525,6 +12776,10 @@ fn filename_channel_match(name: &str, path: &str, query: &str) -> Option<(&'stat
     };
     let normalized_query = normalized(query);
     let normalized_name = normalized(name);
+    let normalized_name_stem = normalized(name_stem);
+    if !normalized_query.is_empty() && normalized_name_stem == normalized_query {
+        return Some(("filename", 0.97));
+    }
     if !normalized_query.is_empty() && normalized_name == normalized_query {
         return Some(("filename", 0.95));
     }
@@ -12555,21 +12810,28 @@ fn filename_channel_match(name: &str, path: &str, query: &str) -> Option<(&'stat
     // 轻微错别字容错：查询与文件主干（去扩展名）的 Damerau-Levenshtein
     // 距离足够小且长度相近时，视为「用户打错字但指的就是这份文件」。
     // 覆盖真实拼写错误的常见形态：相邻字符交换（`kdsstep`↔`ksdstep`、
-    // `YCLonfig2`↔`YLConfig2`）、单字符增删改。置信度低于精确包含匹配
-    // （0.70），但仍高于 path 弱信号——错别字命中应排在纯语义/路径结果前。
-    // 只在无任何更强匹配时启用（位于匹配链末尾）。
-    const FILENAME_FUZZY_SCORE: f32 = 0.70;
+    // `YCLonfig2`↔`YLConfig2`）、单字符增删改。
+    // 评分随编辑距离单调递减：距离越近（错别字越「像」），在文件名通道内的
+    // 排序越靠前。这是为了让真正的目标（通常距离=1）压过同样相似但不完全
+    // 相同的干扰项（如年份 2102↔2012 距离 1，而 2102↔2019/2021 距离 2-3），
+    // 避免大量近等分模糊命中在 RRF 融合里挤掉全文通道命中的正确文件。
+    // 距离 1 命中（0.72）仍高于 path 弱信号（0.65）；距离 ≥3 的宽松命中降到
+    // 低位，不冒充精确目标。只在无任何更强匹配时启用（位于匹配链末尾）。
+    const FILENAME_FUZZY_BASE_SCORE: f32 = 0.80;
+    const FILENAME_FUZZY_DIST_STEP: f32 = 0.08;
+    const FILENAME_FUZZY_MIN_SCORE: f32 = 0.56;
     let query_stem = strip_extension_for_fuzzy(query);
-    let name_stem = strip_extension_for_fuzzy(name);
     let query_len = query_stem.chars().count();
     let name_len = name_stem.chars().count();
     if query_len >= 3 && name_len >= 3 && (query_len as isize - name_len as isize).abs() <= 2 {
-        let distance = damerau_levenshtein(&query_stem, &name_stem);
+        let distance = damerau_levenshtein(query_stem, name_stem);
         // 距离上限随长度微增（约 1/4），最短也允许 1 处差异；
         // 长度相近的短名字（3-12 字符）只允许 1-2 处错误，避免误召回。
         let max_allowed = ((query_len.min(name_len) as f32 * 0.25).ceil() as usize).max(1);
         if distance <= max_allowed {
-            return Some(("filename_fuzzy", FILENAME_FUZZY_SCORE));
+            let fuzzy_score = (FILENAME_FUZZY_BASE_SCORE - distance as f32 * FILENAME_FUZZY_DIST_STEP)
+                .max(FILENAME_FUZZY_MIN_SCORE);
+            return Some(("filename_fuzzy", fuzzy_score));
         }
     }
     if path.contains(query) {
@@ -12578,17 +12840,20 @@ fn filename_channel_match(name: &str, path: &str, query: &str) -> Option<(&'stat
     None
 }
 
-/// 剥一次扩展名（"ksdstep.ini" → "ksdstep"；无扩展名或"a.b"形态原样保留主名）。
+/// 剥一次真实文件扩展名（"ksdstep.ini" → "ksdstep"），但保留版本号里的点号。
 /// 用于错别字容错的文件主干比较，避免扩展名干扰编辑距离。
 fn strip_extension_for_fuzzy(value: &str) -> &str {
     match value.rsplit_once('.') {
-        Some((stem, extension))
-            if !stem.is_empty() && extension.chars().all(|ch| !ch.is_whitespace()) =>
-        {
-            stem
-        }
+        Some((stem, extension)) if !stem.is_empty() && looks_like_file_extension(extension) => stem,
         _ => value,
     }
+}
+
+fn looks_like_file_extension(extension: &str) -> bool {
+    let length = extension.chars().count();
+    (1..=8).contains(&length)
+        && extension.chars().all(|ch| ch.is_ascii_alphanumeric())
+        && extension.chars().any(|ch| ch.is_ascii_alphabetic())
 }
 
 /// Optimal String Alignment（Damerau-Levenshtein 变体）距离：
@@ -12606,11 +12871,11 @@ fn damerau_levenshtein(a: &str, b: &str) -> usize {
         return n;
     }
     let mut dp = vec![vec![0usize; m + 1]; n + 1];
-    for i in 0..=n {
-        dp[i][0] = i;
+    for (i, row) in dp.iter_mut().enumerate().take(n + 1) {
+        row[0] = i;
     }
-    for j in 0..=m {
-        dp[0][j] = j;
+    for (j, cell) in dp[0].iter_mut().enumerate().take(m + 1) {
+        *cell = j;
     }
     for i in 1..=n {
         for j in 1..=m {
@@ -12631,6 +12896,94 @@ fn damerau_levenshtein(a: &str, b: &str) -> usize {
     dp[n][m]
 }
 
+const FULLTEXT_EXACT_QUOTE_SCORE: f32 = 2.0;
+// 用户用引号「明确引用」的短语一旦在某个 chunk 中被逐字匹配上，就给予
+// 全文通道最高分，压过语义/常规全文命中。阈值衡量「引用内容的特异性」：
+// 过严（历史 24 字）会漏掉短而明确的章节标题/固定短语（如 8 字的
+// "一本搞定面试难题"），导致这类内容反查被语义通道的广泛命中稀释；
+// 过松又会拿 1-4 字的噪声当强信号。取 6：既覆盖常见中文短标题，又排除
+// 过短的高频词。页脚/水印等通用引文即使命中多个文件也只是拉平，不误伤。
+const MIN_EXACT_CONTENT_NEEDLE_CHARS: usize = 6;
+
+fn exact_quoted_content_needles(query: &str) -> Vec<String> {
+    // 存在性问句（有没有提到/是否提到/有没有写/有没有讲 X）中引号内的 X 是检索
+    // 主语，不是被逐字引用的原文段落；为其生成精确引文 needle 会把短主语误当成长
+    // 引文做精确 boost。这类问句统一不生成 needle，交给常规检索 + 证据门槛判断。
+    if is_existence_mention_question(query) {
+        return Vec::new();
+    }
+    let mut needles = Vec::new();
+    let mut chars = query.char_indices().peekable();
+    while let Some((start, ch)) = chars.next() {
+        let Some(closing) = matching_quote_delimiter(ch) else {
+            continue;
+        };
+        let content_start = start + ch.len_utf8();
+        let mut content_end = None;
+        for (index, candidate) in chars.by_ref() {
+            if candidate == closing {
+                content_end = Some(index);
+                break;
+            }
+        }
+        let Some(end) = content_end else {
+            break;
+        };
+        let needle = compact_exact_content(&query[content_start..end]);
+        if needle.chars().count() >= MIN_EXACT_CONTENT_NEEDLE_CHARS
+            && !needles.iter().any(|existing| existing == &needle)
+        {
+            needles.push(needle);
+        }
+    }
+    needles
+}
+
+/// 存在性/提及问句判定：引号内内容作为检索主语而非被引原文时，不生成精确引文 needle。
+fn is_existence_mention_question(query: &str) -> bool {
+    const PATTERNS: &[&str] = &[
+        "有没有提到",
+        "是否提到",
+        "有没有写",
+        "是否写了",
+        "有没有讲",
+        "是否讲",
+        "提到了吗",
+        "提过吗",
+        "有没有包含",
+    ];
+    PATTERNS.iter().any(|pattern| query.contains(pattern))
+}
+
+fn matching_quote_delimiter(ch: char) -> Option<char> {
+    match ch {
+        '“' => Some('”'),
+        '"' => Some('"'),
+        '「' => Some('」'),
+        '『' => Some('』'),
+        '‘' => Some('’'),
+        _ => None,
+    }
+}
+
+fn compact_exact_content(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn fulltext_quote_exact_match_score(text: &str, needles: &[String]) -> Option<f32> {
+    if needles.is_empty() {
+        return None;
+    }
+    let compact_text = compact_exact_content(text);
+    needles
+        .iter()
+        .any(|needle| compact_text.contains(needle))
+        .then_some(FULLTEXT_EXACT_QUOTE_SCORE)
+}
 fn search_fulltext(
     connection: &Connection,
     query: &str,
@@ -12645,6 +12998,7 @@ fn search_fulltext(
             "SELECT f.file_id, f.volume_id, f.canonical_path, f.display_name, f.extension, f.mime_type, f.size_bytes, f.fs_created_at, f.modified_at, f.windows_file_id, f.content_sha256, f.availability, f.current_revision_id, f.parse_status, f.first_seen_at, f.last_seen_at, c.revision_id, c.text, c.locator_json, bm25(chunks_fts), c.chunk_id, n.image_asset_id FROM chunks_fts JOIN chunks c ON c.chunk_id = chunks_fts.chunk_id JOIN document_nodes n ON n.node_id = c.node_id JOIN files f ON f.file_id = c.file_id WHERE chunks_fts MATCH ?1 AND f.current_revision_id = c.revision_id ORDER BY bm25(chunks_fts) LIMIT 500",
         )
         .map_err(|error| storage_error("SEARCH_QUERY_FAILED", error, true))?;
+    let exact_content_needles = exact_quoted_content_needles(query);
     let mapped = statement
         .query_map([match_query], |row| {
             let file = file_from_row(row)?;
@@ -12677,7 +13031,10 @@ fn search_fulltext(
         if !file_matches_scope(connection, &file, scope)? {
             continue;
         }
-        let score = (1.0 / (1.0 + rank.abs())) as f32;
+        let mut score = (1.0 / (1.0 + rank.abs())) as f32;
+        if fulltext_quote_exact_match_score(&text, &exact_content_needles).is_some() {
+            score = score.max(FULLTEXT_EXACT_QUOTE_SCORE);
+        }
         let hit = RankedHit {
             file: file.clone(),
             chunk_id: Some(parse_uuid_value(&chunk_id)?),
@@ -12693,7 +13050,92 @@ fn search_fulltext(
         };
         hits.push(hit);
     }
+    // FTS 中文分词会丢弃单字 token —— 用户用引号明确的精确短语若因空格/换行被
+    // 拆成单字（如「一 本 搞 定 面 试 难 题」），对应 chunk 根本进不了 FTS 结果，
+    // 上面的精确 boost 也就作用不到它。这里对作用域内所有 chunk 做一层「字面精确
+    // needle」补充：去除空白后逐字包含某引号短语即按精确命中计分，绕过 FTS 分词
+    // 局限。语料规模小（实测数万 chunk、约 1MB 文本），全量字符串扫描毫秒级，
+    // 与"小语料全量点积"的既有检索策略一致，不会引入明显延迟。
+    if !exact_content_needles.is_empty()
+        && supplement_exact_needle_hits(connection, scope, &exact_content_needles, &mut hits)?
+    {
+        // 稳定地把字面精确命中提到最前；同组内保留原始 bm25 顺序，避免用
+        // 仅供门槛参考的归一化分数再次颠倒 SQLite 的相关性顺序。
+        hits.sort_by(|left, right| {
+            let left_exact = left.channel_score >= FULLTEXT_EXACT_QUOTE_SCORE;
+            let right_exact = right.channel_score >= FULLTEXT_EXACT_QUOTE_SCORE;
+            right_exact.cmp(&left_exact)
+        });
+    }
     Ok(hits)
+}
+
+/// 字面精确 needle 补充扫描：作用域内任一 chunk 去空白后逐字包含某个引号短语，
+/// 就按全文精确命中（`FULLTEXT_EXACT_QUOTE_SCORE`）加入 hit 列表。
+///
+/// 返回 `Ok(true)` 表示补充了至少一个命中、并已按分数排序；调用方据此决定是否
+/// 重排 `hits`。chunk 按 `chunk_id` 去重（chunk 唯一归属某个文件）。仅为已存在的
+/// 精确短语相位检索，不做任何具体文件/关键词特判。
+fn supplement_exact_needle_hits(
+    connection: &Connection,
+    scope: &ScopeFilter,
+    needles: &[String],
+    hits: &mut Vec<RankedHit>,
+) -> Result<bool, AppError> {
+    let mut existing_chunks = HashSet::<String>::new();
+    for hit in hits.iter() {
+        if let Some(chunk_id) = hit.chunk_id {
+            existing_chunks.insert(chunk_id.to_string());
+        }
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT f.file_id, f.volume_id, f.canonical_path, f.display_name, f.extension, f.mime_type, f.size_bytes, f.fs_created_at, f.modified_at, f.windows_file_id, f.content_sha256, f.availability, f.current_revision_id, f.parse_status, f.first_seen_at, f.last_seen_at, c.revision_id, c.text, c.locator_json, c.chunk_id, n.image_asset_id FROM chunks c JOIN document_nodes n ON n.node_id = c.node_id JOIN files f ON f.file_id = c.file_id WHERE f.current_revision_id = c.revision_id",
+        )
+        .map_err(|error| storage_error("SEARCH_QUERY_FAILED", error, true))?;
+    let rows = statement
+        .query_map([], |row| {
+            let file = file_from_row(row)?;
+            Ok((
+                file,
+                row.get::<_, String>(16)?,
+                row.get::<_, String>(17)?,
+                row.get::<_, String>(18)?,
+                row.get::<_, String>(19)?,
+                row.get::<_, Option<String>>(20)?,
+            ))
+        })
+        .map_err(|error| storage_error("SEARCH_QUERY_FAILED", error, true))?;
+    let mut added = false;
+    for row in rows {
+        let (file, revision_id, text, locator_json, chunk_id, image_asset_id) =
+            row.map_err(|error| storage_error("SEARCH_QUERY_FAILED", error, true))?;
+        if existing_chunks.contains(&chunk_id) || !file_matches_scope(connection, &file, scope)? {
+            continue;
+        }
+        if !fulltext_quote_exact_match_score(&text, needles).is_some() {
+            continue;
+        }
+        existing_chunks.insert(chunk_id.clone());
+        let locator = serde_json::from_str::<SourceLocator>(&locator_json).map_err(|error| {
+            AppError::new("EMBEDDING_VECTOR_INVALID", error.to_string(), false)
+        })?;
+        hits.push(RankedHit {
+            file,
+            chunk_id: Some(parse_uuid_value(&chunk_id)?),
+            revision_id: Some(parse_uuid_value(&revision_id)?),
+            image_asset_id: image_asset_id
+                .as_deref()
+                .map(parse_uuid_value)
+                .transpose()?,
+            snippet: text,
+            locator: Some(locator),
+            reason: "fulltext",
+            channel_score: FULLTEXT_EXACT_QUOTE_SCORE,
+        });
+        added = true;
+    }
+    Ok(added)
 }
 
 fn search_semantic(
@@ -13887,6 +14329,111 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn exact_evidence_terms_filter_weak_semantic_neighbors() {
+        let terms = required_exact_evidence_terms(
+            "我好像有一份关于《ACME_RELEASE_6AA2EA2B》的资料，请总结一下。",
+        );
+        assert_eq!(terms, vec!["acme_release_6aa2ea2b"]);
+        assert!(!evidence_quote_satisfies_exact_terms(
+            "release policy mentions ACME and evaluation status separately",
+            &terms,
+        ));
+        assert!(evidence_quote_satisfies_exact_terms(
+            "Project note: ACME_RELEASE_6AA2EA2B rollout plan",
+            &terms,
+        ));
+
+        let terms = required_exact_evidence_terms("我的资料里有没有 VectorFlow 项目？");
+        assert_eq!(terms, vec!["vectorflow"]);
+        assert!(evidence_quote_satisfies_exact_terms(
+            "VectorFlow was used for workflow orchestration.",
+            &terms,
+        ));
+
+        assert!(required_exact_evidence_terms("我的资料里有没有 RAG？").is_empty());
+        assert!(required_exact_evidence_terms("我做过 Agent 项目吗？").is_empty());
+    }
+
+    #[test]
+    fn exact_evidence_terms_are_skipped_for_resolved_document_scope() {
+        let question = "《ReleasePlan_V1.2.pdf》和《DesignDoc_V2.0.pdf》分别讲了什么？";
+        assert!(!required_exact_evidence_terms(question).is_empty());
+        let required_terms = required_exact_evidence_terms_for_scope(question, true);
+        assert!(required_terms.is_empty());
+        assert!(evidence_quote_satisfies_exact_terms(
+            "第一份资料主要说明发布计划，第二份资料主要说明设计方案。",
+            &required_terms,
+        ));
+    }
+    #[test]
+    fn fulltext_exact_quote_boosts_only_long_contiguous_quotes() {
+        let needles = exact_quoted_content_needles(
+            "在哪份资料里提到了“ProjectAlpha deployed the ingestion workflow with staged review and stable rollback markers”？",
+        );
+        assert_eq!(needles.len(), 1);
+        assert!(fulltext_quote_exact_match_score(
+            "ProjectAlpha deployed the ingestion workflow with staged review and stable rollback markers.",
+            &needles,
+        )
+        .is_some());
+        assert!(fulltext_quote_exact_match_score(
+            "ProjectAlpha mentioned staged review, but the rollback markers were described elsewhere.",
+            &needles,
+        )
+        .is_none());
+
+        assert!(exact_quoted_content_needles("有没有提到“ProjectAlpha”？").is_empty());
+    }
+    #[test]
+    fn fuzzy_filename_stem_keeps_version_dots() {
+        assert_eq!(
+            strip_extension_for_fuzzy("release_plan_v6.6(20250606)"),
+            "release_plan_v6.6(20250606)"
+        );
+        assert_eq!(
+            strip_extension_for_fuzzy("release_plan_v6.6.pdf"),
+            "release_plan_v6.6"
+        );
+        assert_eq!(strip_extension_for_fuzzy("archive.7z"), "archive");
+        assert_eq!(
+            strip_extension_for_fuzzy("release_plan_v6.6"),
+            "release_plan_v6.6"
+        );
+
+        let fuzzy = filename_channel_match(
+            "release_plan_v6.6(20250606).pdf",
+            "",
+            "release_paln_v6.6(20250606)",
+        )
+        .expect("versioned filename typo should match fuzzily");
+        assert_eq!(fuzzy.0, "filename_fuzzy");
+    }
+    #[test]
+    fn filename_channel_prefers_exact_stem_over_longer_prefix() {
+        let exact = filename_channel_match("projectalpha.pdf", "", "projectalpha")
+            .expect("exact stem match");
+        let longer = filename_channel_match("projectalpha-final-report.pdf", "", "projectalpha")
+            .expect("longer prefix match");
+
+        assert_eq!(exact.0, "filename");
+        assert_eq!(longer.0, "filename");
+        assert!(
+            exact.1 > longer.1,
+            "a full filename stem should outrank a longer filename that merely starts with the query"
+        );
+
+        let normalized_exact = filename_channel_match("project_alpha.pdf", "", "project alpha")
+            .expect("normalized stem match");
+        assert!(normalized_exact.1 > longer.1);
+
+        let broad_prefix =
+            filename_channel_match("projectalpha.pdf", "", "project").expect("broad prefix match");
+        assert!(
+            broad_prefix.1 < exact.1,
+            "partial prefixes must not be promoted to exact-stem strength"
+        );
+    }
     #[test]
     fn structural_summary_score_rejects_markup_and_tiny_page_counters() {
         let natural =
@@ -16880,6 +17427,92 @@ mod tests {
     }
 
     #[test]
+    fn inbox_failure_and_ignored_filters_are_disjoint() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = CatalogStore::open(directory.path().join("fanfan.db")).expect("open store");
+        let root = store
+            .upsert_root(&test_root_registration())
+            .expect("insert root");
+        let (job, _) = store
+            .prepare_scan_job(&root.root_id, "inbox-filter")
+            .expect("prepare scan");
+        store
+            .mark_scan_running(&root.root_id, &job.job_id)
+            .expect("mark running");
+        let files = [
+            "active-failure.txt",
+            "ignored-failure.txt",
+            "ignored-normal.txt",
+        ]
+        .into_iter()
+        .map(|name| test_discovered(&directory.path().join(name), name))
+        .collect();
+        store
+            .commit_scan(
+                &root.root_id,
+                &job.job_id,
+                &ScanOutcome {
+                    files,
+                    ..ScanOutcome::default()
+                },
+            )
+            .expect("commit scan");
+
+        let query = |status| {
+            store
+                .query_inbox(&InboxQuery {
+                    status,
+                    event_types: vec![],
+                    root_ids: vec![root.root_id],
+                    date_from: None,
+                    date_to: None,
+                    cursor: None,
+                    page_size: 20,
+                })
+                .expect("query inbox")
+        };
+        let initial = query(TriageStatus::New);
+        assert_eq!(initial.items.len(), 3);
+        let active_failure_id = initial.items[0].inbox_id;
+        let ignored_failure_id = initial.items[1].inbox_id;
+        let ignored_normal_id = initial.items[2].inbox_id;
+
+        {
+            let connection = store.connect().expect("connect");
+            connection
+                .execute(
+                    "UPDATE inbox_events SET event_type = 'parse_failed', resolution_status = 'pending_retry' WHERE inbox_id IN (?1, ?2)",
+                    params![active_failure_id.to_string(), ignored_failure_id.to_string()],
+                )
+                .expect("mark failures");
+        }
+        let ignored_failure = store
+            .update_inbox_item(&InboxUpdateRequest {
+                inbox_id: ignored_failure_id,
+                triage_status: TriageStatus::Ignored,
+            })
+            .expect("ignore failure");
+        assert_eq!(
+            ignored_failure.resolution_status,
+            ResolutionStatus::Abandoned
+        );
+        let ignored_normal = store
+            .update_inbox_item(&InboxUpdateRequest {
+                inbox_id: ignored_normal_id,
+                triage_status: TriageStatus::Ignored,
+            })
+            .expect("ignore normal event");
+        assert_eq!(ignored_normal.resolution_status, ResolutionStatus::Normal);
+
+        let failures = query(TriageStatus::Error);
+        assert_eq!(failures.items.len(), 1);
+        assert_eq!(failures.items[0].inbox_id, active_failure_id);
+        let ignored = query(TriageStatus::Ignored);
+        assert_eq!(ignored.items.len(), 1);
+        assert_eq!(ignored.items[0].inbox_id, ignored_failure_id);
+    }
+
+    #[test]
     fn inbox_collections_and_file_relations_form_a_real_offline_flow() {
         let directory = tempfile::tempdir().expect("tempdir");
         let first_path = directory.path().join("归航计划-最终版.txt");
@@ -17418,6 +18051,48 @@ mod tests {
                 .contains(&"semantic".to_owned())
         );
         assert_eq!(semantic.results[0].scores.semantic, Some(1.0));
+
+        // 上游已经锁定单文件时，弱语义向量不得把该文件内真实 FTS 证据再次淘汰。
+        // 普通入口仍保留全库噪声门槛，权威 scope 入口只在显式 file_id 白名单上放行。
+        let scoped_ask = AskRequest {
+            question: "混合召回".into(),
+            session_id: None,
+            scope: ScopeFilter {
+                root_ids: vec![],
+                collection_ids: vec![],
+                file_ids: vec![file_id],
+                extensions: vec![],
+                modified_from: None,
+                modified_to: None,
+                availability: crate::Availability::Present,
+            },
+            answer_style: crate::AnswerStyle::Concise,
+            retrieval_limit: 12,
+            max_source_files: 1,
+            strict_evidence: true,
+            clarification_selection: None,
+            clarification_message_id: None,
+            think_mode: false,
+        };
+        let weak_semantic = SemanticQuery {
+            model_artifact_id: "embedding-test",
+            vector: &[-1.0, 0.0],
+        };
+        let ordinary = store
+            .answer_extractively(&scoped_ask, Some(weak_semantic.clone()))
+            .expect("ordinary scoped retrieval");
+        assert!(ordinary.claims.is_empty(), "普通入口应保留弱候选门槛");
+        let authoritative = store
+            .answer_extractively_in_authoritative_scope(&scoped_ask, Some(weak_semantic))
+            .expect("authoritative scoped retrieval");
+        assert_eq!(authoritative.used_file_ids, vec![file_id]);
+        assert!(
+            authoritative
+                .claims
+                .iter()
+                .any(|claim| claim.text.contains("混合召回")),
+            "已锁定文件中的真实词法证据应被保留"
+        );
         let preview = store.file_preview(&file_id, 10).expect("preview file");
         assert_eq!(preview.nodes.len(), 1);
         assert_eq!(preview.image_assets.len(), 1);
@@ -17550,6 +18225,7 @@ mod tests {
             max_source_files: 8,
             strict_evidence: true,
             clarification_selection: None,
+            clarification_message_id: None,
             think_mode: false,
         };
         let image_answer = store
@@ -17722,6 +18398,7 @@ mod tests {
                     max_source_files: 8,
                     strict_evidence: true,
                     clarification_selection: None,
+                    clarification_message_id: None,
                     think_mode: false,
                 },
                 None,

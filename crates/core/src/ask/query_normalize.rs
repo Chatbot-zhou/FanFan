@@ -30,6 +30,10 @@ const TARGET_STOP_PHRASES: &[&str] = &[
     "帮我",
     "请问",
     "请",
+    "哪个",
+    "哪些",
+    "哪份",
+    "哪几",
     "这个",
     "那个",
     "这些",
@@ -83,6 +87,20 @@ fn stop_phrases_sorted() -> Vec<&'static str> {
     let mut phrases = TARGET_STOP_PHRASES.to_vec();
     phrases.sort_by_key(|phrase| std::cmp::Reverse(phrase.chars().count()));
     phrases
+}
+
+/// 从目标短语中去掉指代/疑问填充词，保留其余字符（不切 token、不插空格）。
+///
+/// 与 [`meaningful_tokens`] 共用同一停止词表（口径一致），区别是这里返回
+/// 连续的清洗串，供 Document Resolver 的 FIND 定位与文件名做「子序列/二元组」
+/// 匹配：content_query「2019年数据库下午的真题文件」→「2019年数据库下午真题」
+/// （去掉 的/文件）。清洗只用于放宽匹配，删词过激只会多召回，不造成误答。
+pub fn strip_target_stop_phrases(text: &str) -> String {
+    let mut cleaned = text.to_owned();
+    for stop in stop_phrases_sorted() {
+        cleaned = cleaned.replace(stop, "");
+    }
+    cleaned
 }
 
 /// 从目标短语提取有意义词元：剥掉指代/疑问填充词后按非字母数字边界切分，
@@ -277,6 +295,25 @@ mod tests {
     fn tokens_extract_from_resume_reference() {
         assert_eq!(meaningful_tokens("我的简历"), vec!["简历"]);
         assert_eq!(meaningful_tokens("我的简历里"), vec!["简历"]);
+    }
+
+    #[test]
+    fn strip_removes_trailing_question_residue() {
+        // 常见功能词干扰：FIND 描述末尾的裸疑问词（哪个/哪些/哪份/哪几）必须
+        // 与「哪个文件」等组合词一样被剥掉，否则残词让子序列匹配在「真题」之后
+        // 卡在「哪」上失配，退化成弱一档的二元组覆盖率兜底。
+        assert_eq!(
+            strip_target_stop_phrases("2019年数据库下午的真题文件是哪个"),
+            "2019年数据库下午真题"
+        );
+        assert_eq!(
+            strip_target_stop_phrases("2020年上午真题是哪份"),
+            "2020年上午真题"
+        );
+        assert_eq!(
+            strip_target_stop_phrases("有哪些数据库真题"),
+            "数据库真题"
+        );
     }
 
     #[test]

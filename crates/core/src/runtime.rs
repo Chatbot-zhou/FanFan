@@ -13,7 +13,7 @@ use crate::AppError;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeBackendKind {
-    LlamaCpp,
+    Ollama,
     OnnxRuntime,
     SherpaOnnx,
     PaddleOcr,
@@ -636,7 +636,7 @@ mod tests {
         let first = manager
             .acquire(RuntimeTaskRequest::interactive(
                 RuntimeTaskKind::Ask,
-                RuntimeBackendKind::LlamaCpp,
+                RuntimeBackendKind::Ollama,
             ))
             .expect("first lease");
         let (sender, receiver) = mpsc::channel();
@@ -644,7 +644,7 @@ mod tests {
         thread::spawn(move || {
             let mut request = RuntimeTaskRequest::interactive(
                 RuntimeTaskKind::DeepImageAnalysis,
-                RuntimeBackendKind::LlamaCpp,
+                RuntimeBackendKind::Ollama,
             );
             request.timeout = Duration::from_secs(1);
             let lease = second_manager.acquire(request).expect("second lease");

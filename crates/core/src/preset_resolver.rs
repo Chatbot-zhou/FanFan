@@ -3,14 +3,12 @@
 //!
 //! 职责边界：
 //! - 仅把 `ModelPreset` 的角色 catalog_id 组装成运行计划，不内嵌下载 URL。
-//! - 视觉模型按「预置、仅在需要时开启」处理，从 catalog 中挑选最小的可下载
-//!   Vision 条目作为预置项，避免把 `ModelPreset` 结构带上版本变更。
+//! - Generation 使用 Ollama 原生多模态能力，不再规划独立 Vision 模型。
 //! - 运行时加载必须经此计划取模型，禁止直接读旧 `model_role_config`。
 
 use serde::{Deserialize, Serialize};
 
-use crate::model_catalog::{ModelPreset, built_in_model_catalog, preset_by_id};
-use crate::models::ModelRole;
+use crate::model_catalog::preset_by_id;
 
 /// 一份选定 Preset 落地到 RAG 各角色所需模型的运行计划。
 /// 只引用 catalog_id；具体下载 / 加载经「ModelCatalog → Artifact」链路解析。
@@ -28,15 +26,13 @@ pub struct RuntimeModelPlan {
     pub ocr: String,
     /// ASR（语音转写）模型 catalog_id；`None` 表示不启用。
     pub asr: Option<String>,
-    /// 预置的视觉模型 catalog_id；仅在需要多模态问答时按需加载。
-    pub vision: Option<String>,
 }
 
 impl RuntimeModelPlan {
     /// 返回该计划需要下载/就绪的全部 catalog_id（按角色顺序、去重）。
     /// 下载编排据此计算「已装/缺失」，同一 catalog_id 在跨档切换时复用。
     pub fn required_catalog_ids(&self) -> Vec<&str> {
-        let mut ids: Vec<&str> = Vec::with_capacity(7);
+        let mut ids: Vec<&str> = Vec::with_capacity(6);
         ids.push(self.generation.as_str());
         ids.push(self.embedding.as_str());
         if let Some(value) = &self.reranker {
@@ -44,9 +40,6 @@ impl RuntimeModelPlan {
         }
         ids.push(self.ocr.as_str());
         if let Some(value) = &self.asr {
-            ids.push(value.as_str());
-        }
-        if let Some(value) = &self.vision {
             ids.push(value.as_str());
         }
         ids
@@ -66,21 +59,7 @@ pub fn resolve_runtime_model_plan(preset_id: &str) -> Option<RuntimeModelPlan> {
         reranker: preset.reranker.clone(),
         ocr: preset.ocr.clone(),
         asr: preset.asr.clone(),
-        vision: resolve_preset_vision(&preset),
     })
-}
-
-/// 预置一个可下载的视觉模型（不修改 `ModelPreset` 结构）。
-/// 策略：从 catalog 中选「体积最小且已锁可下载 edition」的 Vision 条目，
-/// 满足『都预置、只在合适的时候开启』；需要图片问答时再按需加载，不与文本
-/// 生成模型常驻抢占显存。
-fn resolve_preset_vision(preset: &ModelPreset) -> Option<String> {
-    let _ = preset; // 预留：后续可按 preset 档位选择同代际 VL。
-    built_in_model_catalog()
-        .iter()
-        .filter(|entry| entry.role == ModelRole::Vision && entry.install_edition_id.is_some())
-        .min_by(|a, b| a.estimated_memory_gb.total_cmp(&b.estimated_memory_gb))
-        .map(|entry| entry.catalog_id.clone())
 }
 
 #[cfg(test)]

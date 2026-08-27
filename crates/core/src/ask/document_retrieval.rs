@@ -360,7 +360,8 @@ pub fn parallel_document_recall(
     // 归一化 RRF 分数，并把每个候选的命中来源信号合并到 meta 信号（语义命中
     // 补 semantic_match），截断到 top-N。
     let meta_by_id: HashMap<Uuid, DocumentCandidateMatch> = metadata_candidates
-        .into_iter()
+        .iter()
+        .cloned()
         .map(|c| (c.file_id, c))
         .collect();
     let max_score = fused_raw
@@ -399,7 +400,7 @@ pub fn parallel_document_recall(
     let fused = fused.into_iter().take(PARALLEL_RECALL_TOP_N).collect();
 
     ParallelDocumentRecall {
-        metadata_candidates: meta_by_id.into_values().collect(),
+        metadata_candidates,
         semantic_candidates,
         fused,
         semantic_enabled,
@@ -677,5 +678,51 @@ mod tests {
         vectors.insert(profile.file_id, vec![1.0]);
         let ranked = rank_document_candidates("任意问题", Some(&[1.0]), &profiles, &vectors);
         assert!(ranked.is_empty());
+    }
+
+    #[test]
+    fn parallel_recall_can_use_semantic_only_candidate() {
+        // 并行召回的语义通道不依赖 metadata 预筛：文件名/标题没有命中时，
+        // 只要 profile_vector 与问题足够相近，仍能把候选交给后续 chunk 检索。
+        let semantic_profile = mk_profile(8, "final_v3", vec![]);
+        let profiles = vec![(semantic_profile.clone(), "final_v3.pdf".to_owned())];
+        let vectors = HashMap::from([(semantic_profile.file_id, vec![1.0, 0.0])]);
+
+        let recall = parallel_document_recall(
+            "之前那个系统架构材料里写了什么？",
+            Some(&[1.0, 0.0]),
+            &profiles,
+            &vectors,
+        );
+
+        assert!(recall.semantic_enabled);
+        assert!(recall.metadata_candidates.is_empty());
+        assert_eq!(recall.semantic_candidates[0].0, semantic_profile.file_id);
+        assert_eq!(recall.fused[0].file_id, semantic_profile.file_id);
+        assert!(
+            recall.fused[0]
+                .signals
+                .iter()
+                .any(|signal| signal == "semantic_match")
+        );
+    }
+
+    #[test]
+    fn parallel_recall_preserves_metadata_trace_order() {
+        let first = mk_profile(9, "述职报告", vec!["报告"]);
+        let second = mk_profile(10, "述职材料", vec![]);
+        let profiles = vec![
+            (first.clone(), "述职报告.docx".to_owned()),
+            (second.clone(), "述职材料.docx".to_owned()),
+        ];
+
+        let recall = parallel_document_recall("找一下述职报告", None, &profiles, &HashMap::new());
+
+        assert_eq!(recall.metadata_candidates.len(), 2);
+        assert_eq!(recall.metadata_candidates[0].file_id, first.file_id);
+        assert!(
+            recall.metadata_candidates[0].score >= recall.metadata_candidates[1].score,
+            "metadata trace must keep ranked channel order"
+        );
     }
 }

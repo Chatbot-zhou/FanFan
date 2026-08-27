@@ -405,14 +405,10 @@ pub fn recommended_catalog_ids(
     // modest 8 GB RAM / 4 GB VRAM machine instead of the lightest option.
     let memory_gb = memory_total_gb.unwrap_or(8) as f32;
     let vram_gb = gpu_memory_gb.unwrap_or(4) as f32;
-    [
-        ModelRole::Generation,
-        ModelRole::Embedding,
-        ModelRole::Vision,
-    ]
-    .into_iter()
-    .filter_map(|role| recommend_for_role(catalog, role, memory_gb, vram_gb))
-    .collect()
+    [ModelRole::Generation, ModelRole::Embedding]
+        .into_iter()
+        .filter_map(|role| recommend_for_role(catalog, role, memory_gb, vram_gb))
+        .collect()
 }
 
 fn recommend_for_role(

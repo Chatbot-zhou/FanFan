@@ -163,29 +163,6 @@ struct WorkerResponseEnvelope<T> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmbeddingRequest {
-    pub model_path: String,
-    pub tokenizer_path: Option<String>,
-    pub texts: Vec<String>,
-    pub max_length: u32,
-    pub threads: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmbeddingResponse {
-    pub vectors: Vec<Vec<f32>>,
-    pub dimension: u32,
-    pub model_path: String,
-    pub tokenizer_path: String,
-    #[serde(default)]
-    pub device: Option<String>,
-    #[serde(default)]
-    pub execution_provider: Option<String>,
-    #[serde(default)]
-    pub fallback_reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RerankRequest {
     pub model_path: String,
     pub tokenizer_path: Option<String>,
@@ -314,14 +291,6 @@ pub struct ImageOcrRoutingResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExportTableRequest {
-    pub target_path: String,
-    pub format: String,
-    pub headers: Vec<String>,
-    pub rows: Vec<Vec<serde_json::Value>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportResult {
     pub target_path: String,
     pub format: String,
@@ -433,13 +402,6 @@ impl WorkerClient {
         )
     }
 
-    pub fn encode_embeddings(
-        &self,
-        request: &EmbeddingRequest,
-    ) -> Result<EmbeddingResponse, AppError> {
-        self.request_operation("embedding.encode", request)
-    }
-
     pub fn rerank(&self, request: &RerankRequest) -> Result<RerankResponse, AppError> {
         self.request_operation("rerank.score", request)
     }
@@ -476,10 +438,6 @@ impl WorkerClient {
         )
     }
 
-    pub fn export_table(&self, request: &ExportTableRequest) -> Result<ExportResult, AppError> {
-        self.request_operation("export.write", request)
-    }
-
     fn request_operation<P, R>(&self, operation: &'static str, payload: &P) -> Result<R, AppError>
     where
         P: Serialize,
@@ -497,7 +455,7 @@ impl WorkerClient {
             .map_err(|error| AppError::new("WORKER_REQUEST_INVALID", error.to_string(), false))?;
         request_json.push(b'\n');
 
-        let max_attempts = if operation == "export.write" { 1 } else { 2 };
+        let max_attempts = 2;
         let timeout = operation_timeout(operation);
         let mut last_error = None;
         for _ in 0..max_attempts {
@@ -801,7 +759,6 @@ fn operation_timeout(operation: &str) -> Duration {
         // Must stay above the worker-side OCR budget (ocr.py caps at 270s)
         // so a long scan-heavy parse is never killed mid-OCR.
         "document.parse" => Duration::from_secs(360),
-        "embedding.encode" | "export.write" => Duration::from_secs(120),
         "speech.recognize" | "speech.asr_self_test" | "ocr.recognize" | "ocr.self_test" => {
             Duration::from_secs(90)
         }

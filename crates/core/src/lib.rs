@@ -14,7 +14,6 @@ pub mod ollama;
 pub mod organizing;
 pub mod preset_resolver;
 pub mod profile_builder;
-pub mod router;
 pub mod runtime;
 pub mod scanner;
 pub mod storage;
@@ -26,6 +25,10 @@ pub mod worker;
 
 // 注意：ResolutionStatus 与 organizing::ResolutionStatus 撞名，不在此 glob 导出，
 // 需要的调用方从 ask::query_plan 路径引入。
+pub use ask::agent::{
+    KnowledgeTool, PlanCapability, PlanDecision, PlannerTier, ToolInput, ToolOutput, ToolStatus,
+    ToolValidation, ToolValidator, agent_router_enabled, plan_question, registry, tool_for_plan,
+};
 pub use ask::answer_gate::{
     AnswerShape, AnswerabilityInput, AnswerabilityStatus, AnswerabilityVerdict, EvidenceRole,
     GateEvidence, LOCAL_STRICT_SYSTEM_PROMPT, answer_shape_directive, claim_subject_mismatch,
@@ -53,6 +56,7 @@ pub use ask::document_summary::{
     SectionSummary, StructureEntry, build_document_sections, digests_json,
     document_overview_prompt, document_summary_prompt, merge_tail_sections, overview_schema,
     parse_overview, parse_section_summaries, section_batch_json, section_summary_schema,
+    match_section_digests,
 };
 pub use ask::extract::{
     EXTRACT_MATCH_MIN_LEN, EXTRACT_MATERIAL_CHARS, EXTRACT_MAX_ITEMS, ExtractItem, ExtractResults,
@@ -65,14 +69,17 @@ pub use ask::memory_writer::{
     memory_writer_schema, parse_writer_output, prewrite_validate, resolve_proposal_targets,
 };
 pub use ask::no_evidence::NoEvidenceReason;
-pub use ask::query_parser::{parse_query_plan, query_parser_prompt, query_parser_schema};
+pub use ask::query_parser::{
+    finalize_query_plan, parse_query_plan, query_parser_prompt, query_parser_schema,
+};
 pub use ask::query_plan::{
     DocumentCandidate, DocumentResolution, EvidenceStatus, QueryFilters, QueryOperation, QueryPlan,
     QueryTarget, SourceIntent,
 };
 pub use ask::query_planner::{FAST_PATH_CONFIDENCE_THRESHOLD, FastPathPlan, fast_path_plan};
 pub use ask::source_router::{
-    SourceRouting, parse_source_routing, source_router_prompt, source_routing_schema,
+    SourceRouting, apply_ambiguous_override, parse_source_routing, source_router_prompt,
+    source_routing_schema,
 };
 pub use catalog::*;
 pub use contracts::*;
@@ -88,7 +95,6 @@ pub use models::*;
 pub use ollama::*;
 pub use organizing::*;
 pub use preset_resolver::*;
-pub use router::*;
 pub use runtime::*;
 pub use scanner::*;
 pub use storage::*;
