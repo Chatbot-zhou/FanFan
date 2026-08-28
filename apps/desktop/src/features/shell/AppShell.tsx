@@ -1,7 +1,8 @@
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { bridge, type SystemNotice } from "../../bridge";
 import { recordDiagnosticEvent } from "../../bridge/observed-bridge";
+import { maybeAutoPreDownload } from "../../app/autoPreDownload";
 import { useAppStore } from "../../state/app-store";
 import { AskPage } from "../../pages/AskPage";
 import { CollectionsPage } from "../../pages/CollectionsPage";
@@ -25,6 +26,8 @@ export function AppShell({ startup_notice }: AppShellProps) {
   const eventNotices = useBackendEvents();
   const queryClient = useQueryClient();
   const route = useAppStore((state) => state.route);
+  // StrictMode / backendReady 多次翻转时保证本次启动只触发一次「首启自动预下载」。
+  const autoPreDownloadedRef = useRef(false);
   useEffect(() => {
     let timer: number | undefined;
     const showScrollbars = () => {
@@ -111,6 +114,12 @@ export function AppShell({ startup_notice }: AppShellProps) {
     // 不再重试；backendReady 翻转时全局失效一次，让所有查询自动重新加载，
     // 无需用户手动切页。
     void queryClient.invalidateQueries();
+    // 后端就绪且为本次启动首次触发：静默预下载缺失的 ModelScope 文件模型。
+    // 函数内部用 localStorage 标记保证跨启动只执行一次，幂等（只下载缺失模型）。
+    if (!autoPreDownloadedRef.current) {
+      autoPreDownloadedRef.current = true;
+      void maybeAutoPreDownload();
+    }
   }, [backendReady, queryClient]);
 
   useEffect(() => {

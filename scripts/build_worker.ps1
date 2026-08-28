@@ -106,6 +106,18 @@ foreach ($ffmpegDll in @("opencv_videoio_ffmpeg*.dll")) {
         Remove-Item -Force
 }
 
+# 移除 rapidocr 包随 `--collect-all rapidocr` 连带收集的内置默认 OCR 模型
+# （约 30.3 MB，PP-OCRv6_det/rec_small + ch_ppocr_mobile cls）。正式 OCR 链路由
+# Rust 端从 catalog 传入外部模型路径（paddle_ocr.py 的 Det/Cls/Rec.model_path 与
+# Rec.rec_keys_path），从不读取包内默认模型，这些文件属纯死重。剔除后安装包可
+# 回到 100 MB（Gitee 单文件上限）以下，且对 OCR 功能零影响。若 rapidocr 变更打包
+# 方式导致命中路径变化，需重新评估是否仍可安全剔除。
+$rapidocrModelsDir = Join-Path $internalDir "rapidocr\models"
+if (Test-Path -LiteralPath $rapidocrModelsDir) {
+    Get-ChildItem -Path $rapidocrModelsDir -File -Filter *.onnx |
+        Remove-Item -Force
+}
+
 $workerSize = (Get-Item -LiteralPath $workerExecutable).Length
 $internalSize = (Get-ChildItem -Path $internalDir -Recurse -File | Measure-Object -Property Length -Sum).Sum
 Write-Output "Worker build checkpoint passed: $workerExecutable ($workerSize bytes, internal $([math]::Round($internalSize / 1MB)) MB)"
