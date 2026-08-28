@@ -12,9 +12,35 @@ import { ImageAssetGallery } from "../components/ImageAssetGallery";
 import { confirmAction } from "../components/AppConfirm";
 import { AppSelect } from "../components/AppSelect";
 import { AskExecutionPanel } from "../features/ask/AskExecutionPanel";
+import type { AskExecutionState } from "../features/ask/ask-execution-state";
 import { errorMessage } from "../utils/app-error";
 import { useAppStore, type AskTurn } from "../state/app-store";
 import fanfanLogo from "../assets/fanfan-logo.png";
+
+// 发送后的"即时占位"执行状态：后端需先获取模型租约（冷启动可能耗时数秒）才发首个
+// node_started 事件，此段期间用该运行中的"理解问题"节点顶替显示，事件到达后无缝替换。
+const placeholderExecution: AskExecutionState = {
+  operation_id: "__placeholder",
+  status: "running",
+  nodes: [{
+    node_id: "seed-understanding",
+    node_name: "understanding",
+    public_label: "理解问题",
+    status: "running",
+    public_summary: null,
+    progress_lines: [],
+    duration_ms: null,
+    auto_expanded: true,
+    user_expanded: false,
+  }],
+  active_node_id: "seed-understanding",
+  streamed_answer: "",
+  answer_started: false,
+  answer_completed: false,
+  step_count: 1,
+  total_duration_ms: null,
+  last_sequence: 0,
+};
 
 const locatorLabel = (locator: AnswerResult["claims"][number]["citations"][number]["locator"]) => {
   if (locator.page_no) return `第 ${locator.page_no} 页`;
@@ -25,16 +51,22 @@ const locatorLabel = (locator: AnswerResult["claims"][number]["citations"][numbe
   return "正文位置";
 };
 
-// 模型输出区（回答/引用/分析）：把问题关键词补成 markdown **加粗**，交给渲染器显示；
-// 模型已输出的 **加粗** 片段先保护起来，避免重复包裹。
+// 模型输出区（回答/引用/分析）：把问题关键词补成 markdown **加粗**，交给渲染器显示。
+// 高亮前三层保护，确保不破坏模型输出的原样内容：
+//   1) markdown 代码块 ``` ... ```；2) 行内代码 `...`；3) 模型已输出的 **加粗** 片段。
+// 这样目录树符号、连接服务标识、代码段里的中文词不会被硬塞进 `**词**` 而破坏原样。
 const highlightQuestionTerms = (text: string, question: string): string => {
   const unique = extractQuestionTerms(question);
   if (!unique.length) return text;
   const protectedParts: string[] = [];
-  const masked = text.replace(/\*\*([^*\n]+)\*\*/g, (match) => {
+  const mask = (match: string) => {
     protectedParts.push(match);
     return `\uE000${protectedParts.length - 1}\uE001`;
-  });
+  };
+  const masked = text
+    .replace(/```[\s\S]*?```/g, mask)
+    .replace(/`[^`\n]+`/g, mask)
+    .replace(/\*\*([^*\n]+)\*\*/g, mask);
   const expression = new RegExp(`(${unique.map((value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})`, "giu");
   const highlighted = masked.replace(expression, (_, term: string) => `**${term}**`);
   return highlighted.replace(/\uE000(\d+)\uE001/g, (_, index: string) => protectedParts[Number(index)] ?? "");
@@ -184,6 +216,7 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
   const askExecution = useAppStore((state) => state.ask_execution);
   const toggleAskExecutionNode = useAppStore((state) => state.toggle_ask_execution_node);
   const finalizeAskExecution = useAppStore((state) => state.finalize_ask_execution);
+  const rememberAskExecution = useAppStore((state) => state.remember_ask_execution);
   const activeSessionId = useAppStore((state) => state.ask_active_session_id);
   const setActiveSessionId = useAppStore((state) => state.set_ask_active_session_id);
   const scopeCollectionIds = useAppStore((state) => state.ask_scope_collection_ids);
@@ -198,11 +231,15 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
   const [error, setError] = useState<string | null>(null);
   const [collections, setCollections] = useState<CollectionRecord[]>([]);
   const [preview, setPreview] = useState<FilePreview | null>(null);
+  const [previewTargetMessageId, setPreviewTargetMessageId] = useState<string | null>(null);
   const [previewLoading, setPreviewLoading] = useState<string | null>(null);
   const [readiness, setReadiness] = useState<RagReadiness | null>(null);
   // 每条回答的引用文件标签状态：折叠区是否展开、正在查看引文的文件
   const [refsExpanded, setRefsExpanded] = useState<Record<string, boolean>>({});
   const [activeRefFile, setActiveRefFile] = useState<Record<string, string | null>>({});
+  // 澄清场景下用户自定义输入：当系统给出的澄清选项都不符合预期时，
+  // 用户可在选项下方输入自己想表达的问题，重新走完整链路。
+  const [clarifCustom, setClarifCustom] = useState<Record<string, string>>({});
   const [recording, setRecording] = useState(false);
   const [recognizing, setRecognizing] = useState(false);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -269,11 +306,12 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
       const loadedTurns: AskTurn[] = [];
       let pendingUser = "";
       let failedQuestion: string | null = null;
+      const executionHistory = useAppStore.getState().ask_execution_history;
       for (const message of page.items) {
         if (message.role === "user") {
           pendingUser = message.content;
         } else if (message.answer && pendingUser) {
-          loadedTurns.push({ question: pendingUser, answer: message.answer });
+          loadedTurns.push({ question: pendingUser, answer: message.answer, execution: executionHistory[message.answer.message_id] ?? null });
           pendingUser = "";
         } else if (message.error) {
           failedQuestion = pendingUser || failedQuestion;
@@ -290,11 +328,13 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
       setAskOperationId(null);
       setLoading(false);
       setStreamedAnswer("");
+      useAppStore.setState({ ask_execution: null, ask_streamed_thinking: "", ask_think_mode: false, ask_active_phase: "queued" });
       setTurns(loadedTurns);
       setLastFailedQuestion(lastIsFailure ? failedQuestion : null);
       setActiveSessionId(sessionId);
       setPendingQuestion(null);
       setPreview(null);
+      setPreviewTargetMessageId(null);
       const selected = knownSession ?? sessions.find((session) => session.session_id === sessionId);
       if (selected) {
         setScopeCollectionIds(selected.scope.collection_ids ?? []);
@@ -325,6 +365,7 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
   const startNewSession = () => {
     resetAskState();
     setPreview(null);
+    setPreviewTargetMessageId(null);
     setError(null);
   };
 
@@ -340,11 +381,13 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
 
 
   const lastAnswer = turns.at(-1)?.answer;
-  const lastQuestion = turns.at(-1)?.question ?? pendingQuestion ?? "";
-  // 意图路由已接入：生成模型就绪且无核心资源压力时，即使索引/Embedding 未就绪也可发送（闲聊路径可行）
-  const chatUnavailable = readiness !== null && !readiness.ready && readiness.blockers.some((blocker) => blocker.code === "RAG_GENERATION_MISSING" || blocker.code === "RAG_CORE_MODE");
+  // 严格 RAG：生成、Embedding 与当前范围索引均就绪后才允许发送。
+  const chatUnavailable = readiness !== null && !readiness.ready;
 
-  const submit = async (questionOverride?: string, clarificationSelection: string | null = null) => {
+  // 澄清收拢：本次已选澄清（选文件/自定义输入）时携带被澄清回答的 message_id。
+  // 完成后不再追加新轮次，而是用最终回答**原位替换**那条被澄清的轮次，
+  // 使「提问→澄清→最终回答」在历史里始终是一个 turn。
+  const submit = async (questionOverride?: string, clarificationSelection: string | null = null, clarificationMessageId: string | null = null) => {
     const trimmed = (questionOverride ?? question).trim();
     if (!trimmed || loading) return;
     if (chatUnavailable) {
@@ -356,10 +399,11 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
     setError(null);
     setLastFailedQuestion(null);
     setPreview(null);
+    setPreviewTargetMessageId(null);
     setPendingQuestion(trimmed);
     setQuestion("");
     setStreamedAnswer("");
-    useAppStore.setState({ ask_execution: null, ask_streamed_thinking: "", ask_think_mode: false });
+    useAppStore.setState({ ask_execution: null, ask_streamed_thinking: "", ask_think_mode: false, ask_active_phase: "queued" });
     try {
       const result = await bridge.ask_start({
         question: trimmed,
@@ -370,6 +414,7 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
         max_source_files: 8,
         strict_evidence: true,
         clarification_selection: clarificationSelection,
+        clarification_message_id: clarificationMessageId,
         think_mode: false,
       });
       activeOperationRef.current = result.operation_id;
@@ -386,11 +431,27 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
           const completedResult = snapshot.result;
           finalizeAskExecution(completedResult.elapsed_ms);
           const completedExecution = useAppStore.getState().ask_execution;
-          setTurns((current) => [...current, { question: trimmed, answer: completedResult, execution: completedExecution }]);
+          rememberAskExecution(completedResult.message_id, completedExecution);
+          // 澄清收拢：携带被澄清 message_id 时，用最终回答**原位替换**该轮
+          // （不新增第二条用户提问，实现「提问→澄清→最终回答」为一个 turn）；
+          // 否则照常追加新轮次。
+          setTurns((current) => {
+            if (!clarificationMessageId) return [...current, { question: trimmed, answer: completedResult, execution: completedExecution }];
+            const index = current.findIndex((turn) => turn.answer.message_id === clarificationMessageId);
+            if (index === -1) return [...current, { question: trimmed, answer: completedResult, execution: completedExecution }];
+            // 原位覆写：后端已把最终回答 UPDATE 到原澄清消息上，这里对齐 message_id，
+            // 保证会话内 / 历史加载 / 执行记忆三者指向同一消息 id。
+            const next = [...current];
+            next[index] = { question: trimmed, answer: { ...completedResult, message_id: clarificationMessageId }, execution: completedExecution };
+            return next;
+          });
           setActiveSessionId(completedResult.session_id);
           setPendingQuestion(null);
-          void refreshSessions().catch(() => undefined);
           activeOperationRef.current = null;
+          setAskOperationId(null);
+          setStreamedAnswer("");
+          useAppStore.setState({ ask_execution: null, ask_streamed_thinking: "", ask_think_mode: false, ask_active_phase: "queued" });
+          void refreshSessions().catch(() => undefined);
           break;
         }
         if (snapshot.handle.status === "failed" || snapshot.handle.status === "cancelled") {
@@ -399,6 +460,10 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
         await new Promise((resolve) => window.setTimeout(resolve, 120));
       }
     } catch (askError) {
+      activeOperationRef.current = null;
+      setAskOperationId(null);
+      setStreamedAnswer("");
+      useAppStore.setState({ ask_execution: null, ask_streamed_thinking: "", ask_think_mode: false, ask_active_phase: "queued" });
       setError(errorMessage(askError));
       setLastFailedQuestion(trimmed);
       void refreshSessions().catch(() => undefined);
@@ -409,11 +474,20 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
     }
   };
 
-  const showPreview = async (fileId: string, anchorNodeId: string | null = null, offset = 0) => {
+  // 澄清场景：系统给出的选项都不符合用户预期时，用用户自行输入的问题重新
+  // 走完整链路（不带澄清选择，等同重新提问），并携带被澄清消息 id 原地收拢为同一轮。
+  const submitCustomClarification = (messageId: string) => {
+    const text = (clarifCustom[messageId] ?? "").trim();
+    if (!text) return;
+    void submit(text, null, messageId);
+  };
+
+  const showPreview = async (fileId: string, anchorNodeId: string | null = null, offset = 0, messageId: string | null = null) => {
     setPreviewLoading(fileId);
     setError(null);
     try {
       const page = await bridge.preview_get(fileId, offset, 80, anchorNodeId);
+      setPreviewTargetMessageId((current) => messageId ?? current);
       setPreview((current) => current?.file.file_id === fileId && offset > 0
         ? { ...page, nodes: [...current.nodes, ...page.nodes], offset: current.offset, anchor_node_id: current.anchor_node_id }
         : page);
@@ -586,7 +660,7 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
             </span>;
           })}
         </div>
-        {readiness && !readiness.ready && <small className="rag-status-inline">完整 RAG 尚未就绪 · 语义覆盖 {Math.round(readiness.scope_index_coverage * 100)}%{chatUnavailable ? " · 配置完成后才能发送" : " · 可以直接闲聊，资料提问需索引就绪"}</small>}
+        {readiness && !readiness.ready && <small className="rag-status-inline">完整 RAG 尚未就绪 · 语义覆盖 {Math.round(readiness.scope_index_coverage * 100)}% · 配置完成后才能发送</small>}
         <AppSelect className="ask-scope-select" ariaLabel="选择检索范围" value="" showSearch onChange={addScopeCollection} labelRender={() => (
           scopeCollectionIds.length === 0
             ? <span>全部资料</span>
@@ -613,10 +687,8 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
         {turns.length === 0 && !pendingQuestion && <div className="page-empty">
           <QuestionCircleOutlined />
           <h2>从你的资料中寻找答案</h2>
-          <p>回答只依据你的本地资料，每句话都标明来源，确保可追溯可复核。</p>
         </div>}
         {turns.map((turn, index) => {
-          const isLast = index === turns.length - 1;
           return <Fragment key={`${turn.answer.session_id}-${index}`}>
             <UserMessage text={turn.question} />
             <AssistantMessage>
@@ -632,7 +704,7 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
                           key={option.file_id}
                           type="button"
                           disabled={loading}
-                          onClick={() => void submit(turn.question, option.file_id)}
+                          onClick={() => void submit(turn.question, option.file_id, turn.answer.message_id)}
                         >
                           <strong>{option.display_name}</strong>
                           {option.document_type && <small>{option.document_type}</small>}
@@ -640,6 +712,33 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
                         </button>
                       ))}
                     </div>
+                    {!loading && (
+                      <div className="clarification-custom">
+                        <label htmlFor={`clarif-custom-${turn.answer.message_id}`}>
+                          以上都不符合，输入你想表达的问题：
+                        </label>
+                        <div className="clarification-custom__row">
+                          <input
+                            id={`clarif-custom-${turn.answer.message_id}`}
+                            type="text"
+                            value={clarifCustom[turn.answer.message_id] ?? ""}
+                            autoComplete="off"
+                            placeholder="直接输入你的问题，重新帮我看……"
+                            onChange={(event) => setClarifCustom((prev) => ({ ...prev, [turn.answer.message_id]: event.target.value }))}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") submitCustomClarification(turn.answer.message_id);
+                            }}
+                          />
+                          <button
+                            type="button"
+                            disabled={!(clarifCustom[turn.answer.message_id] ?? "").trim()}
+                            onClick={() => submitCustomClarification(turn.answer.message_id)}
+                          >
+                            重新提问
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
                 <div className="answer-actions">
@@ -658,16 +757,16 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
                     activeFile={activeRefFile[turn.answer.message_id] ?? null}
                     onToggleRefs={() => setRefsExpanded((prev) => ({ ...prev, [turn.answer.message_id]: !(prev[turn.answer.message_id] ?? false) }))}
                     onSelectFile={(fileId) => setActiveRefFile((prev) => ({ ...prev, [turn.answer.message_id]: fileId }))}
-                    onOpenPreview={(fileId, nodeId) => void showPreview(fileId, nodeId)}
+                    onOpenPreview={(fileId, nodeId) => void showPreview(fileId, nodeId, 0, turn.answer.message_id)}
                   />
                 </div>
-                {isLast && preview && <div className="answer-preview" aria-label={`${preview.file.display_name}原文预览`}>
+                {preview && previewTargetMessageId === turn.answer.message_id && <div className="answer-preview" aria-label={`${preview.file.display_name}原文预览`}>
                   <header><strong>{preview.file.display_name}</strong><small>{displayPath(preview.file.display_path)}</small></header>
                   {preview.file.extension.toLowerCase() === "pdf" && <PdfVisualPreview preview={preview} />}
                   <OcrAttemptChain attempts={preview.ocr_attempts} />
                   <ImageAssetGallery assets={preview.image_assets} />
                   {preview.nodes.map((node) => <p key={node.node_id} className={node.node_id === preview.anchor_node_id ? "preview-node--anchor" : undefined}><small>{locatorLabel(node.locator)}</small>{highlightPlainTerms(node.text ?? (node.table_data ? JSON.stringify(node.table_data) : ""), turn.question)}</p>)}
-                  {preview.next_offset !== null && <button type="button" className="text-button" disabled={previewLoading === preview.file.file_id} onClick={() => void showPreview(preview.file.file_id, null, preview.next_offset ?? 0)}>继续载入</button>}
+                  {preview.next_offset !== null && <button type="button" className="text-button" disabled={previewLoading === preview.file.file_id} onClick={() => void showPreview(preview.file.file_id, null, preview.next_offset ?? 0, turn.answer.message_id)}>继续载入</button>}
                 </div>}
               </div>
             </AssistantMessage>
@@ -676,8 +775,9 @@ export function AskPage({ model_state }: { model_state: ModelRuntimeState | null
         {pendingQuestion && <UserMessage text={pendingQuestion} />}
         {loading && <AssistantMessage>
           <div className="chat-bubble chat-bubble--assistant" aria-live="polite">
-            {askExecution && <AskExecutionPanel execution={askExecution} onToggleNode={toggleAskExecutionNode} />}
-            {!askExecution && <small className="ask-phase-label">正在处理本地资料</small>}
+            {askExecution && askExecution.nodes.length > 0
+              ? <AskExecutionPanel execution={askExecution} onToggleNode={toggleAskExecutionNode} />
+              : <AskExecutionPanel execution={placeholderExecution} />}
             {streamedAnswer ? <div className="markdown-body"><MarkdownAnswer text={streamedAnswer} question={pendingQuestion ?? ""} /></div> : <span className="chat-typing"><i /><i /><i /></span>}
           </div>
         </AssistantMessage>}

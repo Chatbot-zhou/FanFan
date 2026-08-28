@@ -259,7 +259,7 @@ export interface InferenceBudget {
   system_memory_reserve_bytes: number;
 }
 
-export type RuntimeBackendKind = "llama_cpp" | "onnx_runtime" | "sherpa_onnx" | "paddle_ocr" | "parser";
+export type RuntimeBackendKind = "ollama" | "onnx_runtime" | "sherpa_onnx" | "paddle_ocr" | "parser";
 export type RuntimeTaskKind = "cancel" | "preview" | "speech_recognition" | "ask" | "deep_image_analysis" | "search" | "embedding" | "rerank" | "incremental_index" | "ocr" | "image_understanding" | "collection_analysis" | "maintenance" | "parse";
 export type RuntimeTaskState = "queued" | "running" | "completed" | "cancelled" | "failed";
 
@@ -567,29 +567,6 @@ export interface SummaryMetric {
   value: number;
 }
 
-export interface RecentFile {
-  file_id: string;
-  name: string;
-  extension: string;
-  subtitle: string;
-  modified_at: UtcDateTime;
-}
-
-export interface CollectionSummary {
-  collection_id: string;
-  name: string;
-  item_count: number;
-  tone: "blue" | "purple" | "green" | "pink";
-}
-
-export interface CandidateRoot {
-  candidate_id: string;
-  candidate_type: "onedrive" | "wechat" | "qq";
-  label: string;
-  display_path: string;
-  status: "suggested" | "adding" | "added" | "ignored";
-}
-
 export interface ScanProgress {
   scan_job_id: string;
   status: JobStatus;
@@ -601,16 +578,27 @@ export interface ScanProgress {
   progress: number;
 }
 
+export interface HomeOverview {
+  /** 已发现文件总数。 */
+  discovered_files: number;
+  /** 可被搜索的文件总数。 */
+  searchable_files: number;
+  /** 已完成解析的文件总数。 */
+  parsed_files: number;
+  /** 已完成向量嵌入的文件总数。 */
+  embedded_files: number;
+  /** 已通过 OCR 识别的页数。 */
+  ocr_pages: number;
+}
+
 export interface HomeSummary {
   local_date: string;
   metrics: SummaryMetric[];
   scan_progress: ScanProgress | null;
+  /** 无论是否存在进行中扫描都返回的文件统计，供首页「概况」区展示。 */
+  overview: HomeOverview;
   /** 是否已建立过初始索引（存在可搜索文件）。用于无进行中扫描任务时区分“已完成”与“尚未整理”。 */
   index_initialized: boolean;
-  recent_files: RecentFile[];
-  favorite_files: RecentFile[];
-  collections: CollectionSummary[];
-  candidate_roots: CandidateRoot[];
 }
 
 export interface SearchRequest {
@@ -684,6 +672,10 @@ export interface AskRequest {
   strict_evidence: true;
   /** Step 7：用户对 NEED_CLARIFICATION 选项的选择（file_id），随本轮提问一并提交 */
   clarification_selection: string | null;
+  /** Step 7（澄清收拢）：被澄清的那条 NEED_CLARIFICATION 回答的 message_id。
+   * 携带后，最终回答会**原位覆写**该消息（UPDATE），不再另起一轮 user+assistant；
+   * 前端据此原地替换该轮，保证「提问→澄清→最终回答」历史里始终是一个 turn。 */
+  clarification_message_id: string | null;
   /** 兼容旧协议字段；普通 UI 不展示模型 thinking。 */
   think_mode: boolean;
 }
@@ -1629,6 +1621,8 @@ export interface FanFanBridge {
   ollama_start(): Promise<OllamaStatusSnapshot>;
   /** 请求关闭本机 Ollama（终止 ollama.exe 进程）。 */
   ollama_stop(): Promise<OllamaStatusSnapshot>;
+  /** 打开白名单内的 Ollama 相关链接（官方下载页 / 本机地址）。 */
+  ollama_open_url(url: string): Promise<void>;
   model_state_get(): Promise<ModelRuntimeState>;
   model_role_catalog_list(): Promise<ModelCatalogEntry[]>;
   model_preset_list(): Promise<ModelPreset[]>;
@@ -1643,15 +1637,12 @@ export interface FanFanBridge {
   model_download_start(edition_id: ModelEdition["edition_id"], source: "huggingface" | "modelscope" | "ollama", confirmed: true): Promise<ModelDownloadJob>;
   model_download_list(): Promise<ModelDownloadJob[]>;
   model_store_status_get(): Promise<ModelStoreStatus>;
-  model_download_get(job_id: string): Promise<ModelDownloadJob>;
   model_download_pause(job_id: string): Promise<ModelDownloadJob>;
   model_download_cancel(job_id: string): Promise<ModelDownloadRemoval>;
   model_download_resume(job_id: string): Promise<ModelDownloadJob>;
   model_download_retry(job_id: string): Promise<ModelDownloadJob>;
-  model_download_switch_source(job_id: string, source: "huggingface" | "modelscope" | "ollama"): Promise<ModelDownloadJob>;
   model_download_remove(job_id: string): Promise<ModelDownloadRemoval>;
   home_get_summary(local_date: string): Promise<HomeSummary>;
-  candidate_root_action(candidate_id: string, action: "add" | "ignore"): Promise<CandidateRoot>;
   search_start(request: SearchRequest): Promise<SearchSession>;
   rag_readiness_get(scope: ScopeFilter): Promise<RagReadiness>;
   ask_start(request: AskRequest): Promise<OperationHandle>;
@@ -1669,7 +1660,6 @@ export interface FanFanBridge {
   inbox_query(request: InboxQuery): Promise<InboxPage>;
   inbox_update(inbox_id: string, triage_status: TriageStatus): Promise<InboxItem>;
   inbox_retry(inbox_id: string): Promise<InboxItem>;
-  ocr_retry(file_id: string): Promise<boolean>;
   image_understanding_retry(asset_id: string): Promise<boolean>;
   image_deep_analyze(asset_id: string, question: string): Promise<ImageDeepAnalysis>;
   collection_list(): Promise<CollectionRecord[]>;
@@ -1686,9 +1676,6 @@ export interface FanFanBridge {
   collection_suggestion_confirm(suggestion_id: string): Promise<CollectionRecord>;
   collection_suggestion_reject(suggestion_id: string): Promise<void>;
   relation_refresh(max_files: number): Promise<RelationRefreshResult>;
-  relation_query(request: RelationQuery): Promise<RelationPage>;
-  relation_review(relation_id: string, action: "accepted" | "rejected"): Promise<void>;
-  relation_batch_review(relation_ids: string[], action: "accepted" | "rejected"): Promise<number>;
   relation_group_query(request: RelationGroupQuery): Promise<RelationGroupPage>;
   relation_group_review(group_id: string, action: "accepted" | "rejected"): Promise<void>;
   relation_group_batch_review(group_ids: string[], action: "accepted" | "rejected"): Promise<number>;
@@ -1697,7 +1684,6 @@ export interface FanFanBridge {
   exclusion_rule_upsert(request: ExclusionRuleInput): Promise<ExclusionRule>;
   exclusion_rule_delete(rule_id: string): Promise<void>;
   app_status_get(): Promise<AppStatusSnapshot>;
-  runtime_state_get(): Promise<AiRuntimeSnapshot>;
   maintenance_get(): Promise<MaintenanceSnapshot>;
   maintenance_check(level: "quick" | "full"): Promise<MaintenanceCheckResult>;
   storage_usage_get(): Promise<StorageUsageSnapshot>;
@@ -1708,10 +1694,7 @@ export interface FanFanBridge {
   model_store_migration_cleanup(confirmation: "CLEANUP_MIGRATED_MODEL_STORE"): Promise<MigrationCleanupResult>;
   cache_clear(category: "temporary_cache" | "failed_downloads", confirmation: "CLEAR_CACHE"): Promise<CacheClearResult>;
   app_data_reset_schedule(confirmation: "RESET_APPLICATION_DATA"): Promise<void>;
-  maintenance_log_query(request: LogQuery): Promise<LogPage>;
   maintenance_logs_clear(): Promise<number>;
-  node_trace_query(request: NodeTraceQuery): Promise<NodeTracePage>;
-  node_trace_clear(): Promise<number>;
   /** 一次 Ask 的调试追踪（12+ 阶段分组 + 耗时 + 诊断摘要一行） */
   ask_trace_get(operation_id: string): Promise<AskTrace>;
   /** 单次问答导出 Debug Trace JSON（默认脱敏：路径 / chunk 文本 / prompt） */
@@ -1723,12 +1706,7 @@ export interface FanFanBridge {
   /** 重建 Document Profile（单文件或全部；不重建 Chunk Embedding） */
   document_profile_rebuild(request: DocumentProfileRebuildRequest): Promise<ProfileRefreshResult>;
   /** Memory Inspector：三张表 + 可选关键字过滤 */
-  memory_inspector_query(search?: string): Promise<MemoryInspectorView>;
   /** 记忆关系 confirm / reject（仅 relations 有状态） */
-  memory_relation_set_status(request: MemoryRelationStatusRequest): Promise<void>;
-  memory_alias_delete(alias_id: string): Promise<void>;
-  memory_entity_delete(entity_id: string): Promise<void>;
-  memory_relation_delete(relation_id: string): Promise<void>;
   /** 清空 Memory（只删 memory_aliases/relations/entities；不删文件/索引/Embedding/Ask History） */
   memory_clear(request: MemoryClearRequest): Promise<number>;
   /** 「使用记忆」总开关读取（memory.json 持久化；默认开启） */
@@ -1738,7 +1716,6 @@ export interface FanFanBridge {
   /** 记忆摘要列表（confirmed + candidate 两组；rejected/stale 不展示） */
   memory_summary_list(): Promise<MemorySummaryList>;
   /** 单条记忆详情（Drawer/Modal 用） */
-  memory_summary_get(summary_id: string): Promise<MemorySummary>;
   /** 确认待选记忆：status → confirmed */
   memory_confirm(summary_id: string): Promise<boolean>;
   /** 拒绝待选记忆：status → rejected，不再参与解析 */

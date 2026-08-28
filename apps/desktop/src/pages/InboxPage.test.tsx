@@ -5,7 +5,7 @@ import { bridge, type InboxItem } from "../bridge";
 import { useAppStore } from "../state/app-store";
 import { InboxPage } from "./InboxPage";
 
-function item(inboxId: string, name: string): InboxItem {
+function item(inboxId: string, name: string, overrides: Partial<InboxItem> = {}): InboxItem {
   return {
     inbox_id: inboxId,
     file_id: `file-${inboxId}`,
@@ -23,6 +23,7 @@ function item(inboxId: string, name: string): InboxItem {
     duplicate_group_id: null,
     summary: null,
     error_code: null,
+    ...overrides,
   };
 }
 
@@ -50,10 +51,29 @@ describe("InboxPage", () => {
     await waitFor(() => expect(query.mock.calls[1]?.[0].cursor).toBe("cursor-2"));
   });
 
+  it("shows the four user-facing lists and only offers ignore for processing failures", async () => {
+    vi.spyOn(bridge, "inbox_query").mockResolvedValue({
+      items: [
+        item("1", "普通新增.pdf"),
+        item("2", "处理失败.pdf", { event_type: "parse_failed", resolution_status: "pending_retry", retry_action: "retry_parse", error_code: "PARSE_FAILED" }),
+      ],
+      next_cursor: null,
+      has_more: false,
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    render(<QueryClientProvider client={client}><InboxPage /></QueryClientProvider>);
+
+    expect(await screen.findByText("普通新增.pdf")).toBeInTheDocument();
+    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["全部", "已查看", "失败", "已忽略"]);
+    expect(screen.queryByRole("tab", { name: "待处理" })).not.toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "忽略" })).toHaveLength(1);
+  });
+
   it("updates reviewed state and renders a structured failure as readable text", async () => {
-    vi.spyOn(bridge, "inbox_query").mockResolvedValue({ items: [item("1", "待查看.pdf")], next_cursor: null, has_more: false });
+    const failedItem = item("1", "待查看.pdf", { event_type: "parse_failed", resolution_status: "pending_retry", retry_action: "retry_parse", error_code: "PARSE_FAILED" });
+    vi.spyOn(bridge, "inbox_query").mockResolvedValue({ items: [failedItem], next_cursor: null, has_more: false });
     const update = vi.spyOn(bridge, "inbox_update")
-      .mockResolvedValueOnce({ ...item("1", "待查看.pdf"), triage_status: "reviewed" })
+      .mockResolvedValueOnce({ ...failedItem, triage_status: "reviewed" })
       .mockRejectedValueOnce({ code: "INBOX_UPDATE_FAILED", message: "资料库暂时繁忙", retryable: true });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
     render(<QueryClientProvider client={client}><InboxPage /></QueryClientProvider>);

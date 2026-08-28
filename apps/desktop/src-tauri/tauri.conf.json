@@ -47,13 +47,12 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "../../../.artifacts/worker/fanfan-worker/": "worker/",
-      "../../../.artifacts/runtime/llama/": "runtime/llama/"
+      "../../../.artifacts/worker/fanfan-worker/": "worker/"
     },
     "windows": {
       "allowDowngrades": false,
       "webviewInstallMode": {
-        "type": "offlineInstaller",
+        "type": "downloadBootstrapper",
         "silent": true
       },
       "nsis": {

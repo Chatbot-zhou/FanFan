@@ -11,7 +11,6 @@ import { displayPath } from "../utils/display-path";
 type InboxTab = InboxQuery["status"];
 
 const tabs: Array<{ value: InboxTab; label: string }> = [
-  { value: "new", label: "待处理" },
   { value: "all", label: "全部" },
   { value: "reviewed", label: "已查看" },
   { value: "error", label: "失败" },
@@ -75,7 +74,7 @@ export function InboxPage() {
       {inbox.isLoading && <div className="page-empty"><p>正在读取本地收件箱…</p></div>}
       {inbox.isError && <div className="page-empty"><h2>收件箱暂时无法读取</h2><p>{errorMessage(inbox.error)}</p><button className="primary-button" type="button" onClick={() => void inbox.refetch()}>重试</button></div>}
       {(update.isError || retryProcessing.isError) && <p role="alert" className="inline-error">{errorMessage(update.error ?? retryProcessing.error)}</p>}
-      {!inbox.isLoading && !inbox.isError && items.length === 0 && <div className="page-empty"><InboxOutlined /><h2>{status === "new" ? "没有待处理资料" : "这里还没有记录"}</h2><p>翻翻会把扫描中发现的变化和异常自动放到这里。</p></div>}
+      {!inbox.isLoading && !inbox.isError && items.length === 0 && <div className="page-empty"><InboxOutlined /><h2>这里还没有记录</h2><p>翻翻会把扫描中发现的变化和异常自动放到这里。</p></div>}
       <div className="inbox-list">
         {items.map((item) => (
           <article className="inbox-item" key={item.inbox_id}>
@@ -99,7 +98,7 @@ export function InboxPage() {
               {item.event_type === "relation_suggested" && <button type="button" onClick={() => navigate("library")}>复核资料关系</button>}
               {item.triage_status === "new" ? <>
                 <button type="button" disabled={update.isPending} onClick={() => update.mutate({ inboxId: item.inbox_id, nextStatus: "reviewed" })}><CheckOutlined /> {update.isPending && update.variables?.inboxId === item.inbox_id && update.variables.nextStatus === "reviewed" ? "正在更新" : "已查看"}</button>
-                <button type="button" disabled={update.isPending} onClick={() => update.mutate({ inboxId: item.inbox_id, nextStatus: "ignored" })}>{update.isPending && update.variables?.inboxId === item.inbox_id && update.variables.nextStatus === "ignored" ? "正在忽略" : "忽略"}</button>
+                {isProcessingFailure(item) && <button type="button" disabled={update.isPending} onClick={() => update.mutate({ inboxId: item.inbox_id, nextStatus: "ignored" })}>{update.isPending && update.variables?.inboxId === item.inbox_id && update.variables.nextStatus === "ignored" ? "正在忽略" : "忽略"}</button>}
               </> : <span className="inbox-item__state">{item.triage_status === "reviewed" ? "已查看" : "已忽略"}</span>}
             </div>
           </article>
@@ -108,6 +107,10 @@ export function InboxPage() {
       {inbox.hasNextPage && <button type="button" className="load-more-button" disabled={inbox.isFetchingNextPage} onClick={() => void inbox.fetchNextPage()}>{inbox.isFetchingNextPage ? "正在加载" : "加载更多"}</button>}
     </section>
   );
+}
+
+function isProcessingFailure(item: InboxItem) {
+  return item.resolution_status === "pending_retry" || item.resolution_status === "retrying";
 }
 
 function InboxProcessingDetails({ item }: { item: InboxItem }) {

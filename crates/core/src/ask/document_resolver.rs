@@ -697,9 +697,9 @@ fn score_candidate(input: &ResolverInput<'_>, profile: &DocumentProfile) -> Docu
     }
 
     // 3. 文档标题（用户给的名字与画像标题互含即命中）。
-    //    分类器未运行时（document_type IS NULL）追加「有意义词元」命中：
-    //    「我那个大模型的材料」→ 词元「大模型」⊂ 标题即命中（整串互含对
-    //    指代式短语永远失败，token 化是唯一可行路径）。
+    //    整串互含只对「近似完整标题」的引用有效；指代式短语（「我那个大模型
+    //    的材料」/「那本讲大模型应用开发的册子」）永远无法整串命中，须靠
+    //    主题词元（见下）参与标题匹配。
     let title_tokens = [
         input.plan.target.document_name.as_deref(),
         input.plan.target.reference.as_deref(),
@@ -708,14 +708,17 @@ fn score_candidate(input: &ResolverInput<'_>, profile: &DocumentProfile) -> Docu
     .flatten()
     .filter(|token| !token.trim().is_empty())
     .collect::<Vec<_>>();
-    let target_tokens = if profile.document_type.is_none() {
-        title_tokens
-            .iter()
-            .flat_map(|token| meaningful_tokens(token))
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    // 主题词元：对**任何**画像都提取 reference/document_name 的核心主题词参与标题
+    // 互含匹配。此前只在「未分类文档」时启用，导致已分类文档遇到指代式短语
+    // （如「那本讲大模型应用开发的册子」）时，整串既不被标题包含也不包含标题，
+    // 标题信号落空，即便库内确有该文档也可能定位不到。改为无条件提取：指代包装
+    // 词（那本/讲的/的/册子…）经停用词清洗剥去，仅剩「大模型/应用/开发」等真正
+    // 主题词参与标题匹配，通用提升对任何文档类型的指代式定位。通用语言处理，
+    // 不针对任何具体文件/关键词/case。
+    let target_tokens = title_tokens
+        .iter()
+        .flat_map(|token| meaningful_tokens(token))
+        .collect::<Vec<_>>();
     // GraduationReferenceResolver（CASE 5）：目标含「毕业」→ 毕业类等价
     // 词元（论文/答辩/开题/学位…）参与标题匹配。独立于 target_tokens 的
     // 类型条件：已分类为 Paper 的「学位论文」同样要被「毕业」引用命中。

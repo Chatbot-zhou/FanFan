@@ -13,17 +13,16 @@ use std::{
 };
 
 use chrono::Utc;
-use fanfan_core::ask::builtin_knowledge::lookup_builtin_knowledge;
 use fanfan_core::ask::query_normalize::normalize_query_variants;
 use fanfan_core::ask::query_plan::{QueryIntent, QueryOperation, ResolutionStatus};
 use fanfan_core::ask::source_router::{SourceRouting, personal_reference_hit};
 use fanfan_core::ollama::{OLLAMA_START_TIMEOUT, OllamaClient, OllamaPullProgress, ensure_running};
 use fanfan_core::profile_builder::{TYPE_PROTOTYPE_TEXTS, TypePrototype, classify_document_type};
 use fanfan_core::{
-    AddRootRequest, AiRuntimeSnapshot, AnswerClaim, AnswerMode, AnswerResult, AnswerSourceFile,
-    AnswerabilityInput, AnswerabilityStatus, AppError, AskEvaluationRunReport,
-    AskEvaluationRunRequest, AskMessage, AskMessagePage, AskRequest, AskSessionContext,
-    AskSessionPage, AskTrace, AskTraceExport, AskTraceExportRequest, AskTraceStage, AskTraceTiming,
+    AddRootRequest, AiRuntimeSnapshot, AnswerClaim, AnswerMode, AnswerResult, AnswerShape,
+    AnswerSourceFile, AnswerabilityInput, AnswerabilityStatus, AppError, AskMessage,
+    AskMessagePage, AskRequest,
+    AskSessionContext, AskSessionPage,
     COMPARE_FALLBACK_ITEMS, COMPARE_MATERIAL_CHARS, COMPARE_MATERIAL_ITEMS, CandidateRoot,
     CatalogService, ChunkEmbeddingInput, ClarificationOption, ClarificationPayload,
     CollectionModelReview, CollectionRecord, CollectionRule, CollectionSuggestion,
@@ -31,39 +30,49 @@ use fanfan_core::{
     CollectionSuggestionUpdateRequest, CompareResults, CreateCollectionRequest, DegradationLevel,
     DocumentCandidate, DocumentOverview, DocumentProfile, DocumentProfileInspect,
     DocumentProfileRebuildRequest, DocumentType, DownloadFile, DownloadedModelMetadata,
-    EXTRACT_MATCH_MIN_LEN, EXTRACT_MAX_ITEMS, EmbeddingResponse, EvidenceRef, ExclusionRule,
-    ExclusionRuleInput, ExportResult, FastPathPlan, FilePage, FilePreview, FileQuery, FileRecord,
-    GateEvidence, GenerationActivation, GroundingStatus, ImageOcrResult, ImageOcrRoutingRequest,
-    ImageUnderstandingResult, InboxItem, InboxPage, InboxQuery, InboxUpdateRequest,
-    IncrementalWatchManager, IndexActivityStats, JobRecord, LOCAL_STRICT_SYSTEM_PROMPT,
-    LocalGenerationRuntime, LogPage, LogQuery, MAX_CANDIDATE_SCOPE, MAX_SECTION_CHARS,
-    MAX_SECTIONS, MaintenanceSnapshot, MemoryClearRequest, MemoryHint, MemoryInspectorView,
-    MemoryKind, MemoryRelationStatusRequest, MemorySource, MemoryStatus, MemoryTargetRegistry,
-    MemoryTargetType, MemoryWriteInput, MemoryWriterContext, ModelArtifact, ModelCatalogEntry,
+    EXTRACT_MATCH_MIN_LEN, EXTRACT_MAX_ITEMS, EvidenceRef, ExclusionRule, ExclusionRuleInput,
+    ExportResult, FastPathPlan, FilePage, FilePreview, FileQuery, FileRecord, GateEvidence,
+    GroundingStatus, ImageOcrResult, ImageOcrRoutingRequest, ImageUnderstandingResult, InboxItem,
+    InboxPage, InboxQuery, InboxUpdateRequest, IncrementalWatchManager, IndexActivityStats,
+    JobRecord, LOCAL_STRICT_SYSTEM_PROMPT, LocalGenerationRuntime, MAX_CANDIDATE_SCOPE,
+    MAX_SECTION_CHARS, MAX_SECTIONS, MaintenanceSnapshot, MemoryClearRequest, MemoryHint,
+    MemoryKind, MemorySource, MemoryStatus, MemoryTargetRegistry, MemoryTargetType,
+    MemoryWriteInput, MemoryWriterContext, ModelArtifact, ModelCatalogEntry,
     ModelDownloadFileProgress, ModelDownloadJob, ModelDownloadRemoval, ModelEdition, ModelFormat,
     ModelImportSelection, ModelManager, ModelPreset, ModelRole, ModelSource, ModelStoreStatus,
-    NoEvidenceReason, NodeTracePage, NodeTraceQuery, NodeTraceRecord, OcrRuntimeConfig,
-    OperationTraceInput, PARALLEL_RECALL_TOP_N, ParseMetrics, ParseOutcome, ParseRequest,
-    ParseResult, PendingEmbeddingActivation, ProfileRefreshResult, QueryPlan, RagReadiness,
-    RelationGroupPage, RelationGroupQuery, RelationPage, RelationQuery, RelationRefreshResult,
-    RerankRequest, ResolverInput, RootRecord, RuntimeBackendKind, RuntimeCapability,
-    RuntimeInstanceState, RuntimeManager, RuntimeModelPlacement, RuntimeResourceBudget,
-    RuntimeTaskKind, RuntimeTaskRequest, ScopeFilter, SearchMode, SearchRequest, SearchSession,
-    SectionChunk, SectionSummary, SemanticQuery, SourceIntent, SpeechRecognitionRequest,
-    SpeechRecognitionResult, StructureEntry, SupportStatus, TraceFeatureType, TraceNodeInput,
-    TraceNodeMeta, TriageStatus, WorkerClient, WorkerRole, answer_shape_directive,
-    build_document_sections, chat_prompt, claim_subject_mismatch, compare_prompt, compare_schema,
-    digests_json, document_overview_prompt, document_summary_prompt, evaluate_answerability,
-    existence_requires_project_context, extract_item_is_entity_like, extract_prompt,
-    extract_schema, fast_path_plan, find_external_knowledge_marker, local_no_evidence_answer,
-    longest_common_substr_len, match_alias_hints, match_relation_hints, memory_writer_prompt,
-    memory_writer_schema, merge_tail_sections, overview_schema, parallel_document_recall,
-    parse_compare_results, parse_extract_results, parse_overview, parse_query_plan,
-    parse_rewritten_queries, parse_section_summaries, parse_source_routing, parse_writer_output,
-    prewrite_validate, query_parser_prompt, query_parser_schema, query_rewrite_prompt,
-    resolve_ambiguous, resolve_documents, resolve_proposal_targets, section_summary_schema,
-    source_router_prompt, source_routing_schema, strip_long_path_prefix,
+    NoEvidenceReason, OcrRuntimeConfig, OperationTraceInput,
+    PARALLEL_RECALL_TOP_N, ParseMetrics, ParseOutcome, ParseRequest, ParseResult,
+    PendingEmbeddingActivation, ProfileRefreshResult, QueryPlan, RagReadiness, RelationGroupPage,
+    RelationGroupQuery, RelationRefreshResult, RerankRequest, ResolverInput, RootRecord,
+    RuntimeBackendKind, RuntimeCapability, RuntimeInstanceState, RuntimeManager,
+    RuntimeModelPlacement, RuntimeResourceBudget, RuntimeTaskKind, RuntimeTaskRequest, ScopeFilter,
+    SearchMode, SearchRequest, SearchSession, SectionChunk, SectionSummary, SemanticQuery,
+    SourceIntent, SpeechRecognitionRequest, SpeechRecognitionResult, StructureEntry, SupportStatus,
+    TraceFeatureType, TraceNodeInput, TraceNodeMeta, TriageStatus, WorkerClient, WorkerRole,
+    answer_shape_directive, build_document_sections, claim_subject_mismatch, compare_prompt,
+    compare_schema, digests_json, document_overview_prompt, document_summary_prompt,
+    evaluate_answerability, existence_requires_project_context, extract_item_is_entity_like,
+    extract_prompt, extract_schema, fast_path_plan, find_external_knowledge_marker, fold_recent_history,
+    local_no_evidence_answer, longest_common_substr_len, match_alias_hints, match_relation_hints,
+    memory_writer_prompt, memory_writer_schema, merge_tail_sections, overview_schema,
+    match_section_digests,
+    parallel_document_recall, parse_compare_results, parse_extract_results, parse_overview,
+    finalize_query_plan, parse_query_plan, parse_rewritten_queries, parse_section_summaries,
+    parse_source_routing, parse_writer_output, prewrite_validate, query_parser_prompt,
+    query_parser_schema, query_rewrite_prompt, resolve_ambiguous, resolve_documents,
+    resolve_proposal_targets, section_summary_schema, source_router_prompt, source_routing_schema,
+    strip_long_path_prefix, apply_ambiguous_override,
 };
+use fanfan_core::{KnowledgeTool, PlannerTier, agent_router_enabled, plan_question};
+use crate::commands::ask_tools as agent_tools;
+
+// 以下 Trace/Eval 相关类型仅用于开发与 CI 诊断，发布构建不引入。
+#[cfg(debug_assertions)]
+use fanfan_core::{
+    AskEvaluationRunReport, AskEvaluationRunRequest, AskTrace, AskTraceExport,
+    AskTraceExportRequest, AskTraceStage, AskTraceTiming, NodeTraceRecord,
+};
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -874,7 +883,7 @@ pub fn rag_readiness_get(
     let generation_ready = models.active_artifact(ModelRole::Generation)?.is_some();
     let embedding = models.active_artifact(ModelRole::Embedding)?;
     let embedding_ready = embedding.is_some();
-    let vision_ready = models.active_artifact(ModelRole::Vision)?.is_some();
+    let vision_ready = generation_ready;
     let (image_total, image_ready, pending_image_assets) = catalog.image_understanding_stats()?;
     let image_index_coverage = if image_total == 0 {
         1.0
@@ -1268,14 +1277,6 @@ pub struct ModelDownloadJobRequest {
 }
 
 #[tauri::command(async)]
-pub fn model_download_get(
-    request: ModelDownloadJobRequest,
-    models: State<'_, ModelServiceState>,
-) -> Result<ModelDownloadJob, AppError> {
-    models.get()?.download_job(&request.job_id)
-}
-
-#[tauri::command(async)]
 pub fn model_download_pause(
     request: ModelDownloadJobRequest,
     app: AppHandle,
@@ -1321,6 +1322,43 @@ pub fn model_download_pause(
     Ok(job)
 }
 
+/// 判断指定 edition 是否仍有其他活动下载任务（按下载注册表状态）。
+///
+/// 下载暂存目录按 `edition_id` 共享，同一版本的多个下载任务（不同 job_id）
+/// 会并发写入同一目录。若直接删除整个 edition 目录，会误删其他正在下载任务
+/// 的 `.part` 文件，导致 curl 报 `client returned ERROR on write`
+/// （错误码 MODEL_DOWNLOAD_FAILED）。删除前须确认同版本没有活动任务。
+fn edition_has_active_job(
+    manager: &ModelManager,
+    edition_id: &str,
+    exclude_job_id: &Uuid,
+) -> Result<bool, AppError> {
+    for job in manager.list_download_jobs()? {
+        if job.job_id == *exclude_job_id || job.edition_id != edition_id {
+            continue;
+        }
+        // 同版本存在排队/运行/暂停任务时，暂存目录仍被占用，删除会破坏其断点续传
+        if matches!(job.status.as_str(), "queued" | "running" | "paused") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// 判断指定 edition 是否仍被其他活动下载任务占用（注册表 + 后台线程双重维度）。
+fn edition_has_active_download(
+    manager: &ModelManager,
+    downloads: &ModelDownloadCoordinatorState,
+    edition_id: &str,
+    exclude_job_id: &Uuid,
+) -> Result<bool, AppError> {
+    // 当前任务自身仍在后台运行时，其暂存目录必然不可删除
+    if downloads.is_running(exclude_job_id) {
+        return Ok(true);
+    }
+    edition_has_active_job(manager, edition_id, exclude_job_id)
+}
+
 #[tauri::command(async)]
 pub fn model_download_cancel(
     request: ModelDownloadJobRequest,
@@ -1357,7 +1395,20 @@ pub fn model_download_cancel(
                 }
                 thread::sleep(Duration::from_millis(50));
             }
-            match cleanup_models.remove_download_staging_for_edition(&cleanup_edition_id) {
+            // 清理前确认同版本没有其他活动任务，避免误删并发下载中的文件
+            let cleaned = match edition_has_active_download(
+                &cleanup_models,
+                &cleanup_downloads,
+                &cleanup_edition_id,
+                &cleanup_job_id,
+            ) {
+                Ok(true) => Ok(0),
+                Ok(false) => {
+                    cleanup_models.remove_download_staging_for_edition(&cleanup_edition_id)
+                }
+                Err(error) => Err(error),
+            };
+            match cleaned {
                 Ok(bytes) => {
                     let _ = cleanup_app.emit(
                         "model:download_removed",
@@ -1377,7 +1428,8 @@ pub fn model_download_cancel(
                 ),
             }
         });
-    } else {
+    } else if !edition_has_active_download(&manager, &downloads, &job.edition_id, &request.job_id)?
+    {
         partial_bytes_removed = manager.remove_download_staging_for_edition(&job.edition_id)?;
     }
     let removal = ModelDownloadRemoval {
@@ -1387,12 +1439,6 @@ pub fn model_download_cancel(
     };
     let _ = app.emit("model:download_removed", &removal);
     Ok(removal)
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ModelDownloadSwitchSourceRequest {
-    job_id: Uuid,
-    source: String,
 }
 
 #[tauri::command]
@@ -1475,59 +1521,12 @@ pub async fn model_download_retry(
     )
 }
 
-#[tauri::command]
-pub async fn model_download_switch_source(
-    request: ModelDownloadSwitchSourceRequest,
-    app: AppHandle,
-    catalog: State<'_, CatalogServiceState>,
-    models: State<'_, ModelServiceState>,
-    downloads: State<'_, ModelDownloadCoordinatorState>,
-    sidecars: State<'_, SidecarRegistryState>,
-    generation: State<'_, GenerationServiceState>,
-) -> Result<ModelDownloadJob, AppError> {
-    let manager = models.get()?;
-    let previous = manager.download_job(&request.job_id)?;
-    if !matches!(previous.status.as_str(), "paused" | "failed")
-        && previous.activation_status.as_deref() != Some("failed")
-    {
-        return Err(AppError::new(
-            "MODEL_DOWNLOAD_CONTROL_INVALID",
-            "当前模型任务不能切换来源",
-            false,
-        ));
-    }
-    let target_source = parse_download_source(&request.source)?;
-    if target_source == previous.source {
-        return Err(AppError::new(
-            "MODEL_DOWNLOAD_SOURCE_UNCHANGED",
-            "请选择另一个模型下载来源",
-            false,
-        ));
-    }
-    if manager
-        .pending_embedding_activation()?
-        .is_some_and(|pending| pending.download_job_id == Some(request.job_id))
-    {
-        manager.cancel_embedding_activation(&request.job_id)?;
-    }
-    restart_existing_download(
-        app,
-        catalog.get()?,
-        manager,
-        downloads.inner().clone(),
-        Arc::clone(&sidecars.0),
-        Arc::clone(&generation.0),
-        previous,
-        Some(target_source),
-        true,
-    )
-}
-
 #[tauri::command(async)]
 pub fn model_download_remove(
     request: ModelDownloadJobRequest,
     app: AppHandle,
     models: State<'_, ModelServiceState>,
+    downloads: State<'_, ModelDownloadCoordinatorState>,
 ) -> Result<ModelDownloadRemoval, AppError> {
     let manager = models.get()?;
     let job = manager.download_job(&request.job_id)?;
@@ -1544,7 +1543,11 @@ pub fn model_download_remove(
         manager.cancel_embedding_activation(&request.job_id)?;
     }
     let removed = manager.remove_download_job(&request.job_id)?;
-    let partial_bytes_removed = manager.remove_download_staging_for_edition(&job.edition_id)?;
+    // 同版本存在其他活动下载任务时保留共享暂存目录，防止误删正在下载的文件
+    let mut partial_bytes_removed = 0_u64;
+    if !edition_has_active_download(&manager, &downloads, &job.edition_id, &request.job_id)? {
+        partial_bytes_removed = manager.remove_download_staging_for_edition(&job.edition_id)?;
+    }
     let removal = ModelDownloadRemoval {
         job_id: request.job_id,
         removed,
@@ -1613,19 +1616,6 @@ fn restart_existing_download(
         generation,
     )?;
     manager.download_job(&job.job_id)
-}
-
-fn parse_download_source(source: &str) -> Result<ModelSource, AppError> {
-    match source {
-        "huggingface" => Ok(ModelSource::Huggingface),
-        "modelscope" => Ok(ModelSource::Modelscope),
-        "ollama" => Ok(ModelSource::Ollama),
-        _ => Err(AppError::new(
-            "MODEL_DOWNLOAD_SOURCE_UNAVAILABLE",
-            "不支持的模型下载来源",
-            false,
-        )),
-    }
 }
 
 fn download_file_progress(edition: &ModelEdition) -> Vec<ModelDownloadFileProgress> {
@@ -1871,19 +1861,23 @@ fn download_ollama_edition(
     Ok(())
 }
 
-/// 阶段3：embedding 统一入口。经本机 Ollama `/api/embed` 把文本批量编码为
-/// 向量，返回与既有 `EmbeddingResponse` 兼容的结构，供语义检索 / 向量索引 /
-/// 文档类型分类 / 自检链路沿用，无需各调用点感知后端差异。
-/// 模型 tag 由四档预设统一固定为 `qwen3-embedding:0.6b`（见 model_catalog）。
-fn run_embedding(texts: Vec<String>) -> Result<EmbeddingResponse, AppError> {
+#[derive(Debug)]
+struct OllamaEmbeddingBatch {
+    vectors: Vec<Vec<f32>>,
+    dimension: u32,
+    device: Option<String>,
+    execution_provider: Option<String>,
+    fallback_reason: Option<String>,
+}
+
+/// Embedding 统一入口：经本机 Ollama `/api/embed` 批量编码文本。
+fn run_embedding(texts: Vec<String>) -> Result<OllamaEmbeddingBatch, AppError> {
     let tag = fanfan_core::model_catalog::OLLAMA_EMBEDDING_TAG;
     let client = OllamaClient::local();
     let (vectors, dimension) = client.embed(tag, &texts)?;
-    Ok(EmbeddingResponse {
+    Ok(OllamaEmbeddingBatch {
         vectors,
         dimension,
-        model_path: tag.to_owned(),
-        tokenizer_path: String::new(),
         device: Some("ollama".to_owned()),
         execution_provider: None,
         fallback_reason: None,
@@ -2015,13 +2009,10 @@ fn run_model_download(
             persist_download_job(app, models, &mut job)?;
             let speech_worker = app.state::<SpeechWorkerState>().0.clone();
             let embedding_indexing = self_test_and_activate_downloaded_roles(
-                app,
-                catalog,
                 models,
                 &sidecars.onnx,
                 &sidecars.ocr,
                 &speech_worker,
-                generation,
                 &installed,
                 job.job_id,
             )?;
@@ -2031,7 +2022,12 @@ fn run_model_download(
                     &edition.edition_id,
                     artifact.role,
                 ) {
-                    let _ = fs::remove_dir_all(staging);
+                    // 同版本仍有其他活动下载任务时保留暂存目录，避免误删并发下载中的
+                    // 文件；状态检查失败时保守跳过删除
+                    if !edition_has_active_job(models, &edition.edition_id, &job_id).unwrap_or(true)
+                    {
+                        let _ = fs::remove_dir_all(staging);
+                    }
                 }
             }
             job.current_file = None;
@@ -2193,143 +2189,17 @@ fn run_model_download(
     }
 }
 
-/// 自检输出的可见文本（Phase 4.3）：剥离 thinking 模型的 `<think>…</think>`
-/// 思维链段。思维链未闭合（token 上限截断）时整段丢弃——此时若闭合段外
-/// 已有可见回复仍判定通过；无 `<think>` 标记的普通模型原样返回。
-fn self_test_visible_text(raw: &str) -> String {
-    if !raw.contains("<think>") {
-        return raw.trim().to_owned();
-    }
-    let mut visible = String::new();
-    let mut rest = raw;
-    while let Some(start) = rest.find("<think>") {
-        visible.push_str(&rest[..start]);
-        let after_start = &rest[start + "<think>".len()..];
-        match after_start.find("</think>") {
-            Some(end) => {
-                rest = &after_start[end + "</think>".len()..];
-            }
-            None => {
-                // 未闭合的思维链（截断）：丢弃到结尾
-                rest = "";
-            }
-        }
-    }
-    visible.push_str(rest);
-    visible.trim().to_owned()
-}
-
-/// 清洗 qwen3.5 思考模型的正文标记：`<Thinking>…</Thinking><Answer>…</Answer>`。
-/// 该模型在 think=true 时正文本身会携带这两段标签（与 message.thinking 字段
-/// 不同，这里出现的是**正文内嵌**的标记），直接展示给用户不友好，需剥除。
-/// 剥离规则：去掉 `<Thinking>` / `</Thinking>` / `<Answer>` / `</Answer>`，
-/// 并 trim 空白；剥离失败或全空时原样返回。
-fn clean_qwen_thinking_tags(raw: &str) -> String {
-    let cleaned = raw
-        .replace("<Thinking>", "")
-        .replace("</Thinking>", "")
-        .replace("<Answer>", "")
-        .replace("</Answer>", "")
-        .replace("\\<Thinking>", "")
-        .replace("\\</Thinking>", "")
-        .replace("\\<Answer>", "")
-        .replace("\\</Answer>", "")
-        .trim()
-        .to_owned();
-    if cleaned.is_empty() {
-        raw.trim().to_owned()
-    } else {
-        cleaned
-    }
-}
-
-/// 模型激活后的 GPU 状态日志（Phase 4.3 第四部分）：device / backend /
-/// gpu_layers / 模型文件一次打全，落 runtime 日志供「GPU 到底有没有用上」
-/// 的启动期排查（与 llama.cpp 的 --list-devices 探测结果一致）。
-fn log_model_activation_gpu_status(model_path: &str, activation: &GenerationActivation) {
-    crate::runtime_log::event(
-        "info",
-        "model.runtime",
-        "activation.gpu_status",
-        None,
-        &serde_json::json!({
-            "model_file": model_path.rsplit(['/', '\\']).next().unwrap_or(model_path),
-            "device": activation.device,
-            "backend": activation.backend,
-            "gpu_layers": activation.gpu_layers,
-            "multimodal": activation.multimodal,
-            "context_size": activation.context_size,
-        }),
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
 fn self_test_and_activate_downloaded_roles(
-    app: &AppHandle,
-    catalog: &Arc<CatalogService>,
     models: &ModelManager,
     onnx: &WorkerClient,
     ocr: &WorkerClient,
     speech: &WorkerClient,
-    generation: &Mutex<LocalGenerationRuntime>,
     installed: &[ModelArtifact],
     download_job_id: Uuid,
 ) -> Result<bool, AppError> {
     let mut embedding_indexing = false;
     for artifact in installed {
         match (artifact.role, artifact.format) {
-            (ModelRole::Generation, ModelFormat::Gguf) => {
-                let mut runtime = generation.lock().map_err(|_| {
-                    AppError::new(
-                        "GENERATION_RUNTIME_LOCK_FAILED",
-                        "生成运行时状态已损坏",
-                        true,
-                    )
-                })?;
-                let activation = runtime.activate(
-                    &artifact.local_path,
-                    4096,
-                    interactive_inference_threads(),
-                )?;
-                // Phase 4.3（Qwen3.5 自检失败修复）：thinking 模型的 chat
-                // template 可能强制先输出  thinking 思维链，也可能按
-                // 可见回复过短或纯思维链（如「好的」）不应被误判回滚，
-                // 判定标准统一改为下方注释描述的非空检查。
-                let generated = runtime.complete(
-                    "你是本地模型健康检查器，直接输出答案，不要展开推理。",
-                    "请用一句完整中文句子回复：翻翻本地模型可以正常工作。",
-                    256,
-                )?;
-                let visible = self_test_visible_text(&generated);
-                // 自检只验证本地推理能产出文本：可见文本或原始输出任一非空
-                // 即通过；两者皆空才判定失败，避免 2B Q4 thinking 模型给出
-                // 短确认（如「好的」）或纯思维链时被误判回滚。
-                if visible.trim().is_empty() && generated.trim().is_empty() {
-                    crate::runtime_log::event(
-                        "error",
-                        "model.download",
-                        "self_test.generation_empty",
-                        None,
-                        &serde_json::json!({
-                            "model_file": artifact
-                                .local_path
-                                .rsplit(['/', '\\'])
-                                .next()
-                                .unwrap_or(&artifact.local_path),
-                            "generated_length": generated.chars().count(),
-                            "generated_snippet": generated.chars().take(120).collect::<String>(),
-                        }),
-                    );
-                    runtime.stop();
-                    return Err(AppError::new(
-                        "MODEL_SELF_TEST_FAILED",
-                        "生成模型没有通过最小本地推理自检，已回滚",
-                        true,
-                    ));
-                }
-                log_model_activation_gpu_status(&artifact.local_path, &activation);
-                models.activate_artifact(&artifact.artifact_id, None)?;
-            }
             (ModelRole::Embedding, ModelFormat::Onnx) => {
                 // Ollama 迁移：embedding 由本机 Ollama 统一托管，这里直接经 /api/embed 自检，
                 // 不再读取本地 onnx / tokenizer 文件。
@@ -2351,26 +2221,6 @@ fn self_test_and_activate_downloaded_roles(
                     Some(download_job_id),
                 )?;
                 embedding_indexing = true;
-            }
-            (ModelRole::Vision, ModelFormat::Gguf) => {
-                let projector = models.vision_projector_path(artifact)?;
-                generation
-                    .lock()
-                    .map_err(|_| {
-                        AppError::new(
-                            "VISION_RUNTIME_LOCK_FAILED",
-                            "图片理解运行时状态已损坏",
-                            true,
-                        )
-                    })?
-                    .activate_multimodal(
-                        &artifact.local_path,
-                        &projector.to_string_lossy(),
-                        4096,
-                        interactive_inference_threads(),
-                    )?;
-                models.activate_artifact(&artifact.artifact_id, None)?;
-                spawn_image_understanding_pending(app.clone(), Arc::clone(catalog));
             }
             (ModelRole::Reranker, ModelFormat::Onnx) => {
                 let tokenizer = PathBuf::from(&artifact.local_path)
@@ -2471,7 +2321,25 @@ fn download_model_file(
                     false,
                 ));
             }
-            if metadata.len() > file.size_bytes {
+            let partial_len = metadata.len();
+            if partial_len > file.size_bytes {
+                // 续传错位或文件损坏：超过目标大小，隔离后重下
+                quarantine_download_file(&partial_path)?;
+            } else if partial_len == file.size_bytes {
+                // .part 已写满但上次中断于 rename 前（如任务被取消/暂停）。
+                // ModelScope 下载端点对越界 Range（bytes=<total>-）返回 404 而非
+                // 416，直接断点续传必然失败；内容校验通过则就地完成，否则重下。
+                if models
+                    .verify_download(&partial_path, &file.sha256, file.size_bytes)
+                    .is_ok()
+                {
+                    fs::rename(&partial_path, &completed_path).map_err(|error| {
+                        AppError::new("MODEL_DOWNLOAD_FINALIZE_FAILED", error.to_string(), true)
+                    })?;
+                    update_download_file(job, role, file, file.size_bytes, "completed");
+                    persist_download_job(app, models, job)?;
+                    return Ok(());
+                }
                 quarantine_download_file(&partial_path)?;
             }
         }
@@ -2902,7 +2770,7 @@ pub(crate) fn model_state_from_manager(
     let capabilities = ModelCapabilities {
         generation: models.active_artifact(ModelRole::Generation)?.is_some(),
         embedding: active_embedding.is_some(),
-        vision: models.active_artifact(ModelRole::Vision)?.is_some(),
+        vision: models.active_artifact(ModelRole::Generation)?.is_some(),
         reranker: models.active_artifact(ModelRole::Reranker)?.is_some(),
         ocr: models.active_artifact(ModelRole::Ocr)?.is_some(),
         asr: models.active_artifact(ModelRole::Asr)?.is_some(),
@@ -2954,25 +2822,6 @@ pub(crate) fn model_state_from_manager(
     })
 }
 
-fn privacy_safe_display_path(path: &str) -> String {
-    let normalized = path.replace('/', "\\");
-    let absolute = normalized.as_bytes().get(1) == Some(&b':') || normalized.starts_with("\\");
-    if !absolute {
-        return normalized;
-    }
-    let parts = normalized
-        .split('\\')
-        .filter(|part| !part.is_empty() && !part.ends_with(':'))
-        .collect::<Vec<_>>();
-    let start = parts.len().saturating_sub(3);
-    let visible = parts[start..].join("\\");
-    if start > 0 {
-        format!("…\\{visible}")
-    } else {
-        visible
-    }
-}
-
 #[derive(Debug, Deserialize)]
 pub struct DateRequest {
     local_date: String,
@@ -3004,8 +2853,7 @@ pub fn home_get_summary(
             return Ok(summary);
         }
     }
-    let (today_added, recent) = catalog.home_file_summary(&request.local_date)?;
-    let candidates = catalog.list_candidate_roots()?;
+    let today_added = catalog.home_file_summary(&request.local_date)?;
     let new_inbox = catalog.query_inbox(&InboxQuery {
         status: TriageStatus::New,
         event_types: vec![],
@@ -3024,25 +2872,12 @@ pub fn home_get_summary(
         cursor: None,
         page_size: 200,
     })?;
-    let collections = catalog.list_collections()?;
     // 与状态栏共享 10s TTL 缓存，避免首页轮询重复触发 5 个 COUNT(DISTINCT) 全表扫描
     let index_stats = cached_index_activity_stats(&catalog)?;
     let failed = error_inbox.items.len();
     let awaiting_confirmation = new_inbox.items.len();
     // SQL COUNT 替代拉 500 行再在内存里数
     let possible_duplicates = catalog.count_exact_duplicate_relations()?;
-    let recent_files = recent
-        .iter()
-        .map(|file| {
-            json!({
-                "file_id": file.file_id,
-                "name": file.display_name,
-                "extension": file.extension,
-                "subtitle": privacy_safe_display_path(&file.canonical_path),
-                "modified_at": file.fs_modified_at,
-            })
-        })
-        .collect::<Vec<_>>();
     let scan_progress = active_scan.as_ref().map(|job| {
         json!({
             "scan_job_id": job.job_id,
@@ -3064,19 +2899,15 @@ pub fn home_get_summary(
             { "key": "processing_failed", "label": "处理失败", "value": failed }
         ],
         "scan_progress": scan_progress,
-        "index_initialized": index_stats.searchable_files > 0,
-        "recent_files": recent_files,
-        "favorite_files": [],
-        "collections": collections.into_iter().take(6).enumerate().map(|(index, collection)| {
-            let tone = ["purple", "green", "pink", "blue"][index % 4];
-            json!({
-                "collection_id": collection.collection_id,
-                "name": collection.name,
-                "item_count": collection.file_count,
-                "tone": tone
-            })
-        }).collect::<Vec<_>>(),
-        "candidate_roots": candidates
+        // 无论是否有进行中扫描都返回文件统计，供首页「概况」区始终展示。
+        "overview": json!({
+            "discovered_files": index_stats.discovered_files,
+            "searchable_files": index_stats.searchable_files,
+            "parsed_files": index_stats.parsed_files,
+            "embedded_files": index_stats.embedded_files,
+            "ocr_pages": index_stats.ocr_pages
+        }),
+        "index_initialized": index_stats.searchable_files > 0
     });
     if active_scan.is_none()
         && let Ok(mut cache) = HOME_SUMMARY_CACHE
@@ -3323,19 +3154,6 @@ pub fn inbox_retry(
     }
 }
 
-#[tauri::command(async)]
-pub fn ocr_retry(
-    request: FileIdRequest,
-    app: AppHandle,
-    catalog: State<'_, CatalogServiceState>,
-) -> Result<bool, AppError> {
-    let file_id = parse_file_id(&request)?;
-    let catalog = catalog.get()?;
-    catalog.retry_ocr(&file_id)?;
-    spawn_parse_pending(app, catalog);
-    Ok(true)
-}
-
 #[derive(Debug, Deserialize)]
 pub struct ImageUnderstandingActionRequest {
     asset_id: Uuid,
@@ -3413,14 +3231,15 @@ fn run_image_deep_analysis(
     cancelled: &AtomicBool,
 ) -> Result<ImageDeepAnalysis, AppError> {
     let (image_path, mime_type, _) = catalog.authorized_image_asset_path(&asset_id)?;
-    let artifact = models.active_artifact(ModelRole::Vision)?.ok_or_else(|| {
-        AppError::new(
-            "VISION_MODEL_INVALID",
-            "原图深度分析需要先配置并自检本地多模态模型",
-            true,
-        )
-    })?;
-    let projector = models.vision_projector_path(&artifact)?;
+    let artifact = models
+        .active_artifact(ModelRole::Generation)?
+        .ok_or_else(|| {
+            AppError::new(
+                "VISION_MODEL_INVALID",
+                "原图深度分析需要先配置并自检 Ollama 多模态生成模型",
+                true,
+            )
+        })?;
     let threads = interactive_inference_threads();
     let mut runtime = generation.lock().map_err(|_| {
         AppError::new(
@@ -3429,18 +3248,7 @@ fn run_image_deep_analysis(
             true,
         )
     })?;
-    let projector_path = projector.to_string_lossy();
-    if runtime.active_model_path() != Some(artifact.local_path.as_str())
-        || runtime.active_mmproj_path() != Some(projector_path.as_ref())
-        || !runtime.is_active()
-    {
-        runtime.activate_multimodal(
-            &artifact.local_path,
-            projector_path.as_ref(),
-            4096,
-            threads,
-        )?;
-    }
+    runtime.activate_multimodal(&artifact.local_path, 4096, threads)?;
     let response = runtime.describe_image_cancellable(
         "你是翻翻的本地图片证据分析器。只能根据当前图片中可验证的内容回答，不得补充外部知识；看不清或图片不支持的问题必须明确说明。",
         &format!(
@@ -4102,46 +3910,6 @@ pub fn relation_refresh(
 }
 
 #[tauri::command(async)]
-pub fn relation_query(
-    request: RelationQuery,
-    catalog: State<'_, CatalogServiceState>,
-) -> Result<RelationPage, AppError> {
-    catalog.get()?.query_file_relations(&request)
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RelationReviewRequest {
-    relation_id: Uuid,
-    action: String,
-}
-
-#[tauri::command(async)]
-pub fn relation_review(
-    request: RelationReviewRequest,
-    catalog: State<'_, CatalogServiceState>,
-) -> Result<(), AppError> {
-    catalog
-        .get()?
-        .review_file_relation(&request.relation_id, &request.action)
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RelationBatchReviewRequest {
-    relation_ids: Vec<Uuid>,
-    action: String,
-}
-
-#[tauri::command(async)]
-pub fn relation_batch_review(
-    request: RelationBatchReviewRequest,
-    catalog: State<'_, CatalogServiceState>,
-) -> Result<u64, AppError> {
-    catalog
-        .get()?
-        .review_file_relations(&request.relation_ids, &request.action)
-}
-
-#[tauri::command(async)]
 pub fn relation_group_query(
     request: RelationGroupQuery,
     catalog: State<'_, CatalogServiceState>,
@@ -4589,6 +4357,8 @@ pub fn app_status_get(
     catalog: State<'_, CatalogServiceState>,
     generation: State<'_, GenerationServiceState>,
     worker: State<'_, WorkerServiceState>,
+    sidecars: State<'_, SidecarRegistryState>,
+    speech: State<'_, SpeechWorkerState>,
     runtime_manager: State<'_, RuntimeManagerState>,
 ) -> Result<AppStatusSnapshot, AppError> {
     // 合并并发轮询：前端多个组件会同时请求状态快照，400ms 内复用计算结果，
@@ -4636,6 +4406,15 @@ pub fn app_status_get(
         inference_runtime.pressure_reason =
             Some("正在优先处理搜索或问答，后台模型任务已让出".into());
     }
+    sync_sidecar_instances(
+        &runtime_manager.0,
+        &[
+            (WorkerRole::Parse, &worker.client),
+            (WorkerRole::Onnx, &sidecars.0.onnx),
+            (WorkerRole::Ocr, &sidecars.0.ocr),
+            (WorkerRole::Speech, &speech.0),
+        ],
+    )?;
     let snapshot = AppStatusSnapshot {
         local_only: true,
         source_files_readonly: true,
@@ -4693,25 +4472,6 @@ fn sync_sidecar_instances(
         }
     }
     Ok(())
-}
-
-#[tauri::command(async)]
-pub fn runtime_state_get(
-    runtime_manager: State<'_, RuntimeManagerState>,
-    worker: State<'_, WorkerServiceState>,
-    sidecars: State<'_, SidecarRegistryState>,
-    speech: State<'_, SpeechWorkerState>,
-) -> Result<AiRuntimeSnapshot, AppError> {
-    sync_sidecar_instances(
-        &runtime_manager.0,
-        &[
-            (WorkerRole::Parse, &worker.client),
-            (WorkerRole::Onnx, &sidecars.0.onnx),
-            (WorkerRole::Ocr, &sidecars.0.ocr),
-            (WorkerRole::Speech, &speech.0),
-        ],
-    )?;
-    runtime_manager.0.snapshot()
 }
 
 #[derive(Debug, Deserialize)]
@@ -5273,35 +5033,10 @@ fn environment_degradation(check: &EnvironmentCheck) -> Option<(DegradationLevel
 }
 
 #[tauri::command(async)]
-pub fn maintenance_log_query(
-    request: LogQuery,
-    catalog: State<'_, CatalogServiceState>,
-) -> Result<LogPage, AppError> {
-    let runtime_page = crate::runtime_log::query(&request)?;
-    if runtime_page.total > 0 {
-        return Ok(runtime_page);
-    }
-    catalog.get()?.query_logs(&request)
-}
-
-#[tauri::command(async)]
 pub fn maintenance_logs_clear(catalog: State<'_, CatalogServiceState>) -> Result<u64, AppError> {
     let runtime_removed = crate::runtime_log::clear()?;
     let database_removed = catalog.get()?.clear_logs()?;
     Ok(runtime_removed.saturating_add(database_removed))
-}
-
-#[tauri::command(async)]
-pub fn node_trace_query(
-    request: NodeTraceQuery,
-    catalog: State<'_, CatalogServiceState>,
-) -> Result<NodeTracePage, AppError> {
-    catalog.get()?.query_node_traces(&request)
-}
-
-#[tauri::command(async)]
-pub fn node_trace_clear(catalog: State<'_, CatalogServiceState>) -> Result<u64, AppError> {
-    catalog.get()?.clear_node_traces()
 }
 
 #[derive(Debug, Deserialize)]
@@ -5483,6 +5218,7 @@ pub fn diagnostic_export(
     })
 }
 
+#[cfg(debug_assertions)]
 /// Ask Trace Viewer 阶段展示顺序（固定；未出现的阶段跳过，未知节点追加末尾）。
 const ASK_TRACE_STAGE_ORDER: &[&str] = &[
     "source_routing",
@@ -5511,6 +5247,7 @@ const ASK_TRACE_STAGE_ORDER: &[&str] = &[
 /// 拉取一次 Ask 的全部节点追踪并组装 Trace Viewer 结构
 ///（阶段分组、逐阶段耗时、诊断摘要一行）。任何阶段缺失都不算错——问答
 /// 可能在澄清/拒绝/降级等中途收尾，只展示实际经过的节点。
+#[cfg(debug_assertions)]
 fn build_ask_trace(catalog: &CatalogService, operation_id: &str) -> Result<AskTrace, AppError> {
     let records = catalog.query_node_traces_by_correlation("ask", operation_id)?;
     if records.is_empty() {
@@ -5548,6 +5285,7 @@ fn build_ask_trace(catalog: &CatalogService, operation_id: &str) -> Result<AskTr
 }
 
 /// 按固定顺序把一次 Ask 的节点追踪分组为阶段；未知节点（未来新增）追加末尾。
+#[cfg(debug_assertions)]
 fn group_ask_trace_stages(records: &[NodeTraceRecord]) -> Vec<AskTraceStage> {
     let mut stages = ASK_TRACE_STAGE_ORDER
         .iter()
@@ -5590,6 +5328,7 @@ fn group_ask_trace_stages(records: &[NodeTraceRecord]) -> Vec<AskTraceStage> {
 
 /// 逐阶段耗时聚合：同节点多条记录（如每条 claim 一次 verification）取和；
 /// 阶段未出现保持 null；总耗时取 completed 节点。
+#[cfg(debug_assertions)]
 fn aggregate_ask_timing(stages: &[AskTraceStage]) -> AskTraceTiming {
     let node_sum = |name: &str| -> Option<u64> {
         let sum = stages
@@ -5637,6 +5376,7 @@ fn aggregate_ask_timing(stages: &[AskTraceStage]) -> AskTraceTiming {
 /// 示例：LOCAL DOCUMENT_QA target=resume memory=miss doc=Resolved(0.91)
 ///       scope_files=1 retrieval_candidates=12 rerank_top1=0.83 claims=4
 ///       4/4 supported total=3421ms
+#[cfg(debug_assertions)]
 fn build_diagnostic_summary(stages: &[AskTraceStage]) -> String {
     let output_of = |node: &str| -> Option<&Value> {
         stages
@@ -5781,6 +5521,7 @@ fn build_diagnostic_summary(stages: &[AskTraceStage]) -> String {
 
 /// Debug Trace 导出脱敏：全路径 → [路径]文件名、长文本截断（默认）、
 /// 模型完整 prompt 默认隐藏（generation 节点 input）。
+#[cfg(debug_assertions)]
 fn sanitize_ask_trace_for_export(stages: &mut [AskTraceStage], include_detailed_text: bool) {
     for stage in stages {
         for record in &mut stage.records {
@@ -5803,6 +5544,7 @@ fn sanitize_ask_trace_for_export(stages: &mut [AskTraceStage], include_detailed_
 
 /// 递归脱敏单个 trace 值：Windows 绝对路径 / UNC → 只留文件名；长文本截断。
 /// 截断仅默认模式生效（include_detailed_text = true 保留详细文本）。
+#[cfg(debug_assertions)]
 fn sanitize_trace_value(value: &mut Value, include_detailed_text: bool) {
     const EXPORT_TEXT_LIMIT: usize = 2_000;
     const EXPORT_KEEP_CHARS: usize = 500;
@@ -5828,6 +5570,7 @@ fn sanitize_trace_value(value: &mut Value, include_detailed_text: bool) {
 /// 把文本中的 Windows 绝对路径 / UNC 路径替换为「[路径]文件名」。
 /// 启发式扫描：`X:\`（盘符前不带字母数字，避免误伤 JSON 键）或 `\\` 起始，
 /// 到引号 / 空白 / 常见分隔符为止；只保留最后一段作为文件名。
+#[cfg(debug_assertions)]
 fn sanitize_trace_paths(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut output = String::with_capacity(text.len());
@@ -5879,6 +5622,7 @@ fn sanitize_trace_paths(text: &str) -> String {
 
 /// Ask Debug Trace Viewer 数据（Phase 3）：一次 Ask 的全部节点追踪 →
 /// 12+ 阶段分组 + 逐阶段耗时 + 诊断摘要一行。仅用于 Developer / 诊断模式。
+#[cfg(debug_assertions)]
 #[tauri::command(async)]
 pub fn ask_trace_get(
     operation_id: String,
@@ -5892,6 +5636,7 @@ pub fn ask_trace_get(
 /// 隐私默认：文件路径脱敏、文本 chunk 截断、不含模型完整 prompt；
 /// include_detailed_text 为开发者选项（默认关闭），仅跳过文本截断并保留
 /// prompt，路径脱敏始终生效。
+#[cfg(debug_assertions)]
 #[tauri::command(async)]
 pub fn ask_trace_export(
     request: AskTraceExportRequest,
@@ -5979,6 +5724,7 @@ pub fn ask_trace_export(
 ///   （禁止自动写 Memory）。
 /// - 结果写 output_path（create_new），每例 verdict 与 error_category
 ///   可在 JSON 中人工修改分类后复用。
+#[cfg(debug_assertions)]
 #[tauri::command(async)]
 pub async fn ask_evaluation_run(
     request: AskEvaluationRunRequest,
@@ -6097,6 +5843,7 @@ pub async fn ask_evaluation_run(
 
 /// 单例运行：独立操作/会话，跑完即删会话，收集 trace 与 answer 侧字段。
 #[allow(clippy::too_many_arguments)]
+#[cfg(debug_assertions)]
 fn run_single_evaluation_case(
     case: &fanfan_core::evaluation::EvaluationCase,
     catalog: &CatalogService,
@@ -6125,6 +5872,7 @@ fn run_single_evaluation_case(
         max_source_files: 4,
         strict_evidence: true,
         clarification_selection: None,
+        clarification_message_id: None,
         think_mode: false,
     };
     let started = Instant::now();
@@ -6333,6 +6081,7 @@ fn run_single_evaluation_case(
 /// 批量运行的单例执行器：与 ask_start 同口径的运行时租约 + compute_answer，
 /// 不启动 Memory Candidate Writer，不写前台活动守卫。
 #[allow(clippy::too_many_arguments)]
+#[cfg(debug_assertions)]
 fn run_evaluation_ask(
     request: &AskRequest,
     catalog: &CatalogService,
@@ -6349,7 +6098,7 @@ fn run_evaluation_ask(
         .flatten()
         .map(|artifact| artifact.artifact_id.to_string());
     let mut runtime_request =
-        RuntimeTaskRequest::interactive(RuntimeTaskKind::Ask, RuntimeBackendKind::LlamaCpp);
+        RuntimeTaskRequest::interactive(RuntimeTaskKind::Ask, RuntimeBackendKind::Ollama);
     runtime_request.cpu_threads = interactive_inference_threads();
     runtime_request.timeout = Duration::from_secs(45);
     runtime_request.model_id = generation_artifact_id;
@@ -6448,105 +6197,7 @@ pub fn document_profile_rebuild(
 
 /// Memory Inspector（Phase 3，最小实现）：三张记忆表 + 可选关键字过滤
 ///（alias / entity 名 / predicate / file_id / entity_id）。
-#[tauri::command(async)]
-pub fn memory_inspector_query(
-    search: Option<String>,
-    catalog: State<'_, CatalogServiceState>,
-) -> Result<MemoryInspectorView, AppError> {
-    let catalog = catalog.get()?;
-    let aliases = catalog.list_memory_aliases(500)?;
-    let relations = catalog.list_memory_relations(None, 2000)?;
-    let entities = catalog.list_memory_entities(2000)?;
-    let Some(keyword) = search
-        .map(|value| value.trim().to_lowercase())
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(MemoryInspectorView {
-            aliases,
-            relations,
-            entities,
-        });
-    };
-    let matches_text = |text: &str| text.to_lowercase().contains(&keyword);
-    let matches_uuid = |id: Uuid| id.to_string().contains(&keyword);
-    Ok(MemoryInspectorView {
-        aliases: aliases
-            .into_iter()
-            .filter(|alias| matches_text(&alias.alias) || matches_uuid(alias.target_id))
-            .collect(),
-        relations: relations
-            .into_iter()
-            .filter(|relation| {
-                matches_text(&relation.predicate)
-                    || matches_uuid(relation.subject_id)
-                    || matches_uuid(relation.object_id)
-            })
-            .collect(),
-        entities: entities
-            .into_iter()
-            .filter(|entity| {
-                matches_text(&entity.canonical_name)
-                    || matches_text(&entity.entity_type)
-                    || matches_uuid(entity.entity_id)
-            })
-            .collect(),
-    })
-}
-
 /// Memory 关系 confirm / reject（只改 status，不动数据）。
-#[tauri::command(async)]
-pub fn memory_relation_set_status(
-    request: MemoryRelationStatusRequest,
-    catalog: State<'_, CatalogServiceState>,
-) -> Result<bool, AppError> {
-    let relation_id = Uuid::parse_str(&request.relation_id)
-        .map_err(|_| AppError::new("RELATION_ID_INVALID", "关系标识无效", false))?;
-    let status = match request.status.as_str() {
-        "confirmed" => MemoryStatus::Confirmed,
-        "rejected" => MemoryStatus::Rejected,
-        _ => {
-            return Err(AppError::new(
-                "MEMORY_STATUS_INVALID",
-                "只允许 confirmed 或 rejected",
-                false,
-            ));
-        }
-    };
-    catalog
-        .get()?
-        .update_memory_relation_status(relation_id, status)
-}
-
-#[tauri::command(async)]
-pub fn memory_alias_delete(
-    alias_id: String,
-    catalog: State<'_, CatalogServiceState>,
-) -> Result<bool, AppError> {
-    let alias_id = Uuid::parse_str(&alias_id)
-        .map_err(|_| AppError::new("ALIAS_ID_INVALID", "别名标识无效", false))?;
-    catalog.get()?.delete_memory_alias(alias_id)
-}
-
-#[tauri::command(async)]
-pub fn memory_entity_delete(
-    entity_id: String,
-    catalog: State<'_, CatalogServiceState>,
-) -> Result<bool, AppError> {
-    let entity_id = Uuid::parse_str(&entity_id)
-        .map_err(|_| AppError::new("ENTITY_ID_INVALID", "实体标识无效", false))?;
-    catalog.get()?.delete_memory_entity(entity_id)
-}
-
-#[tauri::command(async)]
-pub fn memory_relation_delete(
-    relation_id: String,
-    catalog: State<'_, CatalogServiceState>,
-) -> Result<bool, AppError> {
-    let relation_id = Uuid::parse_str(&relation_id)
-        .map_err(|_| AppError::new("RELATION_ID_INVALID", "关系标识无效", false))?;
-    catalog.get()?.delete_memory_relation(relation_id)
-}
-
 /// 清空全部记忆（aliases / relations / entities 三表；二次确认短语校验）。
 /// 不动文件 / 索引 / Embedding / Ask 历史。
 #[tauri::command(async)]
@@ -7077,7 +6728,7 @@ pub fn ask_start(
             .flatten()
             .map(|artifact| artifact.artifact_id.to_string());
         let mut runtime_request =
-            RuntimeTaskRequest::interactive(RuntimeTaskKind::Ask, RuntimeBackendKind::LlamaCpp);
+            RuntimeTaskRequest::interactive(RuntimeTaskKind::Ask, RuntimeBackendKind::Ollama);
         runtime_request.cpu_threads = interactive_inference_threads();
         runtime_request.timeout = Duration::from_secs(45);
         runtime_request.model_id = generation_artifact_id;
@@ -7093,18 +6744,36 @@ pub fn ask_start(
                 }
                 reporter.fail_active(&error.message);
                 reporter.ask_completed("failed");
-                reporter.fail_active("运行资源暂不可用");
-                reporter.ask_completed("failed");
                 let _ = app.emit(
                     "ask:failed",
                     json!({"operation_id": operation_id, "error": error}),
                 );
+                // RUNTIME_LEASE_TIMEOUT：记录断言时刻的运行时任务快照，便于复现时
+                // 精确定位到底是哪个任务占住 heavy / backend 槽导致 ask 排队超时。
+                // 通用诊断，不针对具体 task / case。
+                let snapshot = runtime_manager.snapshot().ok();
                 crate::runtime_log::event(
                     "error",
                     "runtime",
                     "runtime.lease_failed",
                     Some(&operation_id.to_string()),
-                    &json!({"task_kind": "ask", "error_code": error.code}),
+                    &json!({
+                        "task_kind": "ask",
+                        "error_code": error.code,
+                        "tasks": snapshot.as_ref().map(|snap| snap
+                            .tasks
+                            .iter()
+                            .map(|task| json!({
+                                "kind": format!("{:?}", task.kind),
+                                "backend": format!("{:?}", task.backend),
+                                "state": format!("{:?}", task.state),
+                                "priority": task.priority,
+                                "wait_ms": task.wait_ms,
+                                "started_at": task.started_at,
+                                "error_code": task.error_code,
+                            }))
+                            .collect::<Vec<_>>()),
+                    }),
                 );
                 return;
             }
@@ -7698,66 +7367,73 @@ fn public_node_spec(node_name: &str) -> Option<AskUiNodeSpec> {
         "intent_routing" | "source_routing" => AskUiNodeSpec {
             node_id: "source_routing",
             public_label: "理解问题",
-            progress_lines: &[
-                "正在判断问题属于资料问答还是普通回复",
-                "正在读取当前会话上下文",
-            ],
+            progress_lines: &["判断问题", "读取会话上下文"],
         },
         "understanding" | "query_parsing" | "query_planning" => AskUiNodeSpec {
             node_id: "query_planning",
             public_label: "规划检索",
-            progress_lines: &["正在拆解问题和目标资料", "正在确定检索方式"],
+            progress_lines: &["拆解问题", "确定检索方式"],
         },
         "context_resolution" | "memory_resolution" | "document_resolution" | "scope_planning" => {
             AskUiNodeSpec {
                 node_id: "document_resolution",
                 public_label: "查找目标资料",
-                progress_lines: &["正在识别你指向的文件", "正在确定资料范围"],
+                progress_lines: &["识别目标文件", "确定资料范围"],
             }
         }
         "document_recall" | "evidence_retrieval" | "hybrid_retrieval" | "retrieval" => {
             AskUiNodeSpec {
                 node_id: "retrieval",
                 public_label: "检索相关内容",
-                progress_lines: &[
-                    "正在搜索相关文件",
-                    "正在融合关键词和语义结果",
-                    "正在召回候选片段",
-                ],
+                progress_lines: &["搜索相关文件", "融合关键词与语义", "召回候选片段"],
             }
         }
         "reranking" | "evidence_selection" | "answerability_gate" | "image_reanalysis" => {
             AskUiNodeSpec {
                 node_id: "evidence",
                 public_label: "整理证据",
-                progress_lines: &["正在筛选更相关的证据", "正在判断证据是否足够回答"],
+                progress_lines: &["筛选证据", "判断证据"],
             }
         }
         "document_summary" => AskUiNodeSpec {
             node_id: "document_summary",
             public_label: "汇总文档",
-            progress_lines: &["正在读取文档结构", "正在汇总主要内容"],
+            progress_lines: &["读取文档结构", "汇总主要内容"],
         },
         "document_compare" => AskUiNodeSpec {
             node_id: "document_compare",
             public_label: "对比资料",
-            progress_lines: &["正在读取对比资料", "正在整理差异与共同点"],
+            progress_lines: &["读取对比资料", "整理差异与共同点"],
         },
         "document_find" => AskUiNodeSpec {
             node_id: "document_find",
             public_label: "定位文件",
-            progress_lines: &["正在匹配可能的文件", "正在整理最相关结果"],
+            progress_lines: &["匹配相关文件", "整理最相关结果"],
+        },
+        // Agent 高层工具阶段（FANFAN_AGENT_ROUTER 开启且命中 Agent 工具时播报）。
+        // 与其余阶段同一套节点映射：无映射时 phase() 会忽略、气泡不展示运行状态，
+        // 补齐使 Agent 路径与 Legacy 一致地展示执行节点。通用映射，不针对具体
+        // 文件/关键词/case。
+        "agent_library_overview" => AskUiNodeSpec {
+            node_id: "agent_library_overview",
+            public_label: "盘点知识库",
+            progress_lines: &["读取资料画像", "统计文件分布"],
+        },
+        "agent_get_outline" => AskUiNodeSpec {
+            node_id: "agent_get_outline",
+            public_label: "提取文档大纲",
+            progress_lines: &["定位目标资料", "读取章节结构"],
         },
         "generating" | "generation" | "chat_generating" => AskUiNodeSpec {
             node_id: "generation",
             public_label: "生成回答",
-            progress_lines: &["正在根据可用信息组织回答", "资料问答只会输出通过校验的内容"],
+            progress_lines: &["组织回答", "输出通过校验的内容"],
         },
         "citation_validation" | "citation_structure_repair" | "verification" | "repair" => {
             AskUiNodeSpec {
                 node_id: "verification",
                 public_label: "核对引用",
-                progress_lines: &["正在逐句核对来源", "只展示通过来源校验的回答内容"],
+                progress_lines: &["核对引用来源", "展示通过来源校验的内容"],
             }
         }
         _ => return None,
@@ -8111,6 +7787,7 @@ fn compute_answer(
         return Err(AppError::new("OPERATION_CANCELLED", "问答已取消", false));
     }
     phase("source_routing", 0.05);
+    let question = request.question.trim();
     let generation_artifact = models.active_artifact(ModelRole::Generation)?;
     let maintenance = catalog.maintenance_snapshot()?;
     let generation_artifact = generation_artifact.ok_or_else(|| {
@@ -8167,7 +7844,6 @@ fn compute_answer(
     // 首次解析失败（JSON 截断/噪声）时重试一次，仍失败才走诚实澄清兜底
     // （不猜意图、不进自由闲聊，避免幻觉）。
     let routing_started = Instant::now();
-    let question = request.question.trim();
     let mut routing: Option<SourceRouting> = None;
     let mut routing_raw = String::new();
     for attempt in 0..2 {
@@ -8209,7 +7885,7 @@ fn compute_answer(
         "ok",
         Some(routing_started.elapsed().as_millis() as u64),
     );
-    let Some(routing) = routing else {
+    let Some(mut routing) = routing else {
         // 路由重试后仍无法解析 → 诚实澄清兜底：不猜意图（不做宽检索猜答案、
         // 不进自由闲聊产生幻觉），明确请用户澄清是查资料还是普通聊天。
         trace_operation_execution(
@@ -8221,27 +7897,47 @@ fn compute_answer(
         );
         return run_clarification_refusal(request, catalog, operation_id, phase);
     };
-    if routing.source == SourceIntent::General {
+    // 确定性澄清兜底：会话记忆恢复 / 缺失所指祈使句这类高精度语义残缺问句，
+    // 0.6B/2B 模型可能在 local（误当资料）与 general（误当闲聊）间漂移，统一
+    // 拉回 ambiguous 交由 Context Resolver 结合会话上下文恢复或澄清。通用模式，
+    // 不针对任何具体文件/关键词/case。
+    apply_ambiguous_override(&request.question, &mut routing);
+    let routing = if routing.source == SourceIntent::General {
+        // 普通聊天（GENERAL）：不检索资料，直接用生成模型做友好自然的对话。
+        // 仅当用户明显点名了本地资料/文件时例外——此时收敛为严格 RAG，绝不
+        // 用闲聊语气取代资料查询。纯通用分流，不针对任何话术特判。
+        if personal_reference_hit(&request.question).is_none() {
+            trace_operation_execution(
+                catalog,
+                &operation_id.to_string(),
+                session_id_ref,
+                "general",
+                "free_chat",
+            );
+            return run_general_chat_answer(
+                request,
+                catalog,
+                generation,
+                &history,
+                operation_id,
+                cancelled,
+                phase,
+            );
+        }
         trace_operation_execution(
             catalog,
             &operation_id.to_string(),
             session_id_ref,
             "general",
-            "chat",
+            "strict_local_rag",
         );
-        return run_chat_answer(
-            request,
-            catalog,
-            generation,
-            &generation_artifact,
-            &maintenance,
-            &history,
-            operation_id,
-            cancelled,
-            phase,
-            on_thinking,
-        );
-    }
+        SourceRouting {
+            source: SourceIntent::Local,
+            confidence: routing.confidence,
+        }
+    } else {
+        routing
+    };
 
     // 2. AMBIGUOUS → Context Resolver（结合会话上下文恢复目标；恢复失败兜底闲聊）
     let mut context_scope: Vec<uuid::Uuid> = Vec::new();
@@ -8270,26 +7966,14 @@ fn compute_answer(
             Some(context_started.elapsed().as_millis() as u64),
         );
         if !context_resolution.is_resolved() {
-            // P0 安全兜底：不猜文件、不假装 LOCAL，走闲聊（会如实说明没看懂指代）
             trace_operation_execution(
                 catalog,
                 &operation_id.to_string(),
                 session_id_ref,
                 "ambiguous_unresolved",
-                "chat",
+                "clarify",
             );
-            return run_chat_answer(
-                request,
-                catalog,
-                generation,
-                &generation_artifact,
-                &maintenance,
-                &history,
-                operation_id,
-                cancelled,
-                phase,
-                on_thinking,
-            );
+            return run_clarification_refusal(request, catalog, operation_id, phase);
         }
         context_scope = context_resolution.resolved_file_ids.clone();
         // 只有文档类型可恢复时：把类型并入 target，交给 Document Resolver 按类型找
@@ -8405,29 +8089,21 @@ fn compute_answer(
             .document_type
             .or(session_context.active_document_type);
     }
-    // 解析器兜底（CASE 1）：Router 判 local 但 Parser 输出 general_chat →
-    // 尊重 Parser 的闲聊判定直接聊天（寒暄/身份问题已由 fast-path 拦截，
-    // 这里兜 0.6B 双模型叠加错误；闲聊绝不进检索管线）。
+    // 兼容旧解析输出：普通聊天意图不再进入自由生成，统一收敛为全库严格 RAG。
     if plan.intent == QueryIntent::GeneralChat {
         trace_operation_execution(
             catalog,
             &operation_id.to_string(),
             session_id_ref,
             "parser_general_chat",
-            "chat",
+            "strict_local_rag",
         );
-        return run_chat_answer(
-            request,
-            catalog,
-            generation,
-            &generation_artifact,
-            &maintenance,
-            &history,
-            operation_id,
-            cancelled,
-            phase,
-            on_thinking,
-        );
+        plan.source = SourceIntent::Local;
+        plan.intent = QueryIntent::LibraryQa;
+        plan.operation = QueryOperation::Qa;
+        plan.content_query = Some(request.question.trim().to_owned());
+        plan.requires_document_resolution = false;
+        plan.requires_full_document = false;
     }
     finish_retrieval_with_plan(
         request,
@@ -8677,7 +8353,13 @@ fn parse_ask_plan(
         ) {
             Ok(text) => {
                 raw = text.clone();
-                plan = parse_query_plan(&text);
+                // 解析后叠加确定性修正（与 harness/单测同源）：target 非空 → 强制
+                // requires_document_resolution=true（否则 LLM 判 library_qa 时会跳过
+                // Document Resolver，目标对象被丢在全库检索里）；LibraryQa+target →
+                // 归一化 DocumentQa；find/qa 意图经结尾标记与内容词做对称兜底；剥掉
+                // content_query 的 scope 引导；回声防护（复读历史 → 解析失败回退）。
+                plan = parse_query_plan(&text)
+                    .and_then(|parsed| finalize_query_plan(parsed, question, history));
                 if plan.is_some() {
                     break;
                 }
@@ -8760,7 +8442,7 @@ fn run_clarification_refusal(
     phase: &dyn Fn(&str, f64),
 ) -> Result<AnswerResult, AppError> {
     let started_at = Instant::now();
-    let message = "我暂时没能判断你的问题是想查本地资料还是普通聊天。请换个说法，或明确说明（例如「查我的资料」「随便聊聊」）。"
+    let message = "我暂时没能从当前问题和会话上下文确定要查询的资料。请换个说法，并明确文件名、资料类型或要查的内容。"
         .to_owned();
     let result = AnswerResult {
         session_id: request.session_id.unwrap_or_else(Uuid::now_v7),
@@ -9149,6 +8831,22 @@ fn finish_retrieval_with_plan(
         None,
     );
 
+    // Phase 2：Agent 工具门控。仅在运行时开启 `FANFAN_AGENT_ROUTER` 且当前
+    // plan 命中「已接入的高层只读 Tool」时接管；否则完全回落 Legacy 链路，
+    // 保证默认路径行为不变。返回 Some 表示已由 Agent 路径作答并结束。
+    if agent_router_enabled() {
+        if let Some(result) = run_agent_tool_answer(
+            request,
+            catalog,
+            &plan,
+            operation_id,
+            cancelled,
+            progress.0,
+        )? {
+            return Ok(result);
+        }
+    }
+
     // 4.5.5 Step 10：COMPARE_DOCUMENTS 走两侧对比管线（spec 十一.6）。
     // 放在 Clarification 之前：比较请求的目标是「两份文档」，primary 出现
     // 多候选时不问「哪一份」——两侧取最有把握的候选，比较意图优先。
@@ -9425,18 +9123,38 @@ fn run_document_recall(
             .collect();
         let all_vectors = catalog.profile_vectors(&all_ids)?;
         let recall = parallel_document_recall(question, question_vector, &profiles, &all_vectors);
+        let profile_labels: std::collections::HashMap<Uuid, (&str, &str)> = profiles
+            .iter()
+            .map(|(profile, file_name)| {
+                (
+                    profile.file_id,
+                    (file_name.as_str(), profile.title.as_str()),
+                )
+            })
+            .collect();
 
         // Trace：分开记录 A/B(metadata) 与 C(semantic) 通道各自召回，再记录融合
         // 结果，便于定位是 Resolver(metadata) 漏召回、Semantic 漏召回还是融合排序偏。
         channel_trace = json!({
             "metadata_candidates": recall.metadata_candidates.iter().map(|c| json!({
                 "file_id": c.file_id.to_string(),
+                "file_name": profile_labels.get(&c.file_id).map(|labels| labels.0),
+                "title": profile_labels.get(&c.file_id).map(|labels| labels.1),
                 "score": c.score,
                 "signals": c.signals,
             })).collect::<Vec<_>>(),
             "semantic_candidates": recall.semantic_candidates.iter().map(|(fid, cosine)| json!({
                 "file_id": fid.to_string(),
+                "file_name": profile_labels.get(fid).map(|labels| labels.0),
+                "title": profile_labels.get(fid).map(|labels| labels.1),
                 "cosine": cosine,
+            })).collect::<Vec<_>>(),
+            "fused_candidates": recall.fused.iter().map(|c| json!({
+                "file_id": c.file_id.to_string(),
+                "file_name": profile_labels.get(&c.file_id).map(|labels| labels.0),
+                "title": profile_labels.get(&c.file_id).map(|labels| labels.1),
+                "score": c.score,
+                "signals": c.signals,
             })).collect::<Vec<_>>(),
             "semantic_enabled": recall.semantic_enabled,
         });
@@ -9559,7 +9277,6 @@ fn run_document_summary_answer(
     let file_name = file.display_name.clone();
     let file_path = file.canonical_path.clone();
 
-    phase("understanding", 0.08);
     // 1. 整份文档结构：document_nodes 分页读取（200/批，上限 4000 节点防失控）
     let nodes_total = catalog.file_document_node_count(&target_file)?;
     let mut nodes = Vec::new();
@@ -9667,32 +9384,12 @@ fn run_document_summary_answer(
             Ok(raw) => parse_section_summaries(&raw),
             Err(_) => Vec::new(),
         };
-        let mut by_title = HashMap::<String, SectionSummary>::new();
-        for digest in parsed {
-            by_title.insert(digest.title.trim().to_ascii_lowercase(), digest);
-        }
-        let mut batch_digests = Vec::with_capacity(batch.len());
-        let mut batch_failed = false;
-        for (_, section, _) in &batch {
-            let key = section.title.trim().to_ascii_lowercase();
-            let base_key = key
-                .trim_end_matches(|ch: char| ch.is_ascii_digit())
-                .trim_end_matches("（续")
-                .trim();
-            let digest = by_title
-                .remove(&key)
-                .or_else(|| by_title.remove(base_key))
-                .unwrap_or_else(|| {
-                    batch_failed = true;
-                    SectionSummary {
-                        title: section.title.clone(),
-                        summary: compact_for_prompt(&section.text(), SUMMARY_FALLBACK_CHARS),
-                        key_points: Vec::new(),
-                    }
-                });
-            batch_digests.push(digest);
-        }
-        if batch_failed {
+        // 标题匹配 + 位置补齐混合对齐：无结构化标题文档的重复标题节
+        // （「未命名内容」）不再因标题不可靠而挤占/回退，按模型输出顺序对应。
+        let batch_start = batch.first().map(|(first, _, _)| *first).unwrap_or(index);
+        let (batch_digests, batch_fallback_count) =
+            match_section_digests(&sections[batch_start..index], parsed, SUMMARY_FALLBACK_CHARS);
+        if batch_fallback_count > 0 {
             batch_fallbacks += 1;
         }
         trace_node(
@@ -9935,6 +9632,254 @@ fn finish_summary_refusal(
     Ok(result)
 }
 
+/// Phase 2：Agent Tool 分发门控。仅当 `plan` 命中「已接入的高层只读 Tool」
+/// 时返回 `Some(AnswerResult)`，否则返回 `None` 让 Legacy 链路原样处理。
+///
+/// 本轮只接入 `LibraryOverview`（库概览，无回退风险）；其余 Tool 或与现有
+/// 整文摘要/检索语义重叠、或尚未验证更优，全部回落 Legacy，由测评决定是否
+/// 扩大覆盖。本函数不针对具体文件/关键词/测试问题写特判。
+fn run_agent_tool_answer(
+    request: &AskRequest,
+    catalog: &CatalogService,
+    plan: &QueryPlan,
+    operation_id: Uuid,
+    cancelled: &AtomicBool,
+    phase: &dyn Fn(&str, f64),
+) -> Result<Option<AnswerResult>, AppError> {
+    // 受约束 Planner：按模型规模档位（0.8B/2B/4B/8B，默认最保守）做出工具决策。
+    // 工具不在档位许可集（或属非资料分支）时 `decision.agent=false`，回落 Legacy。
+    let decision = plan_question(PlannerTier::from_env(), plan);
+    if !decision.agent {
+        return Ok(None);
+    }
+    let tool = match decision.tool {
+        Some(tool) => tool,
+        None => return Ok(None),
+    };
+    let _ = cancelled;
+    match tool {
+        KnowledgeTool::LibraryOverview => {
+            let result =
+                run_agent_library_overview(request, catalog, operation_id, phase)?;
+            Ok(Some(result))
+        }
+        KnowledgeTool::GetOutline => {
+            let result =
+                run_agent_get_outline(request, catalog, plan, operation_id, phase)?;
+            Ok(Some(result))
+        }
+        // 其余 Tool 尚未接入执行器，完全回落 Legacy 链路。
+        _ => Ok(None),
+    }
+}
+
+/// LibraryOverview Tool 执行器（Agent 路径）：「我的知识库有什么」。
+///
+/// 复用 `ask_tools::library_overview` 的只读画像聚合（文件数按类型计数 +
+/// 最近更新定位），不检索正文、不触发底层 Embedding/FTS。组装成与其余
+/// 分支一致的可记录 `AnswerResult`，便于统一入 Trace 与 Evaluation。
+fn run_agent_library_overview(
+    request: &AskRequest,
+    catalog: &CatalogService,
+    operation_id: Uuid,
+    phase: &dyn Fn(&str, f64),
+) -> Result<AnswerResult, AppError> {
+    phase("agent_library_overview", 0.40);
+    let started = Instant::now();
+    let overview = agent_tools::library_overview(catalog)?;
+
+    // 通用汇总文案：文件总数 + 按类型分布 + 最近更新若干。不写具体文件名
+    // 的特判——后续扩展经由 by_type / recent 数据如实输出。
+    let mut lines = vec![format!("知识库里共有 {} 份已索引资料。", overview.total_files)];
+    if !overview.by_type.is_empty() {
+        let type_desc = overview
+            .by_type
+            .iter()
+            .map(|t| format!("{} {} 份", t.name, t.count))
+            .collect::<Vec<_>>()
+            .join("、");
+        lines.push(format!("其中：{type_desc}。"));
+    }
+    if !overview.recent.is_empty() {
+        let recent_names = overview
+            .recent
+            .iter()
+            .take(8)
+            .map(|f| f.file_name.as_str())
+            .collect::<Vec<_>>()
+            .join("、");
+        lines.push(format!("最近更新的：{recent_names}。"));
+    }
+    let answer = lines.join("\n");
+
+    let result = AnswerResult {
+        session_id: request.session_id.unwrap_or_else(Uuid::now_v7),
+        message_id: Uuid::now_v7(),
+        answer,
+        grounding_status: GroundingStatus::Grounded,
+        insufficient_evidence: false,
+        claims: Vec::new(),
+        source_files: Vec::new(),
+        used_file_ids: Vec::new(),
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        answer_mode: AnswerMode::Generated,
+        retrieval_channels: vec!["agent_library_overview".into()],
+        index_coverage: 0.0,
+        degradation_reason: None,
+        no_evidence_reason: None,
+        clarification: None,
+        thinking: None,
+    };
+    let session_id = request.session_id.map(|id| id.to_string());
+    trace_node(
+        catalog,
+        "ask",
+        "agent_tool",
+        &operation_id.to_string(),
+        session_id.as_deref(),
+        None,
+        &json!({
+            "tool": "library_overview",
+            "question": request.question,
+        }),
+        &json!({
+            "total_files": overview.total_files,
+            "by_type": overview.by_type.iter().map(|t| (t.name.clone(), t.count)).collect::<Vec<_>>(),
+        }),
+        "ok",
+        Some(result.elapsed_ms),
+    );
+    catalog.record_ask_exchange(request, &result)?;
+    phase("completed", 1.0);
+    Ok(result)
+}
+
+/// GetOutline Tool 执行器（Agent 路径）：「XX 有哪些章节 / 大纲」。
+///
+/// 复用 `ask_tools::get_outline` 的只读结构提取（章节标题 + 字符数），不做逐节
+/// 模型摘要。目标文件复用与 legacy find 同源的 `resolve_documents` 定位，仅取
+/// 决议命中的首个候选（结构枚举按单文档回答，不展开多候选澄清）。章节标题在
+/// 结构 heading_path 缺失时由 `build_document_sections` 从正文首行标题行兜底
+/// 提取，OCR/纯文本文档亦能输出真实章节，不再退化为「未命名内容」。回答仅为
+/// 章节标题串的可读汇总，逐节可展开；证据取自原始 chunk，不做 Citation 断言。
+fn run_agent_get_outline(
+    request: &AskRequest,
+    catalog: &CatalogService,
+    plan: &QueryPlan,
+    operation_id: Uuid,
+    phase: &dyn Fn(&str, f64),
+) -> Result<AnswerResult, AppError> {
+    phase("agent_get_outline", 0.40);
+    let started = Instant::now();
+
+    // 1. 定位目标文件：复用与 legacy find 同源的 resolve_documents，取首个命中。
+    let found = agent_tools::search_files(catalog, plan)?;
+    let Some(target) = found.candidates.first() else {
+        let result = AnswerResult {
+            session_id: request.session_id.unwrap_or_else(Uuid::now_v7),
+            message_id: Uuid::now_v7(),
+            answer: "无法确定要查看哪份资料的结构大纲。你可以说得更具体一些，例如文件的名称或类型。"
+                .to_owned(),
+            grounding_status: GroundingStatus::Insufficient,
+            insufficient_evidence: true,
+            claims: Vec::new(),
+            source_files: Vec::new(),
+            used_file_ids: Vec::new(),
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            answer_mode: AnswerMode::RagRefusal,
+            retrieval_channels: vec!["agent_get_outline".into()],
+            index_coverage: 0.0,
+            degradation_reason: None,
+            no_evidence_reason: None,
+            clarification: None,
+            thinking: None,
+        };
+        // 未定位到时直接记录并返回拒绝。
+        trace_node(
+            catalog,
+            "ask",
+            "agent_tool",
+            &operation_id.to_string(),
+            request.session_id.map(|id| id.to_string()).as_deref(),
+            None,
+            &json!({
+                "tool": "get_outline",
+                "question": request.question,
+                "resolved": false,
+            }),
+            &json!({}),
+            "no_evidence",
+            Some(result.elapsed_ms),
+        );
+        catalog.record_ask_exchange(request, &result)?;
+        phase("completed", 1.0);
+        return Ok(result);
+    };
+    let file_id: Uuid = target
+        .file_id
+        .parse()
+        .map_err(|_| AppError::new("AGENT_OUTLINE_BAD_FILE_ID", "大纲目标文件标识无效", false))?;
+    let file_preview = catalog.file_preview(&file_id, 1)?.file;
+    let file_name = file_preview.display_name.clone();
+    let file_path = file_preview.canonical_path.clone();
+
+    // 2. 只取结构大纲（章节标题串），不逐节模型摘要。
+    let outline = agent_tools::get_outline(catalog, file_id)?;
+
+    // 3. 汇总为可读章节标题列表（逐节可展开的确定性输出，不生成逐节摘要）。
+    let mut lines = vec![format!("「{file_name}」的结构大纲：")];
+    for section in &outline.sections {
+        lines.push(format!("- {}（{} 字）", section.title, section.char_count));
+    }
+    let answer = lines.join("\n");
+
+    let result = AnswerResult {
+        session_id: request.session_id.unwrap_or_else(Uuid::now_v7),
+        message_id: Uuid::now_v7(),
+        answer,
+        grounding_status: GroundingStatus::Grounded,
+        insufficient_evidence: false,
+        claims: Vec::new(),
+        source_files: vec![AnswerSourceFile {
+            file_id,
+            display_name: file_name.clone(),
+            canonical_path: file_path,
+        }],
+        used_file_ids: vec![file_id],
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        answer_mode: AnswerMode::Summary,
+        retrieval_channels: vec!["agent_get_outline".into()],
+        index_coverage: 0.0,
+        degradation_reason: None,
+        no_evidence_reason: None,
+        clarification: None,
+        thinking: None,
+    };
+    trace_node(
+        catalog,
+        "ask",
+        "agent_tool",
+        &operation_id.to_string(),
+        request.session_id.map(|id| id.to_string()).as_deref(),
+        None,
+        &json!({
+            "tool": "get_outline",
+            "question": request.question,
+            "resolved": true,
+            "file_id": file_id.to_string(),
+        }),
+        &json!({
+            "section_count": outline.sections.len(),
+            "titles": outline.sections.iter().map(|s| (&s.title, s.char_count)).collect::<Vec<_>>(),
+        }),
+        "ok",
+        Some(result.elapsed_ms),
+    );
+    catalog.record_ask_exchange(request, &result)?;
+    phase("completed", 1.0);
+    Ok(result)
+}
+
 /// COMPARE_DOCUMENTS：两篇文档对比（spec 十一.6 / 二十 CASE 8）。
 ///
 /// 管线：两侧目标确定（primary 走 Resolver 结果；secondary_target 独立
@@ -10107,7 +10052,7 @@ fn run_compare_answer(
             .retrieval_limit
             .min(COMPARE_MATERIAL_ITEMS as u32);
         sub_request.max_source_files = sub_request.max_source_files.min(1);
-        let result = catalog.answer_extractively(
+        let result = catalog.answer_extractively_in_authoritative_scope(
             &sub_request,
             Some(SemanticQuery {
                 model_artifact_id: &artifact_id,
@@ -10382,192 +10327,74 @@ fn run_compare_answer(
     Ok(result)
 }
 
-/// 闲聊分支：跳过检索/索引 gate，直接用生成模型对话（带会话历史）。
-#[allow(clippy::too_many_arguments)]
-fn run_chat_answer(
+/// 普通聊天（GENERAL）自由直答：用生成模型做无证据约束的友好对话。
+///
+/// 仅当 LLM 路由判定 `source=general` 且用户没有点名本地资料/文件时进入
+/// （调用方已保证）。聊天回答不携带引用、不伪装资料结论；会话历史仅作上下文
+/// 供模型自然续接寒暄/闲聊。生成失败时给出可诊断错误码，不静默吞错。
+/// 纯通用逻辑，不针对任何话术做特判。
+fn run_general_chat_answer(
     request: &AskRequest,
     catalog: &CatalogService,
     generation: &Mutex<LocalGenerationRuntime>,
-    generation_artifact: &ModelArtifact,
-    maintenance: &MaintenanceSnapshot,
     history: &[AskMessage],
     operation_id: Uuid,
     cancelled: &AtomicBool,
     phase: &dyn Fn(&str, f64),
-    on_thinking: &dyn Fn(&str),
 ) -> Result<AnswerResult, AppError> {
-    if maintenance.degradation_level == "core" {
-        return Err(AppError::new(
-            "RAG_RESOURCE_PRESSURE",
-            "当前资源压力较高，暂未启动回答；请稍后重试",
-            true,
-        ));
-    }
-    // Phase 4.3 第三部分：Chat 幻觉最终保护。personal query（我的/我之前/
-    // 我的资料/毕业时候……）出现在 Chat 入口，说明路由/解析链路已把它误判
-    // 为闲聊且 source_files 为空——这类问题的答案只能来自本地证据，自由
-    // 生成必然幻觉（RAG 定义错误 / 通用简历模板）。此处是最后一道闸：
-    // 固定 NO_EVIDENCE 拒绝文案（RagRefusal），绝不调模型。
-    if let Some(marker) = personal_reference_hit(request.question.trim()) {
-        let started_at = Instant::now();
-        let answer = local_no_evidence_answer(request.question.trim(), &[], false);
-        let result = AnswerResult {
-            session_id: request.session_id.unwrap_or_else(Uuid::now_v7),
-            message_id: Uuid::now_v7(),
-            answer: answer.clone(),
-            grounding_status: fanfan_core::GroundingStatus::Insufficient,
-            insufficient_evidence: true,
-            claims: Vec::new(),
-            source_files: Vec::new(),
-            used_file_ids: Vec::new(),
-            elapsed_ms: started_at.elapsed().as_millis() as u64,
-            answer_mode: AnswerMode::RagRefusal,
-            retrieval_channels: Vec::new(),
-            index_coverage: 0.0,
-            degradation_reason: None,
-            no_evidence_reason: Some(NoEvidenceReason::TrueNoEvidence),
-            clarification: None,
-            thinking: None,
-        };
-        let session_id = request.session_id.map(|id| id.to_string());
-        trace_node(
-            catalog,
-            "ask",
-            "chat_guard_blocked",
-            &operation_id.to_string(),
-            session_id.as_deref(),
-            None,
-            &json!({ "question": request.question }),
-            &json!({
-                "guard": "personal_reference_no_evidence",
-                "marker": marker,
-                "answer_mode": result.answer_mode,
-                "answer": result.answer,
-            }),
-            "ok",
-            Some(result.elapsed_ms),
-        );
-        catalog.record_ask_exchange(request, &result)?;
-        phase("completed", 1.0);
-        return Ok(result);
-    }
-    // Phase 4.3 第二部分：builtin_knowledge 优先于 LLM 自由生成（仅
-    // GENERAL 链路；personal query 已被上方 guard 拦截，词条与个人资料
-    // 完全隔离）。本地小模型对 LangGraph/RAG/Transformer 等稳定技术概念
-    // 极易幻觉（实测 LangGraph→GNN、RAG→递归架构），内置词条直接命中
-    // 返回，不消耗一次生成调用。
-    if let Some(hit) = lookup_builtin_knowledge(request.question.trim()) {
-        let started_at = Instant::now();
-        let result = AnswerResult {
-            session_id: request.session_id.unwrap_or_else(Uuid::now_v7),
-            message_id: Uuid::now_v7(),
-            answer: hit.answer.clone(),
-            grounding_status: fanfan_core::GroundingStatus::Insufficient,
-            insufficient_evidence: false,
-            claims: Vec::new(),
-            source_files: Vec::new(),
-            used_file_ids: Vec::new(),
-            elapsed_ms: started_at.elapsed().as_millis() as u64,
-            answer_mode: AnswerMode::Chat,
-            retrieval_channels: Vec::new(),
-            index_coverage: 0.0,
-            degradation_reason: None,
-            no_evidence_reason: None,
-            clarification: None,
-            thinking: None,
-        };
-        let session_id = request.session_id.map(|id| id.to_string());
-        trace_node(
-            catalog,
-            "ask",
-            "builtin_knowledge_hit",
-            &operation_id.to_string(),
-            session_id.as_deref(),
-            None,
-            &json!({ "question": request.question }),
-            &json!({
-                "key": hit.key,
-                "category": hit.category,
-                "answer_mode": result.answer_mode,
-                "answer": result.answer,
-            }),
-            "ok",
-            Some(result.elapsed_ms),
-        );
-        catalog.record_ask_exchange(request, &result)?;
-        phase("completed", 1.0);
-        return Ok(result);
-    }
-    phase("chat_generating", 0.7);
-    let (system, user) = chat_prompt(request, history);
     let started_at = Instant::now();
-    // 深度思考模式：开启思考并流式输出推理轨迹（message.thinking 增量经
-    // on_thinking 推给前端），正文增量仍走完整的问答 token 事件。非思考
-    // 模式沿用原有同步调用，保证 RAG 内部 JSON 链路的稳定输出。
-    // 深度思考模式返回 (正文, 思考轨迹)；非思考模式思考为 None。
-    let (answer, thinking) = if request.think_mode {
-        let mut text = String::new();
-        let mut thinking_text = String::new();
-        {
-            let mut runtime = generation.lock().map_err(|_| {
-                AppError::new(
-                    "GENERATION_RUNTIME_LOCK_FAILED",
-                    "生成运行时状态已损坏",
-                    true,
-                )
-            })?;
-            let threads = interactive_inference_threads();
-            if runtime.active_model_path() != Some(generation_artifact.local_path.as_str())
-                || !runtime.is_active()
-            {
-                runtime.activate(&generation_artifact.local_path, 4096, threads)?;
-            }
-            let mut delta = |thinking: Option<&str>, content: Option<&str>| {
-                if let Some(thinking) = thinking {
-                    thinking_text.push_str(thinking);
-                    on_thinking(thinking);
-                }
-                if let Some(content) = content {
-                    text.push_str(content);
-                }
-            };
-            runtime
-                .complete_stream_cancellable(&system, &user, 4096, true, cancelled, &mut delta)?;
-        }
-        // 思考模式可能因思考轨迹过长耗尽 token 预算（F4）：content 为空但
-        // 有思考文本时，不报 OLLAMA_RESPONSE_INVALID，改为友好提示并把思考
-        // 文本作为回退正文，保证用户看到「模型确实思考过」而非错误。
-        let text = if text.trim().is_empty() && !thinking_text.trim().is_empty() {
-            "（模型已完成深度思考，但思考过程消耗了全部输出预算，未生成最终正文。你可以关闭深度思考后重试，或换一种更简洁的问法。）".to_owned()
-        } else {
-            if text.trim().is_empty() {
-                return Err(AppError::new(
-                    "OLLAMA_RESPONSE_INVALID",
-                    "Ollama 对话响应缺少回答文本",
-                    false,
-                ));
-            }
-            // qwen3.5 思考模型正文会内嵌 <Thinking>/<Answer> 标记，展示前剥除
-            clean_qwen_thinking_tags(&text)
-        };
-        let thinking = (!thinking_text.trim().is_empty()).then_some(thinking_text);
-        (text, thinking)
-    } else {
-        let answer = complete_with_model(
-            generation,
-            generation_artifact,
-            &system,
-            &user,
-            512,
-            cancelled,
-        )?;
-        (answer, None)
-    };
+    let session_id = request.session_id.map(|id| id.to_string());
+    let session_id_ref = session_id.as_deref();
+    // 闲聊理解完直接进入「生成回答」：不出现「规划检索」环节，
+    // 由 public_node_spec 将 chat_generating 展示为“生成回答”。
+    phase("chat_generating", 0.2);
+    trace_node(
+        catalog,
+        "ask",
+        "chat_answer",
+        &operation_id.to_string(),
+        session_id_ref,
+        None,
+        &json!({ "question": request.question }),
+        &json!({ "mode": "general_chat", "retrieval": false }),
+        "ok",
+        Some(started_at.elapsed().as_millis() as u64),
+    );
+    trace_operation_execution(
+        catalog,
+        &operation_id.to_string(),
+        session_id_ref,
+        "general_chat",
+        "chat",
+    );
+    // 折叠最近会话（8 user + 8 assistant），只作上下文参考，不参与改写。
+    let folded = fold_recent_history(history, 8, 8);
+    let mut runtime = generation.lock().map_err(|_| {
+        AppError::new(
+            "GENERATION_RUNTIME_LOCK_FAILED",
+            "生成运行时状态已损坏",
+            true,
+        )
+    })?;
+    let system = "你是翻翻，一个运行在用户电脑上的本地资料助手，职责是整理、搜索并基于已授权本地资料回答问题。现在用户是在和你闲聊或寒暄，不需要检索任何资料，请用自然、友好、简洁的中文回应，可以正常聊。注意：只有用户明显在询问本地资料的具体内容时才提示去问资料（对已授权目录发起资料问答）；绝不编造或引用任何本地文件，不要出现页码、引用或“资料显示”之类的措辞。";
+    let mut user = format!("用户说：{}\n\n请自然回应：", request.question.trim());
+    if !folded.is_empty() {
+        user = format!("【最近对话（参考上下文，不要复读）】\n{folded}\n\n{user}");
+    }
+    let answer = runtime.complete_cancellable(system, &user, 512, cancelled)?;
+    drop(runtime);
+    if cancelled.load(Ordering::Acquire) {
+        return Err(AppError::new("OPERATION_CANCELLED", "问答已取消", false));
+    }
+    let answer = answer.trim().to_owned();
+    if answer.is_empty() {
+        return Err(AppError::new("GENERATION_EMPTY", "生成模型未返回内容", true));
+    }
     let result = AnswerResult {
         session_id: request.session_id.unwrap_or_else(Uuid::now_v7),
         message_id: Uuid::now_v7(),
-        answer: answer.trim().to_owned(),
-        grounding_status: fanfan_core::GroundingStatus::Insufficient,
+        answer,
+        grounding_status: GroundingStatus::Insufficient,
         insufficient_evidence: false,
         claims: Vec::new(),
         source_files: Vec::new(),
@@ -10579,26 +10406,17 @@ fn run_chat_answer(
         degradation_reason: None,
         no_evidence_reason: None,
         clarification: None,
-        thinking,
+        thinking: None,
     };
-    let session_id = request.session_id.map(|id| id.to_string());
     trace_node(
         catalog,
         "ask",
-        "completed",
+        "chat_answer_completed",
         &operation_id.to_string(),
-        session_id.as_deref(),
+        session_id_ref,
         None,
-        &json!({}),
-        &json!({
-            "answer_mode": result.answer_mode,
-            "answer": result.answer,
-            "claim_count": result.claims.len(),
-            "grounding_status": format!("{:?}", result.grounding_status),
-            "insufficient_evidence": result.insufficient_evidence,
-            "degradation_reason": result.degradation_reason,
-            "elapsed_ms": result.elapsed_ms,
-        }),
+        &json!({ "question": request.question }),
+        &json!({ "answer_mode": result.answer_mode, "answer": result.answer }),
         "ok",
         Some(result.elapsed_ms),
     );
@@ -10607,7 +10425,6 @@ fn run_chat_answer(
     Ok(result)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_retrieval_answer(
     request: &AskRequest,
     // 用户原始问题（request.question 可能已被替换为 content_query 检索词；
@@ -10787,6 +10604,10 @@ fn run_retrieval_answer(
     // 无结果 → 保留 wider chunk retrieval 兜底，绝不中断（增益层，任何
     // 失败都在 run_document_recall 内部吞掉并如实 trace）。
     let mut scoped = request.clone();
+    // 只记录进入 Document Recall 之前已有的 file scope：它来自用户选择、
+    // Document Resolver、可信 Memory 或会话上下文，已是权威目标白名单。
+    // Document Recall 随后写入的候选 file_ids 仍走普通严格相关性门槛。
+    let authoritative_file_scope = !scoped.scope.file_ids.is_empty();
     // 文档级召回为空（spec 十二 DOCUMENT_RECALL_EMPTY 分类依据）：recall 没
     // 定位到任何相关文档 → 后续 NO_EVIDENCE 的根因记在召回层。
     let mut document_recall_empty = false;
@@ -10810,13 +10631,16 @@ fn run_retrieval_answer(
         sub_request.question = question.clone();
         sub_request.retrieval_limit = sub_request.retrieval_limit.min(10);
         sub_request.max_source_files = sub_request.max_source_files.min(6);
-        sub_results.push(catalog.answer_extractively(
-            &sub_request,
-            Some(SemanticQuery {
-                model_artifact_id: &artifact_id,
-                vector,
-            }),
-        )?);
+        let semantic_query = Some(SemanticQuery {
+            model_artifact_id: &artifact_id,
+            vector,
+        });
+        let result = if authoritative_file_scope {
+            catalog.answer_extractively_in_authoritative_scope(&sub_request, semantic_query)
+        } else {
+            catalog.answer_extractively(&sub_request, semantic_query)
+        }?;
+        sub_results.push(result);
     }
     // 检索计时：FTS + 语义 + RRF 在 answer_extractively 内部合并执行，
     // 该总耗时已覆盖 fts/semantic/rrf/mmr（core 内不可再拆，如实记录）。
@@ -11066,7 +10890,7 @@ fn run_retrieval_answer(
     );
     phase("evidence_selection", 0.48);
     let mut image_analysis_context = Vec::new();
-    if reranker_applied && models.active_artifact(ModelRole::Vision)?.is_some() {
+    if reranker_applied && models.active_artifact(ModelRole::Generation)?.is_some() {
         let image_assets = extractive
             .claims
             .iter()
@@ -11165,6 +10989,66 @@ fn run_retrieval_answer(
         None,
     );
     if verdict.status == AnswerabilityStatus::NotAnswerable {
+        // 概念/知识解释类问句（shape=Description，如「分库分表的原理是什么」）在本地
+        // 资料库没有可直接引用的证据时，按已确认的概念题策略**退化为通用知识作答**：
+        // 明确告诉用户本地没有对应资料、并用生成模型以教科书口径讲解，绝不引用任何
+        // 本地文件（无 claims、无 sources、insufficient_evidence=true，前端不会展示
+        // 引用）。而「有没有提到X」这类数据存在性问句（boolean_existence/list 等）
+        // 仍走下方统一拒答——绝不替用户杜撰其资料里到底有没有某内容。
+        if verdict.answer_shape == AnswerShape::Description {
+            const CONCEPT_DEGRADE_TOKENS: u32 = 512;
+            let concept_system = "你是翻翻，运行在用户电脑上的本地资料助手。用户在问一道教科书概念/知识题（不是问具体某份文件里的内容）。你检查了本地资料库，没有检索到可以直接引用的相关证据，因此**不再尝试引用任何本地文件，改用你的通用知识作答**。要求：1) 先在开头用一句话说明「本地资料中没有找到直接对应的内容，以下为通用概念讲解」；2) 然后准确、简洁、有条理地讲解该概念，用 Markdown 分点；3) 绝对不要出现页码、「根据资料」「资料显示」等措辞，不要编造任何本地文件名。";
+            let concept_user = format!("用户问：{}\n\n请用通用知识讲解：", original_question);
+            let concept_text = complete_with_model(
+                generation,
+                &generation_artifact,
+                concept_system,
+                &concept_user,
+                CONCEPT_DEGRADE_TOKENS,
+                cancelled,
+            )?
+            .trim()
+            .to_owned();
+            if !concept_text.is_empty() {
+                extractive.claims.clear();
+                extractive.source_files.clear();
+                extractive.used_file_ids.clear();
+                extractive.insufficient_evidence = true;
+                extractive.grounding_status = fanfan_core::GroundingStatus::Insufficient;
+                extractive.answer = concept_text;
+                extractive.answer_mode = AnswerMode::RagRefusal;
+                extractive.degradation_reason = Some(
+                    "概念题本地无证据→退化为通用知识作答（未引用本地文件）".to_owned(),
+                );
+                extractive.no_evidence_reason = Some(NoEvidenceReason::AnswerabilityRejected);
+                trace_node(
+                    catalog,
+                    "ask",
+                    "completed",
+                    &correlation_id,
+                    session_id_ref,
+                    None,
+                    &json!({}),
+                    &json!({
+                        "answer_mode": "rag_refusal_concept_degrade",
+                        "answer": extractive.answer,
+                        "claim_count": 0,
+                        "grounding_status": format!("{:?}", extractive.grounding_status),
+                        "insufficient_evidence": true,
+                        "degradation_reason": extractive.degradation_reason,
+                        "no_evidence_reason": "ANSWERABILITY_REJECTED_CONCEPT_DEGRADE",
+                        "answerability_status": verdict.status.as_str(),
+                        "answer_shape": verdict.answer_shape.as_str(),
+                    }),
+                    "ok",
+                    Some(extractive.elapsed_ms),
+                );
+                catalog.record_ask_exchange(request, &extractive)?;
+                phase("completed", 1.0);
+                return Ok(extractive);
+            }
+            // 生成退化内容为空 → 落到下方统一拒答兜底。
+        }
         // LOCAL 拒答：统一无证据文案（spec 十六），绝不转闲聊、绝不追加通用知识
         let requires_project = existence_requires_project_context(original_question, &gate_plan);
         extractive.claims.clear();
@@ -11278,7 +11162,7 @@ fn run_retrieval_answer(
         .complete_json_cancellable(
             LOCAL_STRICT_SYSTEM_PROMPT,
             &prompt,
-            768,
+            1024,
             &answer_schema,
             cancelled,
         )
@@ -11301,6 +11185,7 @@ fn run_retrieval_answer(
         None,
     );
     phase("citation_validation", 0.88);
+    let defer_verified_claim_stream = gate_plan.operation == QueryOperation::Extract;
     let mut grounded = fanfan_core::apply_grounded_generation(&extractive, &generated);
     if grounded.is_none() {
         phase("citation_structure_repair", 0.9);
@@ -11477,7 +11362,9 @@ fn run_retrieval_answer(
         single_claim_result.claims = vec![claim.clone()];
         catalog.validate_answer_evidence(&single_claim_result)?;
         grounded.claims.push(claim);
-        verified_claim(grounded.claims.last().expect("verified claim appended"));
+        if !defer_verified_claim_stream {
+            verified_claim(grounded.claims.last().expect("verified claim appended"));
+        }
         phase(
             "citation_validation",
             0.88 + 0.1 * ((index + 1) as f64 / candidate_count as f64),
@@ -12654,7 +12541,7 @@ fn image_asset_cache_dir(app: &AppHandle, revision_id: &Uuid) -> Option<String> 
 #[derive(Debug, Deserialize)]
 struct VisionDescriptionPayload {
     summary: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_visible_text")]
     visible_text: Option<String>,
     #[serde(default)]
     keywords: Vec<String>,
@@ -12662,6 +12549,36 @@ struct VisionDescriptionPayload {
     entities: Vec<String>,
     #[serde(default)]
     chart_summary: Option<String>,
+}
+
+/// 兼容模型把 `visible_text` 输出为字符串或字符串数组两种形式：
+/// 字符串直接使用；数组按行连接为多行文本；其余类型（null/对象等）视为空。
+fn deserialize_visible_text<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::Null => Ok(None),
+        Value::String(text) => {
+            let trimmed = text.trim();
+            Ok((!trimmed.is_empty()).then(|| trimmed.to_owned()))
+        }
+        Value::Array(items) => {
+            let parts = items
+                .into_iter()
+                .filter_map(|item| match item {
+                    Value::String(part) => {
+                        let trimmed = part.trim();
+                        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            Ok((!parts.is_empty()).then(|| parts.join("\n")))
+        }
+        _ => Ok(None),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -13039,7 +12956,7 @@ pub(crate) fn spawn_image_understanding_pending(app: AppHandle, catalog: Arc<Cat
             Ok(models) => models,
             Err(_) => return,
         };
-        let artifact = match models.active_artifact(ModelRole::Vision) {
+        let artifact = match models.active_artifact(ModelRole::Generation) {
             Ok(Some(artifact)) => artifact,
             Ok(None) => return,
             Err(error) => {
@@ -13047,20 +12964,6 @@ pub(crate) fn spawn_image_understanding_pending(app: AppHandle, catalog: Arc<Cat
                     "error",
                     "vision",
                     "vision.model_lookup_failed",
-                    None,
-                    &json!({ "error_code": error.code, "retryable": error.retryable }),
-                );
-                let _ = app.emit("vision:failed", error);
-                return;
-            }
-        };
-        let projector = match models.vision_projector_path(&artifact) {
-            Ok(path) => path,
-            Err(error) => {
-                crate::runtime_log::event(
-                    "error",
-                    "vision",
-                    "vision.projector_lookup_failed",
                     None,
                     &json!({ "error_code": error.code, "retryable": error.retryable }),
                 );
@@ -13084,10 +12987,11 @@ pub(crate) fn spawn_image_understanding_pending(app: AppHandle, catalog: Arc<Cat
             Some(&cycle_id),
             &json!({ "model_artifact_id": model_artifact_id }),
         );
-        let projector_path = projector.to_string_lossy().into_owned();
         let threads = background_inference_threads();
         let mut committed = 0_u64;
         let mut failed = 0_u64;
+        // 连续空转上限：防止 OCR 停滞时 claim 永远为空导致理解管线无限忙循环。
+        let mut idle_spins = 0_u32;
         loop {
             if worker.foreground_activity.load(Ordering::Acquire) > 0 {
                 thread::sleep(Duration::from_millis(250));
@@ -13103,7 +13007,7 @@ pub(crate) fn spawn_image_understanding_pending(app: AppHandle, catalog: Arc<Cat
             let runtime_manager = app.state::<RuntimeManagerState>();
             let mut runtime_request = RuntimeTaskRequest::interactive(
                 RuntimeTaskKind::ImageUnderstanding,
-                RuntimeBackendKind::LlamaCpp,
+                RuntimeBackendKind::Ollama,
             );
             runtime_request.cpu_threads = threads;
             runtime_request.timeout = Duration::from_secs(2);
@@ -13122,10 +13026,17 @@ pub(crate) fn spawn_image_understanding_pending(app: AppHandle, catalog: Arc<Cat
                 }
             };
             let pending = match catalog.claim_pending_image_understanding(&model_artifact_id) {
-                Ok(Some(pending)) => pending,
+                Ok(Some(pending)) => {
+                    idle_spins = 0;
+                    pending
+                }
+                // stats 的待处理口径包含 pending_ocr/ocr_processing（OCR 仍在推进），
+                // 因此 claim 为空时短退避等待新产出；但必须带上限，防止 OCR 停滞时
+                // 永久空转（vision_running 恒为 true 导致理解管线卡死）。
                 Ok(None) => match catalog.image_understanding_stats() {
-                    Ok((_, _, pending)) if pending > 0 => {
-                        thread::yield_now();
+                    Ok((_, _, pending)) if pending > 0 && idle_spins < 30 => {
+                        idle_spins += 1;
+                        thread::sleep(Duration::from_millis(100));
                         continue;
                     }
                     _ => break,
@@ -13170,17 +13081,7 @@ pub(crate) fn spawn_image_understanding_pending(app: AppHandle, catalog: Arc<Cat
                 };
             let operation = (|| {
                 let mut runtime = runtime_guard;
-                if runtime.active_model_path() != Some(artifact.local_path.as_str())
-                    || runtime.active_mmproj_path() != Some(projector_path.as_str())
-                    || !runtime.is_active()
-                {
-                    runtime.activate_multimodal(
-                        &artifact.local_path,
-                        &projector_path,
-                        4096,
-                        threads,
-                    )?;
-                }
+                runtime.activate_multimodal(&artifact.local_path, 4096, threads)?;
                 let location = serde_json::to_string(&pending.locator).map_err(|error| {
                     AppError::new("IMAGE_ASSET_INVALID", error.to_string(), false)
                 })?;
@@ -13286,7 +13187,6 @@ pub(crate) fn spawn_image_understanding_pending(app: AppHandle, catalog: Arc<Cat
         if let Some(mut runtime) =
             try_lock_generation_until(&generation.0, Duration::from_millis(2_000))
             && runtime.active_model_path() == Some(artifact.local_path.as_str())
-            && runtime.active_mmproj_path() == Some(projector_path.as_str())
         {
             runtime.stop();
         }
@@ -14077,36 +13977,6 @@ mod tests {
         assert!(!claim_support_is_verified("UNSUPPORTED"));
         assert!(!claim_support_is_verified("NOT SUPPORTED"));
         assert!(!claim_support_is_verified("The claim is SUPPORTED"));
-    }
-
-    #[test]
-    fn self_test_visible_text_strips_thinking_segments() {
-        // Phase 4.3 CASE F 配套（Qwen3.5 自检失败根因）：剥离  thinking
-        // 思维链后以可见文本参与自检判定，避免思维链截断误判回滚。
-        // 闭合思维链：只留可见回复
-        assert_eq!(
-            self_test_visible_text(
-                "<think>用户让我确认，我应该简短回复。</think>翻翻本地模型可以工作。"
-            ),
-            "翻翻本地模型可以工作。"
-        );
-        // 未闭合（token 截断）：思维链整段丢弃
-        assert_eq!(
-            self_test_visible_text("翻翻已就绪。<think>我再检查一下输出格"),
-            "翻翻已就绪。"
-        );
-        // 纯思维链截断（无可见文本）得到空串；自检时原始输出非空仍判定通过
-        assert_eq!(self_test_visible_text("<think>好的，我需要确认一下"), "");
-        // 普通模型无 think 标记：原样返回
-        assert_eq!(
-            self_test_visible_text("  翻翻本地模型可以工作。  "),
-            "翻翻本地模型可以工作。"
-        );
-        // 多段思维链全部剥离
-        assert_eq!(
-            self_test_visible_text("<think>a</think>中段<think>b</think>尾段"),
-            "中段尾段"
-        );
     }
 
     #[cfg(windows)]

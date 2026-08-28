@@ -160,6 +160,15 @@ def route_image_ocr(
         )
     )
     retained_text = fallback_text or _text(primary)
+    if fallback_error is not None and retained_text is None:
+        # 两个引擎都失败（主引擎出错 + 备用引擎出错），必须向调用方上报失败，
+        # 而不是返回空文本的成功结果，否则后续视觉理解/资产状态会被误判为成功。
+        combined_code = "OCR_ALL_ENGINES_FAILED"
+        combined_message = (
+            f"图片OCR全部引擎失败：rapidocr=({primary_error.code if primary_error else 'ok'}) "
+            f"windows=({fallback_error.code})"
+        )
+        return None, WorkerError(combined_code, combined_message, True)
     route_reason = (
         fallback_error.code.lower()
         if fallback_error is not None

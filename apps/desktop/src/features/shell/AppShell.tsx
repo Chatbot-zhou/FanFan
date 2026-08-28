@@ -15,6 +15,7 @@ import { StatusBar } from "./StatusBar";
 import { TitleBar } from "./TitleBar";
 import { useBackendEvents } from "../../hooks/useBackendEvents";
 import { RootAuthorizationPage } from "../onboarding/RootAuthorizationPage";
+import { deriveModelSetupState } from "../model-management/model-setup-state";
 
 interface AppShellProps {
   startup_notice: string | null;
@@ -54,6 +55,12 @@ export function AppShell({ startup_notice }: AppShellProps) {
     enabled: backendReady,
   });
   const currentModelState = model.data ?? null;
+  const ollama = useQuery({
+    queryKey: ["ollama-status"],
+    queryFn: () => bridge.ollama_status_get(),
+    enabled: backendReady,
+  });
+  const modelSetupState = deriveModelSetupState(ollama.data, currentModelState, ollama.error);
   const modelDownloads = useQuery({
     queryKey: ["model-downloads"],
     queryFn: () => bridge.model_download_list(),
@@ -74,11 +81,6 @@ export function AppShell({ startup_notice }: AppShellProps) {
   const welcome = useQuery({
     queryKey: ["welcome-state"],
     queryFn: () => bridge.welcome_get_state(),
-    enabled: backendReady,
-  });
-  const environment = useQuery({
-    queryKey: ["environment"],
-    queryFn: async () => (await bridge.environment_get_latest()) ?? bridge.environment_detect(),
     enabled: backendReady,
   });
   const appStatus = useQuery({
@@ -204,7 +206,7 @@ export function AppShell({ startup_notice }: AppShellProps) {
   }
 
   const page = {
-    home: <HomePage summary={home.data ?? null} loading={home.isLoading} maintenance={appStatus.data?.maintenance ?? null} />,
+    home: <HomePage summary={home.data ?? null} loading={home.isLoading} model_setup={modelSetupState} authorized_root_count={roots.data?.length ?? null} />,
     search: <SearchPage />,
     ask: <AskPage model_state={currentModelState} />,
     library: <LibraryPage />,

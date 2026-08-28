@@ -199,43 +199,6 @@ pub fn memory_summary_list(
     build_summary_list(&catalog)
 }
 
-#[tauri::command(async)]
-pub fn memory_summary_get(
-    summary_id: String,
-    catalog: State<'_, CatalogServiceState>,
-) -> Result<MemorySummary, AppError> {
-    let catalog = catalog.get()?;
-    let (kind, id) = parse_summary_id(&summary_id)?;
-    let index = TargetNameIndex::load(&catalog);
-    match kind {
-        "alias" => {
-            let alias = catalog.memory_alias_by_id(id)?.ok_or_else(|| {
-                AppError::new("MEMORY_SUMMARY_NOT_FOUND", "这条记忆已不存在", false)
-            })?;
-            Ok(alias_summary_view(
-                &alias,
-                index.name(alias.target_type, alias.target_id),
-                index.available(&catalog, alias.target_type, alias.target_id),
-            ))
-        }
-        _ => {
-            let relation = catalog.memory_relation_by_id(id)?.ok_or_else(|| {
-                AppError::new("MEMORY_SUMMARY_NOT_FOUND", "这条记忆已不存在", false)
-            })?;
-            let subject_available =
-                index.available(&catalog, relation.subject_type, relation.subject_id);
-            let object_available =
-                index.available(&catalog, relation.object_type, relation.object_id);
-            Ok(relation_summary_view(
-                &relation,
-                index.name(relation.subject_type, relation.subject_id),
-                index.name(relation.object_type, relation.object_id),
-                subject_available && object_available,
-            ))
-        }
-    }
-}
-
 /// 确认单条候选记忆（spec 二十九）：alias / relation 均升级 confirmed；
 /// 别名同时升级来源为 user_confirmed。
 #[tauri::command(async)]

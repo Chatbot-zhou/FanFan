@@ -8,8 +8,8 @@ use std::{
     },
 };
 
-use chrono::{DateTime, Utc};
-use fanfan_core::{AppError, AppLogRecord, LogPage, LogQuery, sanitize_log_value};
+use chrono::Utc;
+use fanfan_core::{AppError, sanitize_log_value};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -326,30 +326,6 @@ pub fn event(
     }
 }
 
-pub fn query(request: &LogQuery) -> Result<LogPage, AppError> {
-    request.validate()?;
-    let Some(logger) = RUNTIME_LOGGER.get() else {
-        return Ok(LogPage {
-            items: Vec::new(),
-            next_cursor: None,
-            total: 0,
-        });
-    };
-    let offset = request.offset()? as usize;
-    let total = logger.entry_count.load(Ordering::Relaxed) as usize;
-    let entries = logger.entries_page(offset, request.page_size as usize)?;
-    let items = entries
-        .into_iter()
-        .filter_map(runtime_entry_to_app_log)
-        .collect::<Vec<_>>();
-    let consumed = offset.saturating_add(items.len());
-    Ok(LogPage {
-        items,
-        next_cursor: (consumed < total).then(|| consumed.to_string()),
-        total: total as u64,
-    })
-}
-
 pub fn recent_values(limit: usize) -> Result<Vec<Value>, AppError> {
     let Some(logger) = RUNTIME_LOGGER.get() else {
         return Ok(Vec::new());
@@ -395,25 +371,6 @@ pub fn mark_clean_shutdown() {
 
 pub fn session_id() -> Option<String> {
     RUNTIME_LOGGER.get().map(|logger| logger.session_id.clone())
-}
-
-fn runtime_entry_to_app_log(mut entry: RuntimeLogEntry) -> Option<AppLogRecord> {
-    let mut fields = entry.fields.as_object().cloned().unwrap_or_default();
-    fields.insert("session_id".to_owned(), Value::String(entry.session_id));
-    fields.insert("sequence".to_owned(), Value::from(entry.sequence));
-    if let Some(correlation_id) = entry.correlation_id.take() {
-        fields.insert("correlation_id".to_owned(), Value::String(correlation_id));
-    }
-    Some(AppLogRecord {
-        log_id: entry.event_id,
-        level: entry.level,
-        component: entry.component,
-        event_name: entry.event_name,
-        fields: Value::Object(fields),
-        created_at: DateTime::parse_from_rfc3339(&entry.created_at)
-            .ok()?
-            .with_timezone(&Utc),
-    })
 }
 
 fn normalize_level(level: &str) -> &'static str {

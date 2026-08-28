@@ -41,8 +41,8 @@ class WorkerServiceTests(unittest.TestCase):
         # 每个角色进程只注册本角色需要的操作：ONNX sidecar 不得 import
         # sherpa/paddle，解析 sidecar 不得加载模型缓存。
         cases = [
-            ("parse", ["health.check", "document.probe", "document.parse", "export.write"]),
-            ("onnx", ["health.check", "embedding.encode", "rerank.score"]),
+            ("parse", ["health.check", "document.probe", "document.parse"]),
+            ("onnx", ["health.check", "rerank.score"]),
             ("ocr", ["health.check", "ocr.self_test", "ocr.recognize", "ocr.route_image"]),
             ("speech", ["health.check", "speech.asr_self_test", "speech.recognize"]),
         ]
@@ -53,7 +53,7 @@ class WorkerServiceTests(unittest.TestCase):
                     service.supports(operation),
                     f"{role} 应支持 {operation}",
                 )
-            for operation in ["document.parse", "embedding.encode", "ocr.recognize",
+            for operation in ["document.parse", "ocr.recognize",
                               "ocr.route_image", "speech.recognize", "rerank.score"]:
                 if operation not in supported:
                     self.assertFalse(

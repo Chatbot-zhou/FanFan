@@ -478,6 +478,13 @@ impl ModelManager {
             .copied()
             .collect::<Vec<_>>();
         for artifact in &mut registry.artifacts {
+            // Ollama：local_path 存的是模型 tag 而非真实文件路径，不做本地文件
+            // 完整性校验，否则 build_package_manifest 会把已 pull 就绪的 Ollama
+            // 模型误降级为 incomplete/missing。就绪态由 ensure_ollama_registry_synced
+            // 结合本机 /api/tags 实时探测维护。
+            if artifact.format == ModelFormat::Ollama {
+                continue;
+            }
             let previous_self_test = artifact
                 .package_manifest
                 .as_ref()
@@ -1932,7 +1939,14 @@ impl ModelManager {
         let bytes = fs::read(&self.registry_path).map_err(|error| {
             AppError::new("MODEL_REGISTRY_READ_FAILED", error.to_string(), true)
         })?;
-        let registry = serde_json::from_slice::<ModelRegistryState>(&bytes)
+        // Windows 下编辑器可能给 JSON 写入 UTF-8 BOM；serde 默认拒绝 BOM，
+        // 解析前剥离，避免把合法注册表误判为损坏。仅剥离前置 BOM，不影响内容。
+        let bytes = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            &bytes[3..]
+        } else {
+            &bytes[..]
+        };
+        let registry = serde_json::from_slice::<ModelRegistryState>(bytes)
             .map_err(|error| AppError::new("MODEL_REGISTRY_INVALID", error.to_string(), false))?;
         if registry.registry_version > REGISTRY_VERSION {
             return Err(AppError::new(

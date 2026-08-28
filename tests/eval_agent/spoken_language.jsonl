@@ -1,0 +1,29 @@
+{"id":"spok-001","category":"library_overview","question":"我的知识库有什么？","expected":"rag","note":"库概览：应走 Library Overview，不检索正文，输出文件总数/类型分布"}
+{"id":"spok-002","category":"library_overview","question":"现在都收集整理了哪些资料啊？","expected":"rag","note":"库概览口语化变体"}
+{"id":"spok-003","category":"find_file","question":"归航计划的项目总结放在哪个文件里？","expected":"rag_find","note":"定位文件：01-归航计划项目总结.docx"}
+{"id":"spok-004","category":"find_file","question":"有没有会议纪要方面的文件？","expected":"rag_find","note":"会议纪要：02-归航计划会议纪要.pdf"}
+{"id":"spok-005","category":"find_file","question":"那张扫描的采购收据是哪份？","expected":"rag_find","note":"收据：03-扫描采购收据.pdf / 04-扫描采购收据.png"}
+{"id":"spok-006","category":"find_file","question":"哪几个文件是完全重复的？","expected":"rag_find","note":"完全重复：13-完全重复-A.txt 与 14-完全重复-B.txt"}
+{"id":"spok-007","category":"outline","question":"归航计划阶段汇报的大纲有哪些？","expected":"rag","note":"大纲：07-归航计划阶段汇报.pptx 的章节结构"}
+{"id":"spok-008","category":"outline","question":"项目总结文档里都分了哪些章节？","expected":"rag","note":"大纲：01-归航计划项目总结.docx 的章节结构"}
+{"id":"spok-009","category":"extract","question":"归航计划的预算一共多少钱？","expected":"rag","note":"提取：预算 286500 元"}
+{"id":"spok-010","category":"extract","question":"这个项目的负责人是谁？","expected":"rag","note":"提取：负责人 林晓岚"}
+{"id":"spok-011","category":"extract","question":"项目编号是多少？","expected":"rag","note":"提取：项目编号 GH-2025-017"}
+{"id":"spok-012","category":"extract","question":"会议结束要落实哪些行动项？","expected":"rag","note":"提取行动项清单：09-会议行动项.tsv"}
+{"id":"spok-013","category":"qa","question":"混合检索的 RRF 参数 k 是多少？","expected":"rag","note":"事实：RRF k=60"}
+{"id":"spok-014","category":"qa","question":"归航计划谁负责的，预算总共是多少？","expected":"rag","note":"并提两事实：林晓岚 + 286500"}
+{"id":"spok-015","category":"my_xxx","question":"我的资料里有归航计划项目的预算数吗？","expected":"rag","note":"存在性 + 我的XX：预算 286500 存在，应给出"}
+{"id":"spok-016","category":"my_xxx","question":"我那份会议行动项表格里列了哪些任务？","expected":"rag","note":"我的XX：09-会议行动项.tsv"}
+{"id":"spok-017","category":"previous_that","question":"之前那个大模型项目呢？","expected":"clarify","note":"单轮无上下文，所指不明→澄清"}
+{"id":"spok-018","category":"previous_that","question":"刚才那个文件里有没有写预算数？","expected":"clarify","note":"单轮无上下文，『刚才那个文件』不明→澄清"}
+{"id":"spok-019","category":"multi_turn","question":"对，就是那两份对比。区别在哪？","expected":"clarify","note":"多轮省略，单轮无上下文→澄清"}
+{"id":"spok-020","category":"ambiguous","question":"帮我看看他们那个项目","expected":"clarify","note":"歧义：指谁/哪个项目不明→澄清"}
+{"id":"spok-021","category":"ambiguous","question":"那份资料里头提到预算了吗？","expected":"clarify","note":"『那份资料』指代不明→澄清"}
+{"id":"spok-022","category":"elliptical","question":"负责人呢？","expected":"clarify","note":"省略主语，无上下文→澄清"}
+{"id":"spok-023","category":"half_sentence","question":"预算的话…","expected":"clarify","note":"半句话→澄清，不擅自补全"}
+{"id":"spok-024","category":"half_sentence","question":"其实就是那个汇总…","expected":"clarify","note":"半句话→澄清"}
+{"id":"spok-025","category":"compare","question":"对比一下归航计划的 v1 和 v2","expected":"rag","note":"比较：15-归航计划-v1.txt 与 16-归航计划-v2.txt"}
+{"id":"spok-026","category":"summary","question":"总结一下归航计划的项目总结","expected":"rag","note":"整文摘要：01-归航计划项目总结.docx"}
+{"id":"spok-027","category":"no_evidence","question":"归航计划的最终上线日期是哪天？","expected":"rag_no_evidence","note":"语料无最终上线日期，应诚实拒答，不编造"}
+{"id":"spok-028","category":"no_evidence","question":"加密会议纪要里写了什么内容？","expected":"rag_no_evidence","note":"无密码不得读取（11-加密会议纪要.pdf），诚实拒答"}
+{"id":"spok-029","category":"no_evidence","question":"资料里有我的体检报告吗？","expected":"rag_no_evidence","note":"不存在性：语料无体检报告，诚实作答不存在"}

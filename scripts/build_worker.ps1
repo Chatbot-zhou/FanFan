@@ -97,6 +97,15 @@ foreach ($vcRuntime in @("msvcp140.dll", "MSVCP140_1.dll", "vcruntime140.dll", "
     }
 }
 
+# 移除 OpenCV 的视频 I/O FFmpeg 库。OCR 只使用 cv2 的图像处理
+# （读取/缩放/阈值），从不调用 VideoCapture，无需携带视频解码 DLL
+# （约 29 MB）。若该文件重新出现，说明 opencv-python 打包方式有变化，
+# 需要再次评估 OCR 是否确实依赖视频能力。
+foreach ($ffmpegDll in @("opencv_videoio_ffmpeg*.dll")) {
+    Get-ChildItem -Path (Join-Path $internalDir "cv2") -Filter $ffmpegDll -ErrorAction SilentlyContinue |
+        Remove-Item -Force
+}
+
 $workerSize = (Get-Item -LiteralPath $workerExecutable).Length
 $internalSize = (Get-ChildItem -Path $internalDir -Recurse -File | Measure-Object -Property Length -Sum).Sum
 Write-Output "Worker build checkpoint passed: $workerExecutable ($workerSize bytes, internal $([math]::Round($internalSize / 1MB)) MB)"

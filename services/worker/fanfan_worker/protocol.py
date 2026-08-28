@@ -29,7 +29,6 @@ class WorkerRequest:
         "health.check",
         "document.probe",
         "document.parse",
-        "embedding.encode",
         "rerank.score",
         "runtime.backend_probe",
         "runtime.cache_status",
@@ -39,7 +38,6 @@ class WorkerRequest:
         "ocr.self_test",
         "ocr.recognize",
         "ocr.route_image",
-        "export.write",
     ]
     payload: dict[str, Any] = field(default_factory=dict)
 
@@ -50,7 +48,6 @@ class WorkerRequest:
             "health.check",
             "document.probe",
             "document.parse",
-            "embedding.encode",
             "rerank.score",
             "runtime.backend_probe",
             "runtime.cache_status",
@@ -60,7 +57,6 @@ class WorkerRequest:
             "ocr.self_test",
             "ocr.recognize",
             "ocr.route_image",
-            "export.write",
         }:
             raise ValueError("operation不受支持")
         if not isinstance(self.payload, dict):
@@ -77,7 +73,6 @@ class WorkerRequest:
             "health.check",
             "document.probe",
             "document.parse",
-            "embedding.encode",
             "rerank.score",
             "runtime.backend_probe",
             "runtime.cache_status",
@@ -87,7 +82,6 @@ class WorkerRequest:
             "ocr.self_test",
             "ocr.recognize",
             "ocr.route_image",
-            "export.write",
         }:
             raise ValueError("operation 不受支持")
         if not isinstance(payload, dict):

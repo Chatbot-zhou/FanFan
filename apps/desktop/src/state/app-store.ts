@@ -6,6 +6,38 @@ type InboxStatus = InboxQuery["status"];
 export type SettingsTab = "roots" | "models" | "index" | "appearance" | "memory" | "logs";
 export type SearchModifiedWindow = "all" | "7" | "30" | "365";
 export type AskTurn = { question: string; answer: AnswerResult; execution?: AskExecutionState | null };
+
+// —— 执行状态持久化 ——
+// 每轮问答的执行状态（正在进行/已完成的节点）按 message_id 写入 localStorage，
+// 实现"一个对话一个对话"独立保存：切页甚至重启后仍能恢复并展开查看。
+const EXECUTION_HISTORY_STORAGE_KEY = "fanfan.ask_execution_history.v1";
+/** localStorage 最多保留最近的执行记录条数，避免无限膨胀。 */
+const MAX_EXECUTION_HISTORY = 200;
+
+const isBrowserStorageAvailable = () => typeof window !== "undefined" && typeof localStorage !== "undefined";
+
+const loadExecutionHistory = (): Record<string, AskExecutionState> => {
+  if (!isBrowserStorageAvailable()) return {};
+  try {
+    const raw = localStorage.getItem(EXECUTION_HISTORY_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed: unknown = JSON.parse(raw);
+    return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, AskExecutionState>) : {};
+  } catch {
+    // 读取失败时静默降级：仅内存态可用，不影响功能
+    return {};
+  }
+};
+
+const persistExecutionHistory = (history: Record<string, AskExecutionState>): void => {
+  if (!isBrowserStorageAvailable()) return;
+  try {
+    localStorage.setItem(EXECUTION_HISTORY_STORAGE_KEY, JSON.stringify(history));
+  } catch {
+    // 写入失败（如存储配额）时静默降级，内存态依然可用
+  }
+};
+
 /** 后台分析任务种类：资料关系分析、AI 集合建议分析 */
 export type AnalysisTaskKind = "relation" | "collection";
 /** 分析任务跨页面保留的运行状态：切页不中断也不丢失，页面重挂载后仍显示「正在分析」。 */
@@ -42,6 +74,7 @@ interface AppState {
   ask_operation_id: string | null;
   ask_streamed_answer: string;
   ask_execution: AskExecutionState | null;
+  ask_execution_history: Record<string, AskExecutionState>;
   /** 兼容旧字段；普通 UI 不展示模型 thinking。 */
   ask_streamed_thinking: string;
   /** 兼容旧字段；新请求固定关闭，不展示模型 thinking。 */
@@ -71,6 +104,7 @@ interface AppState {
   apply_ask_stream_event: (event: AskStreamEvent) => void;
   toggle_ask_execution_node: (nodeId: string) => void;
   finalize_ask_execution: (totalDurationMs: number | null) => void;
+  remember_ask_execution: (messageId: string, execution: AskExecutionState | null | undefined) => void;
   set_ask_streamed_thinking: (thinking: string) => void;
   set_ask_think_mode: (thinkMode: boolean) => void;
   set_ask_active_phase: (phase: string) => void;
@@ -104,11 +138,12 @@ export const useAppStore = create<AppState>((set) => ({
   ask_operation_id: null,
   ask_streamed_answer: "",
   ask_execution: null,
+  ask_execution_history: loadExecutionHistory(),
   ask_streamed_thinking: "",
   ask_think_mode: false,
   ask_active_phase: "queued",
   ask_scope_collection_ids: [],
-  inbox_initial_status: "new",
+  inbox_initial_status: "all",
   inbox_today_only: false,
   selected_collection_id: null,
   settings_tab: "roots",
@@ -121,7 +156,7 @@ export const useAppStore = create<AppState>((set) => ({
     analysis_tasks: { ...state.analysis_tasks, [kind]: { ...state.analysis_tasks[kind], ...patch } },
   })),
   navigate: (route) => set((state) => route === state.route ? state : (route === "inbox"
-    ? { route, inbox_initial_status: "new", inbox_today_only: false }
+    ? { route, inbox_initial_status: "all", inbox_today_only: false }
     : route === "collections"
       ? { route, selected_collection_id: null }
       : { route })),
@@ -149,6 +184,16 @@ export const useAppStore = create<AppState>((set) => ({
   set_ask_operation_id: (ask_operation_id) => set({ ask_operation_id }),
   set_ask_streamed_answer: (ask_streamed_answer) => set({ ask_streamed_answer }),
   apply_ask_stream_event: (event) => set((state) => {
+    const activeOperationId = state.ask_operation_id ?? state.ask_execution?.operation_id ?? null;
+    const isCurrentOperation = activeOperationId === event.operation_id
+      || state.ask_execution?.operation_id === event.operation_id;
+    const canAttachPendingOperation = event.event_type === "ask_started"
+      && state.ask_loading
+      && state.ask_pending_question !== null
+      && state.ask_execution === null;
+    if (!isCurrentOperation && !canAttachPendingOperation) {
+      return state;
+    }
     const ask_execution = reduceAskStreamEvent(state.ask_execution, event);
     return {
       ask_execution,
@@ -163,6 +208,20 @@ export const useAppStore = create<AppState>((set) => ({
       ask_execution,
       ask_streamed_answer: ask_execution?.streamed_answer ?? state.ask_streamed_answer,
     };
+  }),
+  remember_ask_execution: (messageId, execution) => set((state) => {
+    if (!execution) return state;
+    const history = { ...state.ask_execution_history, [messageId]: execution };
+    // localStorage 只保留最近的 N 条，防止无限膨胀
+    const keys = Object.keys(history);
+    if (keys.length > MAX_EXECUTION_HISTORY) {
+      const dropCount = keys.length - MAX_EXECUTION_HISTORY;
+      for (const key of keys.slice(0, dropCount)) {
+        delete history[key];
+      }
+    }
+    persistExecutionHistory(history);
+    return { ask_execution_history: history };
   }),
   set_ask_streamed_thinking: (ask_streamed_thinking) => set({ ask_streamed_thinking }),
   set_ask_think_mode: (ask_think_mode) => set({ ask_think_mode }),

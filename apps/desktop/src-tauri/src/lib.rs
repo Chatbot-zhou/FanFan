@@ -250,8 +250,7 @@ pub fn run() {
             });
             // Ollama 迁移：generation 由本机 Ollama 托管，无需本地 llama-server 子进程
             // 与 GPU/CPU 探测（Ollama 自行调度）。运行时在激活时按需处理 Ollama 就绪。
-            let generation_inner =
-                Arc::new(Mutex::new(LocalGenerationRuntime::new(PathBuf::new())));
+            let generation_inner = Arc::new(Mutex::new(LocalGenerationRuntime::new()));
             app.manage(GenerationServiceState(Arc::clone(&generation_inner)));
             app.manage(AskCoordinatorState::default());
             app.manage(ModelDownloadCoordinatorState::default());
@@ -330,6 +329,7 @@ pub fn run() {
             commands::ollama::ollama_status_get,
             commands::ollama::ollama_start,
             commands::ollama::ollama_stop,
+            commands::ollama::ollama_open_url,
             inference_runtime_refresh,
             commands::welcome::welcome_get_state,
             commands::welcome::welcome_complete,
@@ -349,12 +349,10 @@ pub fn run() {
             app_data::model_download_start,
             app_data::model_download_list,
             app_data::model_store_status_get,
-            app_data::model_download_get,
             app_data::model_download_pause,
             app_data::model_download_cancel,
             app_data::model_download_resume,
             app_data::model_download_retry,
-            app_data::model_download_switch_source,
             app_data::model_download_remove,
             app_data::home_get_summary,
             app_data::candidate_root_action,
@@ -373,7 +371,6 @@ pub fn run() {
             app_data::inbox_query,
             app_data::inbox_update,
             app_data::inbox_retry,
-            app_data::ocr_retry,
             app_data::image_understanding_retry,
             app_data::image_deep_analyze,
             app_data::collection_list,
@@ -390,9 +387,6 @@ pub fn run() {
             app_data::collection_suggestion_confirm,
             app_data::collection_suggestion_reject,
             app_data::relation_refresh,
-            app_data::relation_query,
-            app_data::relation_review,
-            app_data::relation_batch_review,
             app_data::relation_group_query,
             app_data::relation_group_review,
             app_data::relation_group_batch_review,
@@ -402,7 +396,6 @@ pub fn run() {
             app_data::exclusion_rule_upsert,
             app_data::exclusion_rule_delete,
             app_data::app_status_get,
-            app_data::runtime_state_get,
             app_data::maintenance_get,
             app_data::maintenance_check,
             app_data::storage_usage_get,
@@ -413,25 +406,20 @@ pub fn run() {
             app_data::model_store_migration_cleanup,
             app_data::cache_clear,
             app_data::app_data_reset_schedule,
-            app_data::maintenance_log_query,
             app_data::maintenance_logs_clear,
-            app_data::node_trace_query,
-            app_data::node_trace_clear,
+            // 以下 Trace/Eval 命令仅用于开发与 CI 调试，发布构建不注册不暴露。
+            #[cfg(debug_assertions)]
             app_data::ask_trace_get,
+            #[cfg(debug_assertions)]
             app_data::ask_trace_export,
+            #[cfg(debug_assertions)]
             app_data::ask_evaluation_run,
             app_data::document_profile_inspect,
             app_data::document_profile_rebuild,
-            app_data::memory_inspector_query,
-            app_data::memory_relation_set_status,
-            app_data::memory_alias_delete,
-            app_data::memory_entity_delete,
-            app_data::memory_relation_delete,
             app_data::memory_clear,
             memory_view::memory_settings_get,
             memory_view::memory_settings_update,
             memory_view::memory_summary_list,
-            memory_view::memory_summary_get,
             memory_view::memory_confirm,
             memory_view::memory_reject,
             memory_view::memory_delete,
@@ -873,11 +861,14 @@ fn execute_pending_storage_migration(
                 source
             }
         }
-        Err(_) => {
+        Err(error) => {
+            // 记录真实 io 错误：此前用 Err(_) 吞掉原因，用户只能看到通用文案，
+            // 也无法定位究竟是磁盘空间、权限、文件占用还是哈希校验失败。
             let mut config = read_storage_location_config(config_dir).unwrap_or_default();
-            config.last_error = Some(
-                "存储迁移未完成，翻翻已继续使用原位置；请检查目标磁盘空间和写入权限后重试".into(),
-            );
+            config.last_error = Some(format!(
+                "存储迁移未完成，翻翻已继续使用原位置；原因：{}",
+                error
+            ));
             config.updated_at = Some(Utc::now().to_rfc3339());
             let _ = write_storage_location_config(config_dir, &config);
             runtime_log::event(
@@ -888,6 +879,7 @@ fn execute_pending_storage_migration(
                 &serde_json::json!({
                     "source_directory": source,
                     "target_directory": target,
+                    "error": error.to_string(),
                 }),
             );
             source
@@ -1215,12 +1207,50 @@ fn copy_tree_verified_with_progress(
     // 先预扫描一遍算总字节数，进度条才有分母。
     let total_bytes = directory_total_bytes(source)?;
     let mut done = 0_u64;
-    copy_directory_entries_with_progress(source, target, total_bytes, &mut done, &mut report)?;
-    verify_directory_entries_with_progress(source, target, total_bytes, &mut done, &mut report)?;
+    let root_relative = Path::new("");
+    copy_directory_entries_with_progress(
+        source,
+        target,
+        root_relative,
+        total_bytes,
+        &mut done,
+        &mut report,
+    )?;
+    verify_directory_entries_with_progress(
+        source,
+        target,
+        root_relative,
+        total_bytes,
+        &mut done,
+        &mut report,
+    )?;
     let marker = target.join(MANAGED_STORAGE_MARKER);
     let mut marker_file = File::create(marker)?;
     marker_file.write_all(b"FANFAN_MANAGED_DATA_V1")?;
     marker_file.sync_all()
+}
+
+/// 迁移期间由本进程持续写入、无法静止的活动文件。
+/// 这类文件在复制同刻源已被追加或更新（运行况日志、SQLite 运行时文件、
+/// 临时复制文件），严格哈希比对必然失真并导致迁移被误判失败。因此迁移时
+/// 对它们仅保证目标存在，不做内容一致校验；应用随后会在目标目录重建续写。
+/// 关键数据（数据库主文件、索引、配置、导入文件）不在此列，仍严格校验。
+fn is_dynamic_runtime_file(relative: &Path, entry_name: &std::ffi::OsStr) -> bool {
+    let name = entry_name.to_string_lossy().into_owned();
+    // SQLite 运行时文件：连接打开期间 db-wal / db-shm 持续变化。
+    if name.ends_with(".db-wal") || name.ends_with(".db-shm") {
+        return true;
+    }
+    // 迁移自身的临时复制文件与通用临时文件。
+    if name.ends_with(".fanfan-copying") || name.ends_with(".tmp") {
+        return true;
+    }
+    // logs 子目录下的运行况日志（runtime-current.jsonl、active-session.json 等）
+    // 由 runtime_log 持续追加，迁移期间无法静止。
+    relative
+        .components()
+        .next()
+        .is_some_and(|component| component.as_os_str().to_string_lossy() == "logs")
 }
 
 fn directory_total_bytes(root: &Path) -> std::io::Result<u64> {
@@ -1240,6 +1270,7 @@ fn directory_total_bytes(root: &Path) -> std::io::Result<u64> {
 fn copy_directory_entries_with_progress(
     source: &Path,
     target: &Path,
+    relative: &Path,
     total_bytes: u64,
     done: &mut u64,
     report: &mut impl FnMut(MigrationProgress),
@@ -1255,17 +1286,21 @@ fn copy_directory_entries_with_progress(
             ));
         }
         let destination = target.join(entry.file_name());
+        let entry_relative = relative.join(entry.file_name());
         if metadata.is_dir() {
             copy_directory_entries_with_progress(
                 &entry.path(),
                 &destination,
+                &entry_relative,
                 total_bytes,
                 done,
                 report,
             )?;
         } else if metadata.is_file() {
             let size = metadata.len();
-            if destination.is_file()
+            let dynamic = is_dynamic_runtime_file(&entry_relative, &entry.file_name());
+            if !dynamic
+                && destination.is_file()
                 && fs::metadata(&destination)?.len() == size
                 && sha256_path(&entry.path())? == sha256_path(&destination)?
             {
@@ -1282,7 +1317,8 @@ fn copy_directory_entries_with_progress(
                 fs::remove_file(&temporary)?;
             }
             fs::copy(entry.path(), &temporary)?;
-            if sha256_path(&entry.path())? != sha256_path(&temporary)? {
+            // 动态文件源的哈希在复制同刻仍在变化，无法与副本比对，跳过二次校验。
+            if !dynamic && sha256_path(&entry.path())? != sha256_path(&temporary)? {
                 fs::remove_file(&temporary)?;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -1307,6 +1343,7 @@ fn copy_directory_entries_with_progress(
 fn verify_directory_entries_with_progress(
     source: &Path,
     target: &Path,
+    relative: &Path,
     total_bytes: u64,
     done: &mut u64,
     report: &mut impl FnMut(MigrationProgress),
@@ -1314,6 +1351,7 @@ fn verify_directory_entries_with_progress(
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let destination = target.join(entry.file_name());
+        let entry_relative = relative.join(entry.file_name());
         let metadata = fs::symlink_metadata(entry.path())?;
         if metadata.is_dir() {
             if !destination.is_dir() {
@@ -1325,20 +1363,29 @@ fn verify_directory_entries_with_progress(
             verify_directory_entries_with_progress(
                 &entry.path(),
                 &destination,
+                &entry_relative,
                 total_bytes,
                 done,
                 report,
             )?;
-        } else if metadata.is_file()
-            && (!destination.is_file()
-                || fs::metadata(&destination)?.len() != metadata.len()
-                || sha256_path(&entry.path())? != sha256_path(&destination)?)
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "storage migration verification failed",
-            ));
         } else if metadata.is_file() {
+            let dynamic = is_dynamic_runtime_file(&entry_relative, &entry.file_name());
+            if !destination.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "storage migration destination missing",
+                ));
+            }
+            // 动态文件只保证目标存在，不做内容一致校验。
+            if !dynamic
+                && (fs::metadata(&destination)?.len() != metadata.len()
+                    || sha256_path(&entry.path())? != sha256_path(&destination)?)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "storage migration verification failed",
+                ));
+            }
             *done = done.saturating_add(metadata.len());
             report(MigrationProgress {
                 phase: "verifying",
@@ -1424,7 +1471,7 @@ fn try_prepare_durable_model_store(
     if durable_store.join(MODEL_STORE_READY_MARKER).is_file() {
         return Ok(());
     }
-    if model_store_has_content(durable_store) && durable_store.join("registry.json").is_file() {
+    if model_store_required_files_complete(durable_store) {
         ModelManager::open_store(durable_store.to_path_buf())
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         fs::write(
@@ -1487,6 +1534,73 @@ fn try_prepare_durable_model_store(
 
 fn model_store_has_content(path: &Path) -> bool {
     path.is_dir() && fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some())
+}
+
+/// 校验模型仓库的必需模型文件是否齐备（目录 + registry.json 可读，且每个
+/// integrity_status 为 ready 的 artifact 的所有 required 文件真实存在、大小匹配）。
+/// ollama 等无 package_manifest 的条目跳过；结构异常或缺失文件一律返回 false。
+/// 仅做 O(1) 元数据与大小对比，不做全量 SHA-256，避免大模型每次启动重复指纹计算。
+fn model_store_required_files_complete(main_store: &Path) -> bool {
+    let registry_path = main_store.join("registry.json");
+    if !main_store.is_dir() || !registry_path.is_file() {
+        return false;
+    }
+    let Ok(bytes) = fs::read(&registry_path) else {
+        return false;
+    };
+    let Ok(registry) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    let Some(artifacts) = registry
+        .get("artifacts")
+        .and_then(|value| value.as_array())
+    else {
+        return false;
+    };
+    for artifact in artifacts {
+        let Some(manifest) = artifact.get("package_manifest") else {
+            // ollama 模型 / 无清单条目：不参与本地文件校验。
+            continue;
+        };
+        // 声明就绪但清单状态不齐备的条目跳过；真正就绪的才要求文件齐全。
+        if manifest.get("integrity_status").and_then(|v| v.as_str()) != Some("ready") {
+            continue;
+        }
+        let Some(files) = manifest.get("files").and_then(|v| v.as_array()) else {
+            return false;
+        };
+        let Some(local_dir) = artifact
+            .get("local_path")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+            .and_then(|path| path.parent().map(|p| p.to_path_buf()))
+        else {
+            return false;
+        };
+        for file in files {
+            let required = file
+                .get("required")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            if !required {
+                continue;
+            }
+            let Some(file_name) = file.get("file_name").and_then(|v| v.as_str()) else {
+                return false;
+            };
+            let Some(expected_size) = file.get("size_bytes").and_then(|v| v.as_u64()) else {
+                return false;
+            };
+            let candidate = local_dir.join(file_name);
+            let size_ok = fs::metadata(&candidate)
+                .map(|meta| meta.is_file() && meta.len() == expected_size)
+                .unwrap_or(false);
+            if !size_ok {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn copy_directory_verified(source: &Path, target: &Path) -> std::io::Result<()> {
@@ -1560,6 +1674,18 @@ fn resolve_model_store_directory(
         };
     }
     let Some(pending) = config.pending.clone() else {
+        // 已配置仓库存在但必需模型文件不齐：不得静默采用残缺仓库，回退默认位置
+        // 并记录错误，避免像既往那样把缺 .onnx 的目录当可用仓库继而阻碍后续迁移。
+        if !model_store_required_files_complete(&configured) {
+            config.last_error =
+                Some("已配置的模型仓库缺少必需模型文件，翻翻已使用默认位置；请确认迁移完整后重启".into());
+            config.updated_at = Some(Utc::now().to_rfc3339());
+            let _ = write_model_store_location_config(config_dir, &config);
+            return {
+                let (path, error) = prepare_durable_model_store(durable_store, legacy_roots);
+                (path, error.map(|e| format!("{:?}", e.kind())))
+            };
+        }
         return (configured, None);
     };
     let source = PathBuf::from(&pending.source_directory);
@@ -2298,13 +2424,13 @@ fn detect_ollama_runtime(app: &tauri::AppHandle, startup: &StartupServiceState) 
                         );
                     }
                     Ok(_) => {
-                        let _ = thread_app.emit("ollama:state", serde_json::json!({ "status": "installed_not_running", "starting": false }));
+                        let _ = thread_app.emit("ollama:state", serde_json::json!({ "status": "installed_not_running", "starting": false, "error_code": "OLLAMA_SERVER_START_TIMEOUT" }));
                         runtime_log::event(
                             "warning",
                             "startup",
                             "ollama.start_timeout",
                             None,
-                            &serde_json::json!({}),
+                            &serde_json::json!({ "error_code": "OLLAMA_SERVER_START_TIMEOUT" }),
                         );
                     }
                     Err(error) => {
@@ -2441,6 +2567,12 @@ fn initialize_background_services(
         // 覆盖旧 GGUF active，避免已装模型仍被判缺失/触发重复下载。
         // Ollama 不可用时静默跳过，不阻塞后续初始化。
         if let Some(preset_id) = catalog.selected_preset_id()? {
+            // 启动期 Ollama 探测与模型登记常有时序差：detect_ollama_runtime 只上报
+            // ollama:state，若冷启动晚于本步，ensure_ollama_registry_synced 会因探测
+            // 未就绪而静默 skip，导致本机已驻留的 2B/embedding 不被点亮、active_generation
+            // 退回旧版 0.8B。这里先确保本机 Ollama 就绪（已装则拉起等待，未装快速返回），
+            // 再登记已驻留模型并收敛 active，保证 preset 选中的模型正确生效。
+            let _ = fanfan_core::ollama::ensure_running(fanfan_core::ollama::OLLAMA_START_TIMEOUT);
             let _ = commands::app_data::ensure_ollama_registry_synced(&model_manager, &preset_id);
         }
         let ocr_runtime_available = model_manager
@@ -2657,6 +2789,28 @@ fn initialize_background_services(
         app_data::spawn_scan_queue(app.clone(), Arc::clone(&catalog), recovered);
         app_data::spawn_parse_pending(app.clone(), Arc::clone(&catalog));
         app_data::spawn_image_ocr_pending(app.clone(), Arc::clone(&catalog));
+        // 启动时自动恢复上次失败/中断的图片理解资产，避免因代码或服务问题永久卡死；
+        // 无效资产会在 claim 阶段的缓存/哈希/授权校验中再次转回 failed。
+        match catalog.recover_failed_image_understandings() {
+            Ok(recovered) if recovered > 0 => runtime_log::event(
+                "info",
+                "vision",
+                "vision.failed_recovered",
+                None,
+                &serde_json::json!({ "recovered_assets": recovered }),
+            ),
+            Ok(_) => {}
+            Err(error) => runtime_log::event(
+                "warning",
+                "vision",
+                "vision.failed_recover_failed",
+                None,
+                &serde_json::json!({
+                    "error_code": error.code,
+                    "retryable": error.retryable,
+                }),
+            ),
+        }
         app_data::spawn_image_understanding_pending(app.clone(), Arc::clone(&catalog));
         app_data::spawn_embed_pending(app.clone(), Arc::clone(&catalog));
         #[cfg(debug_assertions)]

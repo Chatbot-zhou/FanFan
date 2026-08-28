@@ -64,6 +64,8 @@ describe("CollectionsPage", () => {
     render(<QueryClientProvider client={client}><CollectionsPage /></QueryClientProvider>);
 
     expect((await screen.findAllByRole("heading", { name: "项目资料" })).length).toBe(2);
+    // 添加资料入口位于「编辑集合」模式内，先进入编辑模式再添加。
+    fireEvent.click(screen.getByRole("button", { name: "编辑集合" }));
     const filePicker = await screen.findByRole("combobox", { name: /添加资料/ });
     fireEvent.keyDown(filePicker, { key: "Enter", code: "Enter", keyCode: 13 });
     await screen.findByRole("option", { name: /项目总结\.pdf/ });

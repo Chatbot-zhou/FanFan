@@ -1,6 +1,6 @@
 import { CloseOutlined, FileExcelOutlined, FilePdfOutlined, FileWordOutlined, SearchOutlined } from "@ant-design/icons";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { bridge, type CollectionRecord, type FilePreview, type SearchRequest } from "../bridge";
+import { bridge, type CollectionRecord, type FilePreview, type SearchRequest, type SearchResult, type SearchSession } from "../bridge";
 import { PdfVisualPreview } from "../components/PdfVisualPreview";
 import { ImageAssetGallery, imageAssetUrl } from "../components/ImageAssetGallery";
 import { OcrAttemptChain } from "../components/OcrAttemptChain";
@@ -23,6 +23,48 @@ const emptyScope = {
 // 不会因为组件重新挂载导致 ref 重置而误判。
 let searchSerial = 0;
 
+function searchAmbiguityNotice(session: SearchSession | null, sort: SearchRequest["sort"]): string | null {
+  if (!session || sort !== "relevance" || session.results.length < 2) return null;
+  const top = session.results[0];
+  if (!top) return null;
+  const comparable = session.results.slice(1, 3);
+  const topScore = finiteFusedScore(top);
+  const hasCloseScore = topScore > 0 && comparable.some((result) => finiteFusedScore(result) >= topScore * 0.92);
+  const hasSimilarName = comparable.some((result) => filenamesLookSimilar(top, result));
+  if (!hasCloseScore && !hasSimilarName) return null;
+  return "可能有多份相近资料，前几条结果建议一起核对";
+}
+
+function finiteFusedScore(result: SearchResult): number {
+  return Number.isFinite(result.scores.fused) ? result.scores.fused : 0;
+}
+
+function filenamesLookSimilar(left: SearchResult, right: SearchResult): boolean {
+  const leftName = normalizedComparableName(left.name);
+  const rightName = normalizedComparableName(right.name);
+  if (leftName.length < 4 || rightName.length < 4) return false;
+  const shorter = leftName.length <= rightName.length ? leftName : rightName;
+  const longer = leftName.length <= rightName.length ? rightName : leftName;
+  if (shorter.length >= 6 && longer.includes(shorter)) return true;
+  const prefixLength = commonPrefixLength(leftName, rightName);
+  return prefixLength >= Math.min(10, Math.floor(shorter.length * 0.75));
+}
+
+function normalizedComparableName(value: string): string {
+  const extensionMatch = value.match(/^(.*)\.([^.\s]{1,8})$/u);
+  const stem = extensionMatch?.[2] && /[A-Za-z]/.test(extensionMatch[2]) ? (extensionMatch[1] ?? value) : value;
+  return Array.from(stem.toLocaleLowerCase())
+    .filter((character) => /[\p{Letter}\p{Number}]/u.test(character))
+    .join("");
+}
+
+function commonPrefixLength(left: string, right: string): number {
+  const limit = Math.min(left.length, right.length);
+  let index = 0;
+  while (index < limit && left[index] === right[index]) index += 1;
+  return index;
+}
+
 export function SearchPage() {
   // 搜索会话（查询词、结果、筛选偏好、加载状态）放在全局 store，切换页面后回来仍保留
   const query = useAppStore((state) => state.search_query);
@@ -34,6 +76,8 @@ export function SearchPage() {
   const session = useAppStore((state) => state.search_session);
   const sessionQuery = useAppStore((state) => state.search_session_query);
   const setSession = useAppStore((state) => state.set_search_session);
+  const navigate = useAppStore((state) => state.navigate);
+  const setSettingsTab = useAppStore((state) => state.set_settings_tab);
   const prefs = useAppStore((state) => state.search_prefs);
   const setPrefs = useAppStore((state) => state.set_search_prefs);
   const { mode, sort, extension, modified_window: modifiedWindow, scope_collection_ids: scopeCollectionIds } = prefs;
@@ -64,6 +108,8 @@ export function SearchPage() {
       modified_from: modifiedFrom,
     };
   }, [extension, modifiedWindow, scopeCollectionIds]);
+  const ambiguityNotice = useMemo(() => searchAmbiguityNotice(session, sort), [session, sort]);
+
   const addScopeCollection = (value: string) => {
     if (!value || scopeCollectionIds.includes(value)) return;
     setPrefs({ scope_collection_ids: [...scopeCollectionIds, value] });
@@ -193,7 +239,8 @@ export function SearchPage() {
           </span>
         </div>
       )}
-      {session?.results.length === 0 && <div className="page-empty page-empty--compact"><SearchOutlined /><h2>没有找到匹配资料</h2><p>可以缩短关键词、放宽筛选条件，或确认资料已完成扫描。</p></div>}
+      {ambiguityNotice && <p className="search-ambiguity" role="note">{ambiguityNotice}</p>}
+      {session?.results.length === 0 && <div className="page-empty page-empty--compact"><SearchOutlined /><h2>没有找到匹配资料</h2><p>可以缩短关键词、放宽筛选条件，或确认资料已完成扫描。</p><div className="page-empty__actions"><button type="button" className="secondary-gradient-button" onClick={() => setPrefs({ extension: "", modified_window: "all", scope_collection_ids: [] })}>放宽筛选</button><button type="button" className="primary-button" onClick={() => { setSettingsTab("roots"); navigate("settings"); }}>添加资料</button></div></div>}
       {error && <p role="alert" className="inline-error">{error}</p>}
       <div className="search-results">
         {session?.results.map((result) => (

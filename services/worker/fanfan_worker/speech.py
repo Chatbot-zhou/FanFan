@@ -191,13 +191,16 @@ def _get_asr(model: Path, tokens: Path, threads: int, arch: str) -> Any:
     # （2.x 起改为 OfflineRecognizerConfig + 构造函数，特征配置名也改为
     # OfflineFeatureExtractorConfig。按锁定版本取 1.13.4 的 API。）
     if arch == "sense_voice":
+        # sherpa-onnx 1.13.4 的 from_sense_voice 只接受 model/tokens/num_threads/
+        # use_itn/debug/language/provider，并无 sense_voice_model/page_index/
+        # debugging 参数；传错的 3 个关键字会抛 unexpected keyword argument，
+        # 导致模型自检必然失败（MODEL_SELF_TEST_FAILED），故统一按 1.13.4 签名调用。
         engine = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+            model=str(model),
             tokens=str(tokens),
-            sense_voice_model=str(model),
             num_threads=threads,
-            page_index=0,
             use_itn=True,
-            debugging=False,
+            debug=False,
             language="auto",
             provider="cpu",
         )

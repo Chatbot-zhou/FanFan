@@ -1,6 +1,5 @@
 import { AppstoreOutlined, CalendarOutlined, CloseOutlined, FileDoneOutlined, FolderAddOutlined, PlusOutlined, RobotOutlined, SafetyCertificateOutlined } from "@ant-design/icons";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useVirtualizer } from "@tanstack/react-virtual";
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { bridge, type CollectionKind, type CollectionRule, type CreateCollectionRequest } from "../bridge";
 import { confirmAction } from "../components/AppConfirm";
@@ -23,6 +22,10 @@ export function CollectionsPage() {
   const [creating, setCreating] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(initialCollectionId);
+  // 成员编辑模式：true 时每个文件显示复选框/单条移除与添加入口，false 时只读展示。
+  const [memberEditing, setMemberEditing] = useState(false);
+  // 成员编辑模式下被勾选、待批量移出的文件。
+  const [selectedFileIds, setSelectedFileIds] = useState<Set<string>>(new Set());
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [kind, setKind] = useState<CollectionKind>("manual");
@@ -56,11 +59,12 @@ export function CollectionsPage() {
   });
   const collectionItems = files.data?.pages.flatMap((page) => page.items) ?? [];
   const allFiles = useQuery({ queryKey: ["collection-file-picker", filePickerQuery], queryFn: () => bridge.file_query({ cursor: null, page_size: 200, query: filePickerQuery || null, parse_statuses: ["parsed"], availability: "present" }), enabled: selectedCollection?.kind === "manual" || selectedCollection?.kind === "ai" });
-  const collectionListRef = useRef<HTMLDivElement>(null);
   const collectionDetailRef = useRef<HTMLElement>(null);
-  const collectionVirtualizer = useVirtualizer({ count: collectionItems.length, getScrollElement: () => collectionListRef.current, estimateSize: () => 58, overscan: 8 });
   useEffect(() => {
     if (!selectedId) return;
+    // 切换集合时退出成员编辑并清空勾选，避免把上一集合的编辑态带到当前集合。
+    setMemberEditing(false);
+    setSelectedFileIds(new Set());
     requestAnimationFrame(() => {
       const detail = collectionDetailRef.current;
       if (detail && typeof detail.scrollIntoView === "function") {
@@ -104,6 +108,29 @@ export function CollectionsPage() {
       queryClient.invalidateQueries({ queryKey: ["collection-files", selectedId] }),
       queryClient.invalidateQueries({ queryKey: ["collections"] }),
     ]),
+  });
+  // 批量移出：把勾选的所有文件依次移出当前集合，成功后清空勾选。
+  const batchRemoveFiles = useMutation({
+    mutationFn: () => Promise.all([...selectedFileIds].map((fileId) => bridge.collection_remove_file(selectedId!, fileId))),
+    onSuccess: async () => {
+      setSelectedFileIds(new Set());
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["collection-files", selectedId] }),
+        queryClient.invalidateQueries({ queryKey: ["collections"] }),
+      ]);
+    },
+  });
+  // 切换成员编辑模式（进入/退出），退出时清空勾选。
+  const toggleMemberEdit = () => {
+    setMemberEditing((on) => !on);
+    setSelectedFileIds(new Set());
+  };
+  // 勾选/取消单个待移出文件。
+  const toggleSelectedFile = (fileId: string) => setSelectedFileIds((current) => {
+    const next = new Set(current);
+    if (next.has(fileId)) next.delete(fileId);
+    else next.add(fileId);
+    return next;
   });
   const deleteCollection = useMutation({
     mutationFn: () => bridge.collection_delete(selectedId!),
@@ -178,26 +205,6 @@ export function CollectionsPage() {
     if (editingId) update.mutate(request); else create.mutate(request);
   };
 
-  const beginEdit = () => {
-    if (!selectedCollection || selectedCollection.built_in) return;
-    setEditingId(selectedCollection.collection_id); setCreating(true);
-    setName(selectedCollection.name); setDescription(selectedCollection.description ?? "");
-    setKind(selectedCollection.kind);
-    setRuleOperator(selectedCollection.rule?.operator ?? "all");
-    setExtensions(selectedCollection.rule?.extensions.join(", ") ?? "");
-    setKeywords(selectedCollection.rule?.filename_keywords.join(", ") ?? "");
-    setPathKeywords(selectedCollection.rule?.path_keywords.join(", ") ?? "");
-    setTextKeywords(selectedCollection.rule?.text_keywords.join(", ") ?? "");
-    setRecentDays(selectedCollection.rule?.modified_within_days?.toString() ?? "");
-    setMinSizeMb(selectedCollection.rule?.min_size_bytes ? (selectedCollection.rule.min_size_bytes / 1024 / 1024).toString() : "");
-    setMaxSizeMb(selectedCollection.rule?.max_size_bytes ? (selectedCollection.rule.max_size_bytes / 1024 / 1024).toString() : "");
-    setExcludeExtensions(selectedCollection.rule?.exclude_extensions.join(", ") ?? "");
-    setExcludeFilenameKeywords(selectedCollection.rule?.exclude_filename_keywords.join(", ") ?? "");
-    setExcludePathKeywords(selectedCollection.rule?.exclude_path_keywords.join(", ") ?? "");
-    setExcludeTextKeywords(selectedCollection.rule?.exclude_text_keywords.join(", ") ?? "");
-    setPreviewCount(null);
-  };
-
   const closeEditor = () => {
     setCreating(false); setEditingId(null); setName(""); setDescription("");
     resetRuleEditor(); setPreviewCount(null);
@@ -254,8 +261,12 @@ export function CollectionsPage() {
         ))}
       </div>
       {selectedId && <section ref={collectionDetailRef} className="collection-detail" tabIndex={-1}>
-        <header><h2>{selectedCollection?.name}</h2><div>{selectedCollection && !selectedCollection.built_in && <><button className="text-button" type="button" onClick={beginEdit}>编辑集合</button><button className="danger-button" type="button" disabled={deleteCollection.isPending} onClick={() => void confirmAction({ actionKey: "collection_delete", title: `删除集合“${selectedCollection.name}”？`, description: "只删除应用内虚拟分类，原文件不会受到影响。", confirmLabel: "删除集合", danger: true }).then((confirmed) => { if (confirmed) deleteCollection.mutate(); })}>删除集合</button></>}<button className="text-button" type="button" onClick={() => { setSelectedId(null); setAddFileId(""); clearCollectionSelection(); }}>关闭</button></div></header>
-        {(selectedCollection?.kind === "manual" || selectedCollection?.kind === "ai") && <div className="collection-add-file">
+        <header><h2>{selectedCollection?.name}</h2><div>
+          {(selectedCollection?.kind === "manual" || selectedCollection?.kind === "ai") && <button className="text-button" type="button" onClick={toggleMemberEdit}>{memberEditing ? "完成" : "编辑集合"}</button>}
+          {memberEditing && selectedCollection && !selectedCollection.built_in && <button className="danger-button" type="button" disabled={deleteCollection.isPending} onClick={() => void confirmAction({ actionKey: "collection_delete", title: `删除集合“${selectedCollection.name}”？`, description: "只删除应用内虚拟分类，原文件不会受到影响。", confirmLabel: "删除集合", danger: true }).then((confirmed) => { if (confirmed) deleteCollection.mutate(); })}>删除集合</button>}
+          <button className="text-button" type="button" onClick={() => { setSelectedId(null); setAddFileId(""); setMemberEditing(false); setSelectedFileIds(new Set()); clearCollectionSelection(); }}>关闭</button>
+        </div></header>
+        {memberEditing && (selectedCollection?.kind === "manual" || selectedCollection?.kind === "ai") && <div className="collection-add-file">
           <label><FolderAddOutlined /> 添加资料
             <input aria-label="搜索资料" value={filePickerQuery} onChange={(event) => { setFilePickerQuery(event.target.value); setAddFileId(""); }} placeholder="按文件名查找（最多显示200项）" />
             <AppSelect ariaLabel="添加资料" value={addFileId} onChange={setAddFileId} showSearch options={[{ value: "", label: "选择已索引资料" }, ...(allFiles.data?.items.filter((file) => file.parse_status === "parsed" && !collectionItems.some((current) => current.file_id === file.file_id)).map((file) => ({ value: file.file_id, label: `${file.display_name} · ${displayPath(file.display_path)}` })) ?? [])]} />
@@ -263,11 +274,19 @@ export function CollectionsPage() {
           <button type="button" className="primary-button" disabled={!addFileId || addFile.isPending} onClick={() => addFile.mutate()}>{addFile.isPending ? "正在添加" : "添加到集合"}</button>
           {addFile.isError && <p role="alert" className="inline-error">{errorMessage(addFile.error)}</p>}
         </div>}
+        {memberEditing && selectedFileIds.size > 0 && (selectedCollection?.kind === "manual" || selectedCollection?.kind === "ai") && <div className="collection-batchbar">已选 {selectedFileIds.size} 项<button type="button" className="danger-button" disabled={batchRemoveFiles.isPending} onClick={() => batchRemoveFiles.mutate()}>{batchRemoveFiles.isPending ? "正在删除" : "批量删除"}</button></div>}
         {files.isLoading && <p>正在计算集合内容…</p>}
-        {collectionItems.length === 0 && <p>这个集合当前没有资料。</p>}
-        <div ref={collectionListRef} className="collection-members--virtual"><div style={{ height: `${collectionVirtualizer.getTotalSize()}px`, position: "relative" }}>
-          {collectionVirtualizer.getVirtualItems().map((virtualRow) => { const file = collectionItems[virtualRow.index]!; return <div key={file.file_id} style={{ position: "absolute", transform: `translateY(${virtualRow.start}px)`, width: "100%", height: `${virtualRow.size}px` }}><button type="button" onClick={() => void bridge.file_open(file.file_id)}><strong>{file.display_name}</strong><small>{displayPath(file.display_path)}</small></button>{selectedCollection?.kind !== "rule" && <button type="button" className="text-button" disabled={removeFile.isPending} onClick={() => removeFile.mutate(file.file_id)}>{selectedCollection?.kind === "ai" ? "人工排除" : "移出集合"}</button>}</div>; })}
-        </div></div>
+        {files.isError && <p role="alert" className="inline-error">集合内容读取失败：{errorMessage(files.error)}</p>}
+        {!files.isLoading && !files.isError && collectionItems.length === 0 && <p>这个集合当前没有资料。</p>}
+        <ul className="collection-members">
+          {collectionItems.map((file) => (
+            <li className="collection-member" key={file.file_id}>
+              {memberEditing && (selectedCollection?.kind === "manual" || selectedCollection?.kind === "ai") && <label className="collection-member__select"><input type="checkbox" aria-label={`选择${file.display_name}`} checked={selectedFileIds.has(file.file_id)} onChange={() => toggleSelectedFile(file.file_id)} /></label>}
+              <button type="button" className="collection-member__open" onClick={() => void bridge.file_open(file.file_id)}><strong>{file.display_name}</strong><small>{displayPath(file.display_path)}</small></button>
+              {memberEditing && (selectedCollection?.kind === "manual" || selectedCollection?.kind === "ai") && <button type="button" className="text-button" disabled={removeFile.isPending} onClick={() => removeFile.mutate(file.file_id)}>删除</button>}
+            </li>
+          ))}
+        </ul>
         {files.hasNextPage && <button type="button" className="load-more-button" disabled={files.isFetchingNextPage} onClick={() => void files.fetchNextPage()}>{files.isFetchingNextPage ? "正在加载" : "加载更多"}</button>}
       </section>}
       {(suggestions.data?.items.length ?? 0) > 0 && <section className="ai-suggestions">

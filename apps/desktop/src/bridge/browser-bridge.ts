@@ -4,7 +4,6 @@ import type {
   AskOperationSnapshot,
   AskSessionSummary,
   AskTraceStage,
-  CandidateRoot,
   CollectionRecord,
   CollectionSuggestion,
   EnvironmentCheck,
@@ -25,10 +24,6 @@ import type {
   SearchSession,
   ThemePreference,
   WelcomeState,
-  DocumentProfileInspect,
-  MemoryInspectorView,
-  MemoryRelationStatusRequest,
-  MemoryClearRequest,
   IndexStaleStatus,
   IndexRebuildProgress,
   ModelRole,
@@ -42,51 +37,9 @@ const MODEL_KEY = "fanfan.model.state.v1";
 
 const now = () => new Date().toISOString();
 
-const initialCandidates: CandidateRoot[] = [
-  {
-    candidate_id: "018f0000-0000-7000-8000-000000000101",
-    candidate_type: "onedrive",
-    label: "OneDrive",
-    display_path: "D:\\OneDrive",
-    status: "suggested",
-  },
-  {
-    candidate_id: "018f0000-0000-7000-8000-000000000102",
-    candidate_type: "wechat",
-    label: "微信接收文件",
-    display_path: "D:\\WeChat Files",
-    status: "suggested",
-  },
-];
-
-let candidates = structuredClone(initialCandidates);
 const browserAskOperations = new Map<string, AskOperationSnapshot>();
 const browserAskSessions = new Map<string, AskSessionSummary>();
 const browserAskMessages = new Map<string, AskMessage[]>();
-
-const recentFiles = [
-  {
-    file_id: "018f0000-0000-7000-8000-000000000201",
-    name: "项目总结.docx",
-    extension: "docx",
-    subtitle: "今天 10:24",
-    modified_at: now(),
-  },
-  {
-    file_id: "018f0000-0000-7000-8000-000000000202",
-    name: "面试记录.pdf",
-    extension: "pdf",
-    subtitle: "昨天 16:18",
-    modified_at: now(),
-  },
-  {
-    file_id: "018f0000-0000-7000-8000-000000000203",
-    name: "学习资料.xlsx",
-    extension: "xlsx",
-    subtitle: "昨天 09:32",
-    modified_at: now(),
-  },
-];
 
 const makeSummary = (localDate: string): HomeSummary => ({
   local_date: localDate,
@@ -106,19 +59,14 @@ const makeSummary = (localDate: string): HomeSummary => ({
     ocr_pages: 42,
     progress: 0.84,
   },
+  overview: {
+    discovered_files: 1284,
+    searchable_files: 830,
+    parsed_files: 830,
+    embedded_files: 326,
+    ocr_pages: 42,
+  },
   index_initialized: true,
-  recent_files: recentFiles,
-  favorite_files: [
-    { ...recentFiles[0]!, name: "重要项目资料", extension: "folder", subtitle: "12 项" },
-    { ...recentFiles[1]!, name: "产品设计规范.pdf", subtitle: "2024/05/12" },
-    { ...recentFiles[0]!, file_id: "018f0000-0000-7000-8000-000000000204", name: "读书笔记.docx", subtitle: "2024/04/28" },
-  ],
-  collections: [
-    { collection_id: "c1", name: "本周工作相关", item_count: 86, tone: "purple" },
-    { collection_id: "c2", name: "2024年项目资料", item_count: 152, tone: "green" },
-    { collection_id: "c3", name: "未归档资料", item_count: 27, tone: "pink" },
-  ],
-  candidate_roots: candidates.filter((candidate) => candidate.status === "suggested"),
 });
 
 const defaultEnvironment: EnvironmentCheck = {
@@ -423,6 +371,9 @@ export const browserBridge: FanFanBridge = {
   async ollama_stop() {
     return { status: "installed_not_running", version: "", starting: false, error_code: null };
   },
+  async ollama_open_url(url) {
+    window.open(url, "_blank", "noopener,noreferrer");
+  },
   async model_state_get() {
     const stored = window.localStorage.getItem(MODEL_KEY);
     if (stored) return JSON.parse(stored) as ModelRuntimeState;
@@ -548,11 +499,6 @@ export const browserBridge: FanFanBridge = {
   async model_store_migration_cleanup() {
     return { removed_entries: 1, freed_bytes: 0 };
   },
-  async model_download_get(job_id) {
-    const job = demoDownloadJobs.find((item) => item.job_id === job_id);
-    if (!job) throw new Error("下载任务不存在");
-    return structuredClone(job);
-  },
   async model_download_pause(job_id) {
     const job = demoDownloadJobs.find((item) => item.job_id === job_id);
     if (!job) throw new Error("下载任务不存在");
@@ -578,23 +524,11 @@ export const browserBridge: FanFanBridge = {
     job.status = "queued"; job.phase = "queued"; job.error = null; job.retry_count += 1; job.updated_at = now();
     return structuredClone(job);
   },
-  async model_download_switch_source(job_id, source) {
-    const job = demoDownloadJobs.find((item) => item.job_id === job_id);
-    if (!job) throw new Error("下载任务不存在");
-    job.source = source; job.status = "queued"; job.phase = "queued"; job.error = null; job.downloaded_bytes = 0; job.progress = 0; job.updated_at = now();
-    return structuredClone(job);
-  },
   async model_download_remove(job_id) {
     return browserBridge.model_download_cancel(job_id);
   },
   async home_get_summary(local_date) {
     return makeSummary(local_date);
-  },
-  async candidate_root_action(candidate_id, action) {
-    const candidate = candidates.find((item) => item.candidate_id === candidate_id);
-    if (!candidate) throw new Error("候选资料来源不存在");
-    candidate.status = action === "add" ? "added" : "ignored";
-    return structuredClone(candidate);
   },
   async search_start(request: SearchRequest) {
     const normalized = request.query.trim().toLocaleLowerCase("zh-CN");
@@ -628,7 +562,7 @@ export const browserBridge: FanFanBridge = {
   async rag_readiness_get() {
     const generation_ready = demoActiveRoles.has("generation");
     const embedding_ready = demoActiveRoles.has("embedding");
-    const vision_ready = demoActiveRoles.has("vision");
+    const vision_ready = generation_ready;
     const blockers = [
       ...(!generation_ready ? [{ code: "RAG_GENERATION_MISSING", message: "未配置已通过自检的本地生成模型", retryable: true, user_action: null, file_id: null, details: null }] : []),
       ...(!embedding_ready ? [{ code: "RAG_EMBEDDING_MISSING", message: "未配置已通过自检的中文 Embedding 模型", retryable: true, user_action: null, file_id: null, details: null }] : []),
@@ -828,13 +762,18 @@ export const browserBridge: FanFanBridge = {
   },
   async inbox_query(request) {
     const items = inbox.items.filter((item) => request.status === "all"
-      || (request.status === "error" ? ["pending_retry", "retrying"].includes(item.resolution_status) : item.triage_status === request.status));
+      || (request.status === "error"
+        ? ["pending_retry", "retrying"].includes(item.resolution_status)
+        : request.status === "ignored"
+          ? item.triage_status === "ignored" && item.resolution_status === "abandoned"
+          : item.triage_status === request.status));
     return { items: structuredClone(items), next_cursor: null, has_more: false };
   },
   async inbox_update(inbox_id, triage_status) {
     const item = inbox.items.find((candidate) => candidate.inbox_id === inbox_id);
     if (!item) throw new Error("收件箱项目不存在");
     item.triage_status = triage_status;
+    if (triage_status === "ignored" && item.resolution_status !== "normal") item.resolution_status = "abandoned";
     return structuredClone(item);
   },
   async inbox_retry(inbox_id) {
@@ -844,9 +783,6 @@ export const browserBridge: FanFanBridge = {
     item.attempt_count += 1;
     item.last_attempt_at = now();
     return structuredClone(item);
-  },
-  async ocr_retry() {
-    return true;
   },
   async image_understanding_retry() {
     return true;
@@ -940,15 +876,6 @@ export const browserBridge: FanFanBridge = {
   async relation_refresh() {
     return { hashed_files: 2, exact_duplicate_pairs: 1, version_candidate_pairs: 1, semantic_related_pairs: 2, contains_or_summarizes_pairs: 1, groups_created: 1 };
   },
-  async relation_query() {
-    return { items: [], next_cursor: null, total: 0 };
-  },
-  async relation_review() {
-    return undefined;
-  },
-  async relation_batch_review(relation_ids) {
-    return relation_ids.length;
-  },
   async relation_group_query() {
     return { items: [], next_cursor: null, total: 0 };
   },
@@ -988,7 +915,6 @@ export const browserBridge: FanFanBridge = {
     const maintenance = { schema_version: 19, database_size_bytes: 12_582_912, indexed_files: 0, indexable_files: 3, parsed_files: 3, embedded_files: 0, active_index_files: 0, searchable_chunks: 18, embedded_chunks: 0, active_vector_keys: 0, pending_files: 0, failed_files: 0, active_jobs: 0, log_events: 3, background_notice: null, checks: [{ key: "database", label: "本地数据库", status: "passed" as const, detail: "ok" }, { key: "schema", label: "数据结构", status: "passed" as const, detail: "版本 19" }, { key: "source_readonly", label: "源文件保护", status: "passed" as const, detail: "维护操作只作用于翻翻索引与日志" }], checked_at: now() };
     return { local_only: true as const, source_files_readonly: true as const, roots: [...roots], scan_progress: null, maintenance, inference_runtime: defaultInferenceRuntime, ai_runtime: defaultAiRuntime, recovery_actions: ["view_models" as const], checked_at: now() };
   },
-  async runtime_state_get() { return structuredClone(defaultAiRuntime); },
   async maintenance_get() {
     return { schema_version: 19, database_size_bytes: 12_582_912, indexed_files: 0, indexable_files: 3, parsed_files: 3, embedded_files: 0, active_index_files: 0, searchable_chunks: 18, embedded_chunks: 0, active_vector_keys: 0, pending_files: 0, failed_files: 0, active_jobs: 0, log_events: 3, background_notice: null, checks: [{ key: "database", label: "本地数据库", status: "passed" as const, detail: "ok" }, { key: "schema", label: "数据结构", status: "passed" as const, detail: "版本 19" }, { key: "source_readonly", label: "源文件保护", status: "passed" as const, detail: "维护操作只作用于翻翻索引与日志" }], checked_at: now() };
   },
@@ -1022,49 +948,8 @@ export const browserBridge: FanFanBridge = {
   async app_data_reset_schedule() {
     throw new Error("浏览器预览不能重置桌面应用数据，请在翻翻桌面程序中使用。");
   },
-  async maintenance_log_query() {
-    return { items: [{ log_id: "log-demo", level: "info", component: "catalog", event_name: "scan.completed", fields: { files: 3 }, created_at: now() }], next_cursor: null, total: 1 };
-  },
   async maintenance_logs_clear() {
     return 1;
-  },
-  async node_trace_query(request) {
-    const flow = request.flow ?? "ask";
-    return {
-      items: [
-        {
-          trace_id: "trace-demo-1",
-          flow,
-          node: "routing",
-          correlation_id: "demo-correlation",
-          session_id: null,
-          entity_id: null,
-          input_json: { question: "你好" },
-          output_json: { intent: "Retrieval", top_score: 0.466, margin: 0.066, router_active: true },
-          status: "ok",
-          elapsed_ms: 12,
-          created_at: now(),
-        },
-        {
-          trace_id: "trace-demo-2",
-          flow,
-          node: "retrieval",
-          correlation_id: "demo-correlation",
-          session_id: null,
-          entity_id: null,
-          input_json: { question: "你好", retrieval_limit: 10 },
-          output_json: { channels: ["filename", "fts", "embedding", "rrf", "mmr"], candidates: [{ quote: "……", citations: 1 }], insufficient_evidence: false },
-          status: "ok",
-          elapsed_ms: 3200,
-          created_at: now(),
-        },
-      ],
-      next_cursor: null,
-      total: 2,
-    };
-  },
-  async node_trace_clear() {
-    return 2;
   },
   async ask_trace_get(operationId) {
     const node = (name: string, output: Record<string, unknown> = {}) => ({ trace_id: `trace-${name}`, flow: "ask", node: name, correlation_id: operationId, session_id: null, entity_id: null, input_json: { question: "你好" }, output_json: output, status: "ok", elapsed_ms: 10, created_at: now() });
@@ -1120,25 +1005,6 @@ export const browserBridge: FanFanBridge = {
     const n = request.file_ids?.length ?? 5;
     return { profiled_files: n, skipped_files: 0 };
   },
-  async memory_inspector_query(search) {
-    const nowIso = now();
-    const target = search ? `匹配 ${search} 的目标` : "我的简历";
-    return {
-      aliases: search
-        ? [{ alias_id: "alias-1", alias: search, target_type: "file", target_id: "file-1", confidence: 0.9, source_type: "user_explicit", source_id: null, hit_count: 3, last_used_at: nowIso, created_at: nowIso, updated_at: nowIso }]
-        : [],
-      relations: search
-        ? [{ relation_id: "rel-1", subject_type: "entity", subject_id: "ent-1", predicate: "是", object_type: "file", object_id: "file-1", confidence: 0.8, status: "confirmed", source_type: "user_confirmed", source_id: null, created_at: nowIso, updated_at: nowIso }]
-        : [],
-      entities: search
-        ? [{ entity_id: "ent-1", entity_type: "person", canonical_name: target, metadata_json: {}, created_at: nowIso, updated_at: nowIso }]
-        : [],
-    };
-  },
-  async memory_relation_set_status() {},
-  async memory_alias_delete() {},
-  async memory_entity_delete() {},
-  async memory_relation_delete() {},
   async memory_clear() {
     return 0;
   },
@@ -1158,9 +1024,6 @@ export const browserBridge: FanFanBridge = {
         { id: "alias:demo-2", title: "毕业材料", summary: "“毕业材料”可能指《毕业设计答辩.pptx》", kind: "file_alias", status: "candidate" as const, source_label: "翻翻的推测", target_display_name: "毕业设计答辩.pptx", target_available: true, updated_at: nowIso },
       ],
     };
-  },
-  async memory_summary_get() {
-    return { id: "alias:demo-1", title: "我的简历", summary: "“我的简历”通常指向《周晨-大模型开发工程师.pdf》", kind: "file_alias", status: "confirmed" as const, source_label: "你在对话中确认过", target_display_name: "周晨-大模型开发工程师.pdf", target_available: true, updated_at: now() };
   },
   async memory_confirm() {
     return true;

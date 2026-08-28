@@ -1,10 +1,5 @@
 import type { ModelDownloadJob } from "../../bridge";
 
-export const MODEL_DOWNLOAD_SESSION_STARTED_AT = typeof performance !== "undefined"
-  && Number.isFinite(performance.timeOrigin)
-  ? performance.timeOrigin
-  : Date.now();
-
 export const MODEL_DOWNLOAD_PHASE_LABELS: Record<ModelDownloadJob["phase"], string> = {
   queued: "等待下载",
   downloading: "正在下载",
@@ -53,10 +48,7 @@ export function modelDownloadIsActive(job: ModelDownloadJob) {
   return ACTIVE_STATUSES.has(job.status) && !modelDownloadNeedsAttention(job);
 }
 
-export function visibleModelDownloadJobs(
-  jobs: ModelDownloadJob[],
-  sessionStartedAt = MODEL_DOWNLOAD_SESSION_STARTED_AT,
-) {
+export function visibleModelDownloadJobs(jobs: ModelDownloadJob[]) {
   return jobs
     .filter((job) => {
       if (modelDownloadNeedsAttention(job) || modelDownloadIsActive(job)) return true;

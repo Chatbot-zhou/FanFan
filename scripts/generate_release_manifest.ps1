@@ -31,11 +31,16 @@ foreach ($required in @($workerPath)) {
     }
 }
 
-$runtime = Get-Content -LiteralPath $runtimeManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$packageManifestPath = Join-Path $RepositoryRoot 'package.json'
+$packageManifest = Get-Content -LiteralPath $packageManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$productVersion = [string]$packageManifest.version
+if ([string]::IsNullOrWhiteSpace($productVersion)) {
+    throw "Product version missing: $packageManifestPath"
+}
 $signature = Get-AuthenticodeSignature -LiteralPath $installer
 $generatedAt = [DateTimeOffset]::UtcNow.ToString('o')
 $installerItem = Get-Item -LiteralPath $installer
-$productName = ([char]0x62FE).ToString() + ([char]0x5FC6).ToString()
+$productName = ([char]0x7FFB).ToString() + ([char]0x7FFB).ToString()
 $verification = @(
     'contract-catalog',
     'frontend-typecheck-and-tests',
@@ -50,7 +55,7 @@ if ($InstallerSmokePassed) {
 $manifest = [ordered]@{
     schema_version = 1
     product = $productName
-    version = '0.1.0'
+    version = $productVersion
     platform = 'windows-x64'
     channel = 'development-candidate'
     generated_at = $generatedAt
@@ -113,17 +118,6 @@ Get-Content -LiteralPath (Join-Path $RepositoryRoot 'services\worker\requirement
             purl = "pkg:pypi/$($Matches[1])@$($Matches[2])"
         }
     }
-$components += [ordered]@{
-    type = 'application'
-    name = 'llama.cpp'
-    version = $runtime.release
-    properties = @(
-        @{ name = 'fanfan:commit'; value = $runtime.commit },
-        @{ name = 'fanfan:archive_sha256'; value = $runtime.archive_sha256 }
-    )
-    licenses = @(@{ license = @{ id = 'MIT' } })
-}
-
 $bom = [ordered]@{
     bomFormat = 'CycloneDX'
     specVersion = '1.5'
@@ -131,7 +125,7 @@ $bom = [ordered]@{
     version = 1
     metadata = [ordered]@{
         timestamp = $generatedAt
-        component = [ordered]@{ type = 'application'; name = $productName; version = '0.1.0' }
+        component = [ordered]@{ type = 'application'; name = $productName; version = $productVersion }
     }
     components = @($components)
 }

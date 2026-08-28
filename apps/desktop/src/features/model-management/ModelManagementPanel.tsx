@@ -8,7 +8,7 @@ import {
   summarizeModelDownloads,
   visibleModelDownloadJobs,
 } from "../model-downloads/model-downloads";
-import { errorMessage, normalizeAppError } from "../../utils/app-error";
+import { normalizeAppError } from "../../utils/app-error";
 
 /**
  * 官方档位页面底部的收敛区：保留「官方 4 档对应的模型下载任务」。

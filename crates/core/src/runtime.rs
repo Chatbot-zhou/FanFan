@@ -515,14 +515,34 @@ impl RuntimeManager {
         if request.kind.is_background() && running.iter().any(|candidate| candidate.priority <= 2) {
             return false;
         }
-        if request.kind.is_heavy() && running.iter().any(|candidate| candidate.kind.is_heavy()) {
-            return false;
-        }
-        if running
-            .iter()
-            .any(|candidate| candidate.backend == request.backend)
-        {
-            return false;
+        // 前台交互任务（如 Ask）只与「其它前台重/同后端任务」互斥，不被后台
+        // 重任务（索引增量、图片理解等）长期饿死：后台任务可继续持有槽，前台
+        // 任务也能启动，由模型后端（Ollama）内部串行排队执行，避免 45s 租约
+        // 超时。后台任务则保持与所有 heavy 任务及同后端任务互斥，主动让位前台。
+        let front_request = !request.kind.is_background();
+        if front_request {
+            if running
+                .iter()
+                .any(|candidate| {
+                    !candidate.kind.is_background()
+                        && (candidate.kind.is_heavy() || candidate.backend == request.backend)
+                })
+            {
+                return false;
+            }
+        } else {
+            if running
+                .iter()
+                .any(|candidate| candidate.kind.is_heavy())
+            {
+                return false;
+            }
+            if running
+                .iter()
+                .any(|candidate| candidate.backend == request.backend)
+            {
+                return false;
+            }
         }
         let requested = state
             .requests

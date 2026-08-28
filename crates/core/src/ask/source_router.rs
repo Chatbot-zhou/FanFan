@@ -115,12 +115,14 @@ ambiguous：存在「这个、那个、里面、刚才的、之前的、第二�
 7. 领域/概念/知识类问题——数据库（事务、ACID、索引、范式、视图、隔离级别、分库分表等）、大模型（LLM、RAG、Agent、提示词工程、微调等）、以及任何需要解释技术名词或考察知识点的问题——一律判断 local：应优先到用户资料库检索相关文档并用引用回答，而不是直接当作通用常识；只有在用户资料中没有相关证据时才退化为通用知识。
 8. 纯寒暄、日常闲聊、问候、询问助手当前状态/心情/感受、询问本应用或助手的使用方法（怎么问资料、能做什么、怎么导入文件、文件导入后接下来干嘛）等与用户资料内容无关的话题，判断 general。
 9. 「你是谁」「你能做什么」「介绍一下你自己」等身份/能力问题，判断 general。
+   询问助手「能不能/可否/能 读取、搜索、整理、分析 我（电脑里/文件夹里/本地）的 资料/文件/文档/内容 来做某事」这类问题，问的是助手的能力与可行性，而不是要检索某份具体内容——也判断 general，自然介绍自己基于已授权资料工作的能力即可，不去执行检索。只有用户着实点名要检索某份资料、或询问某份具体资料的特定内容时，才判断 local。
 10. 只有真正存在指代不清、或语义残缺无法判断是否涉及本地资料时，才判断 ambiguous（交由澄清处理，不硬猜 local 或 general）。
 
 示例：
 - 「你好」→ general
 - 「你是谁？」→ general（问助手身份，不是问资料）
 - 「你能做什么？」→ general
+- 「你能读取我电脑里的资料吗」「你能帮我搜索文件吗」→ general（询问助手能力/可行性，不是检索某份具体内容）
 - 「今天心情怎么样」「你忙吗」「最近怎么样」→ general（日常闲聊/询问状态）
 - 「我该怎么开始问资料」「怎么导入文件」「文件已经导入好了，接下来干嘛」→ general（询问翻翻的使用流程，不是某份文件内容）
 - 「你是谁写的」「这个功能是谁做的」→ general（问事物来源，不需要资料）
@@ -219,6 +221,74 @@ pub fn apply_ambiguous_override(question: &str, routing: &mut SourceRouting) {
         routing.source = SourceIntent::Ambiguous;
         routing.confidence = (routing.confidence * 0.5 + 0.5).clamp(0.0, 0.7);
     }
+}
+
+/// 确定性能力询问兜底：把「询问助手能否对资料做某动作」的能力/可行性问句
+/// 从 LOCAL 拉回 GENERAL。
+///
+/// 动机：0.6B/2B 模型常把「你能把两份资料摆一块儿比一比吗」「你能帮我整理一下
+/// 这些文件吗」这类**询问助手能力**的问句，按判断原则 6「内容对比/总结 → local」
+/// 误判成 LOCAL，随后 query_parser 误解析为 document_qa/compare，检索无证据 →
+/// 拒答甚至幻觉（把「翻翻」当儿童翻翻书）。而这类问句的意图是「问我能不能做」，
+/// 不是「点名检索某份具体资料的内容」，应按判断原则 9 判 GENERAL，自然介绍助手
+/// 基于已授权本地资料工作的能力即可。
+///
+/// 判定是高精度的通用语言结构，不针对任何具体题目/关键词/文件名/case，且**必须
+/// 同时满足**四项，避免误伤真实资料操作与概念类问题：
+/// 1. 能力/可行性疑问句式：句含「你能不能 / 你能 / 你能否 / 可不可以」；
+/// 2. 含「对资料做处理」的动作动词：比较/对比/比一比/分析/整理/总结/归纳/归类/
+///    分类/筛选/归档/搜索/查找/读取/翻译；
+/// 3. 提及资料类容器名词：资料/文件/文档/内容/材料/论文/报告；
+/// 4. **不**含明确具体定位（否则对象已被前文/上下文指定，属真实操作，保留 LOCAL）：
+///    - 「我的/我之前」等个人引用（走 personal_reference_detector，真实资料操作）；
+///    - 「这份/那份/这篇/那篇/这本」等定指容器（已指向具体文档）。
+///
+/// 概念/知识类问句（如「你能告诉我事务隔离级别区别吗」）因缺第 2/3 项的
+/// 「处理动词+资料容器」组合不命中，仍按判断原则 7 保留 LOCAL 去用户资料库求证。
+/// 只有命中且 LLM 已判 LOCAL 时才改写成 GENERAL；已 general/ambiguous 或 LLM
+/// 明确 general 的不动。
+pub fn apply_capability_override(question: &str, routing: &mut SourceRouting) {
+    if routing.source != SourceIntent::Local {
+        return;
+    }
+    let q = question.trim();
+    if q.is_empty() {
+        return;
+    }
+    // 1) 能力/可行性疑问句式（含「还能…吗」「要是…能不能」等可行性变体）。
+    const CAPABILITY_STARTERS: &[&str] = &["你能不能", "你能", "你能否", "可不可以", "你还能"];
+    let is_capability_ask = CAPABILITY_STARTERS
+        .iter()
+        .any(|marker| q.contains(marker));
+    if !is_capability_ask {
+        return;
+    }
+    // 2) 「对资料做处理」的动作动词（含在资料里定位/找回的检索类动作）。
+    const ACT_VERBS: &[&str] = &[
+        "比一比", "对比", "比较", "分析", "整理", "总结", "归纳", "归类", "分类",
+        "筛选", "归档", "搜索", "查找", "读取", "翻译", "捞", "找回", "定位",
+    ];
+    let has_act = ACT_VERBS.iter().any(|verb| q.contains(verb));
+    if !has_act {
+        return;
+    }
+    // 3) 提及资料类容器名词。
+    const DOC_NOUNS: &[&str] = &["资料", "文件", "文档", "内容", "材料", "论文", "报告"];
+    let has_doc = DOC_NOUNS.iter().any(|noun| q.contains(noun));
+    if !has_doc {
+        return;
+    }
+    // 4) 无明确具体定位（个人引用或定指容器）才视为通用能力询问。
+    const PERSONAL_MARKERS: &[&str] = &["我的", "我之前", "我的资料", "我的文件", "我写过", "我写过的那"];
+    const DEICTIC_DEFINITE: &[&str] = &["这份", "那份", "这篇", "那篇", "这本", "那本"];
+    let has_specific_target = PERSONAL_MARKERS.iter().any(|marker| q.contains(marker))
+        || DEICTIC_DEFINITE.iter().any(|marker| q.contains(marker));
+    if has_specific_target {
+        return;
+    }
+    // 命中：问的是能力/可行性，不是检索某份具体内容 → GENERAL。
+    routing.source = SourceIntent::General;
+    routing.confidence = (routing.confidence * 0.5 + 0.5).clamp(0.0, 0.9);
 }
 
 /// 省略/指代问句的通用高精度信号（兜底第三类）。
@@ -427,6 +497,61 @@ mod tests {
         assert!(user.contains("用户说：第二个项目是什么"));
         // 输出约束含 confidence
         assert!(user.contains("confidence"));
+    }
+
+    #[test]
+    fn capability_override_pulls_generic_ability_questions_to_general() {
+        // 能力询问：「你能把……比一比/分析一下吗」问的是助手可行性，不是检索
+        // 某份具体资料 → 从 local 拉回 general。
+        for question in [
+            "翻翻，你能把两份资料摆一块儿比一比，瞅瞅都有哪些不一样吗", // 本轮 r6q1
+            "你能帮我整理一下这些文件吗",
+            "你能否把这些文档归纳成几类",
+            "可不可以帮我分析和总结一下这批材料",
+            "翻翻，我要是把某份资料的文件名给记岔了，你还能靠印象帮我捞出来不", // 本轮 r7q1
+        ] {
+            let mut r = parse_source_routing(r#"{"source":"local","confidence":0.9}"#).unwrap();
+            apply_capability_override(question, &mut r);
+            assert_eq!(
+                r.source,
+                SourceIntent::General,
+                "{question} 是询问助手能力，应判 general"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_override_keeps_specific_and_concept_questions_intact() {
+        // 明确具体对象 / 概念类问句：不得被能力询问识别误拉成 general。
+        for question in [
+            "你能帮我把我的简历和那篇论文对比一下吗",      // 具体对象（我的+那篇）→ local
+            "你能把这份报告和那份资料摆一块儿比一比吗",       // 定指容器 → local
+            "你还能靠轮廓帮我定位回来的那份文件吗",             // 能力词开头但含定指「那份」→ local
+            "你能告诉我事务隔离级别 ACID 和 BASE 的区别吗",   // 概念题，缺资料容器+处理动词 → local
+            "我的资料里是怎么介绍 RAG 的？",                // 个人引用 → local
+            "帮我把那份文件的分析做完",                     // 无能力疑问词 → local
+            "LangGraph 是什么",                          // 无能力词 → local
+        ] {
+            let mut r = parse_source_routing(r#"{"source":"local","confidence":0.9}"#).unwrap();
+            apply_capability_override(question, &mut r);
+            assert_eq!(
+                r.source,
+                SourceIntent::Local,
+                "{question} 含明确对象/概念，不应被拉成 general"
+            );
+        }
+    }
+
+    #[test]
+    fn capability_override_does_not_touch_general_or_ambiguous() {
+        // 仅当 LLM 判 local 时才可能拉回 general；已 general/ambiguous 不动。
+        let mut r = parse_source_routing(r#"{"source":"general","confidence":0.9}"#).unwrap();
+        apply_capability_override("你能把两份资料比一比吗", &mut r);
+        assert_eq!(r.source, SourceIntent::General);
+
+        let mut r = parse_source_routing(r#"{"source":"ambiguous","confidence":0.6}"#).unwrap();
+        apply_capability_override("你能把两份资料比一比吗", &mut r);
+        assert_eq!(r.source, SourceIntent::Ambiguous);
     }
 
     #[test]

@@ -759,40 +759,66 @@ fn looks_like_opaque_encoded_text(text: &str) -> bool {
     opaque_chars * 4 > char_count * 3 && char_count >= 80
 }
 
+/// 把带引用的答案 claims 中每条证据组装成【S编号 正文/上文/下文】块，并按
+/// 证据预算裁剪，保证喂给本地小模型的证据总量不撑爆上下文。
+///
+/// 预算：单条正文与前后文各按字符上限压缩（复用 compact_quote，超长时截断、
+/// 控制/编码噪音置换为摘要），证据块总数与累计总字符均有上限；越过上限后的
+/// 后续证据不再进入 prompt，避免多证据/长上下文导致输出截断或生成失真。
+fn build_evidence_source_blocks(claims: &[AnswerClaim]) -> String {
+    const MAX_QUOTE_CHARS: usize = 800;
+    const MAX_CONTEXT_CHARS: usize = 300;
+    const MAX_BLOCKS: usize = 8;
+    // 证据总量上限与本地生成模型上下文（4096）匹配：中文证据约 1 字≈1.5 token，
+    // 3000 字符约合 2000 token，为输出 JSON（约 800~1100 token）在 4096 ctx 内
+    // 留足空间，避免模型因 promo+答案超上下文而被截断、退化为陈列原文。
+    const MAX_SOURCES_CHARS: usize = 3_000;
+    let mut sources = String::new();
+    let mut used_blocks = 0_usize;
+    let mut used_chars = 0_usize;
+    for (index, evidence) in claims
+        .iter()
+        .flat_map(|claim| claim.citations.iter())
+        .enumerate()
+    {
+        if used_blocks >= MAX_BLOCKS || used_chars >= MAX_SOURCES_CHARS {
+            break;
+        }
+        let marker = format!("[S{}]", index + 1);
+        let quote = compact_quote(&evidence.quote, MAX_QUOTE_CHARS);
+        let mut block = format!("{marker} 正文：{quote}");
+        if let Some(before) = evidence
+            .context_before
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            let compact_before = compact_quote(before, MAX_CONTEXT_CHARS);
+            block = format!("{marker} 【上文】{compact_before}\n{block}");
+        }
+        if let Some(after) = evidence
+            .context_after
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            let compact_after = compact_quote(after, MAX_CONTEXT_CHARS);
+            block = format!("{block}\n{marker} 【下文】{compact_after}");
+        }
+        if !sources.is_empty() {
+            sources.push('\n');
+        }
+        sources.push_str(&block);
+        used_blocks += 1;
+        used_chars = used_chars.saturating_add(block.chars().count());
+    }
+    sources
+}
+
 pub fn generation_prompt(
     request: &AskRequest,
     extractive: &AnswerResult,
     history: &[AskMessage],
 ) -> String {
-    let sources = extractive
-        .claims
-        .iter()
-        .flat_map(|claim| claim.citations.iter())
-        .enumerate()
-        .map(|(index, evidence)| {
-            // 命中块前后各注入一块相邻文本（已按 token 上限截断），让模型
-            // 知道「这段证据在原文中前后是什么」。【上文】/【下文】只作
-            // 语境，不得被引用。
-            let marker = format!("[S{}]", index + 1);
-            let mut block = format!("{marker} 正文：{}", evidence.quote);
-            if let Some(before) = evidence
-                .context_before
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-            {
-                block = format!("{marker} 【上文】{before}\n{block}");
-            }
-            if let Some(after) = evidence
-                .context_after
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-            {
-                block = format!("{block}\n{marker} 【下文】{after}");
-            }
-            block
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let sources = build_evidence_source_blocks(&extractive.claims);
     // 结构化分区（手册：标题/分隔符区分不同部分，避免指令与示例混淆）。
     // 输出约束用编号列成要点，正面指令优先；示例放最后紧邻输出位置。
     let mut prompt = String::new();
@@ -813,7 +839,7 @@ pub fn generation_prompt(
 5. 不得使用不存在的编号，不得把对话历史当作证据。每条证据中的【上文】/【下文】只是命中块在原文中的邻近文本，仅用于帮助你理解正文证据的语境，不得作为引用来源。\n\
 6. 证据不足时 claims 为空，并在 refusal 中说明“当前资料中未找到足够依据”。\n\
 7. 若是“是否/是否提到/是非/数据”类问题，先给出由证据支持的结论（是/否＋证据中出现的原文依据），再简短补充说明；不要展开证据之外的信息。\n\
-8. 只输出符合指定 JSON Schema 的对象，不要输出 Markdown、代码块或解释。\n\n\
+8. 只输出符合指定 JSON Schema 的对象；不要用代码块包裹整个对象。为了让回答更清晰易读，当问题含多个要点、步骤或条目时，请在 claim 文本内使用结构化 Markdown：「## 小标题」分节、每节内用「- 列表」逐条列点、关键数字与专有名词用「**加粗**」强调；避免整段平铺直叙。claim 文本可跨多行，但必须仍是纯文本字符串（用 JSON 转义的换行符区分列表项）。\n\n\
 【参考示例】\n\
 示例一（证据充足时的润色输出）：\n\
 问题：公司年假政策是什么？\n\
@@ -850,15 +876,17 @@ fn contains_prompt_placeholder(text: &str) -> bool {
         .any(|marker| text.contains(marker))
 }
 
-/// 判断是否值得把已严格引用的摘录答案交给 LLM 二次合成。
+/// 判断是否值得把已严格引用的摘录答案交给 LLM 二次合成（检索增强生成的
+/// 核心：有证据就应合成，而非陈列原文）。
 ///
-/// 大量证据或已经较长的摘录答案会显著增加本地小模型延迟，并更容易产出
-/// 结构不合格或语义漂移的重写结果；这类场景保留摘录式严格引用答案更稳。
+/// 只要证据非空、非控制/编码占位文本且达到最小长度，就交给 LLM 二次合成；
+/// 不再因证据条数多或摘录答案长而跳过生成。证据总量由 generation_prompt
+/// 的预算裁剪保证上下文不溢出，避免本地小模型因超长上下文而输出失真。
+/// 唯一回退到摘录式的情形是证据本身不合格（无关占位文本或过短）。
 pub fn should_synthesize_grounded_answer(extractive: &AnswerResult) -> bool {
     if extractive.insufficient_evidence {
         return false;
     }
-    let mut unique_citations = HashSet::new();
     let mut evidence_chars = 0_usize;
     for citation in extractive
         .claims
@@ -875,18 +903,14 @@ pub fn should_synthesize_grounded_answer(extractive: &AnswerResult) -> bool {
         {
             return false;
         }
-        unique_citations.insert(citation.chunk_id);
         evidence_chars = evidence_chars.saturating_add(citation.quote.chars().count());
     }
     if evidence_chars < 40 {
         return false;
     }
-    if unique_citations.len() >= 6 {
-        return false;
-    }
-    if extractive.answer.chars().count() >= 600 {
-        return false;
-    }
+    // 证据充足也应交给 LLM 二次合成，恢复「检索增强生成」的本质：不再因证据
+    // 条数多或摘录答案长就跳过生成、直接陈列原文。证据总量由 generation_prompt
+    // 的证据预算裁剪保证上下文不溢出，本地小模型仍可稳定产出结构化合成回答。
     true
 }
 
@@ -1373,7 +1397,8 @@ mod tests {
         base.answer = "项目采用混合召回。".into();
         assert!(should_synthesize_grounded_answer(&base));
         base.answer = "长".repeat(600);
-        assert!(!should_synthesize_grounded_answer(&base));
+        // 摘录答案较长也应交给 LLM 合成（恢复增强生成），不因此跳过合成。
+        assert!(should_synthesize_grounded_answer(&base));
         base.answer = "项目采用混合召回。".into();
         let seed = base.claims[0].citations[0].clone();
         base.claims[0].citations = (0..6)
@@ -1386,7 +1411,8 @@ mod tests {
                 ..seed.clone()
             })
             .collect();
-        assert!(!should_synthesize_grounded_answer(&base));
+        // 证据充足（≥6 条）也应交给 LLM 合成，不因证据多就陈列原文。
+        assert!(should_synthesize_grounded_answer(&base));
         base.claims[0].citations = vec![EvidenceRef {
             quote: r"{\rtf1 \ansi \fonttbl {\f0 Times New Roman;} \itap0 \uc1}".into(),
             ..seed.clone()

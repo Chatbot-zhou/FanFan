@@ -1,6 +1,5 @@
 import {
   AppstoreOutlined,
-  DatabaseOutlined,
   FolderOpenOutlined,
   HomeOutlined,
   InboxOutlined,
@@ -45,8 +44,8 @@ export function Sidebar() {
   const route = useAppStore((state) => state.route);
   const navigate = useAppStore((state) => state.navigate);
   const inbox = useQuery({
-    queryKey: ["inbox", "new", "sidebar"],
-    queryFn: () => bridge.inbox_query({ status: "new", event_types: [], root_ids: [], date_from: null, date_to: null, cursor: null, page_size: 100 }),
+    queryKey: ["inbox", "error", "sidebar"],
+    queryFn: () => bridge.inbox_query({ status: "error", event_types: [], root_ids: [], date_from: null, date_to: null, cursor: null, page_size: 100 }),
     refetchInterval: 30_000,
   });
   return (

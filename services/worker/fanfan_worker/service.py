@@ -6,9 +6,7 @@ from pathlib import Path
 
 from .protocol import WorkerError, WorkerRequest, WorkerResponse
 from .parsing import ParseRequest, parse_document
-from .embedding import encode_texts
 from .reranking import rerank_documents
-from .exporting import export_table
 from .runtime_cache import cache_snapshot, clear_sessions
 from .speech import (
     clear_speech_sessions,
@@ -45,9 +43,9 @@ class WorkerService:
             return True
         if operation in {"health.check"}:
             return True
-        if operation.startswith("document.") or operation == "export.write":
+        if operation.startswith("document."):
             return self.role == "parse"
-        if operation in {"embedding.encode", "rerank.score"}:
+        if operation == "rerank.score":
             return self.role == "onnx"
         if operation.startswith("ocr."):
             return self.role == "ocr"
@@ -115,24 +113,8 @@ class WorkerService:
                 result=result.to_dict(),
                 error=result.error,
             )
-        if request.operation == "embedding.encode":
-            result, error = encode_texts(request.payload)
-            return WorkerResponse(
-                request_id=request.request_id,
-                ok=error is None,
-                result=result,
-                error=error,
-            )
         if request.operation == "rerank.score":
             result, error = rerank_documents(request.payload)
-            return WorkerResponse(
-                request_id=request.request_id,
-                ok=error is None,
-                result=result,
-                error=error,
-            )
-        if request.operation == "export.write":
-            result, error = export_table(request.payload)
             return WorkerResponse(
                 request_id=request.request_id,
                 ok=error is None,

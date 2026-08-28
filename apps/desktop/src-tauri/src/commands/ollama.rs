@@ -49,7 +49,24 @@ impl OllamaStatusSnapshot {
     }
 }
 
-/// 只读探测 Ollama 当前三态。
+/// 打开用户明确点击的 Ollama 相关链接。
+///
+/// 只允许官方下载安装页与本机服务地址，避免把设置页变成任意 URL 打开器。
+#[tauri::command(async)]
+pub fn ollama_open_url(url: String) -> Result<(), String> {
+    const ALLOWED_URLS: [&str; 2] = ["https://ollama.com/download", "http://127.0.0.1:11434"];
+    if !ALLOWED_URLS.contains(&url.as_str()) {
+        return Err("只允许打开 Ollama 官方下载页或本机 Ollama 地址".into());
+    }
+    std::process::Command::new("explorer.exe")
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("无法打开链接：{err}"))
+}
+/// 只读探测 Ollama 当前三态.
 #[tauri::command(async)]
 pub fn ollama_status_get() -> OllamaStatusSnapshot {
     OllamaStatusSnapshot::from_probe(&probe_ollama(), false, None)
@@ -148,14 +165,14 @@ fn start_in_background(app: AppHandle) {
             Ok(_) => {
                 let _ = app.emit(
                     "ollama:state",
-                    serde_json::json!({ "status": "installed_not_running", "starting": false }),
+                    serde_json::json!({ "status": "installed_not_running", "starting": false, "error_code": "OLLAMA_SERVER_START_TIMEOUT" }),
                 );
                 crate::runtime_log::event(
                     "warning",
                     "ollama",
                     "ollama.start_timeout",
                     None,
-                    &serde_json::json!({}),
+                    &serde_json::json!({ "error_code": "OLLAMA_SERVER_START_TIMEOUT" }),
                 );
             }
             Err(error) => {

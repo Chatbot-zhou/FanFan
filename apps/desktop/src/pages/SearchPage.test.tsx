@@ -8,7 +8,18 @@ import { SearchPage } from "./SearchPage";
 describe("SearchPage", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
-    useAppStore.setState({ search_query: "" });
+    useAppStore.setState({
+      search_query: "",
+      search_session: null,
+      search_session_query: "",
+      search_prefs: {
+        mode: "hybrid",
+        sort: "relevance",
+        extension: "",
+        modified_window: "all",
+        scope_collection_ids: [],
+      },
+    });
   });
 
   it("shows channel availability, match reasons and a real source locator", async () => {
@@ -57,6 +68,45 @@ describe("SearchPage", () => {
     }));
   });
 
+  it("surfaces ambiguity when top search results are very similar", async () => {
+    vi.spyOn(bridge, "search_start").mockResolvedValue({
+      search_id: "018f0000-0000-7000-8000-000000000720",
+      status: "completed",
+      channels: { filename: "completed", fulltext: "completed", semantic: "completed" },
+      results: [{
+        file_id: "018f0000-0000-7000-8000-000000000721",
+        name: "ProjectAlpha-复盘.md",
+        extension: "md",
+        display_path: "资料/ProjectAlpha-复盘.md",
+        modified_at: "2026-08-20T08:00:00Z",
+        snippet: "ProjectAlpha 的阶段复盘。",
+        match_reasons: ["filename", "semantic"],
+        locator: null,
+        revision_id: "018f0000-0000-7000-8000-000000000722",
+        image_asset_id: null,
+        scores: { filename: 0.93, fulltext: null, semantic: 0.88, fused: 1.0 },
+      }, {
+        file_id: "018f0000-0000-7000-8000-000000000723",
+        name: "ProjectAlpha-复盘-补充.md",
+        extension: "md",
+        display_path: "资料/ProjectAlpha-复盘-补充.md",
+        modified_at: "2026-08-19T08:00:00Z",
+        snippet: "ProjectAlpha 的补充复盘。",
+        match_reasons: ["filename", "semantic"],
+        locator: null,
+        revision_id: "018f0000-0000-7000-8000-000000000724",
+        image_asset_id: null,
+        scores: { filename: 0.9, fulltext: null, semantic: 0.86, fused: 0.95 },
+      }],
+      next_cursor: null,
+      elapsed_ms: 8,
+    });
+    render(<SearchPage />);
+    fireEvent.change(screen.getByPlaceholderText("输入关键词"), { target: { value: "ProjectAlpha" } });
+    fireEvent.click(screen.getByRole("button", { name: "搜索" }));
+
+    expect(await screen.findByRole("note")).toHaveTextContent("可能有多份相近资料");
+  });
   it("shows the exact cached image when image text is the search hit", async () => {
     vi.spyOn(bridge, "search_start").mockResolvedValue({
       search_id: "018f0000-0000-7000-8000-000000000710",

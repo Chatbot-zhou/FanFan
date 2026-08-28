@@ -12,7 +12,9 @@ use crate::ask::query_normalize::strip_target_stop_phrases;
 use crate::ask::query_plan::{
     QueryIntent, QueryOperation, QueryPlan, QueryTarget, QuestionShape, SourceIntent,
 };
-use crate::ask::source_router::{SourceRouting, apply_ambiguous_override};
+use crate::ask::source_router::{
+    SourceRouting, apply_ambiguous_override, apply_capability_override,
+};
 use crate::contracts::DocumentType;
 use crate::knowledge::fold_recent_history;
 
@@ -332,6 +334,20 @@ const STRUCTURE_ENUMERATION_MARKERS: &[&str] = &[
     "多少章", "章节目录",
 ];
 
+/// 「容器/装载」类名词：指文档的整体类别或装载单元（手册/讲义/逐字稿/清单…），
+/// 本身不是能定位某小节的检索词。当**枚举/计数**问句（几个/哪些/多少）的内容查询
+/// 完全由这类词构成（如「整理了几个项目的*逐字稿*」→ content="逐字稿"），说明
+/// 用户要的是**通读全文枚举出所有内容项**，而不是拿容器词做 chunk 局部检索——
+/// 后者召回必然为空而被门控拒答（no_evidence）。收录常见文档类别词与装载单元词，
+/// 作为「纯容器 → 整文概述」兜底（[`finalize_query_plan`] 6.5）的**通用**判定，不针对
+/// 任何具体文件/关键词/case。与 answer_gate 的 GENERIC_BIGRAMS 保留同类词的精神
+/// 一致：容器词不单独承载主题。
+const CONTENT_CONTAINER_NOUNS: &[&str] = &[
+    "逐字稿", "手册", "讲义", "教程", "教案", "笔记", "指南", "规范", "标准",
+    "报告", "说明", "方案", "计划", "清单", "列表", "目录", "大纲", "章节", "小节",
+    "内容", "资料", "文档", "文件", "记录", "汇总", "总结", "材料",
+];
+
 /// 判定问句是否是「跨文档对比」：强对比词 + 双文档结构信号**同时**满足。
 /// 概念对比（「视图和基本表有什么区别」）两侧是概念名词、不是文档对象，
 /// 不满足双文档结构，因此不会误升级（保持 document_qa）。通用语言结构判定，
@@ -448,6 +464,60 @@ fn has_material_enumerate_collocation(question: &str) -> bool {
         }
     }
     false
+}
+
+/// 是否「整库主题/类别分布占比」问句。用于把「你收的这些资料，偏数据库方向的
+/// 多一些，还是偏大模型方向的多一些呀」「你收的资料里，考试类的跟开发手册类的，
+/// 大概是个几比几的占比呀」这类**整库**占比问句归入库概览（LibraryOverview 只读
+/// 主题分布，不触发正文检索），避免 0.6B/2B 把它误判成 document_qa/content-QA 后
+/// 落入宽 scope RAG 返回无关题目碎片。
+///
+/// 判定为高精度的通用语言结构，不针对任何具体文件/主题/case，且**必须同时满足**：
+///   1. 非指向某一份具体文档正文（排除「这份/那本/那段…」定指单文档所指，这类是
+///      文档内容 QA 而非整库分布）；
+///   2. 整库收藏措辞（资料/收的/收着/手头/这边/库里/知识库/整份…），排除「这篇
+///      特定文本内容」误解——只含「论文/手册」而不含整库措辞的不会命中；
+///   3. 分布/占比比较词（占比/比例/几比几/哪种多/多一些/更多/…，或「偏…方向…」句式）。
+fn has_theme_distribution_intent(question: &str) -> bool {
+    let question = question.trim();
+    if question.is_empty() {
+        return false;
+    }
+    // 1) 指向某一份具体文档正文（定指单文档所指），不是整库分布 → 直接排除。
+    const DEFINITE_DOC: &[&str] = &[
+        "这份", "那份", "这篇", "那篇", "这本", "那本", "该文档", "那段", "那一份",
+        "那份文件", "那本手册", "你说的那个", "刚说的那个",
+    ];
+    if DEFINITE_DOC.iter().any(|word| question.contains(word)) {
+        return false;
+    }
+    // 2) 整库收藏措辞：只有真正指向「整个知识库/你收的资料」这类集合才谈得上分布。
+    //    口语里用户常用「手上/手头/这边…这批/这些材料」指代整库集合，不止「资料/收的」。
+    const COLLECTION: &[&str] = &[
+        "资料", "收的", "收着", "收集", "收藏", "手头", "手上", "这边", "库里", "知识库",
+        "整份", "全部文件", "这批", "这批材料",
+    ];
+    if !COLLECTION.iter().any(|word| question.contains(word)) {
+        return false;
+    }
+    // 3) 分布/占比比较词（含「偏…方向…」句式）。
+    //    口语里同一分布语义常用口语连词「的」把方向与多寡连起来（「哪些方向的
+    //    多呀」），也常用「轻重/多少/谁多谁少」指方向间占比；此外用户会直接问
+    //    「哪一类占得最多/最少」「占比最高/最低」这类**极值**比较，故词表同时
+    //    覆盖占比、多寡、偏方向、以及「最多/最少/最高/最低」极值措辞，避免这些
+    //    自然口语变体漏判又重新落回 document_qa。通用语言结构判定，不针对任何
+    //    文件/主题/case。
+    const DISTRIBUTION: &[&str] = &[
+        "占比", "所占比例", "比例", "几比几", "几几开", "半对半", "对半分", "占多", "占得最多",
+        "占得最少", "占的比重", "哪种多", "哪类多", "哪一类多", "哪类比较多", "偏多", "多还是少",
+        "多一些", "更多", "最多", "最少", "占比最高", "占比最低", "比例最高", "比例最低", "哪边多",
+        "哪个方向多", "哪些方向多", "哪个方向的多", "哪些方向的多", "哪个方向的", "哪些方向的",
+        "占大头", "轻重",
+    ];
+    if DISTRIBUTION.iter().any(|word| question.contains(word)) {
+        return true;
+    }
+    question.contains("偏") && question.contains("方向")
 }
 
 /// 提取对比问句的文档描述前缀：第一个强对比词**之前**的部分，再去掉尾随的
@@ -700,8 +770,16 @@ pub fn finalize_query_plan(
         // document_qa 而走 rag 空检索；以「哪份文件里/哪个文件里/哪份资料」等收尾
         // 的问句本质是定位「具体哪一份文件/资料」→ 应走 find（文件定位）。这些是
         // 纯定位语义的高精度结尾标记，正文问答不以「哪份文件里/哪份资料」收尾。
+        // 「帮我（把…）翻出来／找出来／拿出来」的检索/定位家族结尾。0.6B/2B 常把
+        // 这类明明在找某份资料/文件的问句（「还存了份X帮我翻出来」「把Y找出来」）
+        // 解析成 document_qa，拿对象描述做 chunk 检索 → 命中知识集锦等旁支部而非
+        // 目标文件。以「翻/找/拿…出来（一下）」收尾本质是「定位并取回某个文件/
+        // 资料对象」，与 locate 语义同源，应收敛为 find（文件定位）。纯定位语义的
+        // 高精度结尾标记，正文问答不以「…翻出来/找出来」收尾。
         // 通用语言结构判定，不针对任何具体文件/关键词/case。
         "哪份文件里", "哪个文件里", "哪份资料", "是哪份资料", "是哪一份资料",
+        "翻出来", "找出来", "拿出来", "帮我翻出来", "帮我找出来", "帮我拿出来",
+        "帮我翻一下", "帮我拿一下", "翻一下", "拿一下",
     ];
     let question_trimmed = question.trim_matches(|c: char| {
         matches!(
@@ -744,6 +822,13 @@ pub fn finalize_query_plan(
         "哪些方面", "收录了哪些", "包括哪些", "包含哪些", "涉及哪些", "有哪些",
         "什么内容", "主要内容", "讲了什么", "些什么", "哪些", "什么", "区别",
         "分别", "包含", "包括", "涉及", "讲了", "提到", "写了",
+        // 文档「模块/板块/部分」划分问句（「大致分哪几个模块／分几大块／有几大部分」）
+        // 问的是文档内部的构成结构，本质是内容问答/大纲，不是定位文件本身。0.6B/2B
+        // 常把这类问句误判成 find（拿文档名当文件定位），此处收敛回 qa。词条取
+        // 具体「结构划分」短语而非裸「哪几个」，避免把「哪几个文件里存了X」这类真实
+        // 文件定位问句误伤。通用语言结构判定，不针对任何具体文件/关键词/case。
+        "哪几个模块", "分了哪几个", "分成哪几个", "分哪几个", "几个模块", "几大模块",
+        "几大块", "几部分", "几个部分", "分为哪几个", "分成了几个", "分几块",
     ];
     let asks_document_content = content_qa_markers
         .iter()
@@ -945,18 +1030,70 @@ pub fn finalize_query_plan(
             .iter()
             .any(|word| overview_ref.contains(word))
     };
-    let is_library_level = is_library_level_target
-        && plan.target.document_type.is_none()
-        && plan
-            .target
-            .document_name
-            .as_deref()
-            .is_none_or(|v| v.trim().is_empty())
-        && plan
-            .target
-            .entity_name
-            .as_deref()
-            .is_none_or(|v| v.trim().is_empty());
+    // 口语化全库盘点：问句在盘点**整库**的资料数量/方向（「你这边收着多少份
+    // 资料，都是些啥方向的」「一共几份资料」）。这类问句无具体文件、也无具体
+    // 正文内容词，判定其全库枚举语义（盘点量 + 方向），归库概览，避免落入 1.6
+    // 的「枚举定位某类资料文件」而误判 document_find。
+    // 纯通用语言结构判定——绝不依赖任何具体文件/关键词/case。
+    // target 是否构成**可信的内容定位限定**：只有真正由用户说出的限定才算。
+    // 0.6B/2B 对整库盘点问句常凭空填充 dtype/entity_name（如既不盘点也不聊简历
+    // 的问句被填上「我的简历」或「Other」）。真实的目标限定必然来自用户原话、
+    // 能以子串在问句原文中找到，或是用户点到的**具体**文档类型；原文里找不到
+    // 的实体/名称、以及文档类型的通用兜底 Other（模型无法归类时的默认值），
+    // 都是幻觉/非限定，不能用来否定库概览判定。此处以「问句文本可溯源」为准，
+    // 而非盲信模型解析出的 target 字段。
+    let has_specific_type = plan.target.document_type.map_or(false, |ty| {
+        !matches!(ty, DocumentType::Other)
+    });
+    let name_in_question = plan
+        .target
+        .document_name
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+        .is_some_and(|v| question_trimmed.contains(v.trim()));
+    let entity_in_question = plan
+        .target
+        .entity_name
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+        .is_some_and(|v| question_trimmed.contains(v.trim()));
+    let target_unqualified = !has_specific_type && !name_in_question && !entity_in_question;
+    let positional_refs: &[&str] = &[
+        "你这边", "我这边", "我这", "我这里", "这边", "你那", "你那儿", "你手上",
+        "你手头", "我手头",
+    ];
+    // 库级盘点问句是否**面向用户自己的整库**：看位置词是否出现在用户原话里。
+    // 不依赖模型解析的 reference（0.6B/2B 对「你手头收的资料」常解析成具体引用、
+    // 实体或空白，逐次漂移），以问题文本为准更稳定。通用语言结构判定，不针对任何
+    // 具体文件/关键词/case。
+    let is_positional_ref = overview_ref.is_empty()
+        || positional_refs
+            .iter()
+            .any(|w| overview_ref.contains(w) || question_trimmed.contains(w));
+    // 全库盘点措辞：命中「资料集合量 + 盘点」这一类语言结构。为通用、高精度，
+    // 用**量词 + 集合名词的双重条件**（数量盘点「多少份/几份」；方向盘点需配合
+    // 「啥方向/什么方向/哪些方向」这类方向词），避免把正文里偶然出现的「几分/多
+    // 少…」误判。不做任何具体文件/主题特判。
+    let counts_library_collection = ["多少份", "几份", "共几份", "一共几份", "总共几份"]
+        .iter()
+        .any(|w| question_trimmed.contains(w));
+    let asks_library_direction = ["啥方向", "什么方向", "哪些方向", "都有哪些方向", "分别是什么"]
+        .iter()
+        .any(|w| question_trimmed.contains(w));
+    // 类别盘点：问整库资料「拢共能分哪几类/怎么分类」这类**分类**盘点，同样归
+    // 库概览（只读按类型计数，不锁定具体文件）。用整词短语避免正文偶然出现的裸
+    // 「几类」误判；文档内部的「哪几个模块/哪几章」等结构枚举词不在此列，仍走
+    // 文档内容/大纲。通用语言结构判定，不针对任何具体文件/关键词/case。
+    let asks_library_category = [
+        "分哪几类", "能分哪几类", "分为哪几类", "分几类", "怎么分类", "如何分类", "有哪些类",
+    ]
+    .iter()
+    .any(|w| question_trimmed.contains(w));
+    let asks_whole_library_inventory = target_unqualified
+        && is_positional_ref
+        && (counts_library_collection || asks_library_direction || asks_library_category);
+    let is_library_level = (is_library_level_target || asks_whole_library_inventory)
+        && target_unqualified;
     // 库概览语义须由**问题文本**二次确认，不能依赖模型对 content_query 的长度判定
     // （0.6B/2B 对同一存在性问句重跑会给不定长 content）。库概览必须是「枚举库里
     // 有什么」：命中概览枚举词（有哪些/收集了什么）且**不是**存在性命中词（有没有/
@@ -964,6 +1101,11 @@ pub fn finalize_query_plan(
     // 归 rag_search 而非概览。通用语言结构判定，不针对任何具体文件/关键词/case。
     let asks_overview = [
         "有哪些", "哪些资料", "收集了", "收录了", "有什么", "几份", "多少份", "都有什么",
+        // 类别盘点：问「资料拢共能分哪几类/有哪些类/怎么分类」这类整库**分类**盘点。
+        // 用整词短语（哪几类/分哪几类…）避免正文偶然出现的「几类」误判；库级判定
+        // 仍由 is_library_level 把关（须指向整库而非具体资料文件），不针对任何具体
+        // 文件/主题/case。
+        "哪几类", "分哪几类", "能分哪几类", "有哪些类", "有几类", "怎么分类",
     ]
     .iter()
     .any(|word| question_trimmed.contains(word));
@@ -975,6 +1117,31 @@ pub fn finalize_query_plan(
         && !existence_hit
         && !ends_with_location
         && !has_compare_intent(question_trimmed)
+    {
+        plan.intent = QueryIntent::LibraryQa;
+        plan.operation = QueryOperation::Qa;
+        plan.content_query = None;
+        plan.requires_document_resolution = false;
+        plan.requires_full_document = false;
+    }
+    // 1.5b 整库主题/类别分布占比问句 → 库概览（LibraryQa）。1.5 的库概览判定依赖
+    // `target_unqualified`（0.6B/2B 常给整库盘点问句凭空补幻影 document_type，使
+    // target_unqualified 变 false 而卡住 is_library_level）；而「你收的整库资料偏
+    // 某方向多还是偏另一方向多」「考试类跟开发手册类几比几」这类**整库占比分布**
+    // 问句，本身只能指整库、不指特定文件正文，用 `has_theme_distribution_intent`
+    // 这一通用语言结构独立判定即可兜住，不受幻影 type 影响。归一为 library_qa +
+    // content_query=None，由 LibraryOverview 只读主题分布计数（不触发正文检索），
+    // 避免误走 document_qa / 宽 scope RAG 返回无关题目碎片。通用判定，不针对任何
+    // 具体文件/主题/case。
+    if !ends_with_location
+        && !has_compare_intent(question_trimmed)
+        && has_theme_distribution_intent(question_trimmed)
+        && matches!(
+            plan.intent,
+            QueryIntent::DocumentQa
+                | QueryIntent::LibraryQa
+                | QueryIntent::MultiDocumentQa
+        )
     {
         plan.intent = QueryIntent::LibraryQa;
         plan.operation = QueryOperation::Qa;
@@ -1084,6 +1251,48 @@ pub fn finalize_query_plan(
             }
         }
     }
+    // 6.5 文档内「枚举/计数 + 纯容器内容词」→ 整文概述。0.6B/2B 对
+    //   「X 里整理了几个项目的逐字稿／X 里有哪几份清单」这类枚举/计数问句，
+    //   常把检索词压成容器/装载类名词（逐字稿/手册/清单…），拿它做 chunk 检索
+    //   召回必然为空 → 被门控拒答（no_evidence）。这类词指向的是「整篇文档要被
+    //   枚举出的内容项」，不是某小节的定位词；用户真实要的是通读全文、列出所有
+    //   项目/条目。命中即升级为 document_summary（整文内容摘要／按需大纲），由
+    //   摘要管线枚举全文，而不是拿容器词做局部检索。判定**全部满足**才触发：
+    //   1. 当前仍是内容检索类意图（document_qa / multi_document_qa）；
+    //   2. 问句是枚举/计数形态（几个/哪些/多少/有哪些；或模型 question_shape 为
+    //      list / fact）；
+    //   3. content_query 剥壳后为**纯容器词**（无实质主题）；
+    //   4. 已锁定具体目标对象（避免把库级泛指误升级）；
+    //   5. 非定位结尾、非跨文档对比（防御性守卫，与 1.6 一致）。
+    //   通用语言结构判定，不针对任何具体文件/关键词/case。
+    let enumeration_count_shape = plan.question_shape == QuestionShape::List
+        || plan.question_shape == QuestionShape::Fact
+        || ["几个", "多少个", "有哪些", "哪些", "有多少", "多少份"]
+            .iter()
+            .any(|word| question_trimmed.contains(word));
+    let content_pure_container = plan
+        .content_query
+        .as_deref()
+        .map(is_pure_container_query)
+        .unwrap_or(false);
+    if enumeration_count_shape
+        && content_pure_container
+        && target_non_empty
+        && !ends_with_location
+        && !has_compare_intent(question_trimmed)
+        && matches!(
+            plan.intent,
+            QueryIntent::DocumentQa | QueryIntent::MultiDocumentQa
+        )
+    {
+        plan.intent = QueryIntent::DocumentSummary;
+        plan.operation = QueryOperation::Summary;
+        plan.content_query = None;
+        plan.requires_document_resolution = true;
+        plan.requires_full_document = true;
+        // 保持 structure_enumeration=false：这是整文内容枚举，不是「章节标题串」，
+        // 由 legacy 摘要管线通读全文列出内容项（详见 tool_for_plan 注释）。
+    }
     // 7. 确定性歧义同步（省略/指代、裸祈使、会话记忆恢复 → Ambiguous）：
     //    source_router 对这类「需结合会话上下文澄清 / 恢复所指」的问句已判
     //    Ambiguous；这里在规划层把同一判定同步到 plan.source，使 Agent
@@ -1101,6 +1310,20 @@ pub fn finalize_query_plan(
             plan.source = SourceIntent::Ambiguous;
         }
     }
+    // 8. 确定性能力询问同步（source_router 误判 local → general）：与第 7 段同
+    //    源，只依据确定性信号（`apply_capability_override`），不叠加模型对小模型
+    //    不稳定的 source 标签。「你能把……比一比/分析一下吗」类能力询问从 local
+    //    拉回 general，编排层自然介绍本地资料助手能力，不进入文档检索（对应
+    //    source_router 判断原则 9，避免 hit 真实评测能力询问被当 document_qa）。
+    //    通用语言结构判定，不针对任何具体文件/关键词/case。
+    if plan.source != SourceIntent::Ambiguous {
+        let mut capability_routing = SourceRouting {
+            source: plan.source,
+            confidence: 0.0,
+        };
+        apply_capability_override(question, &mut capability_routing);
+        plan.source = capability_routing.source;
+    }
     Some(plan)
 }
 
@@ -1115,6 +1338,34 @@ fn is_bare_ascii_fragment(query: &str) -> bool {
         .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
     let too_short = query.chars().count() <= MAX_FRAGMENT_CHARS;
     !has_cjk && too_short
+}
+
+/// 判定 content_query 是否**只剩容器/装载类名词**（无实质主题内容）。
+/// 反复剥掉尾部/整体命中的容器词（含「的/X/X着」等粘着后缀），余下为空即视为
+/// 纯容器——如「逐字稿/手册」剥光为空。通用语言结构判定，不针对任何具体文件/关键词/case。
+fn is_pure_container_query(query: &str) -> bool {
+    let mut remainder = query.trim();
+    loop {
+        let mut removed = false;
+        for noun in CONTENT_CONTAINER_NOUNS {
+            if remainder == *noun {
+                remainder = "";
+                removed = true;
+                break;
+            }
+            if let Some(stripped) = remainder.strip_suffix(*noun) {
+                remainder = stripped.trim_end_matches(|c: char| {
+                    matches!(c, '的' | '之' | '和' | '与' | '及' | '中' | '着')
+                });
+                removed = true;
+                break;
+            }
+        }
+        if !removed {
+            break;
+        }
+    }
+    remainder.is_empty()
 }
 
 /// 解析 Query Parser 输出；解析失败或必填字段非法返回 None（调用方回退）。

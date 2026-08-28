@@ -69,21 +69,25 @@ Desktop.ini
 .git-commit-msg.txt
 push-to-rag.sh
 
-# Evaluation artifacts and QA fixtures (contain real authorized corpus
-# content; privacy-sensitive, never upload)
-eval/
+# Evaluation source is versioned; private fixtures, environments and run outputs are not.
+eval/*
+!eval/ragas/
+eval/ragas/*
+!eval/ragas/fanfan_ragas.py
+!eval/ragas/pyproject.toml
+!eval/ragas/README.md
+!eval/ragas/tests/
+!eval/ragas/tests/**
+eval/ragas/fixtures/
+eval/ragas/.venv/
 qa-fixtures/
 results*.json
-scripts/run_ragas.ps1
 
 # Local evaluation workspace (database snapshots, model registry copies)
 .evaluation-tmp/
 
 # Debug probes (diagnostic-only binaries, not part of the product)
 _dbg_*.rs
-
-# Evaluation probes (diagnostic-only, not part of the product)
-crates/core/examples/evaluation_optimize.rs
 
 # Installers and packaging
 *.exe

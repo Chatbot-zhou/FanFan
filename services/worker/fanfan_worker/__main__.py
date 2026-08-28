@@ -76,8 +76,11 @@ def main(argv: list[str] | None = None) -> int:
                 with redirect_stdout(sys.stderr):
                     response = service.handle(request)
             except (ValueError, TypeError, json.JSONDecodeError) as error:
+                # JSON 解析失败时无法取得 request_id（行可能根本不是合法 JSON），
+                # 只能在无法解析时用 "unknown" 兜底；已解析但处理失败走下一分支。
+                request_id = getattr(request, "request_id", None) or "unknown"
                 response = WorkerResponse(
-                    request_id="unknown",
+                    request_id=request_id,
                     ok=False,
                     result=None,
                     error=WorkerError("REQUEST_INVALID", str(error), False),
@@ -85,8 +88,11 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as error:
                 # 兜底：任何未预料的异常都不能让整个 worker 进程退出，否则排队中的
                 # 所有任务都会以 WORKER_RESPONSE_INVALID 丢失并反复重试。
+                # 尽量保留请求方传入的 request_id，便于 Rust 侧把错误关联回原始任务，
+                # 避免批量任务整体降级为 unknown。
+                request_id = getattr(request, "request_id", None) or "unknown"
                 response = WorkerResponse(
-                    request_id="unknown",
+                    request_id=request_id,
                     ok=False,
                     result=None,
                     error=WorkerError(

@@ -58,6 +58,21 @@ OCR_PAGE_BUDGET = 100
 # 拦不住大扫描书。识别循环按此预算提前收尾，剩余页标记 OCR_REQUIRED，
 # 首次索引只识别前若干页，绝不因识别太慢拖垮整份解析。
 OCR_TIME_BUDGET_SECONDS = 200.0
+# 纯文本/代码解析的单文件读取上限：超大日志/源码（数 GB）全量 read_bytes()
+# 会把 worker 进程内存耗尽。只读前 64MB，截断后仍可索引可检索的开头部分。
+MAX_TEXT_READ_BYTES = 64 * 1024 * 1024
+# pypdf 逐页提取的探针阈值（字符）：pypdf 提取低于此值、而 PyMuPDF 能提取出
+# 显著更丰富文本（≥30 且 > pypdf 的 3 倍）时，判定 pypdf 只提取到页眉/页脚水印
+# 欠提取正文，改用 PyMuPDF 文本。仅按体量差异比对，不针对具体文件/关键词。
+PDF_TEXT_FALLBACK_PROBE_MIN = 200
+# PyMuPDF 兜底生效需要的最低文本量：低于它的页仍视为需要 OCR 抢救。
+PDF_TEXT_FALLBACK_MIN = 30
+# 水印/样板页 OCR 判定：PDF 页若提取到的文本层很短且在多页重复，通常是页眉/页脚
+# 水印类样板文字（如「内部资料，禁止传播」），正文实际在光栅/描边位图里、不在任何
+# 文本层中。这类页按字面量索引只有水印、正文检索不到，应按"扫描件"送 OCR。判定规则
+# 仅依据「归一化文本长度 + 跨页重复度」，不针对任何具体文件/关键词/case。
+PDF_WATERMARK_MAX_CHARS = 200   # 归一化后少于该字符数的页视为"薄文本页"
+PDF_WATERMARK_REPEAT_MIN = 3    # 相同薄文本至少出现在 N 页才判定为样板/水印
 
 
 def uuid7() -> str:
@@ -271,11 +286,19 @@ def _cache_image_asset(
     clean_suffix = re.sub(r"[^a-zA-Z0-9]", "", suffix.lower().lstrip(".")) or "bin"
     target = cache_directory / f"{asset_id}.{clean_suffix}"
     temporary = cache_directory / f".{asset_id}.part"
-    with temporary.open("xb") as stream:
-        stream.write(content)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, target)
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    except BaseException:
+        # 写入中断/磁盘满等异常时清理残留的 .part，避免下次扫描重复积累垃圾文件。
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     return ImageAsset(
         asset_id=asset_id,
         revision_id=request.revision_id,
@@ -385,7 +408,9 @@ class _VisibleHtmlParser(html.parser.HTMLParser):
 
 
 def _decode_text(path: Path) -> str:
-    raw = path.read_bytes()
+    # 只读前 MAX_TEXT_READ_BYTES：超大文本/源码文件不做全量读入，防止 OOM。
+    with path.open("rb") as stream:
+        raw = stream.read(MAX_TEXT_READ_BYTES)
     for encoding in ("utf-8-sig", "gb18030"):
         try:
             return raw.decode(encoding)
@@ -509,14 +534,21 @@ def _docx_nodes(path: Path) -> list[DocumentNode]:
 
 
 def _xlsx_nodes(path: Path) -> list[DocumentNode]:
+    # 单个 sheet 解析异常只跳过该 sheet（记入警告），不让整个 xlsx 解析失败；
+    # 行数/单元格均有上限，防止超大表格把 worker 内存耗尽。
     spreadsheet_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
     relationship_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
     office_rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    max_rows_per_sheet = 10_000
     with zipfile.ZipFile(path) as package:
         shared: list[str] = []
         if "xl/sharedStrings.xml" in package.namelist():
-            shared_root = ElementTree.fromstring(package.read("xl/sharedStrings.xml"))
-            shared = [_xml_text(item) for item in shared_root.findall(f"{{{spreadsheet_ns}}}si")]
+            try:
+                shared_root = ElementTree.fromstring(package.read("xl/sharedStrings.xml"))
+                shared = [_xml_text(item) for item in shared_root.findall(f"{{{spreadsheet_ns}}}si")]
+            except (ElementTree.ParseError, KeyError, OSError, ValueError):
+                # sharedStrings 损坏时按"无共享字符串"降级，单元格仍可索引其字面量。
+                shared = []
         workbook = ElementTree.fromstring(package.read("xl/workbook.xml"))
         relationships = ElementTree.fromstring(package.read("xl/_rels/workbook.xml.rels"))
         targets = {
@@ -525,17 +557,27 @@ def _xlsx_nodes(path: Path) -> list[DocumentNode]:
         }
         sheets = []
         for sheet in workbook.findall(f".//{{{spreadsheet_ns}}}sheet"):
-            relation_id = sheet.attrib[f"{{{office_rel_ns}}}id"]
-            target = targets[relation_id].replace("\\", "/")
+            relation_id = sheet.attrib.get(f"{{{office_rel_ns}}}id")
+            target = targets.get(relation_id) if relation_id else None
+            if target is None:
+                # 缺少关联目标（异常文件）时跳过该 sheet，不拖垮整体。
+                continue
+            target = target.replace("\\", "/")
             if target.startswith("/"):
                 package_path = target.lstrip("/")
             else:
                 package_path = f"xl/{target}" if not target.startswith("xl/") else target
-            sheets.append((sheet.attrib["name"], package_path))
+            sheets.append((sheet.attrib.get("name", ""), package_path))
         nodes: list[DocumentNode] = []
         for sheet_name, package_path in sheets:
-            sheet_root = ElementTree.fromstring(package.read(package_path))
-            for row in sheet_root.findall(f".//{{{spreadsheet_ns}}}row"):
+            if package_path not in package.namelist():
+                continue
+            try:
+                sheet_root = ElementTree.fromstring(package.read(package_path))
+            except (ElementTree.ParseError, KeyError, OSError, ValueError):
+                # sheet XML 损坏：跳过该 sheet，其余 sheet 照常解析。
+                continue
+            for row in sheet_root.findall(f".//{{{spreadsheet_ns}}}row")[:max_rows_per_sheet]:
                 values: list[str] = []
                 cells = row.findall(f"{{{spreadsheet_ns}}}c")
                 for cell in cells:
@@ -546,7 +588,11 @@ def _xlsx_nodes(path: Path) -> list[DocumentNode]:
                     elif value_element is None:
                         value = ""
                     elif cell_type == "s" and value_element.text:
-                        value = shared[int(value_element.text)]
+                        try:
+                            index = int(value_element.text)
+                            value = shared[index] if 0 <= index < len(shared) else value_element.text
+                        except (ValueError, IndexError):
+                            value = value_element.text
                     else:
                         value = value_element.text or ""
                     values.append(value)
@@ -572,6 +618,18 @@ def _pptx_nodes(path: Path) -> list[DocumentNode]:
     return nodes
 
 
+def _renumber_nodes(nodes: list[DocumentNode]) -> list[DocumentNode]:
+    """按当前顺序为节点重新分配从 1 递增的 ordinal。
+
+    兜底恢复的行级节点与整页节点混排时会因 ordinal 冲突（整页节点用 page_number 作
+    ordinal），这里统一重排保证 ordinal 唯一有序，与 OCR 合并后的重排口径一致。
+    """
+    return [
+        DocumentNode(node.node_id, node.parent_id, ordinal, node.node_type, node.text, node.table_data, node.locator, node.heading_path)
+        for ordinal, node in enumerate(nodes, 1)
+    ]
+
+
 def _ocr_nodes(result: dict[str, Any], kind: str, start_ordinal: int = 0) -> list[DocumentNode]:
     nodes: list[DocumentNode] = []
     for line in result.get("lines", []):
@@ -592,6 +650,38 @@ def _ocr_nodes(result: dict[str, Any], kind: str, start_ordinal: int = 0) -> lis
             )
         )
     return nodes
+
+
+def _ocr_page_area_bbox(result_lines: list[dict[str, Any]], page_number: int) -> dict[str, float] | None:
+    """计算某页所有 OCR 行 bbox 的并集（归一化），供整页 image_ocr 搜索节点粗粒度定位。
+
+    OCR 行级节点各自带细粒度 bbox，而整页聚合的 image_ocr 节点（「图片文字：…」）此前
+    只用 page_no 定位、无 bbox，导致前端无法在 pdfjs 页面上圈出引用区域。这里按页取所有
+    行 bbox 的并集作为该页正文区域，与 _PdfTextFallback.page_text_bbox 同口径（[0,1]
+    归一化、左上原点 y 向下）。无行或无 bbox 时返回 None（调用方保持原无 bbox 语义）。
+    仅依赖 OCR 几何数据，不针对任何文件/关键词/case。
+    """
+    xs: list[tuple[float, float]] = []
+    ys: list[tuple[float, float]] = []
+    for line in result_lines:
+        if not isinstance(line, dict) or line.get("page_no") != page_number:
+            continue
+        bbox = line.get("bbox")
+        if not isinstance(bbox, dict):
+            continue
+        try:
+            xs.append((float(bbox["x0"]), float(bbox["x1"])))
+            ys.append((float(bbox["y0"]), float(bbox["y1"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not xs:
+        return None
+    return {
+        "x0": max(0.0, min(x0 for x0, _ in xs)),
+        "y0": max(0.0, min(y0 for y0, _ in ys)),
+        "x1": min(1.0, max(x1 for _, x1 in xs)),
+        "y1": min(1.0, max(y1 for _, y1 in ys)),
+    }
 
 
 def _recognize_pdf_pages(
@@ -703,6 +793,244 @@ def _ocr_fallback_reason(result: dict[str, Any] | None, error: WorkerError | Non
     return None
 
 
+def _load_pymupdf() -> tuple[Any, str | None]:
+    """返回 (pymupdf 模块, None) 或 (None, 错误说明)。
+
+    PyMuPDF ≥1.24 官方入口为 pymupdf；fitz 为历史别名（仍可用但已弃用）。两种命名
+    都尝试，保证 1.26.7 及更新版本都能加载。供文本兜底与渲染兜底共用。
+    """
+    try:
+        # PyMuPDF ≥1.24 官方入口为 pymupdf；fitz 为历史别名（仍可用但已弃用）。
+        import pymupdf as fitz_module  # type: ignore[attr-defined]
+        return fitz_module, None
+    except ImportError as error:
+        try:
+            import fitz as fitz_module  # type: ignore
+            return fitz_module, None
+        except ImportError as error2:
+            return None, f"PyMuPDF导入失败: {error}\nfitz 兜底导入也失败: {error2}"
+
+
+class _PdfTextFallback:
+    """pypdf 提取文字过少时的 PyMuPDF 兜底提取器。
+
+    部分带有效文本层的 PDF（如「2023数据库系统工程师备考知识点集锦」）用 pypdf
+    逐页只能提取出 0 字符，而 PyMuPDF 能正常提取约 700-800 字符/页。若这类页被
+    误判为扫描件送去 OCR，Windows 渲染器又把它整页画成黑底，正文内容会被彻底
+    丢失。本兜底按需延迟打开 PyMuPDF 文档，从缓存 doc 中按页号（1-based）提取
+    文本；PyMuPDF 未安装或提取失败时返回空串，由调用方走原 OCR 路径。
+    """
+
+    def __init__(self, path: Path) -> None:
+        # 去掉 \\?\ 长路径前缀：PyMuPDF 不接受该前缀。
+        self._path = _strip_long_path_prefix(str(path))
+        self._doc: Any = None
+        self._unavailable = False
+        # 记录 PyMuPDF 不可用的具体原因（导入失败/打开失败），供上层以警告呈现，
+        # 避免「欠提取的页本可用 PyMuPDF 兜底却静默失效」长期难以定位。
+        self.error: str | None = None
+        # 全页块缓存 + 跨页重复样板块集合：首次需要块级数据时惰性构建，之后复用，
+        # 避免每页重复打开/提取。`_boilerplate_norms` 是归一化后判定为页眉/页脚
+        # 样板的文本集合，节点生成前据此剔除（见 page_blocks 的过滤）。
+        self._block_map: dict[int, list[tuple[str, dict[str, float] | None]]] | None = None
+        self._boilerplate_norms: set[str] = set()
+
+    def page_text(self, page_number: int) -> str:
+        """按 1-based 页号提取该页文本层，失败或不可用返回空串。"""
+        if not self._open():
+            return ""
+        try:
+            page = self._doc.load_page(page_number - 1)
+            return (page.get_text() or "").strip()
+        except Exception:
+            return ""
+
+    def page_blocks(self, page_number: int) -> list[tuple[str, dict[str, float] | None]]:
+        """按 1-based 页号提取该页文本块，每块附带归一化 bbox。
+
+        与 OCR 线级 bbox 同口径：坐标是 [0,1] 页面分比例（左上原点，y 向下），供前端
+        PDF 高亮在 pdfjs 渲染页面上定位引用位置。PyMuPDF 的 bbox 是 point 单位、左上
+        原点，这里除以页宽/页高归一化。
+
+        以**文本块**（垂直间隔分隔的段落级单元）为粒度切节点，而非逐行：逐行切会把
+        密集排版页（如「2023 数据库系统工程师备考知识点集锦」里被内联公式/文本框打散
+        的短行）碎成大量 <10 字符的碎片，稀释检索；块级粒度与正文段落对应，既保持
+        语义连贯，又让前端每个引用都能定位到具体块区域高亮。失败或不可用返回空列表。
+
+        返回前剔除跨页重复的页眉/页脚样板块（归一化后出现在足够多页且较短的文本，
+        如「内部资料，禁止传播」页眉、带页码的页脚横幅）：这类块在每一页重复，混入
+        正文会让 chunk 携带大量重复噪声、稀释检索与摘要质量。仅按跨页重复度 + 长度
+        判定，不针对任何具体文件/关键词/case。
+        """
+        if not self._open():
+            return []
+        if self._block_map is None:
+            self._build_block_cache()
+        blocks = self._block_map.get(page_number, [])
+        if not self._boilerplate_norms:
+            return blocks
+        return [
+            (text, bbox)
+            for text, bbox in blocks
+            if not _is_boilerplate_block(text, self._boilerplate_norms)
+        ]
+
+    def _build_block_cache(self) -> None:
+        """提取全页文本块并计算跨页重复样板（页眉/页脚）集合，缓存供后续复用。
+
+        页眉/页脚样板在每个页面重复出现，混入正文块会让 chunk 携带大量重复噪声
+        （实测 2023 知识点集锦 24% chunk 含水印样板）。判定仅依据「归一化文本的
+        跨页重复度 + 长度」，不针对任何具体文件/关键词/case：同一归一化文本出现
+        在 >= PDF_WATERMARK_REPEAT_MIN 页且长度 <= PDF_WATERMARK_MAX_CHARS 时
+        视为样板块。整页文本块提取不做图片解码，成本可接受，仅在真正需要块级
+        数据（PyMuPDF 兜底路径）时才构建。
+        """
+        page_count = 0
+        try:
+            page_count = int(self._doc.page_count or 0)
+        except Exception:
+            page_count = 0
+        normalized_counts: dict[str, int] = {}
+        block_map: dict[int, list[tuple[str, dict[str, float] | None]]] = {}
+        for page_number in range(1, page_count + 1):
+            try:
+                page = self._doc.load_page(page_number - 1)
+                page_width = float(page.rect.width) or 1.0
+                page_height = float(page.rect.height) or 1.0
+                raw_blocks = page.get_text("blocks")
+            except Exception:
+                continue
+            blocks: list[tuple[str, dict[str, float] | None]] = []
+            for block in raw_blocks:
+                # block 形如 (x0, y0, x1, y1, text, block_no, block_type)；仅收文本块。
+                if len(block) < 7 or block[6] != 0:
+                    continue
+                text = str(block[4] or "").strip()
+                if not text:
+                    continue
+                x0, y0, x1, y1 = block[0], block[1], block[2], block[3]
+                try:
+                    bbox = {
+                        "x0": max(0.0, min(1.0, float(x0) / page_width)),
+                        "y0": max(0.0, min(1.0, float(y0) / page_height)),
+                        "x1": max(0.0, min(1.0, float(x1) / page_width)),
+                        "y1": max(0.0, min(1.0, float(y1) / page_height)),
+                    }
+                except Exception:
+                    bbox = None
+                norm = _normalize_boilerplate_text(text)
+                normalized_counts[norm] = normalized_counts.get(norm, 0) + 1
+                blocks.append((text, bbox))
+            block_map[page_number] = blocks
+        self._block_map = block_map
+        self._boilerplate_norms = {
+            norm
+            for norm, count in normalized_counts.items()
+            if norm and count >= PDF_WATERMARK_REPEAT_MIN and len(norm) <= PDF_WATERMARK_MAX_CHARS
+        }
+
+    def page_text_bbox(self, page_number: int) -> dict[str, float] | None:
+        """计算该页文本区域的归一化包围盒（所有文本块 bbox 的并集）。
+
+        供给 pypdf 正常提取的整页节点附上粗粒度 bbox：前端在 pdfjs 页面上据此把
+        「引用在本页」圈到整个正文区域（而不是只圈首个块或整页留白）。无文本块或
+        PyMuPDF 不可用时返回 None（调用方保持原无 bbox 语义）。仅依赖文本块几何，
+        不针对任何文件/关键词/case。
+        """
+        blocks = self.page_blocks(page_number)
+        xs: list[tuple[float, float]] = []
+        ys: list[tuple[float, float]] = []
+        for _, bbox in blocks:
+            if bbox:
+                xs.append((bbox["x0"], bbox["x1"]))
+                ys.append((bbox["y0"], bbox["y1"]))
+        if not xs:
+            return None
+        return {
+            "x0": max(0.0, min(x0 for x0, _ in xs)),
+            "y0": max(0.0, min(y0 for y0, _ in ys)),
+            "x1": min(1.0, max(x1 for _, x1 in xs)),
+            "y1": min(1.0, max(y1 for _, y1 in ys)),
+        }
+
+    def _open(self) -> bool:
+        """延迟打开 PyMuPDF 文档并复用；打开失败则视为不可用。"""
+        if self._doc is not None or self._unavailable:
+            return self._doc is not None
+        module, error = _load_pymupdf()
+        if module is None:
+            self._unavailable = True
+            self.error = error
+            return False
+        try:
+            self._doc = module.open(self._path)
+        except Exception as error:
+            self._unavailable = True
+            self._doc = None
+            self.error = f"PyMuPDF打开失败: {type(error).__name__}: {error}"
+            return False
+        return self._doc is not None
+
+    def close(self) -> None:
+        """显式关闭 PyMuPDF 文档，释放文件句柄。"""
+        if self._doc is not None:
+            try:
+                self._doc.close()
+            except Exception:
+                pass
+            self._doc = None
+
+
+def _normalize_boilerplate_text(text: str) -> str:
+    """归一化样板块文本：折叠空白并剥离尾部页码变体（如「1 / 32」）。
+
+    页脚横幅常带随页变化的「N / M」页码，逐页文本并不完全相同；剥离尾部页码
+    后页脚主体在跨页间一致，才能用「跨页重复度」识别。仅做结构归一化，不针对
+    任何具体文件/关键词/case。
+    """
+    collapsed = " ".join(text.split())
+    return re.sub(r"\s*\d+\s*/\s*\d+\s*$", "", collapsed).strip()
+
+
+def _is_boilerplate_block(text: str, boilerplate_norms: set[str]) -> bool:
+    """判定单块文本是否为页眉/页脚样板块。
+
+    两类命中即视为样板：1) 归一化文本落在跨页重复样板块集合中；2) 纯页码碎片
+    （如「1 / 32」「第 3 页」，不携带任何正文信息）。纯页码碎片归一化后为空串，
+    不会被重复度集合收录，这里单独按形态识别。
+    """
+    norm = _normalize_boilerplate_text(text)
+    if norm in boilerplate_norms:
+        return True
+    collapsed = " ".join(text.split())
+    return bool(re.fullmatch(r"\d+\s*/\s*\d+", collapsed)) or bool(
+        re.fullmatch(r"第\s*\d+\s*页", collapsed)
+    )
+
+
+def _detect_watermark_pages(pages: Any) -> set[int]:
+    """识别"薄文本 + 跨页重复"的样板页，返回需要转送 OCR 的页码集合。
+
+    pypdf 逐页提取文本；某页归一化文本少于 PDF_WATERMARK_MAX_CHARS 且与至少
+    PDF_WATERMARK_REPEAT_MIN 页完全相同，判定为页眉/页脚水印类样板文字（扫描/
+    拼版书的正文不在文本层）。仅按长度 + 重复度判定，不针对任何文件/关键词/case。
+    """
+    texts: list[tuple[int, str]] = []
+    for page_number, page in enumerate(pages, 1):
+        try:
+            text = (page.extract_text() or "").strip()
+        except Exception:
+            text = ""
+        norm = re.sub(r"\s+", "", text)
+        if norm and len(norm) < PDF_WATERMARK_MAX_CHARS:
+            texts.append((page_number, norm))
+    counts: dict[str, int] = {}
+    for _, norm in texts:
+        counts[norm] = counts.get(norm, 0) + 1
+    repeated = {norm for norm, count in counts.items() if count >= PDF_WATERMARK_REPEAT_MIN}
+    return {page_number for page_number, norm in texts if norm in repeated}
+
+
 def _pdf_result(request: ParseRequest, path: Path, started_at: float) -> ParseResult:
     try:
         from pypdf import PdfReader
@@ -723,7 +1051,13 @@ def _pdf_result(request: ParseRequest, path: Path, started_at: float) -> ParseRe
         image_assets: list[ImageAsset] = []
         warnings: list[ParseWarning] = []
         ocr_pages: list[int] = []
+        fitz_fallback = _PdfTextFallback(path)
+        fitz_used_pages = 0
+        fitz_fallback_consulted = False
         pages = reader.pages[: request.max_pages] if request.max_pages else reader.pages
+        # 先做一次轻量预扫：识别"薄文本 + 跨页重复"的样板页（页眉/页脚水印，正文在
+        # 光栅位图里）页码集合。正文缺失的这些页即使文本层有少量水印，也要送 OCR。
+        boilerplate_pages = _detect_watermark_pages(pages)
         for page_number, page in enumerate(pages, 1):
             try:
                 text = (page.extract_text() or "").strip()
@@ -732,7 +1066,33 @@ def _pdf_result(request: ParseRequest, path: Path, started_at: float) -> ParseRe
                 # 标记 OCR 抢救，绝不让整份 PDF 解析失败。
                 text = ""
                 warnings.append(ParseWarning("PDF_PARSE_FAILED", str(error), locator("pdf", page_no=page_number)))
-            if request.ocr_policy == "force" or (request.ocr_policy == "auto" and len(text) < 30):
+            # 每页初始的兜底状态：未发生 PyMuPDF 兜底时 use_blocks 视为不使用行级 bbox 节点。
+            fallback_blocks: list[tuple[str, dict[str, float] | None]] = []
+            used_fitz = False
+            # pypdf 对部分带有效文本层的 PDF 只能提取到页眉/页脚水印（如「2023
+            # 数据库系统工程师备考知识点集锦」pypdf≈91 字符/页只是「内部资料，禁止
+            # 传播（希赛网）」页眉，正文几乎为零；PyMuPDF≈700-900 字符/页能完整提取
+            # 正文）。这类页若按原字面量索引，索引里只有水印、正文检索不到；若被当
+            # 作扫描件送 OCR，Windows 渲染器又把整页画黑、正文反而丢失。因此当 pypdf
+            # 提取偏短（疑似只拿到水印/页眉）、用户未强制 OCR 时，回退 PyMuPDF 比对
+            # 体量：只要它能提取出显著更丰富的真实文本（≥30 字且 > pypdf 的 3 倍），
+            # 就采用 PyMuPDF 文本并按文本页索引。该规则是通用的「某解析器明显欠提取
+            # → 取更全者」，仅按体量差异比对，不针对任何具体文件/关键词/case。
+            if len(text) < PDF_TEXT_FALLBACK_PROBE_MIN and request.ocr_policy != "force":
+                fallback_text = fitz_fallback.page_text(page_number)
+                if len(fallback_text) >= PDF_TEXT_FALLBACK_MIN and len(fallback_text) > len(text) * 3:
+                    text = fallback_text
+                    fallback_blocks = fitz_fallback.page_blocks(page_number)
+                    used_fitz = True
+                    fitz_used_pages += 1
+                else:
+                    fitz_fallback_consulted = True
+            is_boilerplate = page_number in boilerplate_pages
+            # 由 PyMuPDF 兜底恢复了真实正文的页已具备可索引文本，绝不再送 OCR（否则
+            # Windows 渲染器会把这些页画黑、正文反而丢失）。只有真正缺正文的页才进 OCR。
+            if request.ocr_policy == "force" or (
+                request.ocr_policy == "auto" and not used_fitz and (len(text) < 30 or is_boilerplate)
+            ):
                 # 单文档 OCR 预算：纯扫描书（600+ 页）全量 OCR 需几十分钟，
                 # 超出预算的页面标记 OCR_REQUIRED 待后续补跑，首次索引不被拖垮。
                 if request.ocr_policy == "force" or len(ocr_pages) < OCR_PAGE_BUDGET:
@@ -743,9 +1103,31 @@ def _pdf_result(request: ParseRequest, path: Path, started_at: float) -> ParseRe
                         "该页超出本次OCR预算，尚未OCR",
                         locator("pdf", page_no=page_number),
                     ))
-            if len(text) < 30 and request.ocr_policy == "disabled":
-                warnings.append(ParseWarning("OCR_REQUIRED", "该页可提取文字少于30个字符", locator("pdf", page_no=page_number)))
-            nodes.append(DocumentNode(uuid7(), None, page_number, "page", text or None, None, locator("pdf", page_no=page_number)))
+            if (len(text) < 30 or is_boilerplate) and request.ocr_policy == "disabled":
+                warnings.append(ParseWarning("OCR_REQUIRED", "该页缺少可索引正文，需OCR", locator("pdf", page_no=page_number)))
+            if fallback_blocks:
+                # PyMuPDF 兜底按文本块切节点：每块携带归一化 bbox，前端据此在 pdfjs
+                # 渲染页面上高亮引用位置（与 OCR 线级节点同语义）。块级粒度既保持正文
+                # 段落连贯，又能精确定位到引用所在区域。不构造整页节点，避免正文重复
+                # 入库、稀释检索。
+                block_base = len(nodes)
+                for block_text, block_bbox in fallback_blocks:
+                    nodes.append(DocumentNode(
+                        uuid7(), None, block_base + len(nodes) + 1,
+                        "page_block", block_text, None,
+                        locator("pdf", page_no=page_number, bbox=block_bbox),
+                    ))
+                nodes = _renumber_nodes(nodes)
+            else:
+                # pypdf 正常提取的整页节点：补上该页文本区域的粗粒度 bbox，使几乎
+                # 所有文本 PDF 都能在页面上圈出引用位置（块级/线级 bbox 由 OCR、兜底
+                # 路径产出）。不拆分整页节点，避免密集排版页（表格/清单）碎成海量小块
+                # 稀释索引。
+                page_bbox = fitz_fallback.page_text_bbox(page_number)
+                nodes.append(DocumentNode(
+                    uuid7(), None, page_number, "page", text or None, None,
+                    locator("pdf", page_no=page_number, bbox=page_bbox),
+                ))
             # 仅文本页提取内嵌图片：纯扫描页的整页图会由 OCR 渲染路径产出
             # pdf_scanned_page 资产，这里再解一整份写盘是双份冗余；且 pypdf
             # 解码大扫描书每页整图实测 ~0.3s/页，600+ 页会拖垮 360s 的解析
@@ -767,8 +1149,24 @@ def _pdf_result(request: ParseRequest, path: Path, started_at: float) -> ParseRe
                 except Exception as error:
                     # 图片提取尽力而为（如 JBIG2 无解码器抛 RuntimeError），失败只记警告。
                     warnings.append(ParseWarning("PDF_IMAGE_EXTRACT_FAILED", str(error), locator("pdf", page_no=page_number)))
+        # 兜底痕迹：若有页经 PyMuPDF 恢复了 pypdf 缺失的文本层，记一条可诊断警告，
+        # 说明该文件依赖兜底才能获得完整正文（也解释为何这些页没走 OCR 渲染）。
+        if fitz_used_pages:
+            warnings.append(ParseWarning(
+                "PDF_TEXT_FALLBACK",
+                f"{fitz_used_pages} 页经 pypdf 提取文字过少，已用 PyMuPDF 提取文本层兜底（不再误判为扫描件 OCR）",
+                locator("pdf"),
+            ))
+        elif fitz_fallback_consulted and fitz_fallback.error:
+            # 有低位欠提取的页需要 PyMuPDF 兜底但兜底本身不可用（导入/打开失败），
+            # 明确记录原因，避免这些页被静默当作无文本或送 OCR 却不知缘由。
+            warnings.append(ParseWarning(
+                "PDF_TEXT_FALLBACK_UNAVAILABLE",
+                fitz_fallback.error,
+                locator("pdf"),
+            ))
         ocr_page_count = 0
-        parser_name = "pypdf"
+        parser_name = "pypdf+fitz" if fitz_used_pages else "pypdf"
         if ocr_pages:
             render_directory: Path | None = None
             if request.asset_cache_dir:
@@ -793,7 +1191,7 @@ def _pdf_result(request: ParseRequest, path: Path, started_at: float) -> ParseRe
                             for ordinal, node in enumerate(nodes, 1)
                         ]
                         ocr_page_count = len(recognized_pages)
-                        parser_name = f"pypdf+{ocr_engine}"
+                        parser_name = f"{'pypdf+fitz+' if fitz_used_pages else 'pypdf+'}{ocr_engine}"
                     ocr_text_by_page: dict[int, str] = {}
                     ocr_route_by_page: dict[int, tuple[float | None, str | None]] = {}
                     for page_number in ocr_pages:
@@ -834,12 +1232,15 @@ def _pdf_result(request: ParseRequest, path: Path, started_at: float) -> ParseRe
                         try:
                             page_number = int(rendered["page_no"])
                             rendered_path = Path(str(rendered["path"]))
+                            # 整页聚合的 image_ocr 搜索节点（「图片文字：…」）复用该 locator，
+                            # 附上本页 OCR 行 bbox 的并集，前端才能在 pdfjs 页面上圈出引用区域。
+                            page_bbox = _ocr_page_area_bbox(ocr_result.get("lines", []), page_number)
                             asset = _cache_image_asset(
                                 request,
                                 rendered_path.read_bytes(),
                                 ".png",
                                 "pdf_scanned_page",
-                                locator("pdf", page_no=page_number),
+                                locator("pdf", page_no=page_number, bbox=page_bbox),
                                 ocr_text_by_page.get(page_number),
                                 ocr_route_by_page.get(page_number, (None, None))[0],
                                 ocr_engine,
@@ -856,6 +1257,7 @@ def _pdf_result(request: ParseRequest, path: Path, started_at: float) -> ParseRe
                 if render_directory is not None:
                     shutil.rmtree(render_directory, ignore_errors=True)
         status: Literal["parsed", "partial"] = "partial" if warnings else "parsed"
+        fitz_fallback.close()
         return _result(request, status, parser_name, nodes, warnings, len(pages), started_at, ocr_page_count, image_assets, ocr_attempts if ocr_pages else [])
     except Exception as error:
         # pypdf 内部还会抛出 PdfStreamError/TypeError/struct.error 等不在

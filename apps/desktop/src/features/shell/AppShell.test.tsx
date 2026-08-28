@@ -38,7 +38,7 @@ describe("AppShell", () => {
     bridgeMock.startup_get_state.mockResolvedValue({ phase: "ready", ready: true, progress: 1, pending_files: 0, blocker: null, recovery_actions: [] });
     bridgeMock.model_state_get.mockResolvedValue(null);
     bridgeMock.model_download_list.mockResolvedValue([]);
-    bridgeMock.home_get_summary.mockResolvedValue({ local_date: "2026-08-11", metrics: [], scan_progress: null, recent_files: [], favorite_files: [], collections: [], candidate_roots: [] });
+    bridgeMock.home_get_summary.mockResolvedValue({ local_date: "2026-08-11", metrics: [], scan_progress: null, index_initialized: false });
     bridgeMock.environment_get_latest.mockResolvedValue(null);
     bridgeMock.environment_detect.mockResolvedValue({ status: "ready" });
     bridgeMock.app_status_get.mockResolvedValue({ local_only: true, source_files_readonly: true, roots: [], scan_progress: null, maintenance: { active_jobs: 0, background_notice: null }, recovery_actions: [], checked_at: "2026-08-11T00:00:00Z" });

@@ -7,7 +7,10 @@ interface PdfVisualPreviewProps {
   preview: FilePreview;
 }
 
-const sourceUrl = (fileId: string) => `http://fanfan-pdf.localhost/${encodeURIComponent(fileId)}`;
+export const pdfPreviewSourceUrls = (fileId: string) => {
+  const encoded = encodeURIComponent(fileId);
+  return [`fanfan-pdf://localhost/${encoded}`, `http://fanfan-pdf.localhost/${encoded}`];
+};
 
 export function PdfVisualPreview({ preview }: PdfVisualPreviewProps) {
   const targetNode = useMemo(
@@ -32,8 +35,18 @@ export function PdfVisualPreview({ preview }: PdfVisualPreviewProps) {
       try {
         const pdfjs = await import("pdfjs-dist");
         pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).toString();
-        const task = pdfjs.getDocument({ url: sourceUrl(preview.file.file_id), withCredentials: false });
-        loaded = await task.promise;
+        let lastLoadError: unknown = null;
+        for (const url of pdfPreviewSourceUrls(preview.file.file_id)) {
+          const task = pdfjs.getDocument({ url, withCredentials: false });
+          try {
+            loaded = await task.promise;
+            break;
+          } catch (candidateError) {
+            lastLoadError = candidateError;
+            await task.destroy().catch(() => undefined);
+          }
+        }
+        if (!loaded) throw lastLoadError ?? new Error("PDF加载失败");
         if (!disposed) {
           setPdf(loaded);
           setError(null);
@@ -74,7 +87,7 @@ export function PdfVisualPreview({ preview }: PdfVisualPreviewProps) {
         await renderTask.promise;
       } catch (renderError) {
         if (!disposed && !(renderError instanceof Error && renderError.name === "RenderingCancelledException")) {
-      setError(errorMessage(renderError));
+          setError(errorMessage(renderError));
         }
       }
     })();
@@ -84,12 +97,22 @@ export function PdfVisualPreview({ preview }: PdfVisualPreviewProps) {
     };
   }, [pageNo, pdf]);
 
-  const highlight = preview.nodes.find((node) => node.locator.page_no === pageNo && node.locator.bbox)?.locator.bbox ?? null;
+  // 当前页所有带 bbox 的引用节点都要高亮（不应只高亮第一个），锚点节点用更深的颜色突出。
+  // 纯通用逻辑，不做任何文件/关键词特判。
+  const pageHighlights = preview.nodes
+    .filter((node) => node.locator.page_no === pageNo && node.locator.bbox)
+    .map((node) => ({ nodeId: node.node_id, isAnchor: node.node_id === preview.anchor_node_id, bbox: node.locator.bbox! }));
+  const hasHighlight = pageHighlights.some((item) => !item.isAnchor);
 
   if (!window.__TAURI_INTERNALS__) return <p className="pdf-preview__notice">PDF视觉预览仅在翻翻桌面程序中加载。</p>;
   return <section className="pdf-preview" aria-label={`${preview.file.display_name} PDF视觉预览`}>
     <header><strong>PDF视觉页</strong><span>{pdf ? `${pageNo} / ${pdf.numPages}` : "正在加载"}</span><div><button type="button" disabled={!pdf || pageNo <= 1} onClick={() => setPageNo((value) => value - 1)}>上一页</button><button type="button" disabled={!pdf || pageNo >= pdf.numPages} onClick={() => setPageNo((value) => value + 1)}>下一页</button></div></header>
     {error && <p role="alert" className="inline-error">PDF视觉预览失败：{error}</p>}
-    <div ref={viewportRef} className="pdf-preview__viewport"><div className="pdf-preview__page"><canvas ref={canvasRef} />{highlight && <i className="pdf-preview__highlight" style={{ left: `${highlight.x0 * 100}%`, top: `${highlight.y0 * 100}%`, width: `${(highlight.x1 - highlight.x0) * 100}%`, height: `${(highlight.y1 - highlight.y0) * 100}%` }} />}</div></div>
+    <div ref={viewportRef} className="pdf-preview__viewport"><div className="pdf-preview__page"><canvas ref={canvasRef} />
+      {pageHighlights.map(({ nodeId, isAnchor, bbox }) => (
+        <i key={nodeId} className={`pdf-preview__highlight${isAnchor ? " pdf-preview__highlight--anchor" : ""}`} style={{ left: `${bbox.x0 * 100}%`, top: `${bbox.y0 * 100}%`, width: `${(bbox.x1 - bbox.x0) * 100}%`, height: `${(bbox.y1 - bbox.y0) * 100}%` }} />
+      ))}
+      {hasHighlight && <span className="pdf-preview__locator-note">引用位置已高亮</span>}
+    </div></div>
   </section>;
 }

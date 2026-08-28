@@ -1,5 +1,5 @@
 import { CheckCircleOutlined, DownOutlined, ExclamationCircleOutlined, LoadingOutlined, RightOutlined } from "@ant-design/icons";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import type { AskExecutionState, AskExecutionNode } from "./ask-execution-state";
 
 const formatDuration = (durationMs: number | null) => {

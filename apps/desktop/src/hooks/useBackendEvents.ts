@@ -47,8 +47,8 @@ export function useBackendEvents() {
               level: "warning",
               message: "本机未安装 Ollama，问答与语义检索暂不可用",
               details: "翻翻使用本机 Ollama 做本地问答与语义检索；需要你自行安装，翻翻不会自动下载或安装第三方包。",
-              action_label: "去设置",
-              action_route: "settings",
+              action_label: "去模型管理",
+              action_route: "model_setup",
             });
           } else if (status === "installed_not_running") {
             upsertNotice({
@@ -56,10 +56,10 @@ export function useBackendEvents() {
               level: "warning",
               message: "Ollama 已安装但服务未启动",
               details: event.payload?.error_code
-                ? `启动失败：${event.payload.error_code}。可在设置里重试。`
-                : event.payload?.starting === false ? "启动超时，可在设置里重试。" : "正在后台启动，稍候自动刷新。",
-              action_label: "去设置",
-              action_route: "settings",
+                ? `启动失败：${event.payload.error_code}。可在模型管理里重试。`
+                : event.payload?.starting === false ? "启动超时，可在模型管理里重试。" : "正在后台启动，稍候自动刷新。",
+              action_label: "去模型管理",
+              action_route: "model_setup",
             });
           } else {
             setNotices((current) => current.filter((item) => item.notice_key === "ollama-not-installed" ? false : item.notice_key !== "ollama-not-running"));
@@ -84,7 +84,7 @@ export function useBackendEvents() {
         listen(RUNTIME_EVENTS.modelDownloadState, () => {
           void queryClient.invalidateQueries({ queryKey: ["model-downloads"] });
         }),
-        listen<AppError>(RUNTIME_EVENTS.modelDownloadFailed, (event) => {
+        listen<AppError>(RUNTIME_EVENTS.modelDownloadFailed, () => {
           void queryClient.invalidateQueries({ queryKey: ["model-downloads"] });
         }),
         listen(RUNTIME_EVENTS.modelDownloadCompleted, () => {
