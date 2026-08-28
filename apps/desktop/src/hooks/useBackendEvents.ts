@@ -101,9 +101,13 @@ export function useBackendEvents() {
           // 后台 GPU 探测完成时环境检测结果也随之刷新（GPU 名称/显存/后端）
           void queryClient.invalidateQueries({ queryKey: ["environment"] });
         }),
-        listen(RUNTIME_EVENTS.embeddingIndexPhase, () => {
+        listen<string>(RUNTIME_EVENTS.embeddingIndexPhase, (event) => {
           void queryClient.invalidateQueries({ queryKey: ["model-runtime"] });
           void queryClient.invalidateQueries({ queryKey: ["model-downloads"] });
+          // 语义索引重新生效时，撤销先前因失败滞留的 warning，避免一次性失败一直挂着吓用户。
+          if (event.payload === "active") {
+            setNotices((current) => current.filter((item) => !item.notice_key.startsWith("embedding-failed-")));
+          }
         }),
         listen<AppError>(RUNTIME_EVENTS.embeddingFailed, (event) => {
           void queryClient.invalidateQueries({ queryKey: ["model-runtime"] });

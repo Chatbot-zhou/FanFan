@@ -459,6 +459,7 @@
     {"code": "OLLAMA_INSTALLED_NOT_RUNNING", "category": "runtime", "retryable_default": true, "description": "Ollama 已安装但服务未运行，需要启动"},
     {"code": "OLLAMA_MODEL_NOT_FOUND", "category": "model", "retryable_default": false, "description": "Ollama 中不存在指定模型，需要先拉取"},
     {"code": "OLLAMA_NOT_INSTALLED", "category": "runtime", "retryable_default": false, "description": "未检测到 Ollama，需要用户在官方渠道安装"},
+    {"code": "OLLAMA_CONNECTION_CLOSED", "category": "runtime", "retryable_default": true, "description": "Ollama 连接在响应头完整返回前被关闭（模型冷启动/并发排队瞬时故障）"},
     {"code": "OLLAMA_PULL_FAILED", "category": "model", "retryable_default": true, "description": "Ollama 拉取模型失败"},
     {"code": "OLLAMA_REQUEST_FAILED", "category": "runtime", "retryable_default": true, "description": "Ollama 服务请求失败"},
     {"code": "OLLAMA_RESPONSE_INVALID", "category": "runtime", "retryable_default": false, "description": "Ollama 服务响应格式异常"},

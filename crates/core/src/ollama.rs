@@ -719,7 +719,18 @@ impl OllamaClient {
         };
         let mut stream = self.connect()?;
         write_raw_request(&mut stream, method, path, &write_body, self.port)?;
-        let (status, headers, leftover) = read_http_head(&mut stream, path)?;
+        let (status, headers, leftover) = match read_http_head(&mut stream, path) {
+            Ok(head) => head,
+            Err(error) if error.retryable => {
+                // 模型冷启动/并发排队时服务端可能在头部写完前关闭连接，属瞬时故障。
+                // 短退避后原地重建连接重试一次，避免 embedding 等整批因单次 EOF 失败。
+                std::thread::sleep(Duration::from_millis(500));
+                let mut stream = self.connect()?;
+                write_raw_request(&mut stream, method, path, &write_body, self.port)?;
+                read_http_head(&mut stream, path)?
+            }
+            Err(error) => return Err(error),
+        };
         let mut prepend = PrependStream {
             prefix: std::io::Cursor::new(leftover),
             inner: stream,
@@ -841,8 +852,16 @@ fn read_http_head(
             ));
         }
     }
-    let separator = separator_index
-        .ok_or_else(|| AppError::new("OLLAMA_RESPONSE_INVALID", "Ollama 响应头不完整", false))?;
+    // 读到 EOF（read==0）仍未得到完整响应头：说明服务端在头部写完前关闭了连接
+    // （典型：模型冷启动 / 并发排队时连接被掐断）。这是瞬时故障而非响应内容异常，
+    // 归为可重试的连接关闭错误，避免 embedding 等整批失败被误判为不可重试。
+    let separator = separator_index.ok_or_else(|| {
+        AppError::new(
+            "OLLAMA_CONNECTION_CLOSED",
+            "Ollama 连接在响应头完整返回前被关闭",
+            true,
+        )
+    })?;
     let head_text = std::str::from_utf8(&head[..separator])
         .map_err(|_| AppError::new("OLLAMA_RESPONSE_INVALID", "Ollama 响应头格式异常", false))?;
     let mut lines = head_text.lines();
@@ -961,9 +980,12 @@ fn read_exact_bytes(
             }
         };
         if read == 0 {
+            // Content-Length 未读完就 EOF：服务端在正文写完前关闭了连接
+            //（典型：模型冷启动/并发排队瞬时故障）。与读头一致归为可重试的连接关闭错误，
+            // 避免误报成「响应正文未接收完整」这种看似响应内容异常的错误码。
             return Err(AppError::new(
-                "OLLAMA_RESPONSE_INVALID",
-                "Ollama 响应正文未接收完整",
+                "OLLAMA_CONNECTION_CLOSED",
+                "Ollama 连接在响应正文完整返回前被关闭",
                 true,
             ));
         }
