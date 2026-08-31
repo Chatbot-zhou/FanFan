@@ -10,7 +10,9 @@
 //!   不做任何针对具体问题的映射（禁止 开fa→开发 式的硬编码）。
 //!
 //! 纪律：规范化只做「放宽召回」——任何变体都只追加参与 parse/retrieval，
-//! 绝不覆盖原句；不改动专有名词（纯 ASCII 词与不邻接 CJK 的 ASCII 词不动）。
+//!  绝不覆盖原句；不改动专有名词（纯 ASCII 词与不邻接 CJK 的 ASCII 词不动）。
+
+use chrono::Datelike;
 
 /// 目标短语中的指代/疑问填充词（长短语在前，替换按最长优先避免残词）。
 /// 词元提取只用于「放宽候选匹配」，删词过激只会多召回，不会造成误答。
@@ -316,6 +318,210 @@ pub fn normalize_query_variants(question: &str) -> Vec<String> {
     variants
 }
 
+/// 单个中文数字字 → 数值（含「两」=2、「〇」=0，不含「十」）。
+fn cn_digit(ch: char) -> Option<u32> {
+    match ch {
+        '〇' | '零' => Some(0),
+        '一' => Some(1),
+        '二' | '两' => Some(2),
+        '三' => Some(3),
+        '四' => Some(4),
+        '五' => Some(5),
+        '六' => Some(6),
+        '七' => Some(7),
+        '八' => Some(8),
+        '九' => Some(9),
+        _ => None,
+    }
+}
+
+/// 把「一」～「九十九」的中文数字解析成数值；无法解析返回 None。
+///
+/// 覆盖：单字（一～九）、十、X 十（二十）、十 X（十一）、X 十 Y（二十一）。
+/// 二十/三十…用 `cn_digit` 排除「零」作为十位（「零十」非法）。
+fn parse_cn_number(text: &str) -> Option<u32> {
+    let chars: Vec<char> = text.chars().collect();
+    match chars.len() {
+        0 => None,
+        1 => {
+            if chars[0] == '十' {
+                Some(10)
+            } else {
+                cn_digit(chars[0]).filter(|&n| n >= 1)
+            }
+        }
+        2 => {
+            let (a, b) = (chars[0], chars[1]);
+            if a == '十' {
+                cn_digit(b).map(|v| 10 + v)
+            } else if b == '十' {
+                cn_digit(a).and_then(|v| if v == 0 { None } else { Some(v * 10) })
+            } else {
+                None
+            }
+        }
+        3 => {
+            let (a, mid, b) = (chars[0], chars[1], chars[2]);
+            if mid == '十' {
+                let tens = cn_digit(a)?;
+                let ones = cn_digit(b)?;
+                if tens != 0 && ones != 0 {
+                    Some(tens * 10 + ones)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// 把连续阿拉伯数字解析成 1..=99；空串或越界返回 None。
+fn parse_arabic_number(text: &str) -> Option<u32> {
+    if text.is_empty() || !text.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let value: u32 = text.parse().ok()?;
+    if (1..=99).contains(&value) {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// 解析数字词元：先按阿拉伯数字、再按中文数字（「7」/「七」都 → 7）。
+fn parse_number_token(text: &str) -> Option<u32> {
+    parse_arabic_number(text).or_else(|| parse_cn_number(text))
+}
+
+/// 在 `unit`（如「个月前」「天前」）之前提取紧邻的数字（支持「三个月前」
+/// 这种数字与单位之间夹一个「个」的情况），越界/缺失返回 None。
+fn extract_number_before(text: &str, unit: &str) -> Option<u32> {
+    let pos = text.find(unit)?;
+    let prefix: Vec<char> = text[..pos].chars().collect();
+    let mut end = prefix.len();
+    if end > 0 && prefix[end - 1] == '个' {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > 0 {
+        let ch = prefix[start - 1];
+        if ch.is_ascii_digit() || ch == '十' || cn_digit(ch).is_some() {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    if start == end {
+        return None;
+    }
+    let token: String = prefix[start..end].iter().collect();
+    parse_number_token(&token)
+}
+
+/// 构造闭区间 [`DateRange`]，起止均为 `NaiveDate`，格式化为 "YYYY-MM-DD"。
+fn build_range(start: chrono::NaiveDate, end: chrono::NaiveDate) -> crate::ask::query_plan::DateRange {
+    crate::ask::query_plan::DateRange {
+        start_date: start.format("%Y-%m-%d").to_string(),
+        end_date: end.format("%Y-%m-%d").to_string(),
+    }
+}
+
+/// 计算 `months_back` 个月前的整月范围（该月 1 号至月末，闭区间）。
+///
+/// 月减法先把基准规约到当月 1 号，再用 [`chrono::Months`] 做 `checked_sub_months`，
+/// 月末通过「下月 1 号减 1 天」得到，保证 2 月闰年 / 大小月的最后一天都正确。
+fn month_range(today: chrono::NaiveDate, months_back: u32) -> Option<crate::ask::query_plan::DateRange> {
+    let first_this_month = today.with_day(1)?;
+    let first = first_this_month.checked_sub_months(chrono::Months::new(months_back))?;
+    let next = first.checked_add_months(chrono::Months::new(1))?;
+    let end = next - chrono::Duration::days(1);
+    Some(build_range(first, end))
+}
+
+/// 计算 `days_back` 天前的单日范围（start = end = 该日期）。
+fn day_range(today: chrono::NaiveDate, days_back: i64) -> crate::ask::query_plan::DateRange {
+    let day = today - chrono::Duration::days(days_back);
+    build_range(day, day)
+}
+
+/// 计算 `weeks_back` 周前的周范围（周一为一周开始，周一至周日闭区间）。
+fn week_range(today: chrono::NaiveDate, weeks_back: u32) -> crate::ask::query_plan::DateRange {
+    let monday_this_week =
+        today - chrono::Duration::days(i64::from(today.weekday().num_days_from_monday()));
+    let monday = monday_this_week - chrono::Duration::days(i64::from(weeks_back) * 7);
+    let sunday = monday + chrono::Duration::days(6);
+    build_range(monday, sunday)
+}
+
+/// 归一化时间表达：全角→半角、删除所有空白、统一小写（中文不受大小写影响，
+/// 但阿拉伯数字与可能的 ASCII 噪声可被降噪）。
+fn normalize_time_text(raw: &str) -> String {
+    let halfwidth = fullwidth_to_halfwidth(raw);
+    let collapsed: String = halfwidth
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    collapsed.to_lowercase()
+}
+
+/// 相对时间表达 → 具体日期范围（纯函数、无模型、无 IO）。
+///
+/// 入参 `raw` 为模型识别的原始时间表达（可含整句噪声，如「去年的报表」），
+/// `today` 为换算基准日；出参为闭区间日期范围（起止 "YYYY-MM-DD"），
+/// 无法识别或不含时间表达时返回 None。
+///
+/// 覆盖的表达（大小写 / 全角半角 / 空格宽容）：
+/// - 「去年」→ 上一年整年；「今年」→ 今年整年
+/// - 「上个月」「上月」→ 上月 1 号至月末；「上上个月」→ 上上月整月
+/// - 「N 个月前」（N 为 1-99 的阿拉伯或中文数字）→ 当前月减 N 个月的整月
+/// - 「N 天前」「昨天」→ 单日范围（start = end）
+/// - 「上周 / 上上周」→ 上周一至上周日（周一为一周开始）
+///
+/// 降级行为：模型只负责产出「去年」等原始表达，日期由本函数换算，
+/// 数字越界（0 或 ≥100）与无匹配一律返回 None，绝不强行注入。
+pub fn resolve_time_expression(
+    raw: &str,
+    today: chrono::NaiveDate,
+) -> Option<crate::ask::query_plan::DateRange> {
+    let text = normalize_time_text(raw);
+
+    if text.contains("去年") {
+        let start = chrono::NaiveDate::from_ymd_opt(today.year() - 1, 1, 1)?;
+        let end = chrono::NaiveDate::from_ymd_opt(today.year() - 1, 12, 31)?;
+        return Some(build_range(start, end));
+    }
+    if text.contains("今年") {
+        let start = chrono::NaiveDate::from_ymd_opt(today.year(), 1, 1)?;
+        let end = chrono::NaiveDate::from_ymd_opt(today.year(), 12, 31)?;
+        return Some(build_range(start, end));
+    }
+    if text.contains("上上个月") || text.contains("上上月") {
+        return month_range(today, 2);
+    }
+    if text.contains("上个月") || text.contains("上月") {
+        return month_range(today, 1);
+    }
+    if let Some(months) = extract_number_before(&text, "个月前") {
+        return month_range(today, months);
+    }
+    if let Some(days) = extract_number_before(&text, "天前") {
+        return Some(day_range(today, i64::from(days)));
+    }
+    if text.contains("昨天") {
+        return Some(day_range(today, 1));
+    }
+    if text.contains("上上周") {
+        return Some(week_range(today, 2));
+    }
+    if text.contains("上周") {
+        return Some(week_range(today, 1));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,5 +621,64 @@ mod tests {
     fn fullwidth_and_case_variants() {
         let variants = normalize_query_variants("ＲＡＧ 是什么");
         assert!(variants.iter().any(|variant| variant.contains("rag")));
+    }
+
+    #[test]
+    fn resolve_time_expression_maps_relative_ranges() {
+        use chrono::NaiveDate;
+        // 固定基准日 2026-08-30（周日）
+        let today = NaiveDate::from_ymd_opt(2026, 8, 30).unwrap();
+
+        let range = resolve_time_expression("去年", today).unwrap();
+        assert_eq!((range.start_date.as_str(), range.end_date.as_str()), ("2025-01-01", "2025-12-31"));
+
+        let range = resolve_time_expression("今年", today).unwrap();
+        assert_eq!((range.start_date.as_str(), range.end_date.as_str()), ("2026-01-01", "2026-12-31"));
+
+        let range = resolve_time_expression("昨天", today).unwrap();
+        assert_eq!((range.start_date.as_str(), range.end_date.as_str()), ("2026-08-29", "2026-08-29"));
+
+        let range = resolve_time_expression("7天前", today).unwrap();
+        assert_eq!((range.start_date.as_str(), range.end_date.as_str()), ("2026-08-23", "2026-08-23"));
+
+        let range = resolve_time_expression("上个月", today).unwrap();
+        assert_eq!((range.start_date.as_str(), range.end_date.as_str()), ("2026-07-01", "2026-07-31"));
+
+        // 2026-08-30 为周日：本周一为 08-24，上周一为 08-17、上周日为 08-23
+        let range = resolve_time_expression("上周", today).unwrap();
+        assert_eq!((range.start_date.as_str(), range.end_date.as_str()), ("2026-08-17", "2026-08-23"));
+
+        assert!(resolve_time_expression("帮我找一份文件", today).is_none());
+    }
+
+    #[test]
+    fn resolve_time_expression_lenient_and_chinese_numbers() {
+        use chrono::NaiveDate;
+        let today = NaiveDate::from_ymd_opt(2026, 8, 30).unwrap();
+
+        // 空格宽容：上 月 → 上月
+        let range = resolve_time_expression("上 月", today).unwrap();
+        assert_eq!((range.start_date.as_str(), range.end_date.as_str()), ("2026-07-01", "2026-07-31"));
+
+        // 中文数字：三个月前 → 2026-05 整月
+        let range = resolve_time_expression("三个月前", today).unwrap();
+        assert_eq!((range.start_date.as_str(), range.end_date.as_str()), ("2026-05-01", "2026-05-31"));
+
+        // 上上个月 → 2026-06 整月
+        let range = resolve_time_expression("上上个月", today).unwrap();
+        assert_eq!((range.start_date.as_str(), range.end_date.as_str()), ("2026-06-01", "2026-06-30"));
+
+        // 上上周 → 2026-08-10 ~ 2026-08-16
+        let range = resolve_time_expression("上上周", today).unwrap();
+        assert_eq!((range.start_date.as_str(), range.end_date.as_str()), ("2026-08-10", "2026-08-16"));
+
+        // 中文数字：七天前 → 2026-08-23
+        let range = resolve_time_expression("七天前", today).unwrap();
+        assert_eq!((range.start_date.as_str(), range.end_date.as_str()), ("2026-08-23", "2026-08-23"));
+
+        // 越界数字 → None
+        assert!(resolve_time_expression("0天前", today).is_none());
+        assert!(resolve_time_expression("100天前", today).is_none());
+        assert!(resolve_time_expression("一百个月前", today).is_none());
     }
 }

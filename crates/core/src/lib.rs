@@ -1,6 +1,7 @@
 pub mod ask;
 pub mod catalog;
 pub mod contracts;
+pub mod document_understanding;
 pub mod evaluation;
 pub mod exclusions;
 pub mod generation;
@@ -80,6 +81,10 @@ pub use ask::query_planner::{FAST_PATH_CONFIDENCE_THRESHOLD, FastPathPlan, fast_
 pub use ask::source_router::{
     SourceRouting, apply_ambiguous_override, parse_source_routing, source_router_prompt,
     source_routing_schema,
+};
+pub use document_understanding::{
+    DocumentUnderstanding, document_understanding_prompt, document_understanding_schema,
+    fallback_document_understanding, parse_document_understanding,
 };
 pub use catalog::*;
 pub use contracts::*;

@@ -51,12 +51,15 @@ use fanfan_core::{
     TraceFeatureType, TraceNodeInput, TraceNodeMeta, TriageStatus, WorkerClient, WorkerRole,
     answer_shape_directive, build_document_sections, claim_subject_mismatch, compare_prompt,
     compare_schema, digests_json, document_overview_prompt, document_summary_prompt,
+    document_understanding_prompt, document_understanding_schema,
     evaluate_answerability, existence_requires_project_context, extract_item_is_entity_like,
-    extract_prompt, extract_schema, fast_path_plan, find_external_knowledge_marker, fold_recent_history,
+    extract_prompt, extract_schema, fallback_document_understanding, fast_path_plan,
+    find_external_knowledge_marker, fold_recent_history,
     local_no_evidence_answer, longest_common_substr_len, match_alias_hints, match_relation_hints,
     memory_writer_prompt, memory_writer_schema, merge_tail_sections, overview_schema,
     match_section_digests,
-    parallel_document_recall, parse_compare_results, parse_extract_results, parse_overview,
+    parallel_document_recall, parse_compare_results, parse_document_understanding,
+    parse_extract_results, parse_overview,
     finalize_query_plan, parse_query_plan, parse_rewritten_queries, parse_section_summaries,
     parse_source_routing, parse_writer_output, prewrite_validate, query_parser_prompt,
     query_parser_schema, query_rewrite_prompt, resolve_ambiguous, resolve_documents,
@@ -13251,6 +13254,9 @@ const PROFILE_BUILD_BATCH: u32 = 200;
 /// 分类扫描每批最大画像数（与画像构建同量级）。
 const CLASSIFY_BATCH: u32 = 200;
 
+/// Document Understanding 扫描每批最大画像数（与画像构建同量级）。
+const UNDERSTANDING_BATCH: u32 = 200;
+
 /// 文档画像构建循环（Step 1 + Step 2）：每次调用处理一批（≤[`PROFILE_BUILD_BATCH`]）
 /// 「已解析 + 全量嵌入」的文件，画像就绪后立即对仍未分类的画像做类型判定。
 ///
@@ -13315,9 +13321,12 @@ fn run_profile_build_cycle(
             }
             // 画像就绪后立即尝试分类（Step 2）：纯计算 + 少量回写，失败只记日志
             let attempted = run_classification_pass(catalog, &artifact);
-            // 画像批次打满或分类还有待处理画像 → 继续下一轮
+            // 分类就绪后补语义理解（Document Understanding）：有模型走模型，否则纯兜底
+            let understood = run_document_understanding_pass(app, catalog);
+            // 画像批次打满或分类/理解还有待处理画像 → 继续下一轮
             result.profiled_files >= u64::from(PROFILE_BUILD_BATCH)
                 || attempted >= u64::from(CLASSIFY_BATCH)
+                || understood >= u64::from(UNDERSTANDING_BATCH)
         }
         Err(error) => {
             crate::runtime_log::event(
@@ -13500,6 +13509,115 @@ fn run_classification_pass(catalog: &CatalogService, artifact: &ModelArtifact) -
         &json!({
             "attempted": attempted,
             "classified": classified,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+        }),
+    );
+    attempted
+}
+
+/// Document Understanding 扫描（建模链 Step 2.b）：把「画像就绪但 purpose 为空
+/// / topics 为空」的画像补齐语义扩展字段。优先用本地生成模型做受约束 JSON
+/// 提取；无模型、激活失败或输出非法时退化为确定性兜底（纯函数），保证语义
+/// 字段一定可写、绝不阻塞索引主链。返回本轮尝试的画像数；调用方用它决定
+/// 是否继续下一轮。
+fn run_document_understanding_pass(app: &AppHandle, catalog: &CatalogService) -> u64 {
+    let pending = match catalog.list_profiles_needing_understanding(UNDERSTANDING_BATCH) {
+        Ok(pending) => pending,
+        Err(error) => {
+            crate::runtime_log::event(
+                "warning",
+                "profile",
+                "profile.understanding_failed",
+                None,
+                &json!({"error_code": error.code, "phase": "list"}),
+            );
+            return 0;
+        }
+    };
+    if pending.is_empty() {
+        return 0; // 无待理解画像：不取模型、不打扰生成运行时
+    }
+    // 取生成模型（Ok(Some) 才有模型；None/Err 一律走纯兜底，不阻塞理解）。
+    let generation_artifact: Option<ModelArtifact> = {
+        let models_state = app.state::<ModelServiceState>();
+        models_state
+            .get()
+            .ok()
+            .and_then(|models| models.active_artifact(ModelRole::Generation).ok().flatten())
+    };
+    // 生成运行时：与问答链共享同一把锁；理解是后台 best-effort，不额外驻留锁。
+    let generation = Arc::clone(&app.state::<GenerationServiceState>().0);
+    let started = Instant::now();
+    let mut understood = 0_u64;
+    let mut failed = 0_u64;
+    for (profile, file_name) in pending {
+        let (system, user) = document_understanding_prompt(
+            &file_name,
+            &profile.title,
+            &profile.section_titles,
+            &profile.summary,
+        );
+        let schema = document_understanding_schema();
+        // 尝试模型：任何失败（锁中毒/激活失败/推理失败/解析失败）都降级为兜底。
+        let model_result = generation_artifact.as_ref().and_then(|artifact| {
+            let mut runtime = match generation.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if runtime.active_model_path() != Some(artifact.local_path.as_str())
+                || !runtime.is_active()
+            {
+                if runtime
+                    .activate(&artifact.local_path, 4096, interactive_inference_threads())
+                    .is_err()
+                {
+                    return None;
+                }
+            }
+            let cancelled = AtomicBool::new(false);
+            runtime
+                .complete_json_cancellable(&system, &user, 512, &schema, &cancelled)
+                .ok()
+                .and_then(|raw| parse_document_understanding(&raw))
+        });
+        // 兜底：模型不可用/输出非法时用确定性规则派生，语义字段一定可写。
+        let understanding = model_result.unwrap_or_else(|| {
+            fallback_document_understanding(
+                &profile.title,
+                &profile.section_titles,
+                &profile.keywords,
+                profile.document_type,
+            )
+        });
+        let mut updated = profile.clone();
+        updated.purpose = understanding.purpose;
+        updated.topics = understanding.topics;
+        updated.confidence = understanding.confidence;
+        updated.updated_at = Utc::now();
+        match catalog.update_document_profile_semantic(&updated) {
+            Ok(true) => understood += 1,
+            Ok(false) => failed += 1, // 画像被并发删除/重建：下轮由待理解列表补齐
+            Err(error) => {
+                failed += 1;
+                crate::runtime_log::event(
+                    "warning",
+                    "profile",
+                    "profile.understanding_failed",
+                    None,
+                    &json!({"error_code": error.code, "phase": "write"}),
+                );
+            }
+        }
+    }
+    let attempted = understood + failed;
+    crate::runtime_log::event(
+        "info",
+        "profile",
+        "profile.understanding_completed",
+        None,
+        &json!({
+            "attempted": attempted,
+            "understood": understood,
             "elapsed_ms": started.elapsed().as_millis() as u64,
         }),
     );
@@ -13737,18 +13855,19 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
             ));
         };
         let existing_generation = catalog.active_vector_generation(&model_artifact_id)?;
-        // 除新增分块外，active 代际覆盖不足（如上次构建被中断后残留的过期索引）也必须重建，
-        // 否则过期索引会一直保持 active，语义检索/RAG 持续命中陈旧子集。
-        // 注意：不能把 item_count 与 searchable_chunks 直接比较——searchable 会随新增
-        // 嵌入持续增长，直接比较会让每次启动（即使只嵌入几十个 chunk）都触发 19.9 万条
-        // 全量重建，期间 CPU 打满、全部页面查询排队 10-38s。覆盖缺口 <5%（约 1 万
-        // chunk）时继续用旧索引，搜索最多短暂 miss 新入库内容，积累到阈值后自动补齐。
+        // 重建基准从「全部有效 chunk(searchable_chunks)」收紧为「可索引 chunk」：
+        // 只有已生成 embedding 的 chunk 才可能进入向量索引，禁用目录/OCR 失败等
+        // 来源的 chunk 永不 embedding，若以它们为分母，缺口永远无法收敛，反而每个
+        // 周期都触发全量重建。indexable_chunks 与重建时实际加载的条目同口径，因此
+        // 一旦 item_count 落后（哪怕只有 1 条，例如索引建立后又增量嵌入的少数新块），
+        // 这里都能精确捕捉并补齐到 100%，不再容忍 5% 缺口。
+        let indexable_chunks = catalog.count_indexable_chunks(&model_artifact_id, dimension)?;
         let stale_generation = existing_generation.as_ref().is_none_or(|generation| {
             generation.dimension != dimension
                 || generation.item_count == 0
-                || (generation.item_count as f64) < (searchable_chunks as f64 * 0.95)
+                || generation.item_count < indexable_chunks
         });
-        let needs_rebuild = searchable_chunks > 0 && stale_generation;
+        let needs_rebuild = indexable_chunks > 0 && stale_generation;
         if needs_rebuild {
             crate::runtime_log::event(
                 "info",
@@ -13763,18 +13882,17 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
             );
             let _ = app.emit("embedding:index_phase", "building");
             let generation = catalog.rebuild_vector_generation(&model_artifact_id, dimension)?;
-            // 校验阈值必须与上面的 needs_rebuild（95%）同口径，不能用 0.999999：
-            // 增量嵌入滞后时总有几个 chunk 尚无当前模型向量，全量重建后 coverage
-            // 稳定差这几条而永远失败，active 永不切换 → 每个 cycle 都触发 19.9 万条
-            // 全量重建，CPU 打满、UI 冻结，close 时 shutdown 路径被拖死。
+            // 校验口径与上面的 needs_rebuild 一致，都以 indexable_chunks 为基准：
+            // 重建加载的条目即「当前模型维度下已 embedding 的有效 chunk」，因此
+            // item_count 应与 indexable_chunks 完全一致；不一致说明重建未完整收拢，
+            // 此时不切换 active，避免语义检索命中陈旧子集。
             if generation.status != "active"
                 || generation.dimension != dimension
-                || generation.item_count == 0
-                || generation.coverage < 0.95
+                || generation.item_count < indexable_chunks
             {
                 return Err(AppError::new(
                     "VECTOR_INDEX_INCOMPLETE",
-                    "新语义索引未覆盖当前有效分块（缺口大于 5%），未切换活动 Embedding",
+                    "新语义索引未完整覆盖当前可索引分块，未切换活动 Embedding",
                     true,
                 ));
             }
@@ -13792,7 +13910,7 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
                     "coverage": generation.coverage,
                 }),
             );
-        } else if searchable_chunks > 0 {
+        } else if indexable_chunks > 0 {
             let generation = existing_generation.ok_or_else(|| {
                 AppError::new(
                     "VECTOR_INDEX_INCOMPLETE",
@@ -13801,12 +13919,11 @@ fn run_embedding_cycle(app: &AppHandle, catalog: &CatalogService, worker: &Worke
                 )
             })?;
             if generation.dimension != dimension
-                || generation.item_count == 0
-                || generation.coverage < 0.95
+                || generation.item_count < indexable_chunks
             {
                 return Err(AppError::new(
                     "VECTOR_INDEX_INCOMPLETE",
-                    "新语义索引尚未通过覆盖率校验（缺口大于 5%），未切换活动 Embedding",
+                    "新语义索引尚未通过覆盖率校验（未完整覆盖可索引分块），未切换活动 Embedding",
                     true,
                 ));
             }

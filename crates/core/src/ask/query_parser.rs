@@ -8,7 +8,7 @@
 //! Prompt 与解析器集中在本模块；解析失败由调用方回退（不中断问答）。
 
 use crate::AskMessage;
-use crate::ask::query_normalize::strip_target_stop_phrases;
+use crate::ask::query_normalize::{resolve_time_expression, strip_target_stop_phrases};
 use crate::ask::query_plan::{
     QueryIntent, QueryOperation, QueryPlan, QueryTarget, QuestionShape, SourceIntent,
 };
@@ -780,6 +780,19 @@ pub fn finalize_query_plan(
         "哪份文件里", "哪个文件里", "哪份资料", "是哪份资料", "是哪一份资料",
         "翻出来", "找出来", "拿出来", "帮我翻出来", "帮我找出来", "帮我拿出来",
         "帮我翻一下", "帮我拿一下", "翻一下", "拿一下",
+        // 「帮我定位一下／帮我定位到X资料」的检索/定位家族结尾。用户用「定位」表达
+        // 找某份资料/文件的意图，与「找一下/翻出来」同源；0.6B/2B 常把这类明明在
+        // 定位文件的问句判成 document_qa 拿对象描述做 chunk 检索后被门控拒答。以
+        // 「定位…」收尾本质是定位并取回某个文件/资料对象，应收敛为 find（文件定位）。
+        // 高精度结尾定位标记，正文问答不以「…定位一下」收尾。通用语言结构判定，
+        // 不针对任何具体文件/关键词/case。
+        "帮我定位一下", "帮我定位到", "帮忙定位一下", "帮我定位", "定位一下", "定位到",
+        // 「帮我找到／帮我找一下／能帮我找到…」的找文件家族结尾。与「找出来/翻出来」
+        // 同源；0.6B/2B 常把明明在找某类资料文件、以「帮我找到」收尾的问句漂移成
+        // document_qa 拿文件描述做 chunk 检索（命中教程/题库旁支而非目标文件）。以
+        // 「帮我找到」收尾本质是定位并取回资料对象，应收敛为 find（文件定位）。高
+        // 精度结尾定位标记，正文问答不以「…帮我找到」收尾。通用语言结构判定。
+        "帮我找到", "帮我找一下", "能帮我找到", "找个",
     ];
     let question_trimmed = question.trim_matches(|c: char| {
         matches!(
@@ -801,11 +814,51 @@ pub fn finalize_query_plan(
     let ends_with_location = location_enders
         .iter()
         .any(|marker| question_trimmed.ends_with(marker));
-    // 只要以定位词结尾即归 find，不依赖模型 intent 输出。0.6B/2B 对这类问句的
-    // intent 输出不稳定（DocumentQa / LibraryQa 均可能出现），但结尾定位词是
-    // 高精度语义信号——「XX在哪份文件里／是哪份资料」本质是定位文件，与其 intent
-    // 初判无关。1.2/1.3 兜底已显式排除 ends_with_location，故无条件化不会与之冲突。
-    if ends_with_location {
+    // 「XX 和 YY 的区别/不同/差异在哪里」以「在哪里/在哪」收尾，但问的是两个
+    // 概念的差异，不是「文件在哪个位置」。location_enders 的「在哪里/在哪」会把
+    // 这类内容对比结尾误伤成 find（qt24「选择/投影运算区别在哪里」→ 空定位）。
+    // 通用语言结构判定：对比词与「在哪」尾词同现时，该尾词不作为 find 信号，
+    // 反而应归一为内容问答。不针对任何具体文件/关键词/case。
+    let asks_content_compare = ["区别", "不同", "差别", "差异", "区分"]
+        .iter()
+        .any(|marker| question_trimmed.contains(marker));
+    let ends_with_where =
+        question_trimmed.ends_with("在哪里") || question_trimmed.ends_with("在哪");
+    let is_compare_where_ending = asks_content_compare && ends_with_where;
+    // 祈使定位「句内定位动词 + 资料宾语结尾」兜底：location_enders 只做结尾锚定，
+    // 但「帮我在资料里找一份下午真题文件」「帮我找到大模型项目逐字稿」的定位动词
+    // （找一份/帮我找到）在句中、宾语资料名词在结尾，结尾锚定无法命中，模型又把它
+    // 漂移成 document_qa。双信号同现本质是「定位并取回某个资料对象」。通用语言
+    // 结构判定，不针对任何具体文件/关键词/case。
+    let body_locate_verbs: &[&str] = &[
+        "帮我找到", "帮我找", "帮我定位", "帮忙找", "帮我翻出来", "帮我找出来",
+        "找一下", "找一份", "找几份", "找一套", "找一本", "找份", "查找一下", "找出",
+    ];
+    let material_endings: &[&str] = &[
+        "文件", "资料", "真题", "逐字稿", "手册", "宝典", "笔记", "报告", "教程",
+        "文档", "清单", "稿件", "题库", "书籍", "说明书",
+    ];
+    let has_body_locate_verb = body_locate_verbs
+        .iter()
+        .any(|marker| question_trimmed.contains(marker));
+    let ends_with_material = material_endings
+        .iter()
+        .any(|marker| question_trimmed.ends_with(marker));
+    let body_locate_find = has_body_locate_verb && ends_with_material;
+    // 只要以定位词结尾，或构成「句内定位动词+资料宾语」即归 find，不依赖模型
+    // intent 输出。0.6B/2B 对这类问句的 intent 输出不稳定（DocumentQa / LibraryQa
+    // 均可能出现），但定位信号是高精度语义——「XX在哪份文件里／哪份资料／帮我找
+    // 一份X文件」本质是定位文件，与其 intent 初判无关。对比义项（区别在哪里）优先
+    // 归一为内容问答，避免把内容对比误判成定位。1.2/1.3 兜底已显式排除
+    // ends_with_location，故无条件化不会与之冲突。
+    if is_compare_where_ending {
+        if matches!(
+            plan.intent,
+            QueryIntent::DocumentFind | QueryIntent::LibraryQa
+        ) {
+            plan.intent = QueryIntent::DocumentQa;
+        }
+    } else if ends_with_location || body_locate_find {
         plan.intent = QueryIntent::DocumentFind;
     }
     // 1.2 文档内容列举问句 → DocumentQa（与 1.1 对称的向下兜底）。模型会偶尔把
@@ -1323,6 +1376,15 @@ pub fn finalize_query_plan(
         };
         apply_capability_override(question, &mut capability_routing);
         plan.source = capability_routing.source;
+    }
+    // 9. 相对时间程序标准化：模型只产出原始时间表达（filters.time），这里把
+    //    「去年/今年/上个月/N 个月前/N 天前/昨天/上周/上上周」换算为具体日期范围
+    //    写入 time_range（与 time 原始表达并存）。无法解析/解析失败时原样保留、不强行注入。
+    if let Some(time_raw) = plan.filters.time.as_deref() {
+        if plan.filters.time_range.is_none() {
+            let today = chrono::Local::now().date_naive();
+            plan.filters.time_range = resolve_time_expression(time_raw, today);
+        }
     }
     Some(plan)
 }

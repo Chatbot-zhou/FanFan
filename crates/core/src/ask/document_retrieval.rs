@@ -92,6 +92,15 @@ pub fn score_document_metadata(
         score += 0.30;
         signals.push("keyword_match".to_owned());
     }
+    // 主题（模型理解的语义化主题列表）。
+    let topic_hit = profile
+        .topics
+        .iter()
+        .any(|topic| signal_in_question(topic, question));
+    if topic_hit {
+        score += 0.28;
+        signals.push("topic_match".to_owned());
+    }
     // 章节标题。
     let section_hit = profile
         .section_titles
@@ -109,6 +118,12 @@ pub fn score_document_metadata(
     if entity_hit {
         score += 0.20;
         signals.push("entity_match".to_owned());
+    }
+    // 文档目的/用途（模型理解生成，可能为空串）。
+    let purpose_hit = signal_in_question(&profile.purpose, question);
+    if purpose_hit {
+        score += 0.18;
+        signals.push("purpose_match".to_owned());
     }
     // 摘要（最弱）。
     let summary_hit = signal_in_question(&profile.summary, question);
@@ -507,6 +522,10 @@ mod tests {
             type_confidence: None,
             section_titles: Vec::new(),
             representative_text_hash: None,
+            purpose: String::new(),
+            topics: Vec::new(),
+            profile_version: 0,
+            confidence: None,
             updated_at: chrono::DateTime::UNIX_EPOCH,
         }
     }
@@ -724,5 +743,40 @@ mod tests {
             recall.metadata_candidates[0].score >= recall.metadata_candidates[1].score,
             "metadata trace must keep ranked channel order"
         );
+    }
+
+    #[test]
+    fn metadata_topic_hit() {
+        // title / keywords 均不命中，仅 topics 含目标词时也应进入候选。
+        let mut profile = mk_profile(11, "无关标题", vec![]);
+        profile.topics = vec!["机器学习".to_owned()];
+        let (score, signals) = score_document_metadata("哪些资料涉及机器学习", &profile, "f.txt");
+        assert!(score > 0.0, "topic signal must score, got {score}");
+        assert!(signals.contains(&"topic_match".to_owned()));
+    }
+
+    #[test]
+    fn metadata_purpose_hit() {
+        // purpose 命中即计分（title / keywords / topics 均不命中）。
+        let mut profile = mk_profile(12, "无关标题", vec![]);
+        profile.purpose = "年度绩效评审".to_owned();
+        let (score, signals) =
+            score_document_metadata("这份材料用于年度绩效评审", &profile, "f.txt");
+        assert!(score > 0.0, "purpose signal must score, got {score}");
+        assert!(signals.contains(&"purpose_match".to_owned()));
+    }
+
+    #[test]
+    fn metadata_multi_signal_with_topic_purpose_capped() {
+        // 标题 + 话题 + 目的多信号叠加（0.45 + 0.28 + 0.18 = 0.91）仍封顶 0.9。
+        let mut profile = mk_profile(13, "述职报告", vec![]);
+        profile.topics = vec!["年度总结".to_owned()];
+        profile.purpose = "团队绩效".to_owned();
+        let (score, signals) =
+            score_document_metadata("年度总结述职报告团队绩效", &profile, "述职报告.docx");
+        assert!(score <= 0.9, "score must be capped at 0.9, got {score}");
+        assert!(signals.contains(&"title_match".to_owned()));
+        assert!(signals.contains(&"topic_match".to_owned()));
+        assert!(signals.contains(&"purpose_match".to_owned()));
     }
 }

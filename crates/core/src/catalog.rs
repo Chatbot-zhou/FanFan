@@ -835,6 +835,23 @@ impl CatalogService {
         self.store.update_document_profile_classifier(profile)
     }
 
+    /// 列出待语义理解画像（purpose 为空或 topics 为空且当前版本在场），
+    /// 供 Document Understanding 扫描。
+    pub fn list_profiles_needing_understanding(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<(crate::DocumentProfile, String)>, AppError> {
+        self.store.list_profiles_needing_understanding(limit)
+    }
+
+    /// 回写画像的语义扩展列（purpose/topics/confidence/updated_at）。
+    pub fn update_document_profile_semantic(
+        &self,
+        profile: &crate::DocumentProfile,
+    ) -> Result<bool, AppError> {
+        self.store.update_document_profile_semantic(profile)
+    }
+
     // ------------------------------ Memory 数据层（Step 3） ------------------------------
 
     pub fn upsert_memory_entity(
@@ -1559,6 +1576,14 @@ impl CatalogService {
         model_artifact_id: &str,
     ) -> Result<Option<crate::IndexGeneration>, AppError> {
         self.store.active_vector_generation(model_artifact_id)
+    }
+
+    pub fn count_indexable_chunks(
+        &self,
+        model_artifact_id: &str,
+        dimension: u32,
+    ) -> Result<u64, AppError> {
+        self.store.count_indexable_chunks(model_artifact_id, dimension)
     }
 
     /// 是否存在任何已激活的向量索引代际（不限 Embedding 模型）。

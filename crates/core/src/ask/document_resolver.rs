@@ -725,14 +725,23 @@ fn score_candidate(input: &ResolverInput<'_>, profile: &DocumentProfile) -> Docu
     let graduation_reference = title_tokens
         .iter()
         .any(|token| token.contains(GRADUATION_REFERENCE_MARKER));
-    if !title_tokens.is_empty()
-        && (title_tokens
-            .iter()
-            .any(|token| profile.title.contains(token) || token.contains(profile.title.trim()))
-            || target_tokens
-                .iter()
-                .any(|token| profile.title.contains(token)))
-    {
+    // 类型明确冲突：目标点名了类型（如「简历」= Resume），而该画像已是另一
+    // 个确定类型（如 LearningMaterial 教程）。此时画像标题里出现与目标类型
+    // 同义的字面词（教程「如何写好简历」标题含「简历」）不能当成目标文档的
+    // 证据——靠 target_tokens 主词元互含（主要用于反指代式短语）在冲突时抑制，
+    // 仅保留「完整标题互含」这条精确引用通道，避免教程只因标题带类型词抢位。
+    let type_conflict = matches!(
+        (input.plan.target.document_type, profile.document_type),
+        (Some(expected), Some(actual)) if expected != actual
+    );
+    let title_whole_match = !title_tokens.is_empty()
+        && title_tokens.iter().any(|token| {
+            profile.title.contains(token) || token.contains(profile.title.trim())
+        });
+    let title_token_match = !title_tokens.is_empty()
+        && !type_conflict
+        && target_tokens.iter().any(|token| profile.title.contains(token));
+    if title_whole_match || title_token_match {
         score += weight("document_title");
         signals.push("document_title".to_owned());
     } else if graduation_reference
@@ -991,6 +1000,10 @@ mod tests {
             type_confidence: None,
             section_titles: Vec::new(),
             representative_text_hash: None,
+            purpose: String::new(),
+            topics: Vec::new(),
+            profile_version: 0,
+            confidence: None,
             updated_at: chrono::Utc::now(),
         }
     }

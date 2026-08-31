@@ -55,7 +55,7 @@ use crate::{
     normalized_version_key,
 };
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 34;
+pub const CURRENT_SCHEMA_VERSION: u32 = 35;
 
 /// operation_traces 表的 schema 版本（与 CURRENT_SCHEMA_VERSION 独立演进）。
 pub const OPERATION_TRACE_SCHEMA_VERSION: u32 = 1;
@@ -1140,6 +1140,16 @@ const MIGRATIONS: &[Migration] = &[
               CREATE INDEX idx_image_assets_ocr_queue
                 ON image_assets(status, updated_at, asset_id)
                 WHERE status IN ('pending_ocr', 'ocr_processing');",
+    },
+    Migration {
+        version: 35,
+        name: "document_profiles_semantic_columns",
+        // document_profiles 语义字段扩展：purpose/topics_json/profile_version/
+        // confidence 由 Document Understanding 与分类器写入，旧行用默认值兜底。
+        sql: "ALTER TABLE document_profiles ADD COLUMN purpose TEXT NOT NULL DEFAULT '';
+              ALTER TABLE document_profiles ADD COLUMN topics_json TEXT NOT NULL DEFAULT '[]';
+              ALTER TABLE document_profiles ADD COLUMN profile_version INTEGER NOT NULL DEFAULT 0;
+              ALTER TABLE document_profiles ADD COLUMN confidence REAL;",
     },
 ];
 
@@ -5854,6 +5864,35 @@ impl CatalogStore {
         }))
     }
 
+    /// 统计当前模型与维度下「已生成 embedding 且属有效范围」的 chunk 数，
+    /// 即重建向量索引时会实际加载的条目数。
+    ///
+    /// 增量嵌入完成后，用它与当前代际 `item_count` 比较即可精确判定索引是否已
+    /// 收敛到 100%。不能以「全部有效 chunk」作为基准：禁用目录、OCR 失败等
+    /// 来源的 chunk 可能永不生成 embedding，若拿它们做分母会让每个嵌入周期都
+    /// 误判为「有缺口」并反复触发全量重建。
+    pub fn count_indexable_chunks(
+        &self,
+        model_artifact_id: &str,
+        dimension: u32,
+    ) -> Result<u64, AppError> {
+        if model_artifact_id.trim().is_empty() || dimension == 0 {
+            return Ok(0);
+        }
+        let connection = self.connect()?;
+        let sql = format!(
+            "SELECT COUNT(*) FROM chunk_embeddings e JOIN files f ON f.file_id = e.file_id \
+             WHERE e.model_artifact_id = ?1 AND e.dimension = ?2 \
+             AND f.current_revision_id = e.revision_id AND f.availability = 'present' \
+             AND {AUTHORIZED_FILE_SQL}"
+        );
+        connection
+            .query_row(&sql, params![model_artifact_id, dimension], |row| {
+                row.get::<_, u64>(0)
+            })
+            .map_err(|error| storage_error("RAG_INDEXABLE_COVERAGE_QUERY_FAILED", error, true))
+    }
+
     /// 是否存在任何已激活的向量索引代际（不限模型）。
     /// 用于检测「Embedding 换代但新模型尚未建立索引代」的提示场景；只读，不触碰索引数据。
     pub fn any_active_vector_generation(&self) -> Result<bool, AppError> {
@@ -8427,7 +8466,7 @@ impl CatalogStore {
                 // 结果属于旧内容，必须清空等待重新分类（旧类型绝不带到新版本）。
                 transaction
                     .execute(
-                        "INSERT INTO document_profiles (file_id, revision_id, title, summary, keywords_json, entities_json, embedding_model_id, dimension, vector_blob, candidate_bucket, algorithm_version, section_titles_json, representative_text_hash, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, '[]', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13) ON CONFLICT(file_id) DO UPDATE SET revision_id = excluded.revision_id, title = excluded.title, summary = excluded.summary, keywords_json = excluded.keywords_json, entities_json = excluded.entities_json, embedding_model_id = excluded.embedding_model_id, dimension = excluded.dimension, vector_blob = excluded.vector_blob, candidate_bucket = excluded.candidate_bucket, algorithm_version = excluded.algorithm_version, section_titles_json = excluded.section_titles_json, representative_text_hash = excluded.representative_text_hash, document_type = CASE WHEN document_profiles.revision_id <> excluded.revision_id THEN NULL ELSE document_profiles.document_type END, type_confidence = CASE WHEN document_profiles.revision_id <> excluded.revision_id THEN NULL ELSE document_profiles.type_confidence END, updated_at = excluded.updated_at",
+                        "INSERT INTO document_profiles (file_id, revision_id, title, summary, keywords_json, entities_json, embedding_model_id, dimension, vector_blob, candidate_bucket, algorithm_version, section_titles_json, representative_text_hash, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, '[]', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13) ON CONFLICT(file_id) DO UPDATE SET revision_id = excluded.revision_id, title = excluded.title, summary = excluded.summary, keywords_json = excluded.keywords_json, entities_json = excluded.entities_json, embedding_model_id = excluded.embedding_model_id, dimension = excluded.dimension, vector_blob = excluded.vector_blob, candidate_bucket = excluded.candidate_bucket, algorithm_version = excluded.algorithm_version, section_titles_json = excluded.section_titles_json, representative_text_hash = excluded.representative_text_hash, document_type = CASE WHEN document_profiles.revision_id <> excluded.revision_id THEN NULL ELSE document_profiles.document_type END, type_confidence = CASE WHEN document_profiles.revision_id <> excluded.revision_id THEN NULL ELSE document_profiles.type_confidence END, profile_version = document_profiles.profile_version + 1, purpose = CASE WHEN document_profiles.revision_id <> excluded.revision_id THEN '' ELSE document_profiles.purpose END, topics_json = CASE WHEN document_profiles.revision_id <> excluded.revision_id THEN '[]' ELSE document_profiles.topics_json END, confidence = CASE WHEN document_profiles.revision_id <> excluded.revision_id THEN NULL ELSE document_profiles.confidence END, updated_at = excluded.updated_at",
                         params![
                             file_id,
                             revision_id,
@@ -8520,7 +8559,8 @@ impl CatalogStore {
         let row = connection.query_row(
             "SELECT p.file_id, p.revision_id, p.title, p.summary, p.keywords_json, \
                         p.entities_json, p.document_type, p.type_confidence, \
-                        p.section_titles_json, p.representative_text_hash, p.updated_at \
+                        p.section_titles_json, p.representative_text_hash, p.purpose, \
+                        p.topics_json, p.profile_version, p.confidence, p.updated_at \
                  FROM document_profiles p WHERE p.file_id = ?1",
             params![file_id.to_string()],
             map_profile_row,
@@ -8564,6 +8604,36 @@ impl CatalogStore {
         Ok(changed > 0)
     }
 
+    /// 写入画像的语义扩展列（purpose/topics_json/confidence/updated_at）。
+    /// topics 用 JSON 序列化；profile_version 由重建链（UPSERT）递增，不由本方法维护。
+    /// 画像行不存在时返回 Ok(false)（语义理解在画像就绪后运行，no-op 无副作用）。
+    pub fn update_document_profile_semantic(
+        &self,
+        profile: &DocumentProfile,
+    ) -> Result<bool, AppError> {
+        let connection = self.connect()?;
+        let topics_json = serde_json::to_string(&profile.topics)
+            .map_err(|error| AppError::new("DOCUMENT_PROFILE_INVALID", error.to_string(), false))?;
+        let changed = connection
+            .execute(
+                "UPDATE document_profiles SET \
+                    purpose = ?2, \
+                    topics_json = ?3, \
+                    confidence = ?4, \
+                    updated_at = ?5 \
+                 WHERE file_id = ?1",
+                params![
+                    profile.file_id.to_string(),
+                    profile.purpose.as_str(),
+                    topics_json,
+                    profile.confidence.map(f64::from),
+                    profile.updated_at.to_rfc3339(),
+                ],
+            )
+            .map_err(|error| storage_error("DOCUMENT_PROFILE_WRITE_FAILED", error, true))?;
+        Ok(changed > 0)
+    }
+
     /// 列出文档画像（可按文档类型过滤），返回 (画像, 文件名)。
     /// 供 Document Resolver 定位目标文件；limit 保护画像库过大。
     ///
@@ -8599,7 +8669,8 @@ impl CatalogStore {
         let sql = format!(
             "SELECT p.file_id, p.revision_id, p.title, p.summary, p.keywords_json, \
                     p.entities_json, p.document_type, p.type_confidence, \
-                    p.section_titles_json, p.representative_text_hash, p.updated_at, f.name \
+                    p.section_titles_json, p.representative_text_hash, p.purpose, \
+                    p.topics_json, p.profile_version, p.confidence, p.updated_at, f.name \
              FROM document_profiles p JOIN files f ON f.file_id = p.file_id \
              WHERE f.availability = 'present' AND p.revision_id = f.current_revision_id {type_clause} \
              ORDER BY p.updated_at DESC LIMIT ?1"
@@ -8645,7 +8716,8 @@ impl CatalogStore {
             .prepare(
                 "SELECT p.file_id, p.revision_id, p.title, p.summary, p.keywords_json, \
                         p.entities_json, p.document_type, p.type_confidence, \
-                        p.section_titles_json, p.representative_text_hash, p.updated_at, f.name \
+                        p.section_titles_json, p.representative_text_hash, p.purpose, \
+                        p.topics_json, p.profile_version, p.confidence, p.updated_at, f.name \
                  FROM document_profiles p JOIN files f ON f.file_id = p.file_id \
                  WHERE f.availability = 'present' AND p.revision_id = f.current_revision_id \
                    AND p.document_type IS NULL \
@@ -8660,6 +8732,43 @@ impl CatalogStore {
             let (raw, name) =
                 row.map_err(|error| storage_error("DOCUMENT_PROFILE_LIST_FAILED", error, true))?;
             // 单行损坏跳过（分类是 best-effort，不因一行坏画像拖垮整批）
+            if let Ok(profile) = parse_profile_row(raw) {
+                profiles.push((profile, name.unwrap_or_default()));
+            }
+        }
+        drop(rows);
+        Ok(profiles)
+    }
+
+    /// 列出待语义理解画像：`purpose = '' OR topics_json = '[]'` 且当前
+    /// （revision 匹配、文件在场）。Document Understanding 在画像就绪后扫描
+    /// 这些行；与待分类列表同构，仅 WHERE 条件不同。按 updated_at DESC：
+    /// 最后更新的画像优先（用户最可能马上问到）。
+    pub fn list_profiles_needing_understanding(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<(DocumentProfile, String)>, AppError> {
+        let connection = self.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT p.file_id, p.revision_id, p.title, p.summary, p.keywords_json, \
+                        p.entities_json, p.document_type, p.type_confidence, \
+                        p.section_titles_json, p.representative_text_hash, p.purpose, \
+                        p.topics_json, p.profile_version, p.confidence, p.updated_at, f.name \
+                 FROM document_profiles p JOIN files f ON f.file_id = p.file_id \
+                 WHERE f.availability = 'present' AND p.revision_id = f.current_revision_id \
+                   AND (p.purpose = '' OR p.topics_json = '[]') \
+                 ORDER BY p.updated_at DESC LIMIT ?1",
+            )
+            .map_err(|error| storage_error("DOCUMENT_PROFILE_LIST_FAILED", error, true))?;
+        let mut rows = statement
+            .query_map(params![limit as i64], map_profile_row)
+            .map_err(|error| storage_error("DOCUMENT_PROFILE_LIST_FAILED", error, true))?;
+        let mut profiles = Vec::new();
+        for row in rows.by_ref() {
+            let (raw, name) =
+                row.map_err(|error| storage_error("DOCUMENT_PROFILE_LIST_FAILED", error, true))?;
+            // 单行损坏跳过（理解是 best-effort，不因一行坏画像拖垮整批）
             if let Ok(profile) = parse_profile_row(raw) {
                 profiles.push((profile, name.unwrap_or_default()));
             }
@@ -13903,6 +14012,10 @@ type ProfileRow = (
     Option<f64>,    // type_confidence
     String,         // section_titles_json
     Option<String>, // representative_text_hash
+    String,         // purpose
+    String,         // topics_json
+    i64,            // profile_version
+    Option<f64>,    // confidence
     String,         // updated_at
 );
 
@@ -13983,8 +14096,12 @@ fn map_profile_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(ProfileRow, Opt
             row.get(8)?,
             row.get(9)?,
             row.get(10)?,
+            row.get(11)?,
+            row.get(12)?,
+            row.get(13)?,
+            row.get(14)?,
         ),
-        row.get(11).ok(),
+        row.get(15).ok(),
     ))
 }
 
@@ -14001,6 +14118,10 @@ fn parse_profile_row(raw: ProfileRow) -> Result<DocumentProfile, AppError> {
         type_confidence,
         section_titles_json,
         representative_text_hash,
+        purpose,
+        topics_json,
+        profile_version,
+        confidence,
         updated_at,
     ) = raw;
     let invalid = |error: serde_json::Error| {
@@ -14019,6 +14140,10 @@ fn parse_profile_row(raw: ProfileRow) -> Result<DocumentProfile, AppError> {
         type_confidence: type_confidence.map(|value| value as f32),
         section_titles: serde_json::from_str(&section_titles_json).map_err(invalid)?,
         representative_text_hash,
+        purpose,
+        topics: serde_json::from_str(&topics_json).map_err(invalid)?,
+        profile_version: u64::try_from(profile_version).unwrap_or(0),
+        confidence: confidence.map(|value| value as f32),
         updated_at: parse_datetime_value(&updated_at)?,
     })
 }
@@ -15550,6 +15675,7 @@ mod tests {
                 (32, "operation_trace_infrastructure".to_owned()),
                 (33, "evaluation_loop_persistence".to_owned()),
                 (34, "image_ocr_before_vision".to_owned()),
+                (35, "document_profiles_semantic_columns".to_owned()),
             ]
         );
         let rules = store.list_exclusion_rules().expect("list exclusion rules");
@@ -18408,37 +18534,55 @@ mod tests {
         let evidence = answer.claims[0].citations[0].clone();
         assert!(evidence.quote.contains("正文乙段"), "命中块正文应包含乙段");
         // 精确契约：邻居上下文 = 同节点相邻块文本按 NEIGHBOR_CONTEXT_TOKEN_CAP
-        // 截断，与库里真实相邻块逐字节一致。
+        // 截断，与库里命中块（chunk_id）真正相邻的块（ordinal±1）逐字节一致。
+        // 校验基准是命中块的 chunk_id，而非「按关键字找中间块」：长文按 64
+        // token 重叠切块后没有「纯甲/乙/丙段」，每块都带前一块的尾巴，块首字
+        // 还常被切出一个不完整单元（如「文甲段」），因此不能靠文本子串假设
+        // 相邻块形态，只能以 DB 中真实的 ordinal 邻接为准。
         let connection = store.connect().expect("connect");
-        let chunks = connection
-            .prepare("SELECT ordinal, text FROM chunks ORDER BY ordinal")
-            .expect("prepare chunks")
-            .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            .expect("query chunks")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("collect chunks");
-        assert!(chunks.len() >= 3, "应切出至少甲乙丙三段对应块");
-        // 命中块 = 含乙段、不含丙段的那块（丙块同时含乙段尾巴与丙段）
-        let hit = chunks
-            .iter()
-            .position(|(_, text)| text.contains("正文乙段") && !text.contains("下文丙段"))
-            .expect("命中中间块");
+        let (hit_ordinal, hit_node): (i64, String) = connection
+            .query_row(
+                "SELECT ordinal, node_id FROM chunks WHERE chunk_id = ?1",
+                params![evidence.chunk_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("查询命中块");
+        // 同节点 ordinal±1 的真实相邻块文本
+        let neighbor_text = |target: i64| -> Option<String> {
+            connection
+                .query_row(
+                    "SELECT text FROM chunks WHERE node_id = ?1 AND ordinal = ?2 LIMIT 1",
+                    params![hit_node, target],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .expect("查询相邻块")
+        };
+        let expected_before =
+            neighbor_text(hit_ordinal - 1).map(|text| crate::indexing::cap_by_estimated_tokens(&text, 128));
+        let expected_after =
+            neighbor_text(hit_ordinal + 1).map(|text| crate::indexing::cap_by_estimated_tokens(&text, 128));
         assert_eq!(
-            evidence.context_before.as_deref(),
-            Some(crate::indexing::cap_by_estimated_tokens(&chunks[hit - 1].1, 128).as_str()),
-            "前邻居应为甲块文本按上限截断"
+            evidence.context_before,
+            expected_before,
+            "前邻居应为命中块 ordinal-1 块文本按上限截断"
         );
         assert_eq!(
-            evidence.context_after.as_deref(),
-            Some(crate::indexing::cap_by_estimated_tokens(&chunks[hit + 1].1, 128).as_str()),
-            "后邻居应为丙块文本按上限截断"
+            evidence.context_after,
+            expected_after,
+            "后邻居应为命中块 ordinal+1 块文本按上限截断"
         );
-        // 语义抽查：前邻居纯甲段、后邻居含丙段（在完整块文本上成立）
-        assert!(chunks[hit - 1].1.contains("上文甲段"));
-        assert!(!chunks[hit - 1].1.contains("正文乙段"));
-        assert!(chunks[hit + 1].1.contains("下文丙段"));
+        // 语义抽查：前邻居应落在甲、乙段文档方向上，后邻居落在丙段方向。
+        // 重叠块文本跨段边界，故只断言各自能代表原文对应区段，而非整段。
+        let before_text = evidence.context_before.unwrap_or_default();
+        let after_text = evidence.context_after.unwrap_or_default();
+        assert!(
+            before_text.contains("上文甲段") || before_text.contains("文甲段"),
+            "前邻居应对应文档甲段方向，实际: {before_text}"
+        );
+        assert!(
+            after_text.contains("下文丙段"), "后邻居应含下段（丙段）文本"
+        );
     }
 
     #[test]

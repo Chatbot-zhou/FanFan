@@ -70,6 +70,10 @@ fn profile(file_id: Uuid, document_type: Option<DocumentType>, title: &str) -> D
         type_confidence: None,
         section_titles: Vec::new(),
         representative_text_hash: None,
+        purpose: String::new(),
+        topics: Vec::new(),
+        profile_version: 0,
+        confidence: None,
         updated_at: chrono::Utc::now(),
     }
 }

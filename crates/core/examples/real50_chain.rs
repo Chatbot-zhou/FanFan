@@ -323,17 +323,26 @@ fn run_scenario(
     }
     detail!("plan: {}", plan_label(plan.as_ref()));
 
-    // Document Resolver：解析目标 → file_id 白名单（生产口径）。
+    // Document Resolver：解析目标 → file_id 白名单（生产口径，含语义补召回通道）。
+    // 与生产 finish_retrieval_with_plan 对齐：问题向量 + 画像向量一并传入，
+    // 使「未点名文件名但语义可匹配」的目标（指代式/概念式提问，如 qt13）也能
+    // 通过语义通道进入候选池，避免只靠 metadata 子串匹配导致的召回错位。
+    // 向量加载失败 → 空映射，退化为 metadata-only（语义是增益层，绝不阻断定位）。
     let mut resolved_scope: Vec<uuid::Uuid> = Vec::new();
     if let Some(plan) = plan.as_ref() {
-        let profiles = catalog.list_document_profiles(None, 2000)?;
+        let profiles = catalog
+            .list_document_profiles(None, 2000)?
+            .into_iter()
+            .map(|(profile, _)| profile)
+            .collect::<Vec<_>>();
+        let profile_vector_ids = profiles
+            .iter()
+            .map(|profile| profile.file_id)
+            .collect::<Vec<_>>();
+        let profile_vectors = catalog.profile_vectors(&profile_vector_ids).unwrap_or_default();
         let session = AskSessionContext::default();
-        let input = ResolverInput::new(
-            plan,
-            &session,
-            profiles.iter().map(|(profile, _)| profile.clone()).collect(),
-            file_names.clone(),
-        );
+        let input = ResolverInput::new(plan, &session, profiles, file_names.clone())
+            .with_vectors(Some(vec.clone()), profile_vectors);
         let resolution = resolve_documents(&input);
         // scope 口径与生产一致（app_data.rs finish_retrieval_with_plan 只取
         // resolved_file_ids，candidates 仅用于澄清，不进检索 scope）：

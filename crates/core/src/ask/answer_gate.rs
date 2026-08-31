@@ -735,18 +735,32 @@ pub fn evaluate_answerability(input: &AnswerabilityInput) -> AnswerabilityVerdic
         }
     }
 
-    // 规则 2：实体明显不一致 → 拒答（CASE A）
+    // 规则 2：实体明显不一致 → 拒答（CASE A）。
+    // 「英文实体全 miss」只有在问题不含可用中文主题锚点时，才是「证据与主题
+    // 无关」的可靠信号。中英混合问题里，英文词常只是概念的译名原文（如
+    // Read Committed / Repeatable Read），中文证据以译文（读已提交/可重复读）
+    // 出现，英文词全 miss 不代表主题不一致。此时不在此拒答，交由后续规则 4
+    // （Partial，允许继续）与规则 6（中文内容词门控）兜底，避免因译名差异误拒。
     if !query_entities.is_empty() && matched.is_empty() {
-        return AnswerabilityVerdict {
-            status: AnswerabilityStatus::NotAnswerable,
-            confidence: 0.15,
-            reason: format!("entity_mismatch:{}", query_entities.join(",")),
-            answer_shape,
-            query_entities,
-            evidence_entities: matched,
-            missing_entities: missing,
-            evidence_roles,
-        };
+        let theme_source = input
+            .content_query
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| input.question.trim());
+        let has_chinese_theme = !extract_chinese_content_terms(theme_source).is_empty();
+        if !has_chinese_theme {
+            return AnswerabilityVerdict {
+                status: AnswerabilityStatus::NotAnswerable,
+                confidence: 0.15,
+                reason: format!("entity_mismatch:{}", query_entities.join(",")),
+                answer_shape,
+                query_entities,
+                evidence_entities: matched,
+                missing_entities: missing,
+                evidence_roles,
+            };
+        }
+        // 含中文主题词：不在此提前拒答，落到规则 4/6 做中文一致性兜底。
     }
 
     // 规则 3：项目存在性断言需要 PROJECT 语境证据（spec 五）

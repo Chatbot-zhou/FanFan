@@ -223,6 +223,19 @@ pub struct QueryTarget {
     pub entity_name: Option<String>,
 }
 
+/// 结构化日期范围（闭区间，起止均为 "YYYY-MM-DD"）。
+///
+/// 由相对时间程序标准化产出：模型只负责把「去年 / 上个月 / N 天前」等
+/// 原始表达填入 `QueryFilters.time`，具体年月日范围由纯函数换算后写入
+/// [`QueryFilters::time_range`]，模型不参与日期计算。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DateRange {
+    /// 范围起始日（含）
+    pub start_date: String,
+    /// 范围结束日（含）
+    pub end_date: String,
+}
+
 /// 检索过滤条件（第一版只建模时间与文件类型，P0 阶段多为空）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -230,6 +243,9 @@ pub struct QueryFilters {
     pub time: Option<String>,
     pub file_type: Option<String>,
     pub path: Option<String>,
+    /// 程序换算后的具体日期范围（与 `time` 原始表达并存，见 [`DateRange`]）。
+    #[serde(default)]
+    pub time_range: Option<DateRange>,
 }
 
 /// 结构化查询计划：Source Router 与 Query Parser 的完整产物。
